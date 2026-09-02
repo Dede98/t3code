@@ -1,5 +1,6 @@
 import {
   AgentControlRunOnceId,
+  EventId,
   type AgentControlEvent,
   type AgentControlGithubEvent,
   type AgentControlProjectState,
@@ -21,6 +22,7 @@ import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -76,6 +78,7 @@ const LEASE_DURATION_MS = 60_000;
 const PROJECT_WORKERS = 2;
 const RETRY_BASE_DELAY_MS = 25;
 const RETRY_MAX_DELAY_MS = 1_000;
+const isRunOnceError = Schema.is(AgentControlRunOnceError);
 interface PersistedRunState extends RunOnceStateBinding {
   readonly runId: AgentControlRunOnceId;
   readonly nextOrdinal: number;
@@ -265,9 +268,7 @@ export const makeAgentControlRunOnceWorkScheduler = Effect.fn(
           .map((reason) => reason.error);
         const mustFailClosed =
           failures.length !== exit.cause.reasons.length ||
-          failures.some(
-            (failure) => !(failure instanceof AgentControlRunOnceError) || !isRetryable(failure),
-          );
+          failures.some((failure) => !isRunOnceError(failure) || !isRetryable(failure));
         if (mustFailClosed) {
           return Effect.logError("Run-Once project work failed closed", {
             projectId,
@@ -530,7 +531,9 @@ const make = Effect.gen(function* () {
         github_event_sequence AS "githubEventSequence",
         github_event_stream_version AS "githubEventStreamVersion",
         reconcile_revision AS "reconcileRevision", source_fingerprint AS "sourceFingerprint",
-        activated_at AS "activatedAt"
+        activated_at AS "activatedAt", origin_mode AS "originMode",
+        armed_dispatch_id AS "armedDispatchId", armed_claim_id AS "armedClaimId",
+        armed_marker_id AS "armedMarkerId"
       FROM main.agent_control_run_once_activations WHERE run_id = ${runId}
     `.pipe(Effect.mapError((cause) => error(projectId, runId, null, "persistence", cause)));
     const row = rows[0];
@@ -540,7 +543,16 @@ const make = Effect.gen(function* () {
       typeof row.activationExpectedRevision !== "number" ||
       typeof row.activationCommandFingerprint !== "string" ||
       !(row.activationEventPayloadBytes instanceof Uint8Array) ||
-      !(row.activationEventMetadataBytes instanceof Uint8Array)
+      !(row.activationEventMetadataBytes instanceof Uint8Array) ||
+      (row.originMode !== "observe" && row.originMode !== "armed") ||
+      (row.originMode === "observe" &&
+        (row.armedDispatchId !== null ||
+          row.armedClaimId !== null ||
+          row.armedMarkerId !== null)) ||
+      (row.originMode === "armed" &&
+        (typeof row.armedDispatchId !== "string" ||
+          typeof row.armedClaimId !== "string" ||
+          typeof row.armedMarkerId !== "string"))
     ) {
       return yield* error(projectId, runId, null, "authority-conflict");
     }
@@ -559,6 +571,10 @@ const make = Effect.gen(function* () {
       reconcileRevision: row.reconcileRevision,
       sourceFingerprint: row.sourceFingerprint,
       activatedAt: row.activatedAt,
+      originMode: row.originMode,
+      armedDispatchId: row.armedDispatchId,
+      armedClaimId: row.armedClaimId,
+      armedMarkerId: row.armedMarkerId,
     } as AgentControlRunOnceActivation;
     return {
       activation,
@@ -601,11 +617,13 @@ const make = Effect.gen(function* () {
       : project.events.findLast((event) => {
           if (
             event.type !== "agentControl.project.mode.changed" ||
-            event.authority !== "human" ||
-            event.payload.previousMode !== "observe" ||
             event.payload.mode !== "run-once" ||
             event.payload.previousPausedFromMode !== null ||
-            event.payload.pausedFromMode !== null
+            event.payload.pausedFromMode !== null ||
+            !(
+              (event.authority === "human" && event.payload.previousMode === "observe") ||
+              (event.authority === "system" && event.payload.previousMode === "armed")
+            )
           ) {
             return false;
           }
@@ -623,11 +641,14 @@ const make = Effect.gen(function* () {
     if (
       activationEvent === undefined ||
       activationEvent.type !== "agentControl.project.mode.changed" ||
-      activationEvent.authority !== "human" ||
-      activationEvent.payload.previousMode !== "observe" ||
       activationEvent.payload.mode !== "run-once" ||
       activationEvent.payload.previousPausedFromMode !== null ||
-      activationEvent.payload.pausedFromMode !== null
+      activationEvent.payload.pausedFromMode !== null ||
+      !(
+        (activationEvent.authority === "human" &&
+          activationEvent.payload.previousMode === "observe") ||
+        (activationEvent.authority === "system" && activationEvent.payload.previousMode === "armed")
+      )
     )
       return yield* error(projectId, null, "activation-admitted", "authority-conflict");
 
@@ -655,6 +676,56 @@ const make = Effect.gen(function* () {
       }
     }
 
+    const originMode = activationEvent.payload.previousMode === "armed" ? "armed" : "observe";
+    const armedRows =
+      originMode === "armed"
+        ? yield* sql<Record<string, unknown>>`
+            SELECT evidence.dispatch_id AS "dispatchId", evidence.claim_id AS "claimId",
+              evidence.marker_id AS "markerId", evidence.github_intake_sequence AS "githubIntakeSequence",
+              evidence.github_event_id AS "githubEventId",
+              evidence.github_event_sequence AS "githubEventSequence",
+              evidence.github_event_stream_version AS "githubEventStreamVersion",
+              evidence.reconcile_revision AS "reconcileRevision",
+              evidence.source_fingerprint AS "sourceFingerprint",
+              state.activation_event_id AS "activationEventId",
+              state.activation_event_sequence AS "activationEventSequence",
+              state.activation_event_stream_version AS "activationEventStreamVersion"
+            FROM main.agent_control_armed_dispatch_evidence evidence
+            JOIN main.agent_control_armed_dispatch_receipts receipt
+              ON receipt.evidence_id = evidence.evidence_id
+            JOIN main.agent_control_armed_dispatch_markers marker
+              ON marker.marker_id = evidence.marker_id
+            JOIN main.agent_control_armed_dispatch_states state
+              ON state.dispatch_id = evidence.dispatch_id
+            WHERE evidence.project_id = ${projectId}
+              AND evidence.mode_command_id = ${activationEvent.commandId}
+              AND state.status = 'activated'
+          `.pipe(
+            Effect.mapError((cause) =>
+              error(projectId, null, "activation-admitted", "persistence", cause),
+            ),
+          )
+        : [];
+    const armed = armedRows[0];
+    if (
+      originMode === "armed" &&
+      (armedRows.length !== 1 ||
+        armed === undefined ||
+        armed.activationEventId !== activationEvent.eventId ||
+        armed.activationEventSequence !== activationEvent.sequence ||
+        armed.activationEventStreamVersion !== activationEvent.streamVersion ||
+        typeof armed.dispatchId !== "string" ||
+        typeof armed.claimId !== "string" ||
+        typeof armed.markerId !== "string" ||
+        typeof armed.githubIntakeSequence !== "number" ||
+        typeof armed.githubEventId !== "string" ||
+        typeof armed.githubEventSequence !== "number" ||
+        typeof armed.githubEventStreamVersion !== "number" ||
+        typeof armed.reconcileRevision !== "number" ||
+        typeof armed.sourceFingerprint !== "string")
+    ) {
+      return yield* error(projectId, null, "activation-admitted", "authority-conflict");
+    }
     const github = yield* readGithubHistory(projectId);
     const beforeActivation = github.events.filter(
       (event) => event.sequence < activationEvent.sequence,
@@ -696,6 +767,20 @@ const make = Effect.gen(function* () {
     if (tasks.some((task) => task.githubIntakeSequence !== sourceEvent.sequence)) {
       return yield* error(projectId, null, "activation-admitted", "task-history-corrupt");
     }
+    const currentSourceFingerprint = fingerprintAgentControlRunOnceSource(
+      snapshot.value.sourcePrecondition,
+    );
+    if (
+      originMode === "armed" &&
+      (armed?.githubIntakeSequence !== sourceEvent.sequence ||
+        armed.githubEventId !== sourceEvent.eventId ||
+        armed.githubEventSequence !== sourceEvent.sequence ||
+        armed.githubEventStreamVersion !== sourceEvent.streamVersion ||
+        armed.reconcileRevision !== reconcile.value.revision ||
+        armed.sourceFingerprint !== currentSourceFingerprint)
+    ) {
+      return yield* error(projectId, null, "activation-admitted", "authority-conflict");
+    }
     const runId = deriveAgentControlRunOnceId({
       projectId,
       activationEventId: activationEvent.eventId,
@@ -719,8 +804,44 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error(projectId, runId, "activation-admitted", "authority-conflict");
     }
-    return {
-      activation: {
+    let activation: AgentControlRunOnceActivation;
+    if (originMode === "armed") {
+      if (
+        armed === undefined ||
+        typeof armed.githubIntakeSequence !== "number" ||
+        typeof armed.githubEventId !== "string" ||
+        typeof armed.githubEventSequence !== "number" ||
+        typeof armed.githubEventStreamVersion !== "number" ||
+        typeof armed.reconcileRevision !== "number" ||
+        typeof armed.sourceFingerprint !== "string" ||
+        typeof armed.dispatchId !== "string" ||
+        typeof armed.claimId !== "string" ||
+        typeof armed.markerId !== "string"
+      ) {
+        return yield* error(projectId, runId, "activation-admitted", "authority-conflict");
+      }
+      activation = {
+        schemaVersion: 1,
+        runId,
+        projectId,
+        activationEventId: activationEvent.eventId,
+        activationEventSequence: activationEvent.sequence,
+        activationEventStreamVersion: activationEvent.streamVersion,
+        activationCommandId: activationEvent.commandId,
+        githubIntakeSequence: armed.githubIntakeSequence,
+        githubEventId: EventId.make(armed.githubEventId),
+        githubEventSequence: armed.githubEventSequence,
+        githubEventStreamVersion: armed.githubEventStreamVersion,
+        reconcileRevision: armed.reconcileRevision,
+        sourceFingerprint: armed.sourceFingerprint,
+        activatedAt: activationEvent.occurredAt,
+        originMode: "armed",
+        armedDispatchId: armed.dispatchId,
+        armedClaimId: armed.claimId,
+        armedMarkerId: armed.markerId,
+      };
+    } else {
+      activation = {
         schemaVersion: 1,
         runId,
         projectId,
@@ -733,9 +854,16 @@ const make = Effect.gen(function* () {
         githubEventSequence: sourceEvent.sequence,
         githubEventStreamVersion: sourceEvent.streamVersion,
         reconcileRevision: reconcile.value.revision,
-        sourceFingerprint: fingerprintAgentControlRunOnceSource(snapshot.value.sourcePrecondition),
+        sourceFingerprint: currentSourceFingerprint,
         activatedAt: activationEvent.occurredAt,
-      } satisfies AgentControlRunOnceActivation,
+        originMode: "observe",
+        armedDispatchId: null,
+        armedClaimId: null,
+        armedMarkerId: null,
+      };
+    }
+    return {
+      activation,
       modeAuthority,
       tasks,
       project,
@@ -786,7 +914,7 @@ const make = Effect.gen(function* () {
         event.correlationId === expectedResetCommandId &&
         event.causationEventId === null &&
         event.payload.previousMode === "run-once" &&
-        event.payload.mode === "observe" &&
+        event.payload.mode === activation.originMode &&
         event.payload.previousPausedFromMode === null &&
         event.payload.pausedFromMode === null
       ) {
@@ -947,7 +1075,8 @@ const make = Effect.gen(function* () {
             AND event.aggregate_kind = 'project-controller'
             AND event.stream_id = activation.project_id
             AND event.event_type = 'agentControl.project.mode.changed'
-            AND event.actor_authority = 'human'
+            AND event.actor_authority = CASE activation.origin_mode
+              WHEN 'observe' THEN 'human' ELSE 'system' END
             AND event.sequence = activation.activation_event_sequence
             AND event.stream_version = activation.activation_event_stream_version
             AND event.command_id = activation.activation_command_id
@@ -956,7 +1085,7 @@ const make = Effect.gen(function* () {
             AND event.occurred_at = activation.activated_at
             AND CAST(event.payload_json AS BLOB) = activation.activation_event_payload_json
             AND CAST(event.metadata_json AS BLOB) = activation.activation_event_metadata_json
-            AND receipt.authority = 'human'
+            AND receipt.authority = event.actor_authority
             AND receipt.aggregate_kind = 'project-controller'
             AND receipt.aggregate_id = activation.project_id
             AND receipt.status = 'accepted'
@@ -966,6 +1095,24 @@ const make = Effect.gen(function* () {
             AND receipt.accepted_at = event.occurred_at
             AND receipt.error_code IS NULL
             AND receipt.command_fingerprint = activation.activation_command_fingerprint
+            AND (
+              (activation.origin_mode = 'observe'
+                AND activation.armed_dispatch_id IS NULL
+                AND activation.armed_claim_id IS NULL
+                AND activation.armed_marker_id IS NULL)
+              OR
+              (activation.origin_mode = 'armed' AND EXISTS (
+                SELECT 1 FROM main.agent_control_armed_dispatch_evidence armed
+                JOIN main.agent_control_armed_dispatch_markers marker
+                  ON marker.marker_id = armed.marker_id
+                JOIN main.agent_control_armed_dispatch_states dispatch
+                  ON dispatch.dispatch_id = armed.dispatch_id
+                WHERE armed.dispatch_id = activation.armed_dispatch_id
+                  AND armed.claim_id = activation.armed_claim_id
+                  AND armed.marker_id = activation.armed_marker_id
+                  AND dispatch.status IN ('activated', 'completed')
+              ))
+            )
         )
         LIMIT 1
       `;
@@ -1118,7 +1265,7 @@ const make = Effect.gen(function* () {
       )
       .pipe(
         Effect.mapError((cause) =>
-          cause instanceof AgentControlRunOnceError
+          isRunOnceError(cause)
             ? cause
             : error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
         ),
@@ -1256,102 +1403,24 @@ const make = Effect.gen(function* () {
                 "authority-conflict",
               );
             }
-            const currentProject = authority.project.state;
-            const restoreProjection =
-              currentProject.revision !== authority.activation.activationEventStreamVersion ||
-              currentProject.sequence !== authority.activation.activationEventSequence;
-            if (restoreProjection) {
-              const rewound = yield* sql<{ readonly projectId: unknown }>`
-                UPDATE main.agent_control_project_states
-                SET mode = 'run-once', paused_from_mode = NULL,
-                  revision = ${authority.activation.activationEventStreamVersion},
-                  last_event_sequence = ${authority.activation.activationEventSequence},
-                  updated_at = ${authority.activation.activatedAt}
-                WHERE project_id = ${projectId}
-                  AND mode = ${currentProject.mode}
-                  AND paused_from_mode IS ${currentProject.pausedFromMode}
-                  AND revision = ${currentProject.revision}
-                  AND last_event_sequence = ${currentProject.sequence}
-                  AND updated_at IS ${currentProject.updatedAt}
-                RETURNING project_id AS "projectId"
-              `.pipe(
-                Effect.mapError((cause) =>
-                  error(
-                    projectId,
-                    authority.activation.runId,
-                    "activation-admitted",
-                    "persistence",
-                    cause,
-                  ),
-                ),
-              );
-              if (rewound.length !== 1 || rewound[0]?.projectId !== projectId) {
-                return yield* error(
-                  projectId,
-                  authority.activation.runId,
-                  "activation-admitted",
-                  "authority-conflict",
-                );
-              }
-            }
             const activation = yield* admitRunOnceActivation(
               sql,
               authority.activation,
               authority.modeAuthority,
             );
-            const restoreProjectProjection = restoreProjection
-              ? Effect.gen(function* () {
-                  const restored = yield* sql<{ readonly projectId: unknown }>`
-                UPDATE main.agent_control_project_states
-                SET mode = ${currentProject.mode},
-                  paused_from_mode = ${currentProject.pausedFromMode},
-                  revision = ${currentProject.revision},
-                  last_event_sequence = ${currentProject.sequence},
-                  updated_at = ${currentProject.updatedAt}
-                WHERE project_id = ${projectId}
-                  AND mode = 'run-once' AND paused_from_mode IS NULL
-                  AND revision = ${authority.activation.activationEventStreamVersion}
-                  AND last_event_sequence = ${authority.activation.activationEventSequence}
-                  AND updated_at = ${authority.activation.activatedAt}
-                RETURNING project_id AS "projectId"
-              `.pipe(
-                    Effect.mapError((cause) =>
-                      error(
-                        projectId,
-                        authority.activation.runId,
-                        "activation-admitted",
-                        "persistence",
-                        cause,
-                      ),
-                    ),
-                  );
-                  if (restored.length !== 1 || restored[0]?.projectId !== projectId) {
-                    return yield* error(
-                      projectId,
-                      authority.activation.runId,
-                      "activation-admitted",
-                      "authority-conflict",
-                    );
-                  }
-                })
-              : Effect.void;
-            const step = yield* writeRunOnceStepInTransaction(
-              sql,
-              {
-                runId: initial.runId,
-                projectId,
-                ordinal: initial.nextOrdinal,
-                step: "activation-admitted",
-                payload: {
-                  schemaVersion: 1,
-                  activation: authority.activation as unknown as JsonValue,
-                },
-                bindings: {},
-                state: nextState(initial, {}),
-                recordedAt: authority.activation.activatedAt,
+            const step = yield* writeRunOnceStepInTransaction(sql, {
+              runId: initial.runId,
+              projectId,
+              ordinal: initial.nextOrdinal,
+              step: "activation-admitted",
+              payload: {
+                schemaVersion: 1,
+                activation: authority.activation as unknown as JsonValue,
               },
-              restoreProjectProjection,
-            );
+              bindings: {},
+              state: nextState(initial, {}),
+              recordedAt: authority.activation.activatedAt,
+            });
             return {
               activation: authority.activation,
               activationReplay: activation.replayed,
@@ -1361,7 +1430,7 @@ const make = Effect.gen(function* () {
         )
         .pipe(
           Effect.mapError((cause) =>
-            cause instanceof AgentControlRunOnceError
+            isRunOnceError(cause)
               ? cause
               : error(projectId, null, "activation-admitted", "persistence", cause),
           ),
@@ -1482,6 +1551,26 @@ const make = Effect.gen(function* () {
                     "task-history-corrupt",
                   );
                 }
+                if (activation.originMode === "armed") {
+                  const selectedByDispatch = yield* sql<{ readonly taskId: unknown }>`
+                    SELECT selected_task_id AS "taskId"
+                    FROM main.agent_control_armed_dispatch_evidence
+                    WHERE dispatch_id = ${activation.armedDispatchId}
+                      AND project_id = ${projectId}
+                  `;
+                  if (
+                    selectedByDispatch.length !== 1 ||
+                    typeof selectedByDispatch[0]?.taskId !== "string" ||
+                    selectedByDispatch[0].taskId !== taskId
+                  ) {
+                    return yield* error(
+                      projectId,
+                      run!.runId,
+                      "task-selected",
+                      "authority-conflict",
+                    );
+                  }
+                }
                 if (
                   taskId !== null &&
                   !(yield* isAgentControlRunOnceCandidateVacant(sql, projectId, taskId))
@@ -1512,7 +1601,7 @@ const make = Effect.gen(function* () {
             )
             .pipe(
               Effect.mapError((cause) =>
-                cause instanceof AgentControlRunOnceError
+                isRunOnceError(cause)
                   ? cause
                   : error(projectId, run!.runId, "task-selected", "persistence", cause),
               ),
@@ -1694,7 +1783,7 @@ const make = Effect.gen(function* () {
               commandId,
               projectId,
               expectedRevision: project.state.revision,
-              mode: "observe",
+              mode: activation.originMode,
             }),
           );
           if (Exit.isFailure(dispatched)) {
@@ -1716,7 +1805,7 @@ const make = Effect.gen(function* () {
             event.authority !== "system" ||
             event.type !== "agentControl.project.mode.changed" ||
             event.payload.previousMode !== "run-once" ||
-            event.payload.mode !== "observe" ||
+            event.payload.mode !== activation.originMode ||
             event.payload.previousPausedFromMode !== null ||
             event.payload.pausedFromMode !== null ||
             event.streamVersion !== result.state.revision ||
@@ -1779,9 +1868,7 @@ const make = Effect.gen(function* () {
       .withPermit(projectId, processSerialized(projectId))
       .pipe(
         Effect.mapError((cause) =>
-          cause instanceof AgentControlRunOnceError
-            ? cause
-            : error(projectId, null, null, "persistence", cause),
+          isRunOnceError(cause) ? cause : error(projectId, null, null, "persistence", cause),
         ),
       );
 
@@ -1803,8 +1890,13 @@ const make = Effect.gen(function* () {
           AND activation.activation_command_id = event.command_id
         WHERE event.aggregate_kind = 'project-controller'
           AND event.event_type = 'agentControl.project.mode.changed'
-          AND event.actor_authority = 'human'
-          AND json_extract(CAST(event.payload_json AS TEXT), '$.previousMode') = 'observe'
+          AND (
+            (event.actor_authority = 'human'
+              AND json_extract(CAST(event.payload_json AS TEXT), '$.previousMode') = 'observe')
+            OR
+            (event.actor_authority = 'system'
+              AND json_extract(CAST(event.payload_json AS TEXT), '$.previousMode') = 'armed')
+          )
           AND json_extract(CAST(event.payload_json AS TEXT), '$.mode') = 'run-once'
           AND json_extract(CAST(event.payload_json AS TEXT), '$.previousPausedFromMode') IS NULL
           AND json_extract(CAST(event.payload_json AS TEXT), '$.pausedFromMode') IS NULL
@@ -1831,7 +1923,7 @@ const make = Effect.gen(function* () {
   const recover: AgentControlRunOnceControllerShape["recover"] = Effect.gen(function* () {
     yield* auditRecoveryAuthority().pipe(
       Effect.mapError((cause) =>
-        cause instanceof AgentControlRunOnceError
+        isRunOnceError(cause)
           ? cause
           : error("run-once-recovery" as ProjectId, null, null, "persistence", cause),
       ),

@@ -37,7 +37,7 @@ export class AgentControlTaskConsumerGuardError extends Schema.TaggedErrorClass<
 
 export interface AgentControlTaskProjectGate {
   readonly projectId: ProjectId;
-  readonly activation: "inactive" | "waiting-source" | "observe";
+  readonly activation: "inactive" | "waiting-source" | "observe" | "armed";
   readonly currentSourceSequence: number | null;
   readonly targetSequence: number | null;
   readonly lastCompletedSequence: number | null;

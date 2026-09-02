@@ -450,7 +450,9 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
           reason: "projection-unavailable",
         });
       }
-      if (project.value.mode !== "observe") return Option.none();
+      if (project.value.mode !== "observe" && project.value.mode !== "armed") {
+        return Option.none();
+      }
 
       const github = yield* githubStates.get(projectId);
       if (Option.isNone(github) || github.value.config === null) return Option.none();

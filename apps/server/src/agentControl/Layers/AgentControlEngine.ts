@@ -213,24 +213,40 @@ const makeAgentControlEngine = Effect.gen(function* () {
       ),
     );
 
-    const committed = yield* sql.withTransaction(
-      Effect.gen(function* () {
-        const existingReceipt = yield* receipts
-          .getByCommandId(envelope.command.commandId)
-          .pipe(Effect.mapError((error) => mapInfrastructureError(error, "persistence")));
-        if (Option.isSome(existingReceipt)) {
-          const receipt = existingReceipt.value;
-          if (
-            receipt.commandFingerprint !== fingerprint ||
-            receipt.authority !== envelope.authority ||
-            receipt.aggregateKind !== "project-controller"
-          ) {
-            return yield* new AgentControlCommandIdentityMismatchError({
-              code: "command-identity-mismatch",
-              commandId: envelope.command.commandId,
-            });
-          }
-          if (unavailableProject !== null) {
+    const committed = yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const existingReceipt = yield* receipts
+            .getByCommandId(envelope.command.commandId)
+            .pipe(Effect.mapError((error) => mapInfrastructureError(error, "persistence")));
+          if (Option.isSome(existingReceipt)) {
+            const receipt = existingReceipt.value;
+            if (
+              receipt.commandFingerprint !== fingerprint ||
+              receipt.authority !== envelope.authority ||
+              receipt.aggregateKind !== "project-controller"
+            ) {
+              return yield* new AgentControlCommandIdentityMismatchError({
+                code: "command-identity-mismatch",
+                commandId: envelope.command.commandId,
+              });
+            }
+            if (unavailableProject !== null) {
+              if (receipt.status === "rejected") {
+                return {
+                  _tag: "Rejected" as const,
+                  error: new AgentControlCommandPreviouslyRejectedError({
+                    code: "command-previously-rejected",
+                    commandId: receipt.commandId,
+                    originalErrorCode: receipt.errorCode,
+                  }),
+                };
+              }
+              return {
+                _tag: "Rejected" as const,
+                error: unavailableError(unavailableProject),
+              };
+            }
             if (receipt.status === "rejected") {
               return {
                 _tag: "Rejected" as const,
@@ -241,168 +257,158 @@ const makeAgentControlEngine = Effect.gen(function* () {
                 }),
               };
             }
+            const state = yield* loadStateAtRevision(
+              envelope.command.projectId,
+              receipt.resultStreamVersion,
+            );
+            if (state.sequence !== receipt.resultSequence) {
+              return yield* new AgentControlProjectionCorruptError({
+                code: "projection-corrupt",
+                projector: "agent-control-project-modes-v1",
+              });
+            }
             return {
-              _tag: "Rejected" as const,
-              error: unavailableError(unavailableProject),
+              _tag: "Accepted" as const,
+              events: [],
+              result: {
+                state,
+                resultSequence: receipt.resultSequence,
+                eventCreated: receipt.eventCreated,
+              } satisfies AgentControlSetProjectModeResult,
             };
           }
-          if (receipt.status === "rejected") {
-            return {
-              _tag: "Rejected" as const,
-              error: new AgentControlCommandPreviouslyRejectedError({
-                code: "command-previously-rejected",
-                commandId: receipt.commandId,
-                originalErrorCode: receipt.errorCode,
-              }),
-            };
+
+          if (unavailableProject !== null) {
+            const error = unavailableError(unavailableProject);
+            yield* receipts
+              .insert({
+                commandId: envelope.command.commandId,
+                commandFingerprint: fingerprint,
+                authority: envelope.authority,
+                aggregateKind: "project-controller",
+                aggregateId: envelope.command.projectId,
+                status: "rejected",
+                resultSequence: 0,
+                resultStreamVersion: 0,
+                eventCreated: false,
+                acceptedAt: occurredAt,
+                errorCode: error.code,
+              })
+              .pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
+            return { _tag: "Rejected" as const, error };
           }
-          const state = yield* loadStateAtRevision(
-            envelope.command.projectId,
-            receipt.resultStreamVersion,
+
+          const persistedState = yield* projectStates
+            .get(envelope.command.projectId)
+            .pipe(Effect.mapError((error) => mapInfrastructureError(error, "projection")));
+          const currentState = Option.getOrElse(persistedState, () =>
+            createDefaultAgentControlProjectState(envelope.command.projectId),
           );
-          if (state.sequence !== receipt.resultSequence) {
-            return yield* new AgentControlProjectionCorruptError({
-              code: "projection-corrupt",
-              projector: "agent-control-project-modes-v1",
+
+          if (currentState.revision !== envelope.command.expectedRevision) {
+            const error = new AgentControlProjectRevisionConflictError({
+              code: "revision-conflict",
+              projectId: envelope.command.projectId,
+              expectedRevision: envelope.command.expectedRevision,
+              actualRevision: currentState.revision,
             });
+            yield* receipts
+              .insert({
+                commandId: envelope.command.commandId,
+                commandFingerprint: fingerprint,
+                authority: envelope.authority,
+                aggregateKind: "project-controller",
+                aggregateId: envelope.command.projectId,
+                status: "rejected",
+                resultSequence: currentState.sequence,
+                resultStreamVersion: currentState.revision,
+                eventCreated: false,
+                acceptedAt: occurredAt,
+                errorCode: error.code,
+              })
+              .pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
+            return { _tag: "Rejected" as const, error };
           }
+
+          const decision = yield* Effect.result(
+            decideAgentControlProjectCommand({
+              state: currentState,
+              command: envelope.command,
+              eventId,
+              occurredAt,
+              authority: envelope.authority,
+            }),
+          );
+          if (decision._tag === "Failure") {
+            yield* receipts
+              .insert({
+                commandId: envelope.command.commandId,
+                commandFingerprint: fingerprint,
+                authority: envelope.authority,
+                aggregateKind: "project-controller",
+                aggregateId: envelope.command.projectId,
+                status: "rejected",
+                resultSequence: currentState.sequence,
+                resultStreamVersion: currentState.revision,
+                eventCreated: false,
+                acceptedAt: occurredAt,
+                errorCode: decision.failure.code as AgentControlRejectedCommandErrorCode,
+              })
+              .pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
+            return { _tag: "Rejected" as const, error: decision.failure };
+          }
+
+          const events =
+            decision.success.length === 0
+              ? []
+              : yield* eventStore
+                  .append({
+                    projectId: envelope.command.projectId,
+                    expectedStreamVersion: currentState.revision,
+                    events: decision.success,
+                  })
+                  .pipe(Effect.mapError((error) => mapInfrastructureError(error, "event-append")));
+
+          let nextState = currentState;
+          for (const event of events) {
+            yield* projection
+              .projectEvent(event)
+              .pipe(Effect.mapError((error) => mapInfrastructureError(error, "projection")));
+            nextState = yield* projectAgentControlEvent(nextState, event);
+          }
+          const eventCreated = events.length > 0;
+          yield* receipts
+            .insert({
+              commandId: envelope.command.commandId,
+              commandFingerprint: fingerprint,
+              authority: envelope.authority,
+              aggregateKind: "project-controller",
+              aggregateId: envelope.command.projectId,
+              status: "accepted",
+              resultSequence: nextState.sequence,
+              resultStreamVersion: nextState.revision,
+              eventCreated,
+              acceptedAt: occurredAt,
+              errorCode: null,
+            })
+            .pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
+
           return {
             _tag: "Accepted" as const,
-            events: [],
+            events,
             result: {
-              state,
-              resultSequence: receipt.resultSequence,
-              eventCreated: receipt.eventCreated,
+              state: nextState,
+              resultSequence: nextState.sequence,
+              eventCreated,
             } satisfies AgentControlSetProjectModeResult,
           };
-        }
-
-        if (unavailableProject !== null) {
-          const error = unavailableError(unavailableProject);
-          yield* receipts
-            .insert({
-              commandId: envelope.command.commandId,
-              commandFingerprint: fingerprint,
-              authority: envelope.authority,
-              aggregateKind: "project-controller",
-              aggregateId: envelope.command.projectId,
-              status: "rejected",
-              resultSequence: 0,
-              resultStreamVersion: 0,
-              eventCreated: false,
-              acceptedAt: occurredAt,
-              errorCode: error.code,
-            })
-            .pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
-          return { _tag: "Rejected" as const, error };
-        }
-
-        const persistedState = yield* projectStates
-          .get(envelope.command.projectId)
-          .pipe(Effect.mapError((error) => mapInfrastructureError(error, "projection")));
-        const currentState = Option.getOrElse(persistedState, () =>
-          createDefaultAgentControlProjectState(envelope.command.projectId),
-        );
-
-        if (currentState.revision !== envelope.command.expectedRevision) {
-          const error = new AgentControlProjectRevisionConflictError({
-            code: "revision-conflict",
-            projectId: envelope.command.projectId,
-            expectedRevision: envelope.command.expectedRevision,
-            actualRevision: currentState.revision,
-          });
-          yield* receipts
-            .insert({
-              commandId: envelope.command.commandId,
-              commandFingerprint: fingerprint,
-              authority: envelope.authority,
-              aggregateKind: "project-controller",
-              aggregateId: envelope.command.projectId,
-              status: "rejected",
-              resultSequence: currentState.sequence,
-              resultStreamVersion: currentState.revision,
-              eventCreated: false,
-              acceptedAt: occurredAt,
-              errorCode: error.code,
-            })
-            .pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
-          return { _tag: "Rejected" as const, error };
-        }
-
-        const decision = yield* Effect.result(
-          decideAgentControlProjectCommand({
-            state: currentState,
-            command: envelope.command,
-            eventId,
-            occurredAt,
-            authority: envelope.authority,
-          }),
-        );
-        if (decision._tag === "Failure") {
-          yield* receipts
-            .insert({
-              commandId: envelope.command.commandId,
-              commandFingerprint: fingerprint,
-              authority: envelope.authority,
-              aggregateKind: "project-controller",
-              aggregateId: envelope.command.projectId,
-              status: "rejected",
-              resultSequence: currentState.sequence,
-              resultStreamVersion: currentState.revision,
-              eventCreated: false,
-              acceptedAt: occurredAt,
-              errorCode: decision.failure.code as AgentControlRejectedCommandErrorCode,
-            })
-            .pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
-          return { _tag: "Rejected" as const, error: decision.failure };
-        }
-
-        const events =
-          decision.success.length === 0
-            ? []
-            : yield* eventStore
-                .append({
-                  projectId: envelope.command.projectId,
-                  expectedStreamVersion: currentState.revision,
-                  events: decision.success,
-                })
-                .pipe(Effect.mapError((error) => mapInfrastructureError(error, "event-append")));
-
-        let nextState = currentState;
-        for (const event of events) {
-          yield* projection
-            .projectEvent(event)
-            .pipe(Effect.mapError((error) => mapInfrastructureError(error, "projection")));
-          nextState = yield* projectAgentControlEvent(nextState, event);
-        }
-        const eventCreated = events.length > 0;
-        yield* receipts
-          .insert({
-            commandId: envelope.command.commandId,
-            commandFingerprint: fingerprint,
-            authority: envelope.authority,
-            aggregateKind: "project-controller",
-            aggregateId: envelope.command.projectId,
-            status: "accepted",
-            resultSequence: nextState.sequence,
-            resultStreamVersion: nextState.revision,
-            eventCreated,
-            acceptedAt: occurredAt,
-            errorCode: null,
-          })
-          .pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
-
-        return {
-          _tag: "Accepted" as const,
-          events,
-          result: {
-            state: nextState,
-            resultSequence: nextState.sequence,
-            eventCreated,
-          } satisfies AgentControlSetProjectModeResult,
-        };
-      }),
-    );
+        }),
+      )
+      .pipe(
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(mapInfrastructureError(cause, "persistence")),
+        ),
+      );
 
     if (committed._tag === "Rejected") return yield* committed.error;
     for (const event of committed.events) yield* PubSub.publish(eventPubSub, event);
@@ -493,11 +499,39 @@ const makeAgentControlEngine = Effect.gen(function* () {
       return yield* Deferred.await(result);
     });
 
+  // System commands are internal recovery/transition continuations. Processing
+  // them through the single public command queue can deadlock when an Armed
+  // critical section owns the shared project fence while a queued Human
+  // command is waiting for that same fence. The SQLite transaction and
+  // expected-revision CAS remain the authority boundary, so the direct path is
+  // safe across independent Engine instances as well as within this process.
+  const dispatchSystem: AgentControlEngineShape["dispatchSystem"] = (rawInput) =>
+    Effect.gen(function* () {
+      const input = yield* decodeSetProjectModeInput(rawInput).pipe(
+        Effect.mapError(
+          () =>
+            new AgentControlRuntimeValidationError({
+              code: "validation",
+              operation: "set-project-mode",
+            }),
+        ),
+      );
+      const unusedResult = yield* Deferred.make<
+        AgentControlSetProjectModeResult,
+        AgentControlRuntimeRpcError
+      >();
+      return yield* processEnvelopeRaw({
+        command: { type: "agentControl.project.mode.set", ...input },
+        authority: "system",
+        result: unusedResult,
+      });
+    });
+
   return AgentControlEngine.of({
     getProjectState,
     dispatchHuman: (input) => dispatchWithAuthority("human", input),
     dispatchController: (input) => dispatchWithAuthority("controller", input),
-    dispatchSystem: (input) => dispatchWithAuthority("system", input),
+    dispatchSystem,
     get streamDomainEvents() {
       return Stream.fromPubSub(eventPubSub);
     },

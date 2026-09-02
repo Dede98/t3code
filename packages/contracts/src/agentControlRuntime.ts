@@ -25,19 +25,19 @@ export const AGENT_CONTROL_RUNTIME_RPC_METHODS = {
   setProjectMode: "agentControl.setProjectMode",
 } as const;
 
-export const AGENT_CONTROL_PROJECT_MODES = ["manual", "observe", "run-once", "paused"] as const;
+export const AGENT_CONTROL_PROJECT_MODES = [
+  "manual",
+  "observe",
+  "armed",
+  "run-once",
+  "paused",
+] as const;
 
 export const AgentControlProjectMode = Schema.Literals(AGENT_CONTROL_PROJECT_MODES);
 export type AgentControlProjectMode = typeof AgentControlProjectMode.Type;
 
-/**
- * Durable project modes deliberately exclude the historical request-only
- * `armed` value.
- */
-export const AgentControlRequestedProjectMode = Schema.Union([
-  AgentControlProjectMode,
-  Schema.Literal("armed"),
-]);
+/** Human requests use the same closed set as durable project state. */
+export const AgentControlRequestedProjectMode = AgentControlProjectMode;
 export type AgentControlRequestedProjectMode = typeof AgentControlRequestedProjectMode.Type;
 
 export const AgentControlProjectState = Schema.Struct({
@@ -120,9 +120,6 @@ export const AgentControlEvent = AgentControlProjectModeChangedEvent;
 export type AgentControlEvent = typeof AgentControlEvent.Type;
 
 export const AgentControlSetProjectModeResult = Schema.Struct({
-  // This is a transport result shape, not durable authority. The request-only
-  // union keeps legacy implementations source-compatible; production state
-  // and event schemas above still reject `armed`.
   state: Schema.Struct({
     schemaVersion: Schema.Literal(1),
     projectId: ProjectId,

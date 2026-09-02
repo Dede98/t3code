@@ -24,6 +24,7 @@ import {
 import { AgentControlTaskVerificationFinalizer } from "../task/Services/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlRunOnceController } from "../runOnce/Services/AgentControlRunOnceController.ts";
 import { AgentControlRunOnceError } from "../runOnce/model.ts";
+import { AgentControlArmedScheduler } from "../armed/Services/AgentControlArmedScheduler.ts";
 import { AgentControlReactor } from "../Services/AgentControlReactor.ts";
 import { AgentControlImplementationStageFinalizer } from "../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlVerificationAdmission } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -74,6 +75,15 @@ const runOnceStubLayer = Layer.succeed(
     subscribePublications: Effect.succeed(Stream.never),
   }),
 );
+const armedStubLayer = Layer.succeed(
+  AgentControlArmedScheduler,
+  AgentControlArmedScheduler.of({
+    awaitFailure: Effect.never,
+    recover: Effect.void,
+    processProject: () => Effect.void,
+    prepare: () => Effect.void,
+  }),
+);
 const layer = AgentControlReactorLive.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -81,6 +91,7 @@ const layer = AgentControlReactorLive.pipe(
       finalizerStubLayer,
       taskFinalizerStubLayer,
       runOnceStubLayer,
+      armedStubLayer,
     ),
   ),
 );
@@ -102,6 +113,7 @@ it.effect("fails the relevant reactor composition visibly when the evaluator lay
         Layer.succeed(AgentControlVerificationStageFinalizer, {} as never),
         taskFinalizerStubLayer,
         runOnceStubLayer,
+        armedStubLayer,
       );
       const incomplete = AgentControlReactorLive.pipe(Layer.provide(dependenciesWithoutEvaluator));
       const missing = yield* Effect.exit(
@@ -127,6 +139,7 @@ it.effect("starts Verification consumers before Admission and cleans them in rev
       const reactorLayer = AgentControlReactorLive.pipe(
         Layer.provide(
           Layer.mergeAll(
+            armedStubLayer,
             Layer.succeed(
               AgentControlGithubObserveReactor,
               AgentControlGithubObserveReactor.of({
@@ -321,6 +334,7 @@ it.effect("fails readiness on Run-Once recovery and never starts downstream admi
       const reactorLayer = AgentControlReactorLive.pipe(
         Layer.provide(
           Layer.mergeAll(
+            armedStubLayer,
             evaluatorStubLayer,
             finalizerStubLayer,
             taskFinalizerStubLayer,

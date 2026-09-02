@@ -218,6 +218,10 @@ const seedActivation = Effect.fn("seedRunOnceActivation")(function* (sql: SqlCli
         expectedIssueCount: 0,
       }),
       activatedAt: at,
+      originMode: "observe",
+      armedDispatchId: null,
+      armedClaimId: null,
+      armedMarkerId: null,
     } satisfies AgentControlRunOnceActivation,
     authority: modeAuthority({
       commandId: activationCommandId,
@@ -234,7 +238,7 @@ layer("run-once durable authority", (it) => {
   it.effect("replays identical E/R/M bytes with zero DML and rejects divergence", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 63 });
+      yield* runMigrations({ toMigrationInclusive: 64 });
       const seeded = yield* seedActivation(sql);
       const activation = seeded.activation;
       assert.deepStrictEqual(

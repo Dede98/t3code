@@ -18,6 +18,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
+import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -230,6 +231,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
   const intake = yield* AgentControlTaskIntake;
   const guard = yield* AgentControlTaskConsumerGuard;
   const lifecycle = yield* Ref.make<ReactorLifecycle>({ _tag: "idle" });
+  const completions = yield* PubSub.unbounded<ProjectId>();
 
   const retryLimit = positiveInt(options.retryLimit, RETRY_LIMIT);
   const retryBaseMs = positiveInt(options.retryBaseMs, RETRY_BASE_MS);
@@ -467,6 +469,7 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       state.workerPassEpoch = null;
     }
     yield* resolveWaiters(state);
+    yield* PubSub.publish(completions, state.projectId);
     if (options.testHooks?.afterFinishPass !== undefined) {
       yield* options.testHooks.afterFinishPass(state.projectId, epoch);
     }
@@ -767,7 +770,9 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       if (runtime !== null) {
         yield* guard.inspectProject(projectId).pipe(
           Effect.flatMap((current) =>
-            current.activation === "observe" || runtimes.get(projectId) !== state
+            current.activation === "observe" ||
+            current.activation === "armed" ||
+            runtimes.get(projectId) !== state
               ? Effect.void
               : removeProject(projectId, state.generation),
           ),
@@ -1499,7 +1504,11 @@ export const make = Effect.fn("AgentControlTaskIntakeReactor.make")(function* (
       };
     });
 
-  return AgentControlTaskIntakeReactor.of({ start, getStatus });
+  return AgentControlTaskIntakeReactor.of({
+    start,
+    getStatus,
+    subscribeCompletions: PubSub.subscribe(completions).pipe(Effect.map(Stream.fromSubscription)),
+  });
 });
 
 export const layer = Layer.effect(AgentControlTaskIntakeReactor, make());

@@ -44,6 +44,7 @@ const repository = {
 } as const;
 const now = "2026-07-23T10:00:00.000Z";
 const encodeTaskState = Schema.encodeUnknownEffect(Schema.fromJsonString(AgentControlTaskState));
+const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 const sourcePrecondition = (
   projectId: ProjectId,
   expectedIssueCount: number,
@@ -243,7 +244,7 @@ layer("AgentControl task intake", (it) => {
   );
 
   it.effect(
-    "automatic reconcile stops transactionally after an Observe exit while manual reconcile remains available",
+    "automatic reconcile runs while Armed and stops transactionally after a Human exit",
     () =>
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
@@ -253,11 +254,17 @@ layer("AgentControl task intake", (it) => {
         const reconciles = yield* AgentControlTaskReconcileStateRepository;
         const projectId = ProjectId.make("task-observe-mode-enforcement");
         yield* addProject(sql, projectId);
-        yield* projectEngine.dispatchController({
+        yield* projectEngine.dispatchHuman({
           commandId: CommandId.make("task-observe-mode-enter"),
           projectId,
           expectedRevision: 0,
           mode: "observe",
+        });
+        yield* projectEngine.dispatchHuman({
+          commandId: CommandId.make("task-observe-mode-arm"),
+          projectId,
+          expectedRevision: 1,
+          mode: "armed",
         });
         yield* setGithubSnapshot(projectId, [issue(1), issue(2)]);
         const acceptedBefore =
@@ -275,10 +282,10 @@ layer("AgentControl task intake", (it) => {
               Effect.tap(() =>
                 observedDispatches++ === 0
                   ? projectEngine
-                      .dispatchController({
+                      .dispatchHuman({
                         commandId: CommandId.make("task-observe-mode-exit"),
                         projectId,
-                        expectedRevision: 1,
+                        expectedRevision: 2,
                         mode: "manual",
                       })
                       .pipe(Effect.orDie)
@@ -316,6 +323,38 @@ layer("AgentControl task intake", (it) => {
         assert.equal(manual.createdCount, 1);
         assert.equal((yield* validTasks(projectId)).length, 2);
       }),
+  );
+
+  it.effect("keeps automatic intake closed in manual, paused, and run-once modes", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const intake = yield* AgentControlTaskIntake;
+      const projectEngine = yield* AgentControlProjectEngine;
+      for (const mode of ["manual", "paused", "run-once"] as const) {
+        const projectId = ProjectId.make(`task-intake-inactive-${mode}`);
+        yield* addProject(sql, projectId);
+        yield* setGithubSnapshot(projectId, [issue(80)]);
+        if (mode !== "manual") {
+          yield* projectEngine.dispatchHuman({
+            commandId: CommandId.make(`task-intake-inactive-${mode}-observe`),
+            projectId,
+            expectedRevision: 0,
+            mode: "observe",
+          });
+          yield* projectEngine.dispatchHuman({
+            commandId: CommandId.make(`task-intake-inactive-${mode}-enter`),
+            projectId,
+            expectedRevision: 1,
+            mode,
+          });
+        }
+        const result = yield* Effect.result(intake.reconcileObservedProject({ projectId }));
+        assert.equal(result._tag, "Failure", mode);
+        if (result._tag === "Failure") {
+          assert.equal(result.failure.code, "project-mode-inactive", mode);
+        }
+      }
+    }),
   );
 
   it.effect("refreshes not-ready, paused, closed, and invalid timeline gates independently", () =>
@@ -795,7 +834,7 @@ layer("AgentControl task intake", (it) => {
 
         yield* addProject(sql, projectId);
         yield* setGithubSnapshot(projectId, [sourceIssue]);
-        yield* projectEngine.dispatchController({
+        yield* projectEngine.dispatchHuman({
           commandId: CommandId.make("task-auto-receipt-observe"),
           projectId,
           expectedRevision: 0,
@@ -809,7 +848,7 @@ layer("AgentControl task intake", (it) => {
             WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
           `)[0]?.count ?? 0;
 
-        yield* projectEngine.dispatchController({
+        yield* projectEngine.dispatchHuman({
           commandId: CommandId.make("task-auto-receipt-paused"),
           projectId,
           expectedRevision: 1,
@@ -867,7 +906,7 @@ layer("AgentControl task intake", (it) => {
 
         yield* addProject(sql, projectId);
         yield* setGithubSnapshot(projectId, [sourceIssue]);
-        yield* projectEngine.dispatchController({
+        yield* projectEngine.dispatchHuman({
           commandId: CommandId.make("task-auto-receipt-rejected-observe"),
           projectId,
           expectedRevision: 0,
@@ -879,7 +918,7 @@ layer("AgentControl task intake", (it) => {
           assert.equal(rejected.failure.code, "source-identity-conflict");
         }
 
-        yield* projectEngine.dispatchController({
+        yield* projectEngine.dispatchHuman({
           commandId: CommandId.make("task-auto-receipt-rejected-paused"),
           projectId,
           expectedRevision: 1,
@@ -945,7 +984,7 @@ layer("AgentControl task intake", (it) => {
       yield* addProject(sql, projectId);
       yield* setGithubSnapshot(projectId, [issue(11), issue(12)]);
       yield* intake.reconcileOnce({ projectId });
-      yield* projectEngine.dispatchController({
+      yield* projectEngine.dispatchHuman({
         commandId: CommandId.make("task-rebuild-controller-mode"),
         projectId,
         expectedRevision: 0,
@@ -964,7 +1003,15 @@ layer("AgentControl task intake", (it) => {
         ) VALUES (
           'task-rebuild-orchestration-event', 'project', ${projectId}, 1,
           'project.created', ${now}, 'task-rebuild-orchestration-command',
-          NULL, 'task-rebuild-orchestration-command', 'client', '{}', '{}'
+          NULL, 'task-rebuild-orchestration-command', 'client', ${encodeUnknownJson({
+            projectId,
+            title: "Task intake test",
+            workspaceRoot: `/tmp/${projectId}`,
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: now,
+            updatedAt: now,
+          })}, '{}'
         )
       `;
       yield* sql`

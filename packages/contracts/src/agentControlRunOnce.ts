@@ -44,7 +44,7 @@ export const AgentControlRunOnceStatus = Schema.Literals([
 ]);
 export type AgentControlRunOnceStatus = typeof AgentControlRunOnceStatus.Type;
 
-export const AgentControlRunOnceActivation = Schema.Struct({
+const AgentControlRunOnceActivationFields = {
   schemaVersion: Schema.Literal(1),
   runId: AgentControlRunOnceId,
   projectId: ProjectId,
@@ -59,7 +59,24 @@ export const AgentControlRunOnceActivation = Schema.Struct({
   reconcileRevision: PositiveInt,
   sourceFingerprint: TrimmedNonEmptyString,
   activatedAt: IsoDateTime,
-});
+} as const;
+
+export const AgentControlRunOnceActivation = Schema.Union([
+  Schema.Struct({
+    ...AgentControlRunOnceActivationFields,
+    originMode: Schema.Literal("observe"),
+    armedDispatchId: Schema.Null,
+    armedClaimId: Schema.Null,
+    armedMarkerId: Schema.Null,
+  }),
+  Schema.Struct({
+    ...AgentControlRunOnceActivationFields,
+    originMode: Schema.Literal("armed"),
+    armedDispatchId: TrimmedNonEmptyString,
+    armedClaimId: TrimmedNonEmptyString,
+    armedMarkerId: TrimmedNonEmptyString,
+  }),
+]);
 export type AgentControlRunOnceActivation = typeof AgentControlRunOnceActivation.Type;
 
 export const AgentControlRunOnceState = Schema.Struct({

@@ -53,6 +53,7 @@ import { AgentControlInitialPlanningWakeupLive } from "./agentControl/initialPla
 import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
 import { layer as AgentControlTaskIntakeReactorLive } from "./agentControl/task/Layers/AgentControlTaskIntakeReactor.ts";
 import { AgentControlTaskVerificationFinalizerLive } from "./agentControl/task/Layers/AgentControlTaskVerificationFinalizer.ts";
+import { layer as AgentControlArmedSchedulerLive } from "./agentControl/armed/Layers/AgentControlArmedScheduler.ts";
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
@@ -578,6 +579,13 @@ const AgentControlRunOnceControllerServiceLayerLive = AgentControlRunOnceControl
   Layer.provide(RuntimeCoreDependenciesBaseLive),
 );
 
+const AgentControlArmedSchedulerLayerLive = AgentControlArmedSchedulerLive.pipe(
+  Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
+  Layer.provideMerge(AgentControlTaskIntakeReactorLayerLive),
+  Layer.provideMerge(AgentControlRunOnceControllerServiceLayerLive),
+  Layer.provide(RuntimeCoreDependenciesBaseLive),
+);
+
 const AgentControlVerificationTurnCoordinatorLayerLive =
   AgentControlVerificationTurnCoordinatorLive.pipe(
     Layer.provideMerge(AgentControlVerificationAdmissionLayerLive),
@@ -607,6 +615,7 @@ const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
       AgentControlVerificationStageFinalizerLayerLive,
       AgentControlTaskVerificationFinalizerLayerLive,
       AgentControlRunOnceControllerServiceLayerLive,
+      AgentControlArmedSchedulerLayerLive,
     ),
   ),
 );

@@ -20834,7 +20834,7 @@ layer("Agent Control worktree materialization", (it) => {
     }),
   );
 
-  it.effect("rechecks lease authority after Git inspection before starting the callback", () =>
+  it.effect("rejects Ready reuse when lifecycle lease authority advances before callback", () =>
     Effect.gen(function* () {
       const inspected = yield* Deferred.make<void>();
       const continuePreflight = yield* Deferred.make<void>();
@@ -20901,7 +20901,7 @@ layer("Agent Control worktree materialization", (it) => {
   );
 
   it.effect(
-    "creates exactly one validated worktree from the pinned base under parallel replay",
+    "creates one validated worktree and keeps initial Ready reuse on prepared lease authority",
     () =>
       Effect.gen(function* () {
         const { cwd, baseCommitSha } = yield* makeRepository();
@@ -20956,13 +20956,18 @@ layer("Agent Control worktree materialization", (it) => {
           (yield* git(cwd, ["check-ref-format", "--branch", first.branchName])).exitCode,
           0,
         );
+        const initialReuseCallbacks = yield* Ref.make(0);
         assert.equal(
           yield* controller.useReadyWorktree(
             { projectId, reservationId: first.reservationId },
-            (state) => Effect.succeed(state.internalWorktreePath),
+            (state) =>
+              Ref.update(initialReuseCallbacks, (count) => count + 1).pipe(
+                Effect.as(state.internalWorktreePath),
+              ),
           ),
           first.internalWorktreePath,
         );
+        assert.equal(yield* Ref.get(initialReuseCallbacks), 1);
         yield* git(cwd, ["remote", "set-url", "origin", "https://github.com/other/repository.git"]);
         const remoteGuard = yield* Effect.result(
           controller.useReadyWorktree({ projectId, reservationId: first.reservationId }, () =>

@@ -1,5 +1,4 @@
 import {
-  AgentControlModeNotAvailableError,
   type AgentControlProjectModeChangedEventDraft,
   type AgentControlProjectState,
   type AgentControlSetProjectModeCommand,
@@ -34,10 +33,14 @@ const isAllowedTransition = (
 ) =>
   (authority === "human" &&
     ((from === "manual" && to === "observe") ||
-      (from === "observe" && (to === "manual" || to === "paused" || to === "run-once")) ||
-      (from === "run-once" && (to === "manual" || to === "paused")) ||
+      (from === "observe" &&
+        (to === "manual" || to === "paused" || to === "run-once" || to === "armed")) ||
+      (from === "armed" && (to === "manual" || to === "observe" || to === "paused")) ||
+      (from === "run-once" && (to === "manual" || to === "observe" || to === "paused")) ||
       (from === "paused" && (to === "manual" || to === pausedFromMode)))) ||
-  (authority === "system" && from === "run-once" && to === "observe");
+  (authority === "system" &&
+    ((from === "armed" && to === "run-once") ||
+      (from === "run-once" && (to === "observe" || to === "armed"))));
 
 export const decideAgentControlProjectCommand = Effect.fn("decideAgentControlProjectCommand")(
   function* ({
@@ -53,14 +56,6 @@ export const decideAgentControlProjectCommand = Effect.fn("decideAgentControlPro
     readonly occurredAt: string;
     readonly authority: AgentControlCommandAuthority;
   }) {
-    if (command.mode === "armed") {
-      return yield* new AgentControlModeNotAvailableError({
-        code: "mode-not-available",
-        projectId: command.projectId,
-        mode: command.mode,
-      });
-    }
-
     if (command.mode === state.mode) {
       if (authority !== "human") {
         return yield* new AgentControlTransitionNotAllowedError({
@@ -83,7 +78,8 @@ export const decideAgentControlProjectCommand = Effect.fn("decideAgentControlPro
     }
 
     const pausedFromMode =
-      command.mode === "paused" && (state.mode === "observe" || state.mode === "run-once")
+      command.mode === "paused" &&
+      (state.mode === "observe" || state.mode === "armed" || state.mode === "run-once")
         ? state.mode
         : null;
     return [

@@ -52,11 +52,18 @@ it.effect("allows every V1 transition and maintains pause origin", () =>
     const allowed = [
       ["manual", null, "observe", null],
       ["observe", null, "manual", null],
+      ["observe", null, "armed", null],
+      ["armed", null, "observe", null],
+      ["armed", null, "manual", null],
+      ["armed", null, "paused", "armed"],
+      ["paused", "armed", "armed", null],
+      ["paused", "armed", "manual", null],
       ["observe", null, "paused", "observe"],
       ["observe", null, "run-once", null],
       ["run-once", null, "paused", "run-once"],
       ["paused", "run-once", "run-once", null],
       ["run-once", null, "manual", null],
+      ["run-once", null, "observe", null],
       ["paused", "observe", "observe", null],
       ["paused", "observe", "manual", null],
     ] as const;
@@ -97,7 +104,7 @@ it.effect("rejects unavailable and semantically invalid transitions", () =>
 
     const armed = yield* Effect.result(decide(manual, "armed"));
     assert.equal(armed._tag, "Failure");
-    if (armed._tag === "Failure") assert.equal(armed.failure.code, "mode-not-available");
+    if (armed._tag === "Failure") assert.equal(armed.failure.code, "transition-not-allowed");
   }),
 );
 
@@ -124,10 +131,7 @@ it.effect("reserves run-once reset for system authority and takeover for humans"
     assert.equal(systemReset[0]?.payload.mode, "observe");
 
     const humanReset = yield* Effect.result(decide(active, "observe"));
-    assert.equal(humanReset._tag, "Failure");
-    if (humanReset._tag === "Failure") {
-      assert.equal(humanReset.failure.code, "transition-not-allowed");
-    }
+    assert.equal(humanReset._tag, "Success");
     const staleSystemNoop = yield* Effect.result(
       decideAgentControlProjectCommand({
         state: observeState,

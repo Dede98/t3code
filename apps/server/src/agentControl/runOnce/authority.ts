@@ -8,6 +8,7 @@ import {
   type ProjectId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
@@ -25,6 +26,9 @@ import {
   deriveRunOnceReceiptId,
 } from "./identity.ts";
 import { AgentControlRunOnceError, type RunOnceStepBindings } from "./model.ts";
+
+const isRunOnceError = Schema.is(AgentControlRunOnceError);
+const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
 
 export interface RunOnceStateBinding {
   readonly projectId: ProjectId;
@@ -156,17 +160,17 @@ export const loadRunOnceModeAuthority = Effect.fn("loadRunOnceModeAuthority")(fu
   ) {
     return yield* failure(projectId, null, null, "authority-conflict");
   }
-  let parsedPayload: JsonValue;
-  let parsedMetadata: JsonValue;
-  try {
-    parsedPayload = JSON.parse(row.payloadJson) as JsonValue;
-    parsedMetadata = JSON.parse(row.metadataJson) as JsonValue;
-  } catch (cause) {
-    return yield* failure(projectId, null, null, "authority-conflict", cause);
-  }
+  const parsedPayload = yield* decodeUnknownJson(row.payloadJson).pipe(
+    Effect.mapError((cause) => failure(projectId, null, null, "authority-conflict", cause)),
+  );
+  const parsedMetadata = yield* decodeUnknownJson(row.metadataJson).pipe(
+    Effect.mapError((cause) => failure(projectId, null, null, "authority-conflict", cause)),
+  );
   if (
-    canonicalJson(parsedPayload) !== canonicalJson(event.payload as unknown as JsonValue) ||
-    canonicalJson(parsedMetadata) !== canonicalJson(event.metadata as unknown as JsonValue)
+    canonicalJson(parsedPayload as JsonValue) !==
+      canonicalJson(event.payload as unknown as JsonValue) ||
+    canonicalJson(parsedMetadata as JsonValue) !==
+      canonicalJson(event.metadata as unknown as JsonValue)
   ) {
     return yield* failure(projectId, null, null, "authority-conflict");
   }
@@ -429,7 +433,7 @@ const writeRunOnceStepInOwnedTransaction = Effect.fn("writeRunOnceStepInOwnedTra
       `;
     }).pipe(
       Effect.mapError((cause) =>
-        cause instanceof AgentControlRunOnceError
+        isRunOnceError(cause)
           ? cause
           : failure(input.projectId, input.runId, input.step, "persistence", cause),
       ),
@@ -456,7 +460,7 @@ export const writeRunOnceStep = Effect.fn("writeRunOnceStep")(function* (
     .withTransaction(writeRunOnceStepInOwnedTransaction(sql, input))
     .pipe(
       Effect.mapError((cause) =>
-        cause instanceof AgentControlRunOnceError
+        isRunOnceError(cause)
           ? cause
           : failure(input.projectId, input.runId, input.step, "persistence", cause),
       ),
@@ -475,7 +479,8 @@ export const admitRunOnceActivation = Effect.fn("admitRunOnceActivation")(functi
       activation_expected_revision, activation_command_fingerprint,
       activation_event_payload_json, activation_event_metadata_json,
       github_intake_sequence, github_event_id, github_event_sequence,
-      github_event_stream_version, reconcile_revision, source_fingerprint, activated_at
+      github_event_stream_version, reconcile_revision, source_fingerprint, activated_at,
+      origin_mode, armed_dispatch_id, armed_claim_id, armed_marker_id
     ) VALUES (
       ${activation.runId}, ${activation.projectId}, ${activation.activationEventId},
       ${activation.activationEventSequence}, ${activation.activationEventStreamVersion},
@@ -484,7 +489,8 @@ export const admitRunOnceActivation = Effect.fn("admitRunOnceActivation")(functi
       ${modeAuthority.eventMetadataBytes}, ${activation.githubIntakeSequence},
       ${activation.githubEventId}, ${activation.githubEventSequence},
       ${activation.githubEventStreamVersion}, ${activation.reconcileRevision},
-      ${activation.sourceFingerprint}, ${activation.activatedAt}
+      ${activation.sourceFingerprint}, ${activation.activatedAt}, ${activation.originMode},
+      ${activation.armedDispatchId}, ${activation.armedClaimId}, ${activation.armedMarkerId}
     )
     ON CONFLICT (run_id) DO NOTHING
     RETURNING run_id AS "runId"
@@ -507,7 +513,9 @@ export const admitRunOnceActivation = Effect.fn("admitRunOnceActivation")(functi
       github_event_id AS "githubEventId", github_event_sequence AS "githubEventSequence",
       github_event_stream_version AS "githubEventStreamVersion",
       reconcile_revision AS "reconcileRevision", source_fingerprint AS "sourceFingerprint",
-      activated_at AS "activatedAt"
+      activated_at AS "activatedAt", origin_mode AS "originMode",
+      armed_dispatch_id AS "armedDispatchId", armed_claim_id AS "armedClaimId",
+      armed_marker_id AS "armedMarkerId"
     FROM main.agent_control_run_once_activations WHERE run_id = ${activation.runId}
   `.pipe(
     Effect.mapError((cause) =>
@@ -530,6 +538,10 @@ export const admitRunOnceActivation = Effect.fn("admitRunOnceActivation")(functi
     reconcileRevision: activation.reconcileRevision,
     sourceFingerprint: activation.sourceFingerprint,
     activatedAt: activation.activatedAt,
+    originMode: activation.originMode,
+    armedDispatchId: activation.armedDispatchId,
+    armedClaimId: activation.armedClaimId,
+    armedMarkerId: activation.armedMarkerId,
   };
   if (
     rows.length !== 1 ||

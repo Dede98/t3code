@@ -48,7 +48,7 @@ it.live("terminally supersedes every active step before admitting a new activati
             const context = yield* Layer.buildWithScope(NodeSqliteClient.layerMemory(), scope);
             yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
             const sql = Context.get(context, SqlClient.SqlClient);
-            yield* runMigrations({ toMigrationInclusive: 63 }).pipe(
+            yield* runMigrations({ toMigrationInclusive: 64 }).pipe(
               Effect.provideService(SqlClient.SqlClient, sql),
             );
             yield* sql`DROP TRIGGER main.agent_control_run_once_downstream_evidence_validate`;
@@ -272,6 +272,10 @@ it.live("terminally supersedes every active step before admitting a new activati
                 expectedIssueCount: 0,
               }),
               activatedAt: at,
+              originMode: "observe",
+              armedDispatchId: null,
+              armedClaimId: null,
+              armedMarkerId: null,
             } satisfies AgentControlRunOnceActivation;
             const activationFingerprint = fingerprintRunOnceModeCommand({
               commandId: activationCommandId,

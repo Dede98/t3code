@@ -97,8 +97,8 @@ const pollSucceeded = (projectId: ProjectIdType, sequence: number): AgentControl
 
 const modeChanged = (
   projectId: ProjectIdType,
-  previousMode: "manual" | "observe" | "paused",
-  mode: "manual" | "observe" | "paused",
+  previousMode: "manual" | "observe" | "armed" | "run-once" | "paused",
+  mode: "manual" | "observe" | "armed" | "run-once" | "paused",
   sequence = 1,
 ): AgentControlEvent => ({
   eventId: EventId.make(`mode-event-${projectId}-${sequence}`),
@@ -116,8 +116,12 @@ const modeChanged = (
     projectId,
     previousMode,
     mode,
-    previousPausedFromMode: null,
-    pausedFromMode: null,
+    previousPausedFromMode: previousMode === "paused" ? "observe" : null,
+    pausedFromMode:
+      mode === "paused" &&
+      (previousMode === "observe" || previousMode === "armed" || previousMode === "run-once")
+        ? previousMode
+        : null,
     changedAt: at,
   },
   metadata: { schemaVersion: 1 },
@@ -526,7 +530,7 @@ it.effect("poll success reconciles once and burst events coalesce onto the newes
 );
 
 it.effect(
-  "manual and paused stay inactive; Observe transition reconciles; exit and delete clean up",
+  "manual and paused stay inactive; Observe and Armed reconcile; exit and delete clean up",
   () =>
     Effect.gen(function* () {
       const projectId = ProjectId.make("mode-rules");
@@ -543,8 +547,12 @@ it.effect(
       yield* PubSub.publish(harness.projectEvents, modeChanged(projectId, "manual", "observe", 3));
       yield* eventually(() => harness.reconcileCalls.length === 1, "Observe did not reconcile");
 
+      harness.gates.set(projectId, gate(projectId, { activation: "armed", sequence: 3 }));
+      yield* PubSub.publish(harness.projectEvents, modeChanged(projectId, "observe", "armed", 4));
+      yield* eventually(() => harness.reconcileCalls.length === 2, "Armed did not reconcile");
+
       harness.gates.set(projectId, gate(projectId, { activation: "inactive", fingerprint: null }));
-      yield* PubSub.publish(harness.projectEvents, modeChanged(projectId, "observe", "paused", 4));
+      yield* PubSub.publish(harness.projectEvents, modeChanged(projectId, "armed", "paused", 5));
       let paused = yield* harness.reactor.getStatus({ projectId });
       for (let attempt = 0; attempt < 100 && paused.workerState !== "stopped"; attempt += 1) {
         yield* Effect.yieldNow;
@@ -561,6 +569,25 @@ it.effect(
       assert.equal(deletedRuntime.workerState, "stopped");
       yield* Scope.close(scope, Exit.void);
     }),
+);
+
+it.effect("publishes a completion wakeup after subscribe-before-catch-up", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("completion-subscribe-before-catchup");
+    const harness = yield* makeHarness({ projects: [projectId] });
+    const scope = yield* Scope.make("sequential");
+    const completions = yield* harness.reactor.subscribeCompletions!.pipe(Scope.provide(scope));
+    const observed = yield* Deferred.make<ProjectIdType>();
+    const listener = yield* Stream.runForEach(completions, (completedProjectId) =>
+      Deferred.succeed(observed, completedProjectId).pipe(Effect.asVoid),
+    ).pipe(Effect.forkChild);
+    yield* harness.reactor.start().pipe(Scope.provide(scope));
+    assert.equal(yield* Deferred.await(observed), projectId);
+    assert.deepStrictEqual(harness.reconcileCalls, [{ projectId, sequence: 1 }]);
+    yield* Fiber.interrupt(listener);
+    yield* Scope.close(scope, Exit.void);
+    assert.deepStrictEqual(Object.values(harness.activeSubscriptions), [0, 0, 0]);
+  }),
 );
 
 it.effect("leaving Observe interrupts in-flight automatic work without starting an overlap", () =>

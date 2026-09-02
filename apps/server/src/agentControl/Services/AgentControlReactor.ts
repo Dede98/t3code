@@ -9,6 +9,7 @@ import type { AgentControlGithubObserveStartupError } from "../github/Services/A
 import type { AgentControlTaskIntakeStartupError } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import type { AgentControlVerificationAdmissionError } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
 import type { AgentControlRunOnceError } from "../runOnce/model.ts";
+import type { AgentControlArmedError } from "../armed/model.ts";
 
 export class AgentControlReactorStartupError extends Schema.TaggedErrorClass<AgentControlReactorStartupError>()(
   "AgentControlReactorStartupError",
@@ -27,6 +28,7 @@ export interface AgentControlReactorShape {
     | AgentControlTaskIntakeStartupError
     | AgentControlVerificationAdmissionError
     | AgentControlRunOnceError
+    | AgentControlArmedError
     | AgentControlReactorStartupError,
     Scope.Scope
   >;

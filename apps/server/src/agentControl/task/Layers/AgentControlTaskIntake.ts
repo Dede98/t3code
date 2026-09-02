@@ -102,7 +102,10 @@ export const make = Effect.gen(function* () {
                   safeError("internal-persistence-error", "reconcile-once", precondition.projectId),
                 ),
               );
-            if (Option.isNone(project) || project.value.mode !== "observe") {
+            if (
+              Option.isNone(project) ||
+              (project.value.mode !== "observe" && project.value.mode !== "armed")
+            ) {
               return yield* safeError(
                 "project-mode-inactive",
                 "reconcile-once",

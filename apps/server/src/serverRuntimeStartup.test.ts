@@ -28,6 +28,7 @@ import { AgentControlTaskIntakeReactor } from "./agentControl/task/Services/Agen
 import { AgentControlTaskVerificationFinalizer } from "./agentControl/task/Services/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlRunOnceController } from "./agentControl/runOnce/Services/AgentControlRunOnceController.ts";
 import { AgentControlRunOnceError } from "./agentControl/runOnce/model.ts";
+import { AgentControlArmedScheduler } from "./agentControl/armed/Services/AgentControlArmedScheduler.ts";
 import { AgentControlReactor } from "./agentControl/Services/AgentControlReactor.ts";
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
 import { AgentControlVerificationAdmission } from "./agentControl/verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -719,17 +720,20 @@ it.effect(
       Effect.gen(function* () {
         const coordinatorEntered = yield* Deferred.make<void>();
         const stageStarterEntered = yield* Deferred.make<void>();
+        const armedEntered = yield* Deferred.make<void>();
         const reaperEntered = yield* Deferred.make<void>();
         const releaseReaper = yield* Deferred.make<void>();
         const reaperFailures = yield* Ref.make(1);
         const coordinatorAttempts = yield* Ref.make(0);
         const stageStarterAttempts = yield* Ref.make(0);
+        const armedAttempts = yield* Ref.make(0);
         const completedWrites = yield* Ref.make<ReadonlyArray<string>>([]);
         let coordinatorDrain: Effect.Effect<void> = Effect.void;
         let stageStarterDrain: Effect.Effect<void> = Effect.void;
+        let armedDrain: Effect.Effect<void> = Effect.void;
 
         const makeAttemptWorker = Effect.fn("makeAttemptWorker")(function* (
-          name: "coordinator" | "stage-starter",
+          name: "coordinator" | "stage-starter" | "armed",
           attempts: Ref.Ref<number>,
           entered: Deferred.Deferred<void>,
         ) {
@@ -843,6 +847,23 @@ it.effect(
                 }),
               ),
               Layer.succeed(
+                AgentControlArmedScheduler,
+                AgentControlArmedScheduler.of({
+                  awaitFailure: Effect.never,
+                  recover: Effect.void,
+                  processProject: () => Effect.void,
+                  prepare: () =>
+                    makeAttemptWorker("armed", armedAttempts, armedEntered).pipe(
+                      Effect.tap((drain) =>
+                        Effect.sync(() => {
+                          armedDrain = drain;
+                        }),
+                      ),
+                      Effect.asVoid,
+                    ),
+                }),
+              ),
+              Layer.succeed(
                 AgentControlVerificationAdmission,
                 AgentControlVerificationAdmission.of({
                   processResultEvidence: () => Effect.succeed({ _tag: "NotCandidate" }),
@@ -888,16 +909,19 @@ it.effect(
         }).pipe(Effect.forkChild({ startImmediately: true }));
         yield* Deferred.await(coordinatorEntered);
         yield* Deferred.await(stageStarterEntered);
+        yield* Deferred.await(armedEntered);
         yield* Deferred.await(reaperEntered);
         const oldCoordinatorDrain = coordinatorDrain;
         const oldStageStarterDrain = stageStarterDrain;
         const coordinatorWaiter = yield* oldCoordinatorDrain.pipe(Effect.forkChild);
         const stageStarterWaiter = yield* oldStageStarterDrain.pipe(Effect.forkChild);
+        const oldArmedDrain = armedDrain;
+        const armedWaiter = yield* oldArmedDrain.pipe(Effect.forkChild);
         yield* Deferred.succeed(releaseReaper, undefined);
 
         const failedExit = yield* Fiber.await(failedStartup);
         assert.isTrue(Exit.isFailure(failedExit));
-        for (const waiter of [coordinatorWaiter, stageStarterWaiter]) {
+        for (const waiter of [coordinatorWaiter, stageStarterWaiter, armedWaiter]) {
           const drainExit = yield* Fiber.await(waiter);
           assert.isTrue(Exit.isFailure(drainExit));
           if (Exit.isFailure(drainExit)) assert.isTrue(Cause.hasInterruptsOnly(drainExit.cause));
@@ -912,13 +936,17 @@ it.effect(
           agentControlReactor,
           providerSessionReaper,
         });
-        yield* Effect.all([coordinatorDrain, stageStarterDrain], { concurrency: "unbounded" });
+        yield* Effect.all([coordinatorDrain, stageStarterDrain, armedDrain], {
+          concurrency: "unbounded",
+        });
         assert.deepStrictEqual([...(yield* Ref.get(completedWrites))].sort(), [
+          "armed",
           "coordinator",
           "stage-starter",
         ]);
         assert.equal(yield* Ref.get(coordinatorAttempts), 2);
         assert.equal(yield* Ref.get(stageStarterAttempts), 2);
+        assert.equal(yield* Ref.get(armedAttempts), 2);
         yield* Scope.close(ownerScope, Exit.void);
       }),
     ),

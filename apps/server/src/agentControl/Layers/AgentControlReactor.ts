@@ -19,6 +19,7 @@ import { AgentControlVerificationTurnCoordinator } from "../verificationTurn/Ser
 import { AgentControlTaskIntakeReactor } from "../task/Services/AgentControlTaskIntakeReactor.ts";
 import { AgentControlTaskVerificationFinalizer } from "../task/Services/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlRunOnceController } from "../runOnce/Services/AgentControlRunOnceController.ts";
+import { AgentControlArmedScheduler } from "../armed/Services/AgentControlArmedScheduler.ts";
 import {
   AgentControlReactor,
   AgentControlReactorStartupError,
@@ -31,6 +32,7 @@ const make = Effect.gen(function* () {
   const taskIntake = yield* AgentControlTaskIntakeReactor;
   const taskVerificationFinalizer = yield* AgentControlTaskVerificationFinalizer;
   const runOnce = yield* AgentControlRunOnceController;
+  const armed = yield* AgentControlArmedScheduler;
   const initialPlanningFinalizer = yield* AgentControlInitialPlanningFinalizer;
   const implementationAdmission = yield* AgentControlImplementationAdmission;
   const implementationTurnCoordinator = yield* AgentControlImplementationTurnCoordinator;
@@ -123,6 +125,9 @@ const make = Effect.gen(function* () {
                       // Subscribe before the shared activation opens, then recover
                       // durable run-once state before normal command readiness.
                       yield* runOnce.prepare(activation);
+                      // Armed subscribes before its catch-up and completes durable recovery
+                      // before this top-level startup attempt becomes ready.
+                      yield* armed.prepare(activation);
                       yield* verificationAdmission.start();
                     }).pipe(Scope.provide(attemptScope)),
                   ),

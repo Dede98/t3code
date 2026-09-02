@@ -114,31 +114,52 @@ layer("AgentControlEngine", (it) => {
     }),
   );
 
-  it.effect("commits human Observe to Run Once and resumes a paused run", () =>
-    Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      const engine = yield* AgentControlEngine;
-      const projectId = ProjectId.make("project-engine-run-once");
-      yield* addProject(sql, projectId);
+  it.effect(
+    "commits human Armed and Run Once transitions while generic system reset fails closed",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const engine = yield* AgentControlEngine;
+        const projectId = ProjectId.make("project-engine-run-once");
+        yield* addProject(sql, projectId);
 
-      yield* engine.dispatchHuman(setMode("run-once-observe", projectId, 0, "observe"));
-      const activation = yield* engine.dispatchHuman(
-        setMode("run-once-activate", projectId, 1, "run-once"),
-      );
-      assert.equal(activation.state.mode, "run-once");
-      const paused = yield* engine.dispatchHuman(setMode("run-once-pause", projectId, 2, "paused"));
-      assert.equal(paused.state.pausedFromMode, "run-once");
-      const resumed = yield* engine.dispatchHuman(
-        setMode("run-once-resume", projectId, 3, "run-once"),
-      );
-      assert.equal(resumed.state.mode, "run-once");
-      assert.equal(resumed.state.pausedFromMode, null);
+        yield* engine.dispatchHuman(setMode("run-once-observe", projectId, 0, "observe"));
+        const armed = yield* engine.dispatchHuman(setMode("run-once-armed", projectId, 1, "armed"));
+        assert.equal(armed.state.mode, "armed");
+        const armedPaused = yield* engine.dispatchHuman(
+          setMode("run-once-armed-pause", projectId, 2, "paused"),
+        );
+        assert.equal(armedPaused.state.pausedFromMode, "armed");
+        const armedResumed = yield* engine.dispatchHuman(
+          setMode("run-once-armed-resume", projectId, 3, "armed"),
+        );
+        assert.equal(armedResumed.state.mode, "armed");
+        yield* engine.dispatchHuman(setMode("run-once-back-observe", projectId, 4, "observe"));
+        const activation = yield* engine.dispatchHuman(
+          setMode("run-once-activate", projectId, 5, "run-once"),
+        );
+        assert.equal(activation.state.mode, "run-once");
+        const paused = yield* engine.dispatchHuman(
+          setMode("run-once-pause", projectId, 6, "paused"),
+        );
+        assert.equal(paused.state.pausedFromMode, "run-once");
+        const resumed = yield* engine.dispatchHuman(
+          setMode("run-once-resume", projectId, 7, "run-once"),
+        );
+        assert.equal(resumed.state.mode, "run-once");
+        assert.equal(resumed.state.pausedFromMode, null);
 
-      const reset = yield* engine.dispatchSystem(
-        setMode("run-once-system-reset", projectId, 4, "observe"),
-      );
-      assert.equal(reset.state.mode, "observe");
-    }),
+        const reset = yield* Effect.result(
+          engine.dispatchSystem(setMode("run-once-system-reset", projectId, 8, "observe")),
+        );
+        assert.equal(reset._tag, "Failure");
+        assert.equal((yield* engine.getProjectState({ projectId })).mode, "run-once");
+
+        const takeover = yield* engine.dispatchHuman(
+          setMode("run-once-human-takeover", projectId, 8, "observe"),
+        );
+        assert.equal(takeover.state.mode, "observe");
+      }),
   );
 
   it.effect("persists rejected commands and requires a new id for a corrected request", () =>
@@ -147,17 +168,17 @@ layer("AgentControlEngine", (it) => {
       const engine = yield* AgentControlEngine;
       const projectId = ProjectId.make("project-engine-rejection");
       yield* addProject(sql, projectId);
-      const unavailable = setMode("unavailable-command", projectId, 0, "armed");
+      const unavailable = setMode("unavailable-command", projectId, 0, "paused");
 
       const first = yield* Effect.result(engine.dispatchHuman(unavailable));
       assert.equal(first._tag, "Failure");
-      if (first._tag === "Failure") assert.equal(first.failure.code, "mode-not-available");
+      if (first._tag === "Failure") assert.equal(first.failure.code, "transition-not-allowed");
       const retry = yield* Effect.result(engine.dispatchHuman(unavailable));
       assert.equal(retry._tag, "Failure");
       if (retry._tag === "Failure") {
         assert.equal(retry.failure.code, "command-previously-rejected");
         if (retry.failure.code === "command-previously-rejected") {
-          assert.equal(retry.failure.originalErrorCode, "mode-not-available");
+          assert.equal(retry.failure.originalErrorCode, "transition-not-allowed");
         }
       }
       const corrected = yield* engine.dispatchHuman(

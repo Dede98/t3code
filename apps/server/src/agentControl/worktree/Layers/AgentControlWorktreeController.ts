@@ -44,6 +44,7 @@ import {
 import {
   loadAuthoritativeInitialStageRunHistory,
   loadAuthoritativeLeaseState,
+  loadAuthoritativeStageRunState,
 } from "../../stageRunLease/authoritative.ts";
 import { canonicalTimestampMillis } from "../../stageRunLease/invariant.ts";
 import { AgentControlStageRunEventStore } from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
@@ -55,6 +56,14 @@ import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.
 import { deriveAgentControlSourceIdentityFingerprint } from "../../stageRun/identity.ts";
 import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
+import {
+  deriveInitialPlanningFinalizationCommandId,
+  deriveInitialPlanningFinalizationMarkerId,
+  deriveInitialPlanningLeaseReleaseEventId,
+  deriveInitialPlanningResultEvidenceId,
+  deriveInitialPlanningTerminalStageEventId,
+  fingerprintInitialPlanningFinalization,
+} from "../../initialPlanning/finalizationIdentity.ts";
 import {
   deriveAgentControlWorktreeBranchName,
   deriveAgentControlWorktreeReservationId,
@@ -105,6 +114,114 @@ const error = (
   taskId: AgentControlTaskId | null,
   reservationId: AgentControlWorktreeReservationState["reservationId"] | null = null,
 ) => new AgentControlWorktreeRpcError({ code, operation, projectId, taskId, reservationId });
+
+const ReadyReusePlanningAuthorityRow = Schema.Struct({
+  resultEvidenceId: Schema.String,
+  finalizationCommandId: Schema.String,
+  finalizationFingerprint: Schema.String,
+  outcome: Schema.Literal("succeeded"),
+  handoffId: Schema.String,
+  handoffFingerprint: Schema.String,
+  projectId: Schema.String,
+  taskId: Schema.String,
+  taskRevision: Schema.Number,
+  githubIntakeSequence: Schema.Number,
+  sourceIdentityFingerprint: Schema.String,
+  controlledThreadReservationId: Schema.String,
+  threadId: Schema.String,
+  stageRunId: Schema.String,
+  attemptId: Schema.String,
+  leaseId: Schema.String,
+  leaseHolderId: Schema.String,
+  fenceToken: Schema.Number,
+  providerDeliveryId: Schema.String,
+  providerInstanceId: Schema.String,
+  providerTurnId: Schema.String,
+  runtimeMode: Schema.Literals(["approval-required", "full-access"]),
+  modelSelectionFingerprint: Schema.String,
+  deliveryTerminalState: Schema.Literal("completed"),
+  deliveryRevision: Schema.Number,
+  terminalAt: Schema.String,
+  orchestrationStartedEventId: Schema.String,
+  orchestrationStartedSequence: Schema.Number,
+  orchestrationTerminalEventId: Schema.String,
+  orchestrationTerminalSequence: Schema.Number,
+  planId: Schema.String,
+  planEventId: Schema.String,
+  planEventSequence: Schema.Number,
+  proposedPlanJson: Schema.String,
+  proposedPlanDigest: Schema.String,
+  stageEventId: Schema.String,
+  stageEventSequence: Schema.Number,
+  stageEventStreamVersion: Schema.Number,
+  leaseEventId: Schema.String,
+  leaseEventSequence: Schema.Number,
+  leaseEventStreamVersion: Schema.Number,
+  finalizedAt: Schema.String,
+  receiptFingerprint: Schema.String,
+  receiptEvidenceId: Schema.String,
+  receiptHandoffId: Schema.String,
+  receiptOutcome: Schema.String,
+  receiptStageEventId: Schema.String,
+  receiptStageEventSequence: Schema.Number,
+  receiptLeaseEventId: Schema.String,
+  receiptLeaseEventSequence: Schema.Number,
+  receiptAcceptedAt: Schema.String,
+  markerId: Schema.String,
+  markerFingerprint: Schema.String,
+  markerCommandId: Schema.String,
+  markerEvidenceId: Schema.String,
+  markerHandoffId: Schema.String,
+  markerCommittedAt: Schema.String,
+});
+type ReadyReusePlanningAuthority = typeof ReadyReusePlanningAuthorityRow.Type;
+const decodeReadyReusePlanningAuthority = Schema.decodeUnknownEffect(
+  ReadyReusePlanningAuthorityRow,
+);
+
+const isPositiveSafeInteger = (value: number) => Number.isSafeInteger(value) && value >= 1;
+
+const readyReuseResultFingerprintParts = (row: ReadyReusePlanningAuthority) => [
+  row.handoffId,
+  row.handoffFingerprint,
+  row.projectId,
+  row.taskId,
+  String(row.taskRevision),
+  String(row.githubIntakeSequence),
+  row.sourceIdentityFingerprint,
+  row.controlledThreadReservationId,
+  row.threadId,
+  row.stageRunId,
+  row.attemptId,
+  row.leaseId,
+  row.leaseHolderId,
+  String(row.fenceToken),
+  row.providerDeliveryId,
+  row.providerInstanceId,
+  row.providerTurnId,
+  row.runtimeMode,
+  row.modelSelectionFingerprint,
+  row.outcome,
+  row.deliveryTerminalState,
+  String(row.deliveryRevision),
+  row.terminalAt,
+  row.orchestrationStartedEventId,
+  String(row.orchestrationStartedSequence),
+  row.orchestrationTerminalEventId,
+  String(row.orchestrationTerminalSequence),
+  row.planId,
+  row.planEventId,
+  String(row.planEventSequence),
+  row.proposedPlanJson,
+  row.proposedPlanDigest,
+  row.stageEventId,
+  String(row.stageEventSequence),
+  String(row.stageEventStreamVersion),
+  row.leaseEventId,
+  String(row.leaseEventSequence),
+  String(row.leaseEventStreamVersion),
+  row.finalizedAt,
+];
 
 const transitionCommandId = (
   base: CommandId,
@@ -3056,10 +3173,331 @@ const make = Effect.gen(function* () {
       );
     });
 
+  const loadReadyReusePlanningAuthority = Effect.fn(
+    "AgentControlWorktreeController.loadReadyReusePlanningAuthority",
+  )(function* (
+    projectId: ProjectId,
+    taskId: AgentControlTaskId,
+    reservationId: AgentControlWorktreeReservationState["reservationId"],
+    stageRun: Effect.Success<ReturnType<typeof loadAuthoritativeInitialStageRunHistory>>[number],
+    stageHistory: Effect.Success<ReturnType<typeof loadAuthoritativeInitialStageRunHistory>>,
+    lease: Effect.Success<ReturnType<typeof loadAuthoritativeLeaseState>>,
+    operation: AgentControlWorktreeRpcError["operation"],
+  ) {
+    if (Option.isNone(lease)) {
+      return yield* error("lease-missing", operation, projectId, taskId, reservationId);
+    }
+    const rows = yield* sql<Record<string, unknown>>`
+      SELECT result.result_evidence_id AS "resultEvidenceId",
+        result.finalization_command_id AS "finalizationCommandId",
+        result.finalization_fingerprint AS "finalizationFingerprint",
+        result.outcome, result.handoff_id AS "handoffId",
+        result.handoff_fingerprint AS "handoffFingerprint",
+        result.project_id AS "projectId", result.task_id AS "taskId",
+        result.task_revision AS "taskRevision",
+        result.github_intake_sequence AS "githubIntakeSequence",
+        result.source_identity_fingerprint AS "sourceIdentityFingerprint",
+        result.controlled_thread_reservation_id AS "controlledThreadReservationId",
+        result.thread_id AS "threadId", result.stage_run_id AS "stageRunId",
+        result.attempt_id AS "attemptId", result.lease_id AS "leaseId",
+        result.lease_holder_id AS "leaseHolderId", result.fence_token AS "fenceToken",
+        result.provider_delivery_id AS "providerDeliveryId",
+        result.provider_instance_id AS "providerInstanceId",
+        result.provider_turn_id AS "providerTurnId", result.runtime_mode AS "runtimeMode",
+        result.model_selection_fingerprint AS "modelSelectionFingerprint",
+        result.delivery_terminal_state AS "deliveryTerminalState",
+        result.delivery_revision AS "deliveryRevision", result.terminal_at AS "terminalAt",
+        result.orchestration_started_event_id AS "orchestrationStartedEventId",
+        result.orchestration_started_sequence AS "orchestrationStartedSequence",
+        result.orchestration_terminal_event_id AS "orchestrationTerminalEventId",
+        result.orchestration_terminal_sequence AS "orchestrationTerminalSequence",
+        result.plan_id AS "planId", result.plan_event_id AS "planEventId",
+        result.plan_event_sequence AS "planEventSequence",
+        result.proposed_plan_json AS "proposedPlanJson",
+        result.proposed_plan_digest AS "proposedPlanDigest",
+        result.stage_event_id AS "stageEventId",
+        result.stage_event_sequence AS "stageEventSequence",
+        result.stage_event_stream_version AS "stageEventStreamVersion",
+        result.lease_event_id AS "leaseEventId",
+        result.lease_event_sequence AS "leaseEventSequence",
+        result.lease_event_stream_version AS "leaseEventStreamVersion",
+        result.finalized_at AS "finalizedAt",
+        receipt.finalization_fingerprint AS "receiptFingerprint",
+        receipt.result_evidence_id AS "receiptEvidenceId",
+        receipt.handoff_id AS "receiptHandoffId", receipt.outcome AS "receiptOutcome",
+        receipt.stage_event_id AS "receiptStageEventId",
+        receipt.stage_event_sequence AS "receiptStageEventSequence",
+        receipt.lease_event_id AS "receiptLeaseEventId",
+        receipt.lease_event_sequence AS "receiptLeaseEventSequence",
+        receipt.accepted_at AS "receiptAcceptedAt", marker.marker_id AS "markerId",
+        marker.marker_fingerprint AS "markerFingerprint",
+        marker.finalization_command_id AS "markerCommandId",
+        marker.result_evidence_id AS "markerEvidenceId",
+        marker.handoff_id AS "markerHandoffId", marker.committed_at AS "markerCommittedAt"
+      FROM main.agent_control_initial_planning_result_evidence result
+      JOIN main.agent_control_initial_planning_finalization_receipts receipt
+        ON receipt.finalization_command_id = result.finalization_command_id
+      JOIN main.agent_control_initial_planning_finalization_markers marker
+        ON marker.finalization_command_id = result.finalization_command_id
+      JOIN main.agent_control_controlled_thread_reservation_states controlled
+        ON controlled.controlled_thread_reservation_id =
+          result.controlled_thread_reservation_id
+      WHERE result.project_id = ${projectId}
+        AND result.task_id = ${taskId}
+        AND result.stage_run_id = ${stageRun.stageRunId}
+        AND result.attempt_id = ${stageRun.attemptId}
+        AND result.lease_id = ${lease.value.state.leaseId}
+        AND result.outcome = 'succeeded'
+        AND receipt.finalization_fingerprint = result.finalization_fingerprint
+        AND receipt.result_evidence_id = result.result_evidence_id
+        AND receipt.handoff_id = result.handoff_id
+        AND receipt.outcome = result.outcome
+        AND receipt.stage_event_id = result.stage_event_id
+        AND receipt.stage_event_sequence = result.stage_event_sequence
+        AND receipt.lease_event_id = result.lease_event_id
+        AND receipt.lease_event_sequence = result.lease_event_sequence
+        AND receipt.accepted_at = result.finalized_at
+        AND marker.result_evidence_id = result.result_evidence_id
+        AND marker.handoff_id = result.handoff_id
+        AND marker.committed_at = result.finalized_at
+        AND controlled.project_id = result.project_id
+        AND controlled.task_id = result.task_id
+        AND controlled.task_revision = result.task_revision
+        AND controlled.github_intake_sequence = result.github_intake_sequence
+        AND controlled.source_identity_fingerprint = result.source_identity_fingerprint
+        AND controlled.stage_run_id = result.stage_run_id
+        AND controlled.attempt_id = result.attempt_id
+        AND controlled.role_id = 'planning'
+        AND controlled.stage_kind = 'planning'
+        AND controlled.stage_ordinal = 1
+        AND controlled.attempt_ordinal = 1
+        AND controlled.lease_id = result.lease_id
+        AND controlled.fence_token = result.fence_token
+        AND controlled.thread_id = result.thread_id
+        AND controlled.worktree_reservation_id = ${reservationId}
+        AND controlled.status = 'bound'
+        AND controlled.revision = 3
+    `.pipe(
+      Effect.mapError(() =>
+        error("internal-persistence-error", operation, projectId, taskId, reservationId),
+      ),
+    );
+    if (rows.length !== 1) {
+      return yield* error("source-snapshot-stale", operation, projectId, taskId, reservationId);
+    }
+    const row = yield* decodeReadyReusePlanningAuthority(rows[0]).pipe(
+      Effect.mapError(() =>
+        error("source-snapshot-stale", operation, projectId, taskId, reservationId),
+      ),
+    );
+    const numericCoordinates = [
+      row.taskRevision,
+      row.githubIntakeSequence,
+      row.fenceToken,
+      row.deliveryRevision,
+      row.orchestrationStartedSequence,
+      row.orchestrationTerminalSequence,
+      row.planEventSequence,
+      row.stageEventSequence,
+      row.stageEventStreamVersion,
+      row.leaseEventSequence,
+      row.leaseEventStreamVersion,
+      row.receiptStageEventSequence,
+      row.receiptLeaseEventSequence,
+    ];
+    const expectedResultFingerprint = fingerprintInitialPlanningFinalization(
+      "result",
+      readyReuseResultFingerprintParts(row),
+    );
+    const expectedMarkerFingerprint = fingerprintInitialPlanningFinalization("marker", [
+      row.handoffId,
+      row.handoffFingerprint,
+      row.finalizationCommandId,
+      row.resultEvidenceId,
+      row.finalizationFingerprint,
+      row.stageEventId,
+      String(row.stageEventSequence),
+      row.leaseEventId,
+      String(row.leaseEventSequence),
+      row.finalizedAt,
+    ]);
+    const proposedPlanDigest = NodeCrypto.createHash("sha256")
+      .update(row.proposedPlanJson, "utf8")
+      .digest("hex");
+    if (
+      numericCoordinates.some((value) => !isPositiveSafeInteger(value)) ||
+      row.taskRevision !== stageRun.taskRevision ||
+      row.githubIntakeSequence !== stageRun.githubIntakeSequence ||
+      row.sourceIdentityFingerprint !== stageRun.sourceIdentityFingerprint ||
+      row.leaseHolderId !== holderId ||
+      row.terminalAt !== row.finalizedAt ||
+      canonicalTimestampMillis(row.finalizedAt) === null ||
+      row.orchestrationTerminalSequence <= row.orchestrationStartedSequence ||
+      proposedPlanDigest !== row.proposedPlanDigest ||
+      row.finalizationCommandId !==
+        deriveInitialPlanningFinalizationCommandId(row.handoffId, row.handoffFingerprint) ||
+      row.resultEvidenceId !==
+        deriveInitialPlanningResultEvidenceId(row.handoffId, row.handoffFingerprint) ||
+      row.stageEventId !==
+        deriveInitialPlanningTerminalStageEventId(row.handoffId, row.handoffFingerprint) ||
+      row.leaseEventId !==
+        deriveInitialPlanningLeaseReleaseEventId(row.handoffId, row.handoffFingerprint) ||
+      row.markerId !==
+        deriveInitialPlanningFinalizationMarkerId(row.handoffId, row.handoffFingerprint) ||
+      row.finalizationFingerprint !== expectedResultFingerprint ||
+      row.markerFingerprint !== expectedMarkerFingerprint ||
+      row.receiptFingerprint !== row.finalizationFingerprint ||
+      row.receiptEvidenceId !== row.resultEvidenceId ||
+      row.receiptHandoffId !== row.handoffId ||
+      row.receiptOutcome !== row.outcome ||
+      row.receiptStageEventId !== row.stageEventId ||
+      row.receiptStageEventSequence !== row.stageEventSequence ||
+      row.receiptLeaseEventId !== row.leaseEventId ||
+      row.receiptLeaseEventSequence !== row.leaseEventSequence ||
+      row.receiptAcceptedAt !== row.finalizedAt ||
+      row.markerCommandId !== row.finalizationCommandId ||
+      row.markerEvidenceId !== row.resultEvidenceId ||
+      row.markerHandoffId !== row.handoffId ||
+      row.markerCommittedAt !== row.finalizedAt
+    ) {
+      return yield* error("source-snapshot-stale", operation, projectId, taskId, reservationId);
+    }
+
+    const authoritativeStage = yield* loadAuthoritativeStageRunState(
+      stageRun.stageRunId,
+      stageEvents,
+      stageStates,
+    ).pipe(
+      Effect.mapError((failure) =>
+        error(
+          failure._tag === "AgentControlPersistenceSqlError"
+            ? "internal-persistence-error"
+            : "stage-run-projection-corrupt",
+          operation,
+          projectId,
+          taskId,
+          reservationId,
+        ),
+      ),
+    );
+    const stage = Option.getOrNull(authoritativeStage);
+    const preparedStage = stage?.statesByVersion[0];
+    const startedStage = stage?.statesByVersion[1];
+    const terminalStage = stage?.statesByVersion[2];
+    const terminalStageEvent = stage?.events[2];
+    const releaseEvent = lease.value.events[row.leaseEventStreamVersion - 1];
+    const releasedLease = lease.value.statesByVersion[row.leaseEventStreamVersion - 1];
+    if (
+      stage === null ||
+      stage.events.length !== 3 ||
+      stage.statesByVersion.length !== 3 ||
+      preparedStage?.status !== "prepared" ||
+      startedStage?.status !== "running" ||
+      terminalStage?.status !== "succeeded" ||
+      terminalStage.revision !== 3 ||
+      terminalStageEvent?.type !== "agentControl.stageRun.planningSucceeded" ||
+      terminalStageEvent.authority !== "system" ||
+      terminalStageEvent.eventId !== row.stageEventId ||
+      terminalStageEvent.sequence !== row.stageEventSequence ||
+      terminalStageEvent.streamVersion !== row.stageEventStreamVersion ||
+      terminalStageEvent.payload.handoffId !== row.handoffId ||
+      terminalStageEvent.payload.handoffFingerprint !== row.handoffFingerprint ||
+      terminalStageEvent.payload.controlledThreadReservationId !==
+        row.controlledThreadReservationId ||
+      terminalStageEvent.payload.threadId !== row.threadId ||
+      terminalStageEvent.payload.providerDeliveryId !== row.providerDeliveryId ||
+      terminalStageEvent.payload.providerInstanceId !== row.providerInstanceId ||
+      terminalStageEvent.payload.providerTurnId !== row.providerTurnId ||
+      terminalStageEvent.payload.runtimeMode !== row.runtimeMode ||
+      terminalStageEvent.payload.modelSelectionFingerprint !== row.modelSelectionFingerprint ||
+      terminalStageEvent.payload.leaseId !== row.leaseId ||
+      terminalStageEvent.payload.leaseHolderId !== row.leaseHolderId ||
+      terminalStageEvent.payload.fenceToken !== row.fenceToken ||
+      terminalStageEvent.payload.resultEvidenceId !== row.resultEvidenceId ||
+      terminalStageEvent.payload.finalizedAt !== row.finalizedAt ||
+      lease.value.events.length < row.leaseEventStreamVersion ||
+      releasedLease?.status !== "released" ||
+      releasedLease.projectId !== row.projectId ||
+      releasedLease.taskId !== row.taskId ||
+      releasedLease.stageRunId !== row.stageRunId ||
+      releasedLease.attemptId !== row.attemptId ||
+      releasedLease.taskRevision !== row.taskRevision ||
+      releasedLease.githubIntakeSequence !== row.githubIntakeSequence ||
+      releasedLease.sourceIdentityFingerprint !== row.sourceIdentityFingerprint ||
+      releasedLease.holderId !== row.leaseHolderId ||
+      releasedLease.fenceToken !== row.fenceToken ||
+      releasedLease.revision !== row.leaseEventStreamVersion ||
+      releasedLease.releasedAt !== row.finalizedAt ||
+      releaseEvent?.type !== "agentControl.stageRunLease.releasedAfterPlanning" ||
+      releaseEvent.authority !== "system" ||
+      releaseEvent.eventId !== row.leaseEventId ||
+      releaseEvent.sequence !== row.leaseEventSequence ||
+      releaseEvent.streamVersion !== row.leaseEventStreamVersion ||
+      releaseEvent.payload.handoffId !== row.handoffId ||
+      releaseEvent.payload.handoffFingerprint !== row.handoffFingerprint ||
+      releaseEvent.payload.controlledThreadReservationId !== row.controlledThreadReservationId ||
+      releaseEvent.payload.threadId !== row.threadId ||
+      releaseEvent.payload.providerDeliveryId !== row.providerDeliveryId ||
+      releaseEvent.payload.providerInstanceId !== row.providerInstanceId ||
+      releaseEvent.payload.providerTurnId !== row.providerTurnId ||
+      releaseEvent.payload.runtimeMode !== row.runtimeMode ||
+      releaseEvent.payload.modelSelectionFingerprint !== row.modelSelectionFingerprint ||
+      releaseEvent.payload.resultEvidenceId !== row.resultEvidenceId ||
+      releaseEvent.payload.stageStatus !== row.outcome ||
+      releaseEvent.payload.releasedAt !== row.finalizedAt
+    ) {
+      return yield* error("source-snapshot-stale", operation, projectId, taskId, reservationId);
+    }
+    for (let index = row.leaseEventStreamVersion; index < lease.value.events.length; index += 1) {
+      const successorEvent = lease.value.events[index];
+      const successorState = lease.value.statesByVersion[index];
+      const matchingStages = stageHistory.filter(
+        (candidate) =>
+          candidate.stageRunId === successorState?.stageRunId &&
+          candidate.attemptId === successorState?.attemptId &&
+          candidate.taskRevision === row.taskRevision &&
+          candidate.githubIntakeSequence === row.githubIntakeSequence &&
+          candidate.sourceIdentityFingerprint === row.sourceIdentityFingerprint &&
+          candidate.stageOrdinal > 1 &&
+          (candidate.stageKind === "implementation" || candidate.stageKind === "verification"),
+      );
+      if (
+        successorEvent === undefined ||
+        successorState === undefined ||
+        matchingStages.length !== 1 ||
+        successorEvent.streamVersion !== index + 1 ||
+        successorEvent.payload.leaseId !== row.leaseId ||
+        successorEvent.payload.stageRunId !== successorState.stageRunId ||
+        successorEvent.payload.attemptId !== successorState.attemptId ||
+        successorEvent.payload.holderId !== row.leaseHolderId ||
+        successorEvent.payload.fenceToken !== successorState.fenceToken ||
+        ((successorEvent.type === "agentControl.stageRunLease.reserved" ||
+          successorEvent.type === "agentControl.stageRunLease.releasedAfterPlanning" ||
+          successorEvent.type === "agentControl.stageRunLease.releasedAfterImplementation" ||
+          successorEvent.type === "agentControl.stageRunLease.releasedAfterVerification") &&
+          (successorEvent.payload.projectId !== row.projectId ||
+            successorEvent.payload.taskId !== row.taskId ||
+            successorEvent.payload.taskRevision !== row.taskRevision ||
+            successorEvent.payload.githubIntakeSequence !== row.githubIntakeSequence ||
+            successorEvent.payload.sourceIdentityFingerprint !== row.sourceIdentityFingerprint)) ||
+        successorState.projectId !== row.projectId ||
+        successorState.taskId !== row.taskId ||
+        successorState.taskRevision !== row.taskRevision ||
+        successorState.githubIntakeSequence !== row.githubIntakeSequence ||
+        successorState.sourceIdentityFingerprint !== row.sourceIdentityFingerprint ||
+        successorState.holderId !== row.leaseHolderId
+      ) {
+        return yield* error("source-snapshot-stale", operation, projectId, taskId, reservationId);
+      }
+    }
+    return row;
+  });
+
   const preflight = Effect.fn("AgentControlWorktreeController.preflight")(function* (
     projectId: ProjectId,
     taskId: AgentControlTaskId,
     operation: AgentControlWorktreeRpcError["operation"],
+    readyReuseReservationId: AgentControlWorktreeReservationState["reservationId"] | null = null,
   ) {
     const runId = yield* AgentControlRunOnceExecutionContext;
     const useSelected = (task: AgentControlTaskState) =>
@@ -3127,7 +3565,10 @@ const make = Effect.gen(function* () {
           return yield* error("stage-run-history-ambiguous", operation, projectId, taskId);
         }
         const stageRun = matches[0]!;
-        if (stageRun.status !== "prepared") {
+        if (
+          stageRun.status !== "prepared" &&
+          !(readyReuseReservationId !== null && stageRun.status === "succeeded")
+        ) {
           return yield* error("stage-run-not-prepared", operation, projectId, taskId);
         }
         const leaseId = yield* deriveAgentControlStageRunLeaseId({ projectId, taskId });
@@ -3147,7 +3588,7 @@ const make = Effect.gen(function* () {
           return yield* error("lease-missing", operation, projectId, taskId);
         }
         const leaseState = lease.value.state;
-        if (leaseState.status !== "reserved") {
+        if (stageRun.status === "prepared" && leaseState.status !== "reserved") {
           return yield* error("lease-not-reserved", operation, projectId, taskId);
         }
         if (leaseState.holderId !== holderId) {
@@ -3157,18 +3598,35 @@ const make = Effect.gen(function* () {
           leaseState.leaseId !== leaseId ||
           leaseState.projectId !== projectId ||
           leaseState.taskId !== taskId ||
-          leaseState.stageRunId !== stageRun.stageRunId ||
-          leaseState.attemptId !== stageRun.attemptId ||
           leaseState.taskRevision !== task.revision ||
           leaseState.githubIntakeSequence !== task.githubIntakeSequence ||
-          leaseState.sourceIdentityFingerprint !== sourceIdentityFingerprint
+          leaseState.sourceIdentityFingerprint !== sourceIdentityFingerprint ||
+          (stageRun.status === "prepared" &&
+            (leaseState.stageRunId !== stageRun.stageRunId ||
+              leaseState.attemptId !== stageRun.attemptId))
         ) {
           return yield* error("source-snapshot-stale", operation, projectId, taskId);
         }
-        const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
-        const now = yield* DateTime.now;
-        if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
-          return yield* error("lease-expired", operation, projectId, taskId);
+        let readyReuseAuthority: ReadyReusePlanningAuthority | null = null;
+        if (stageRun.status === "prepared") {
+          const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
+          const now = yield* DateTime.now;
+          if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
+            return yield* error("lease-expired", operation, projectId, taskId);
+          }
+        } else {
+          if (readyReuseReservationId === null) {
+            return yield* error("stage-run-not-prepared", operation, projectId, taskId);
+          }
+          readyReuseAuthority = yield* loadReadyReusePlanningAuthority(
+            projectId,
+            taskId,
+            readyReuseReservationId,
+            stageRun,
+            stageHistory,
+            lease,
+            operation,
+          );
         }
         return {
           task,
@@ -3177,6 +3635,7 @@ const make = Effect.gen(function* () {
           sourceIdentityFingerprint,
           stageRun,
           lease: leaseState,
+          readyReuseAuthority,
         };
       });
     return yield* (
@@ -3234,6 +3693,7 @@ const make = Effect.gen(function* () {
       canonical.sourceIdentityFingerprint,
       JSON.stringify(canonical.stageRun),
       JSON.stringify(canonical.lease),
+      JSON.stringify(canonical.readyReuseAuthority),
     ]);
 
   const ensureCanonicalBinding = Effect.fn("AgentControlWorktreeController.ensureCanonicalBinding")(
@@ -3242,14 +3702,17 @@ const make = Effect.gen(function* () {
       state: AgentControlWorktreeReservationState,
       operation: AgentControlWorktreeRpcError["operation"],
     ) {
+      const boundLeaseId = canonical.readyReuseAuthority?.leaseId ?? canonical.lease.leaseId;
+      const boundFenceToken =
+        canonical.readyReuseAuthority?.fenceToken ?? canonical.lease.fenceToken;
       if (
         canonical.task.revision !== state.taskRevision ||
         canonical.task.githubIntakeSequence !== state.githubIntakeSequence ||
         canonical.sourceIdentityFingerprint !== state.sourceIdentityFingerprint ||
         canonical.stageRun.stageRunId !== state.stageRunId ||
         canonical.stageRun.attemptId !== state.attemptId ||
-        canonical.lease.leaseId !== state.leaseId ||
-        canonical.lease.fenceToken !== state.fenceToken
+        boundLeaseId !== state.leaseId ||
+        boundFenceToken !== state.fenceToken
       ) {
         return yield* error(
           "source-snapshot-stale",
@@ -5316,6 +5779,7 @@ const make = Effect.gen(function* () {
               authoritative.projectId,
               authoritative.taskId,
               "materialize",
+              authoritative.reservationId,
             );
             yield* ensureCanonicalBinding(canonical, authoritative, "materialize");
             const initialAuthorityFingerprint = authorityFingerprint(canonical);
@@ -5357,6 +5821,7 @@ const make = Effect.gen(function* () {
               authoritative.projectId,
               authoritative.taskId,
               "materialize",
+              authoritative.reservationId,
             );
             yield* ensureCanonicalBinding(secondCanonical, authoritative, "materialize");
             if (authorityFingerprint(secondCanonical) !== initialAuthorityFingerprint) {

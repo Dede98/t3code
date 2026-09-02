@@ -17,7 +17,7 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   canonicalJson,
   decodeCanonicalUtf8Bytes,
-  parseCanonicalJson,
+  parseJsonStrict,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
 import { projectAgentControlTaskEvent } from "../task/projector.ts";
@@ -71,7 +71,9 @@ const EventCoordinates = Schema.Struct({
   causationEventId: Schema.NullOr(Schema.String),
   correlationId: Schema.String,
   authority: Schema.String,
+  payloadStorageClass: Schema.Literal("text"),
   payloadBytes: Schema.Unknown,
+  metadataStorageClass: Schema.Literal("text"),
   metadataBytes: Schema.Unknown,
 });
 const WorktreeCatalogRow = Schema.Struct({
@@ -103,12 +105,15 @@ const WorktreeEnvelopeRow = Schema.Struct({
 const decodeEventCoordinates = Schema.decodeUnknownEffect(EventCoordinates);
 const decodeTaskEvent = Schema.decodeUnknownEffect(AgentControlTaskEvent);
 const decodeWorktreeEvent = Schema.decodeUnknownEffect(AgentControlWorktreeEvent);
+const encodeTaskEvent = Schema.encodeUnknownEffect(AgentControlTaskEvent);
+const encodeWorktreeEvent = Schema.encodeUnknownEffect(AgentControlWorktreeEvent);
 const decodeWorktreeCatalog = Schema.decodeUnknownEffect(WorktreeCatalogRow);
 const decodeWorktreeEnvelope = Schema.decodeUnknownEffect(WorktreeEnvelopeRow);
 
-const decodeCanonicalEvent = Effect.fn("decodeCanonicalVerificationAuthorityEvent")(function* <A>(
+const decodeStoredEvent = Effect.fn("decodeStoredVerificationAuthorityEvent")(function* <A>(
   raw: Record<string, unknown>,
   decode: (input: unknown) => Effect.Effect<A, Schema.SchemaError>,
+  encode: (input: A) => Effect.Effect<unknown, Schema.SchemaError>,
   operation: string,
 ) {
   const coordinates = yield* decodeEventCoordinates(raw).pipe(
@@ -123,17 +128,14 @@ const decodeCanonicalEvent = Effect.fn("decodeCanonicalVerificationAuthorityEven
     catch: (cause) => historyError(`${operation}-metadata-bytes`, "history-undecodable", cause),
   });
   const payload = yield* Effect.try({
-    try: () => parseCanonicalJson(payloadSource),
+    try: () => parseJsonStrict(payloadSource),
     catch: (cause) => historyError(`${operation}-payload-json`, "history-undecodable", cause),
   });
   const metadata = yield* Effect.try({
-    try: () => parseCanonicalJson(metadataSource),
+    try: () => parseJsonStrict(metadataSource),
     catch: (cause) => historyError(`${operation}-metadata-json`, "history-undecodable", cause),
   });
-  if (metadataSource !== '{"schemaVersion":1}') {
-    return yield* historyError(`${operation}-metadata-shape`, "history-divergent");
-  }
-  return yield* decode({
+  const event = yield* decode({
     sequence: coordinates.sequence,
     eventId: coordinates.eventId,
     aggregateKind: coordinates.aggregateKind,
@@ -148,7 +150,29 @@ const decodeCanonicalEvent = Effect.fn("decodeCanonicalVerificationAuthorityEven
     payload,
     metadata,
   }).pipe(Effect.mapError((cause) => historyError(operation, "history-undecodable", cause)));
+  const encoded = yield* encode(event).pipe(
+    Effect.mapError((cause) => historyError(`${operation}-reencode`, "history-undecodable", cause)),
+  );
+  if (encoded === null || typeof encoded !== "object" || Array.isArray(encoded)) {
+    return yield* historyError(`${operation}-reencode-shape`, "history-undecodable");
+  }
+  const encodedEvent = encoded as { readonly payload?: unknown; readonly metadata?: unknown };
+  const acceptedSource = (source: string, typedValue: unknown): boolean =>
+    source === JSON.stringify(typedValue) || source === canonicalJson(typedValue as JsonValue);
+  if (!acceptedSource(payloadSource, encodedEvent.payload)) {
+    return yield* historyError(`${operation}-payload-shape`, "history-divergent");
+  }
+  if (!acceptedSource(metadataSource, encodedEvent.metadata)) {
+    return yield* historyError(`${operation}-metadata-shape`, "history-divergent");
+  }
+  return event;
 });
+
+export const decodeAgentControlVerificationStoredTaskEvent = (raw: Record<string, unknown>) =>
+  decodeStoredEvent(raw, decodeTaskEvent, encodeTaskEvent, "task-history-event");
+
+export const decodeAgentControlVerificationStoredWorktreeEvent = (raw: Record<string, unknown>) =>
+  decodeStoredEvent(raw, decodeWorktreeEvent, encodeWorktreeEvent, "worktree-history-event");
 
 const sameTaskState = (left: AgentControlTaskState, right: AgentControlTaskState) =>
   canonicalJson(left as unknown as JsonValue) === canonicalJson(right as unknown as JsonValue);
@@ -161,7 +185,9 @@ export const loadAgentControlVerificationTaskAuthorityInTransaction = Effect.fn(
       stream_id AS "aggregateId", stream_version AS "streamVersion",
       event_type AS type, occurred_at AS "occurredAt", command_id AS "commandId",
       causation_event_id AS "causationEventId", correlation_id AS "correlationId",
-      actor_authority AS authority, CAST(payload_json AS BLOB) AS "payloadBytes",
+      actor_authority AS authority, typeof(payload_json) AS "payloadStorageClass",
+      CAST(payload_json AS BLOB) AS "payloadBytes",
+      typeof(metadata_json) AS "metadataStorageClass",
       CAST(metadata_json AS BLOB) AS "metadataBytes"
     FROM main.agent_control_events
     WHERE aggregate_kind = 'task' AND stream_id = ${taskId}
@@ -173,7 +199,7 @@ export const loadAgentControlVerificationTaskAuthorityInTransaction = Effect.fn(
     return yield* historyError("task-history-count", "history-divergent");
   }
   const events = yield* Effect.forEach(rawEvents, (row) =>
-    decodeCanonicalEvent(row, decodeTaskEvent, "task-history-event"),
+    decodeAgentControlVerificationStoredTaskEvent(row),
   );
   let state: AgentControlTaskState | null = null;
   for (const [index, event] of events.entries()) {
@@ -192,7 +218,8 @@ export const loadAgentControlVerificationTaskAuthorityInTransaction = Effect.fn(
     return yield* historyError("task-history-state", "history-divergent");
   }
   const projectionRows = yield* sql<Record<string, unknown>>`
-    SELECT CAST(state_json AS BLOB) AS "stateBytes", task_id AS "taskId",
+    SELECT typeof(state_json) AS "stateStorageClass",
+      CAST(state_json AS BLOB) AS "stateBytes", task_id AS "taskId",
       project_id AS "projectId", revision, last_event_sequence AS sequence,
       repository_node_id AS "repositoryNodeId", issue_node_id AS "issueNodeId",
       issue_number AS "issueNumber", issue_url AS "issueUrl", status,
@@ -207,12 +234,16 @@ export const loadAgentControlVerificationTaskAuthorityInTransaction = Effect.fn(
   if (projectionRows.length !== 1) {
     return yield* historyError("task-projection-count", "projection-divergent");
   }
+  if (projectionRows[0]!.stateStorageClass !== "text") {
+    return yield* historyError("task-projection-storage", "projection-divergent");
+  }
+  const { stateStorageClass: _taskStorageClass, ...taskProjectionCoordinates } = projectionRows[0]!;
   const projectionSource = yield* Effect.try({
     try: () => decodeCanonicalUtf8Bytes(projectionRows[0]!.stateBytes),
     catch: (cause) => historyError("task-projection-bytes", "projection-divergent", cause),
   });
   const projection = yield* decodeAgentControlTaskProjectionRow(
-    { ...projectionRows[0], state: projectionSource },
+    { ...taskProjectionCoordinates, state: projectionSource },
     "verification-task-projection",
   ).pipe(
     Effect.mapError((cause) =>
@@ -260,7 +291,9 @@ export const loadAgentControlVerificationWorktreeAuthorityInTransaction = Effect
       stream_id AS "aggregateId", stream_version AS "streamVersion",
       event_type AS type, occurred_at AS "occurredAt", command_id AS "commandId",
       causation_event_id AS "causationEventId", correlation_id AS "correlationId",
-      actor_authority AS authority, CAST(payload_json AS BLOB) AS "payloadBytes",
+      actor_authority AS authority, typeof(payload_json) AS "payloadStorageClass",
+      CAST(payload_json AS BLOB) AS "payloadBytes",
+      typeof(metadata_json) AS "metadataStorageClass",
       CAST(metadata_json AS BLOB) AS "metadataBytes"
     FROM main.agent_control_events
     WHERE aggregate_kind = 'worktree-reservation' AND stream_id = ${reservationId}
@@ -285,7 +318,7 @@ export const loadAgentControlVerificationWorktreeAuthorityInTransaction = Effect
     ),
   );
   const events = yield* Effect.forEach(rawEvents, (row) =>
-    decodeCanonicalEvent(row, decodeWorktreeEvent, "worktree-history-event"),
+    decodeAgentControlVerificationStoredWorktreeEvent(row),
   );
   const selectedIndex =
     target === undefined
@@ -344,7 +377,8 @@ export const loadAgentControlVerificationWorktreeAuthorityInTransaction = Effect
     return yield* historyError("worktree-history-state", "history-divergent");
   }
   const projectionRows = yield* sql.unsafe<Record<string, unknown>>(
-    `SELECT ${AGENT_CONTROL_WORKTREE_STATE_SELECT.replace("state_json AS state", "CAST(state_json AS BLOB) AS stateBytes")}
+    `SELECT typeof(state_json) AS stateStorageClass,
+       ${AGENT_CONTROL_WORKTREE_STATE_SELECT.replace("state_json AS state", "CAST(state_json AS BLOB) AS stateBytes")}
      FROM main.agent_control_worktree_reservation_states WHERE reservation_id = ?`,
     [reservationId],
   );
@@ -354,12 +388,17 @@ export const loadAgentControlVerificationWorktreeAuthorityInTransaction = Effect
   if (projectionRows.length !== 1) {
     return yield* historyError("worktree-projection-count", "projection-divergent");
   }
+  if (projectionRows[0]!.stateStorageClass !== "text") {
+    return yield* historyError("worktree-projection-storage", "projection-divergent");
+  }
+  const { stateStorageClass: _worktreeStorageClass, ...worktreeProjectionCoordinates } =
+    projectionRows[0]!;
   const projectionSource = yield* Effect.try({
     try: () => decodeCanonicalUtf8Bytes(projectionRows[0]!.stateBytes),
     catch: (cause) => historyError("worktree-projection-bytes", "projection-divergent", cause),
   });
   const projection = yield* decodeAgentControlWorktreeProjectionRow(
-    { ...projectionRows[0], state: projectionSource },
+    { ...worktreeProjectionCoordinates, state: projectionSource },
     "verification-worktree-projection",
   ).pipe(
     Effect.mapError((cause) =>

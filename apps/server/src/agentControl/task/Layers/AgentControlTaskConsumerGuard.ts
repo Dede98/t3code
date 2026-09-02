@@ -1,6 +1,6 @@
+import { AgentControlRunOnceId } from "@t3tools/contracts";
 import type {
   AgentControlGithubIssueSnapshot,
-  AgentControlRunOnceId,
   AgentControlTaskId,
   AgentControlTaskState,
   AgentControlTaskSourceSnapshot,
@@ -103,7 +103,10 @@ const make = Effect.gen(function* () {
     const project = yield* projects
       .get(projectId)
       .pipe(Effect.mapError(() => guardError(projectId, "internal-persistence-error")));
-    if (Option.isNone(project) || project.value.mode !== "observe") {
+    if (
+      Option.isNone(project) ||
+      (project.value.mode !== "observe" && project.value.mode !== "armed")
+    ) {
       return {
         projectId,
         activation: "inactive",
@@ -157,7 +160,7 @@ const make = Effect.gen(function* () {
 
     return {
       projectId,
-      activation: "observe",
+      activation: project.value.mode,
       currentSourceSequence: sourceSequence,
       ...watermarkFields,
       sequenceCurrent,
@@ -429,6 +432,47 @@ const make = Effect.gen(function* () {
     } satisfies AgentControlTaskProjectGate;
   });
 
+  const loadConsumableGate = Effect.fn("AgentControlTaskConsumerGuard.loadConsumableGate")(
+    function* (projectId: ProjectId, taskId: AgentControlTaskId) {
+      const ordinary = yield* Effect.result(ensureProjectCurrent(projectId));
+      if (ordinary._tag === "Success") return ordinary.success;
+      if (ordinary.failure.reason !== "mode-inactive") return yield* ordinary.failure;
+      const project = yield* projects
+        .get(projectId)
+        .pipe(Effect.mapError(() => guardError(projectId, "internal-persistence-error")));
+      if (Option.isNone(project) || project.value.mode !== "run-once") {
+        return yield* ordinary.failure;
+      }
+
+      const rows = yield* sql<{ readonly runId: unknown }>`
+      SELECT activation.run_id AS "runId"
+      FROM main.agent_control_run_once_activations activation
+      JOIN main.agent_control_run_once_states state ON state.run_id = activation.run_id
+      JOIN main.agent_control_project_states project ON project.project_id = activation.project_id
+      JOIN main.agent_control_run_once_step_evidence selected
+        ON selected.run_id = activation.run_id AND selected.step = 'task-selected'
+      JOIN main.agent_control_run_once_step_receipts receipt
+        ON receipt.evidence_id = selected.evidence_id AND receipt.status = 'accepted'
+      JOIN main.agent_control_run_once_step_markers marker
+        ON marker.evidence_id = selected.evidence_id AND marker.receipt_id = receipt.receipt_id
+      WHERE activation.project_id = ${projectId}
+        AND selected.task_id = ${taskId}
+        AND state.status = 'active'
+        AND project.mode = 'run-once'
+        AND project.paused_from_mode IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM main.agent_control_run_once_step_markers terminal
+          WHERE terminal.run_id = activation.run_id AND terminal.step = 'completed'
+        )
+    `.pipe(Effect.mapError(() => guardError(projectId, "internal-persistence-error")));
+      if (rows.length === 0) return yield* ordinary.failure;
+      if (rows.length !== 1 || typeof rows[0]?.runId !== "string") {
+        return yield* guardError(projectId, "task-projection-corrupt");
+      }
+      return yield* loadRunOnceGate(AgentControlRunOnceId.make(rows[0].runId), projectId, taskId);
+    },
+  );
+
   const useTaskSelectedForRunOnceInTransaction: NonNullable<
     AgentControlTaskConsumerGuardShape["useTaskSelectedForRunOnceInTransaction"]
   > = (runId, projectId, taskId, use) =>
@@ -440,8 +484,8 @@ const make = Effect.gen(function* () {
   const useTaskConsumableInTransaction: AgentControlTaskConsumerGuardShape["useTaskConsumableInTransaction"] =
     (projectId, taskId, use) =>
       Effect.gen(function* () {
-        const observe = yield* ensureProjectCurrent(projectId);
-        return yield* useValidatedTask(projectId, taskId, observe, use);
+        const gate = yield* loadConsumableGate(projectId, taskId);
+        return yield* useValidatedTask(projectId, taskId, gate, use);
       });
 
   const useTaskConsumable: AgentControlTaskConsumerGuardShape["useTaskConsumable"] = (
@@ -452,7 +496,7 @@ const make = Effect.gen(function* () {
     sql
       .withTransaction(
         Effect.gen(function* () {
-          const gate = yield* ensureProjectCurrent(projectId);
+          const gate = yield* loadConsumableGate(projectId, taskId);
           return yield* useValidatedTask(projectId, taskId, gate, use);
         }),
       )

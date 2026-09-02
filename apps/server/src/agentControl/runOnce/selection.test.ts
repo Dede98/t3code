@@ -1,6 +1,7 @@
 import { ProjectId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { runMigrations } from "../../persistence/Migrations.ts";
@@ -11,13 +12,15 @@ import {
   selectAgentControlRunOnceCandidate,
 } from "./selection.ts";
 
+const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+
 const layer = it.layer(NodeSqliteClient.layerMemory());
 
 layer("run-once candidate selection", (it) => {
   it.effect("uses the exact covering index and orders issue number then task id", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 63 });
+      yield* runMigrations({ toMigrationInclusive: 64 });
       const projectId = ProjectId.make("run-once-selection");
       const insert = (input: {
         readonly taskId: string;
@@ -60,7 +63,7 @@ layer("run-once candidate selection", (it) => {
           'manual-stage-event', 'stage-run', 'manual-stage-run', 1,
           'agentControl.stageRun.prepared', '2026-08-31T10:00:00.000Z',
           'manual-stage-command', NULL, 'manual-stage-command', 'controller',
-          ${JSON.stringify({ projectId, taskId: "task-a" })}, '{"schemaVersion":1}'
+          ${encodeUnknownJson({ projectId, taskId: "task-a" })}, '{"schemaVersion":1}'
         )
       `;
       assert.isFalse(yield* isAgentControlRunOnceCandidateVacant(sql, projectId, selected!));
@@ -73,7 +76,7 @@ layer("run-once candidate selection", (it) => {
           'ambiguous-stage-event', 'stage-run', 'ambiguous-stage-run', 1,
           'agentControl.stageRun.prepared', '2026-08-31T10:00:00.000Z',
           'ambiguous-stage-command', NULL, 'ambiguous-stage-command', 'controller',
-          ${JSON.stringify({ projectId, taskId: "task-a" })}, '{"schemaVersion":1}'
+          ${encodeUnknownJson({ projectId, taskId: "task-a" })}, '{"schemaVersion":1}'
         )
       `;
       assert.equal(yield* selectAgentControlRunOnceCandidate(sql, projectId, 7), "task-a");

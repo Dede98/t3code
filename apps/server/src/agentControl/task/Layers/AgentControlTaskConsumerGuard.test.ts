@@ -295,6 +295,10 @@ const seedSelectedRunOnceTask = Effect.fn("seedSelectedRunOnceTask")(function* (
       expectedIssueCount: 1,
     }),
     activatedAt: at,
+    originMode: "observe",
+    armedDispatchId: null,
+    armedClaimId: null,
+    armedMarkerId: null,
   } as const;
   yield* admitRunOnceActivation(sql, activation, {
     expectedRevision: 1,
@@ -339,7 +343,7 @@ const seedSelectedRunOnceTask = Effect.fn("seedSelectedRunOnceTask")(function* (
 
 const makeGuard = (input?: {
   readonly available?: boolean;
-  readonly mode?: "manual" | "observe" | "paused";
+  readonly mode?: "manual" | "observe" | "armed" | "run-once" | "paused";
   readonly sourceSequence?: number | null;
   readonly watermarkStatus?: "reconciling" | "completed" | "recovery-required" | null;
   readonly targetSequence?: number;
@@ -553,6 +557,12 @@ sqlite("AgentControl task consumer guard", (it) => {
       );
       assert.isTrue(current.sequenceCurrent);
       assert.equal(current.currentSourceSequence, 5);
+      const armedGuard = yield* makeGuard({ mode: "armed" });
+      const armed = yield* armedGuard.useTaskConsumable(projectId, task(5).taskId, (_task, gate) =>
+        Effect.succeed(gate),
+      );
+      assert.equal(armed.activation, "armed");
+      assert.isTrue(armed.sequenceCurrent);
     }),
   );
 
@@ -1007,7 +1017,7 @@ sqlite("AgentControl task consumer guard", (it) => {
   it.effect("admits only the exact selected active Run-Once task and fails closed on races", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 63 });
+      yield* runMigrations({ toMigrationInclusive: 64 });
       const seeded = yield* seedSelectedRunOnceTask(sql);
       const inputs = {
         sourceSequence: seeded.githubSequence,
@@ -1035,6 +1045,19 @@ sqlite("AgentControl task consumer guard", (it) => {
       assert.equal(accepted.selected.taskId, seeded.selectedTask.taskId);
       assert.equal(accepted.gate.currentSourceSequence, seeded.githubSequence);
       assert.equal(callbackCount, 1);
+
+      const implicitlySelected = yield* guard.useTaskConsumable(
+        projectId,
+        seeded.selectedTask.taskId,
+        (selected, gate) =>
+          Effect.sync(() => {
+            callbackCount += 1;
+            return { selected, gate };
+          }),
+      );
+      assert.equal(implicitlySelected.selected.taskId, seeded.selectedTask.taskId);
+      assert.equal(implicitlySelected.gate.currentSourceSequence, seeded.githubSequence);
+      assert.equal(callbackCount, 2);
 
       const wrongRun = yield* Effect.result(
         useSelected(
@@ -1171,7 +1194,7 @@ sqlite("AgentControl task consumer guard", (it) => {
         assert.equal(divergentSource.failure.reason, "task-source-mismatch");
       }
       yield* assertForeignActivationSupersedesOldRun;
-      assert.equal(callbackCount, 1);
+      assert.equal(callbackCount, 2);
     }),
   );
 });

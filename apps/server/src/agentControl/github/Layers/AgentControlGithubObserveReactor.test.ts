@@ -129,7 +129,7 @@ const intakeState = (
 
 const addProject = Effect.fn("test.addProject")(function* (input: {
   readonly projectId: ProjectId;
-  readonly mode: "manual" | "observe" | "paused";
+  readonly mode: "manual" | "observe" | "armed" | "paused";
   readonly withConfig?: boolean;
   readonly pollIntervalSeconds?: number;
   readonly corruptControllerProjection?: boolean;
@@ -144,15 +144,21 @@ const addProject = Effect.fn("test.addProject")(function* (input: {
       NULL, '[]', ${EPOCH}, ${EPOCH}, NULL
     )
   `;
+  if (input.corruptControllerProjection === true) {
+    yield* sql`PRAGMA ignore_check_constraints = ON`;
+  }
   yield* sql`
-    INSERT INTO agent_control_project_states (
-      project_id, mode, paused_from_mode, revision, last_event_sequence, updated_at
-    ) VALUES (
-      ${input.projectId}, ${input.mode},
-      ${input.mode === "paused" ? "observe" : null},
-      ${input.corruptControllerProjection ? "broken" : 1}, 1, ${EPOCH}
-    )
-  `;
+      INSERT INTO agent_control_project_states (
+        project_id, mode, paused_from_mode, revision, last_event_sequence, updated_at
+      ) VALUES (
+        ${input.projectId}, ${input.mode},
+        ${input.mode === "paused" ? "observe" : null},
+        ${input.corruptControllerProjection ? "broken" : 1}, 1, ${EPOCH}
+      )
+    `;
+  if (input.corruptControllerProjection === true) {
+    yield* sql`PRAGMA ignore_check_constraints = OFF`;
+  }
   if (input.withConfig !== false) {
     const state = intakeState(input.projectId, input.pollIntervalSeconds);
     yield* sql`
@@ -657,18 +663,20 @@ const run = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.scoped(effect).pipe(Effect.provide(testLayer));
 
 it.effect(
-  "starts exactly one worker for each healthy Observe project and skips manual, paused, missing, and corrupt projects",
+  "starts exactly one worker for each healthy Observe or Armed project and skips manual, paused, missing, and corrupt projects",
   () =>
     run(
       Effect.gen(function* () {
         const observeOne = ProjectId.make("observe-one");
         const observeTwo = ProjectId.make("observe-two");
+        const armed = ProjectId.make("armed");
         const manual = ProjectId.make("manual");
         const paused = ProjectId.make("paused");
         const missingConfig = ProjectId.make("missing-config");
         const corrupt = ProjectId.make("corrupt");
         yield* addProject({ projectId: observeOne, mode: "observe" });
         yield* addProject({ projectId: observeTwo, mode: "observe" });
+        yield* addProject({ projectId: armed, mode: "armed" });
         yield* addProject({ projectId: manual, mode: "manual" });
         yield* addProject({ projectId: paused, mode: "paused" });
         yield* addProject({ projectId: missingConfig, mode: "observe", withConfig: false });
@@ -682,6 +690,7 @@ it.effect(
         yield* flush;
 
         assert.deepStrictEqual(harness.pollInputs.map(({ projectId }) => projectId).toSorted(), [
+          armed,
           observeOne,
           observeTwo,
         ]);

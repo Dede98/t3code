@@ -550,7 +550,7 @@ it.live("delivers committed publications exactly once through a durable WAL inbo
       yield* Effect.addFinalizer(() => Scope.close(connectionC.scope, Exit.void));
       yield* Effect.addFinalizer(() => Scope.close(connectionB.scope, Exit.void));
       yield* Effect.addFinalizer(() => Scope.close(connectionA.scope, Exit.void));
-      yield* runMigrations({ toMigrationInclusive: 63 }).pipe(
+      yield* runMigrations({ toMigrationInclusive: 64 }).pipe(
         Effect.provideService(SqlClient.SqlClient, connectionA.sql),
       );
 

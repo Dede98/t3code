@@ -210,7 +210,10 @@ const makeEngine = Effect.gen(function* () {
                 );
               }
               const project = yield* projects.get(command.projectId);
-              if (Option.isNone(project) || project.value.mode !== "observe") {
+              if (
+                Option.isNone(project) ||
+                (project.value.mode !== "observe" && project.value.mode !== "armed")
+              ) {
                 return yield* rpcError("project-mode-inactive", command);
               }
             }

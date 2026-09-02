@@ -60,49 +60,45 @@ it.effect("keeps command authority out of the client input contract", () =>
   }),
 );
 
-it.effect("decodes Armed only on the historical request boundary", () =>
+it.effect("decodes Armed as closed durable state, event and request authority", () =>
   Effect.gen(function* () {
     assert.equal(yield* decodeRequestedMode("armed"), "armed");
     assert.equal(
-      (yield* Effect.result(
-        decodeProjectState({
-          schemaVersion: 1,
-          projectId: "project-armed",
-          mode: "armed",
-          pausedFromMode: null,
-          revision: 1,
-          sequence: 1,
-          updatedAt: "2026-08-31T10:00:00.000Z",
-        }),
-      ))._tag,
-      "Failure",
+      (yield* decodeProjectState({
+        schemaVersion: 1,
+        projectId: "project-armed",
+        mode: "armed",
+        pausedFromMode: null,
+        revision: 1,
+        sequence: 1,
+        updatedAt: "2026-08-31T10:00:00.000Z",
+      })).mode,
+      "armed",
     );
     assert.equal(
-      (yield* Effect.result(
-        decodeProjectEvent({
-          eventId: "event-armed",
-          type: "agentControl.project.mode.changed",
-          aggregateKind: "project-controller",
-          aggregateId: "project-armed",
-          occurredAt: "2026-08-31T10:00:00.000Z",
-          commandId: "command-armed",
-          causationEventId: null,
-          correlationId: "command-armed",
-          authority: "human",
-          payload: {
-            projectId: "project-armed",
-            previousMode: "observe",
-            mode: "armed",
-            previousPausedFromMode: null,
-            pausedFromMode: null,
-            changedAt: "2026-08-31T10:00:00.000Z",
-          },
-          metadata: { schemaVersion: 1 },
-          streamVersion: 2,
-          sequence: 2,
-        }),
-      ))._tag,
-      "Failure",
+      (yield* decodeProjectEvent({
+        eventId: "event-armed",
+        type: "agentControl.project.mode.changed",
+        aggregateKind: "project-controller",
+        aggregateId: "project-armed",
+        occurredAt: "2026-08-31T10:00:00.000Z",
+        commandId: "command-armed",
+        causationEventId: null,
+        correlationId: "command-armed",
+        authority: "human",
+        payload: {
+          projectId: "project-armed",
+          previousMode: "observe",
+          mode: "armed",
+          previousPausedFromMode: null,
+          pausedFromMode: null,
+          changedAt: "2026-08-31T10:00:00.000Z",
+        },
+        metadata: { schemaVersion: 1 },
+        streamVersion: 2,
+        sequence: 2,
+      })).payload.mode,
+      "armed",
     );
   }),
 );
