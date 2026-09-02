@@ -1,6 +1,8 @@
 import { EnvironmentHttpApi } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
 import { FetchHttpClient, HttpRouter, HttpServer } from "effect/unstable/http";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
@@ -55,6 +57,7 @@ import { layer as AgentControlTaskIntakeReactorLive } from "./agentControl/task/
 import { AgentControlTaskVerificationFinalizerLive } from "./agentControl/task/Layers/AgentControlTaskVerificationFinalizer.ts";
 import { layer as AgentControlArmedSchedulerLive } from "./agentControl/armed/Layers/AgentControlArmedScheduler.ts";
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
+import { AgentControlReactor } from "./agentControl/Services/AgentControlReactor.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory.ts";
@@ -638,7 +641,60 @@ const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
   Layer.provide(NetService.layer),
 );
 
-const RuntimeServicesLive = ServerRuntimeStartup.layer.pipe(
+export const makeServerRuntimeStartupFailClosed = Effect.fn("makeServerRuntimeStartupFailClosed")(
+  function* (
+    startup: ServerRuntimeStartup.ServerRuntimeStartup["Service"],
+    agentControl: AgentControlReactor["Service"],
+    config: Pick<ServerConfig.ServerConfig["Service"], "mode" | "host" | "port">,
+  ) {
+    const terminalError = yield* Ref.make<ServerRuntimeStartup.ServerRuntimeStartupError | null>(
+      null,
+    );
+    const terminal = yield* Deferred.make<never, ServerRuntimeStartup.ServerRuntimeStartupError>();
+    yield* Effect.flip(agentControl.awaitFailure).pipe(
+      Effect.flatMap((cause) => {
+        const error = new ServerRuntimeStartup.ServerRuntimeStartupError({
+          mode: config.mode,
+          host: config.host ?? null,
+          port: config.port,
+          cause,
+        });
+        return Ref.set(terminalError, error).pipe(
+          Effect.andThen(Deferred.fail(terminal, error)),
+          Effect.asVoid,
+        );
+      }),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    const runtimeFailure = Deferred.await(terminal);
+    const ensureOpen = Ref.get(terminalError).pipe(
+      Effect.flatMap((error) => (error === null ? Effect.void : Effect.fail(error))),
+    );
+    return ServerRuntimeStartup.ServerRuntimeStartup.of({
+      awaitCommandReady: ensureOpen.pipe(
+        Effect.andThen(Effect.raceFirst(startup.awaitCommandReady, runtimeFailure)),
+        Effect.andThen(ensureOpen),
+      ),
+      markHttpListening: startup.markHttpListening,
+      enqueueCommand: (effect) =>
+        ensureOpen.pipe(
+          Effect.andThen(Effect.raceFirst(startup.enqueueCommand(effect), runtimeFailure)),
+        ),
+    });
+  },
+);
+
+const ServerRuntimeStartupFailClosedLive = Layer.effect(
+  ServerRuntimeStartup.ServerRuntimeStartup,
+  Effect.gen(function* () {
+    const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
+    const agentControl = yield* AgentControlReactor;
+    const config = yield* ServerConfig.ServerConfig;
+    return yield* makeServerRuntimeStartupFailClosed(startup, agentControl, config);
+  }),
+).pipe(Layer.provide(ServerRuntimeStartup.layer));
+
+const RuntimeServicesLive = ServerRuntimeStartupFailClosedLive.pipe(
   Layer.provideMerge(RuntimeDependenciesLive),
 );
 

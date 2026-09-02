@@ -28,6 +28,7 @@ import { AgentControlTaskIntakeReactor } from "./agentControl/task/Services/Agen
 import { AgentControlTaskVerificationFinalizer } from "./agentControl/task/Services/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlRunOnceController } from "./agentControl/runOnce/Services/AgentControlRunOnceController.ts";
 import { AgentControlRunOnceError } from "./agentControl/runOnce/model.ts";
+import { AgentControlArmedError } from "./agentControl/armed/model.ts";
 import { AgentControlArmedScheduler } from "./agentControl/armed/Services/AgentControlArmedScheduler.ts";
 import { AgentControlReactor } from "./agentControl/Services/AgentControlReactor.ts";
 import { layer as AgentControlReactorLive } from "./agentControl/Layers/AgentControlReactor.ts";
@@ -37,6 +38,7 @@ import { AgentControlVerificationEvaluator } from "./agentControl/verificationTu
 import { AgentControlVerificationStageFinalizer } from "./agentControl/verificationTurn/Services/AgentControlVerificationStageFinalizer.ts";
 import { AgentControlVerificationTurnCoordinator } from "./agentControl/verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
 import type { ReactorStartupActivation } from "./reactorStartupActivation.ts";
+import { makeServerRuntimeStartupFailClosed } from "./server.ts";
 
 it("uses the canonical Codex default for auto-bootstrapped model selection", () => {
   assert.deepStrictEqual(ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(), {
@@ -88,6 +90,59 @@ it.effect("enqueueCommand fails queued work when readiness fails", () =>
 
       const error = yield* Effect.flip(Fiber.join(queuedCommandFiber));
       assert.equal(error.message, "Server runtime startup failed before command readiness.");
+    }),
+  ),
+);
+
+it.effect("fails command readiness closed after an Armed runtime failure", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const armedFailure = yield* Deferred.make<never, AgentControlArmedError>();
+      const executedBeforeFailure = yield* Ref.make(false);
+      const executedAfterFailure = yield* Ref.make(false);
+      const startup = ServerRuntimeStartup.ServerRuntimeStartup.of({
+        awaitCommandReady: Effect.void,
+        markHttpListening: Effect.void,
+        enqueueCommand: (effect) => effect,
+      });
+      const guarded = yield* makeServerRuntimeStartupFailClosed(
+        startup,
+        AgentControlReactor.of({
+          awaitFailure: Deferred.await(armedFailure),
+          start: () => Effect.void,
+        }),
+        { mode: "web", host: "127.0.0.1", port: 3773 },
+      );
+
+      yield* guarded.awaitCommandReady;
+      yield* guarded.enqueueCommand(Ref.set(executedBeforeFailure, true));
+      assert.isTrue(yield* Ref.get(executedBeforeFailure));
+
+      const failure = new AgentControlArmedError({
+        projectId: ProjectId.make("armed-runtime-fail-closed"),
+        reason: "authority-conflict",
+      });
+      const activeAtFailure = yield* guarded
+        .enqueueCommand(Effect.never)
+        .pipe(Effect.result, Effect.forkChild({ startImmediately: true }));
+      yield* Effect.yieldNow;
+      yield* Deferred.fail(armedFailure, failure);
+      assert.equal((yield* Fiber.join(activeAtFailure))._tag, "Failure");
+      const readiness = yield* Effect.result(guarded.awaitCommandReady);
+      assert.equal(readiness._tag, "Failure");
+      if (readiness._tag === "Failure") {
+        assert.equal(readiness.failure._tag, "ServerRuntimeStartupError");
+        assert.strictEqual(readiness.failure.cause, failure);
+      }
+      const command = yield* Effect.result(
+        guarded.enqueueCommand(Ref.set(executedAfterFailure, true)),
+      );
+      assert.equal(command._tag, "Failure");
+      if (command._tag === "Failure") {
+        assert.equal(command.failure._tag, "ServerRuntimeStartupError");
+        assert.strictEqual(command.failure.cause, failure);
+      }
+      assert.isFalse(yield* Ref.get(executedAfterFailure));
     }),
   ),
 );
@@ -152,6 +207,7 @@ it.effect(
           commit: () => Effect.void,
         };
         const agentControlReactor = {
+          awaitFailure: Effect.never,
           start: () =>
             Ref.getAndUpdate(agentControlFailures, (count) => Math.max(0, count - 1)).pipe(
               Effect.flatMap((remaining) =>
@@ -295,6 +351,7 @@ it.effect(
             }),
         };
         const agentControlReactor = {
+          awaitFailure: Effect.never,
           start: () =>
             Ref.getAndUpdate(agentControlFailures, (count) => Math.max(0, count - 1)).pipe(
               Effect.flatMap((remaining) =>
@@ -391,6 +448,7 @@ it.effect("shares one attempt activation and discards it when Reaper startup fai
         commit: () => orchestrationActivation!.open,
       };
       const agentControlReactor = {
+        awaitFailure: Effect.never,
         start: (activation?: ReactorStartupActivation) =>
           Effect.gen(function* () {
             agentControlActivation = activation;
@@ -466,6 +524,7 @@ it.effect("lets parent shutdown close every owned attempt before cutover and ret
           Ref.update(barrierOpens, (count) => count + 1).pipe(Effect.andThen(activation!.open)),
       };
       const agentControlReactor = {
+        awaitFailure: Effect.never,
         start: (attemptActivation?: ReactorStartupActivation) =>
           Effect.gen(function* () {
             assert.strictEqual(attemptActivation, activation);
@@ -570,6 +629,7 @@ it.effect.each(["before-barrier", "after-barrier", "after-gate"] as const)(
               }),
           },
           agentControlReactor: {
+            awaitFailure: Effect.never,
             start: (attemptActivation?: ReactorStartupActivation) =>
               Effect.gen(function* () {
                 assert.strictEqual(attemptActivation, activation);
@@ -679,6 +739,7 @@ it.effect(
         const agentFinalized = yield* Ref.make(0);
         const finalizedAfterBothConsumers = yield* Ref.make(false);
         const agentControlReactor = {
+          awaitFailure: Effect.never,
           start: (attemptActivation?: ReactorStartupActivation) =>
             Effect.gen(function* () {
               assert.strictEqual(attemptActivation, activation);
@@ -1028,7 +1089,10 @@ it.effect("preserves startup and rollback causes at the server readiness boundar
           ServerRuntimeStartup.startReactorsAtomically({
             ownerScope,
             orchestrationReactor,
-            agentControlReactor: { start: () => testCase.startup as never },
+            agentControlReactor: {
+              awaitFailure: Effect.never,
+              start: () => testCase.startup as never,
+            },
             providerSessionReaper: { start: () => Effect.void },
           }),
           commandGate,
@@ -1074,7 +1138,7 @@ it.effect(
                 ),
               commit: () => activation!.open.pipe(Effect.andThen(Effect.die(commitDefect))),
             },
-            agentControlReactor: { start: () => Effect.void },
+            agentControlReactor: { awaitFailure: Effect.never, start: () => Effect.void },
             providerSessionReaper: { start: () => Effect.void },
           }),
         );

@@ -380,9 +380,10 @@ const createArmedTables = Effect.gen(function* () {
         typeof(payload_fingerprint) = 'text' AND length(payload_fingerprint) = 64
         AND payload_fingerprint NOT GLOB '*[^0-9a-f]*'
       ),
-      UNIQUE (project_id, github_event_id, github_event_sequence, github_event_stream_version,
-        source_fingerprint, reconcile_revision, task_frontier_sequence,
-        task_frontier_revision, task_frontier_count, task_frontier_fingerprint),
+      UNIQUE (project_id, github_intake_sequence, github_event_id, github_event_sequence,
+        github_event_stream_version, source_fingerprint, reconcile_revision,
+        task_frontier_sequence, task_frontier_revision, task_frontier_count,
+        task_frontier_fingerprint),
       FOREIGN KEY (github_event_id) REFERENCES agent_control_events(event_id),
       FOREIGN KEY (receipt_id) REFERENCES agent_control_armed_no_candidate_receipts(receipt_id)
         DEFERRABLE INITIALLY DEFERRED,
@@ -930,6 +931,108 @@ const replaceRunOnceTriggers = Effect.gen(function* () {
           AND project.revision = evidence.project_revision
           AND project.last_event_sequence = evidence.project_event_sequence
           AND NEW.stream_version = project.revision + 1
+          AND EXISTS (
+            SELECT 1 FROM main.agent_control_github_intake_states projected
+            WHERE projected.project_id = evidence.project_id
+              AND projected.last_event_sequence = evidence.github_intake_sequence
+              AND projected.revision = evidence.github_event_stream_version
+              AND json_extract(projected.state_json, '$.config.revision') =
+                evidence.github_event_stream_version
+              AND json_extract(projected.state_json, '$.pollStatus.status') = 'success'
+          )
+          AND EXISTS (
+            SELECT 1 FROM main.agent_control_events github
+            WHERE github.event_id = evidence.github_event_id
+              AND github.aggregate_kind = 'github-intake'
+              AND github.stream_id = evidence.project_id
+              AND github.event_type = 'agentControl.github.poll.succeeded'
+              AND github.sequence = evidence.github_event_sequence
+              AND github.stream_version = evidence.github_event_stream_version
+              AND github.sequence = evidence.github_intake_sequence
+              AND ${sql.literal(SOURCE_FINGERPRINT_MATCH)}(
+                evidence.source_fingerprint, evidence.project_id,
+                evidence.github_intake_sequence, evidence.github_event_stream_version,
+                evidence.github_event_stream_version,
+                json_extract(github.payload_json, '$.repository.repositoryNodeId'),
+                json_array_length(json_extract(github.payload_json, '$.issues'))
+              ) = 1
+          )
+          AND EXISTS (
+            SELECT 1 FROM main.agent_control_task_reconcile_states reconcile
+            WHERE reconcile.project_id = evidence.project_id
+              AND reconcile.status = 'completed'
+              AND reconcile.target_sequence = evidence.github_intake_sequence
+              AND reconcile.last_completed_sequence = evidence.github_intake_sequence
+              AND reconcile.revision = evidence.reconcile_revision
+          )
+          AND evidence.task_frontier_sequence = COALESCE((
+            SELECT MAX(task.last_event_sequence)
+            FROM main.agent_control_task_states task
+            WHERE task.project_id = evidence.project_id
+          ), 0)
+          AND evidence.task_frontier_revision = COALESCE((
+            SELECT MAX(task.revision)
+            FROM main.agent_control_task_states task
+            WHERE task.project_id = evidence.project_id
+          ), 0)
+          AND evidence.task_frontier_count = (
+            SELECT COUNT(*) FROM main.agent_control_task_states task
+            WHERE task.project_id = evidence.project_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM main.agent_control_task_states task
+            WHERE task.project_id = evidence.project_id
+              AND NOT EXISTS (
+                SELECT 1
+                FROM json_each(CAST(evidence.payload_json AS TEXT), '$.taskFrontier') item
+                WHERE json_extract(item.value, '$.taskId') = task.task_id
+                  AND json_extract(item.value, '$.issueNumber') = task.issue_number
+                  AND json_extract(item.value, '$.status') = task.status
+                  AND json_extract(item.value, '$.sourceGate') = task.source_gate
+                  AND json_extract(item.value, '$.stage') = task.stage
+                  AND json_extract(item.value, '$.githubIntakeSequence') =
+                    task.github_intake_sequence
+                  AND json_extract(item.value, '$.revision') = task.revision
+                  AND json_extract(item.value, '$.lastEventSequence') =
+                    task.last_event_sequence
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM json_each(CAST(evidence.payload_json AS TEXT), '$.taskFrontier') item
+            WHERE NOT EXISTS (
+              SELECT 1 FROM main.agent_control_task_states task
+              WHERE task.project_id = evidence.project_id
+                AND task.task_id = json_extract(item.value, '$.taskId')
+                AND task.issue_number = json_extract(item.value, '$.issueNumber')
+                AND task.status = json_extract(item.value, '$.status')
+                AND task.source_gate = json_extract(item.value, '$.sourceGate')
+                AND task.stage = json_extract(item.value, '$.stage')
+                AND task.github_intake_sequence =
+                  json_extract(item.value, '$.githubIntakeSequence')
+                AND task.revision = json_extract(item.value, '$.revision')
+                AND task.last_event_sequence =
+                  json_extract(item.value, '$.lastEventSequence')
+            )
+          )
+          AND EXISTS (
+            SELECT 1 FROM main.agent_control_task_states selected
+            WHERE selected.task_id = evidence.selected_task_id
+              AND selected.project_id = evidence.project_id
+              AND selected.github_intake_sequence = evidence.github_intake_sequence
+              AND selected.status = 'candidate' AND selected.source_gate = 'eligible'
+              AND selected.stage = 'intake'
+              AND NOT EXISTS (
+                SELECT 1 FROM main.agent_control_task_states earlier
+                WHERE earlier.project_id = evidence.project_id
+                  AND earlier.github_intake_sequence = evidence.github_intake_sequence
+                  AND earlier.status = 'candidate' AND earlier.source_gate = 'eligible'
+                  AND earlier.stage = 'intake'
+                  AND (earlier.issue_number < selected.issue_number
+                    OR (earlier.issue_number = selected.issue_number
+                      AND earlier.task_id < selected.task_id))
+              )
+          )
           AND json_extract(NEW.payload_json, '$.projectId') = evidence.project_id
           AND json_extract(NEW.payload_json, '$.previousPausedFromMode') IS NULL
           AND json_extract(NEW.payload_json, '$.pausedFromMode') IS NULL

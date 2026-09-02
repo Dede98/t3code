@@ -12808,6 +12808,90 @@ activationLayer("Controlled thread activation facade", (it) => {
       }),
     360_000,
   );
+
+  it.effect("fails Ready reuse closed on controlled-thread stream/projection divergence", () =>
+    Effect.gen(function* () {
+      const repo = yield* makeRepository();
+      const projectId = ProjectId.make("worktree-ready-controlled-thread-divergence");
+      const seeded = yield* seedPrepared(projectId, repo.cwd);
+      yield* reserveLease(seeded.stageRun);
+      const controller = yield* AgentControlWorktreeController;
+      const ready = yield* controller.reserveAndMaterialize({
+        commandId: CommandId.make("worktree-ready-controlled-thread-divergence-materialize"),
+        projectId,
+        taskId: seeded.task.taskId,
+      });
+      const activated = yield* (yield* AgentControlControlledThreadActivation).activateInitial({
+        commandId: CommandId.make("worktree-ready-controlled-thread-divergence-activate"),
+        projectId,
+        taskId: seeded.task.taskId,
+      });
+      const sql = yield* SqlClient.SqlClient;
+      const projection = (yield* sql<{
+        readonly boundAt: string;
+        readonly stateJson: string;
+      }>`
+        SELECT bound_at AS "boundAt", state_json AS "stateJson"
+        FROM agent_control_controlled_thread_reservation_states
+        WHERE controlled_thread_reservation_id =
+          ${activated.reservation.controlledThreadReservationId}
+      `)[0]!;
+      const updateTrigger = (yield* sql<{ readonly sql: string }>`
+        SELECT sql FROM main.sqlite_schema
+        WHERE type = 'trigger'
+          AND name = 'agent_control_controlled_thread_projection_validate_update'
+      `)[0]!.sql;
+      const divergentBoundAt = "2026-07-30T12:00:00.999Z";
+      const callbackStarted = yield* Ref.make(false);
+
+      yield* sql`DROP TRIGGER agent_control_controlled_thread_projection_validate_update`;
+      yield* Effect.gen(function* () {
+        yield* sql`
+          UPDATE agent_control_controlled_thread_reservation_states
+          SET bound_at = ${divergentBoundAt},
+            state_json = json_set(state_json, '$.boundAt', ${divergentBoundAt})
+          WHERE controlled_thread_reservation_id =
+            ${activated.reservation.controlledThreadReservationId}
+        `;
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT projection.bound_at AS "projectionBoundAt",
+              json_extract(event.payload_json, '$.boundAt') AS "eventBoundAt"
+            FROM agent_control_controlled_thread_reservation_states projection
+            JOIN agent_control_events event
+              ON event.aggregate_kind = 'controlled-thread-reservation'
+             AND event.stream_id = projection.controlled_thread_reservation_id
+             AND event.stream_version = 3
+            WHERE projection.controlled_thread_reservation_id =
+              ${activated.reservation.controlledThreadReservationId}
+          `,
+          [{ projectionBoundAt: divergentBoundAt, eventBoundAt: projection.boundAt }],
+        );
+        const result = yield* Effect.result(
+          controller.useReadyWorktree({ projectId, reservationId: ready.reservationId }, () =>
+            Ref.set(callbackStarted, true),
+          ),
+        );
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.equal(result.failure.code, "source-snapshot-stale");
+        }
+        assert.isFalse(yield* Ref.get(callbackStarted));
+      }).pipe(
+        Effect.ensuring(
+          Effect.gen(function* () {
+            yield* sql`
+              UPDATE agent_control_controlled_thread_reservation_states
+              SET bound_at = ${projection.boundAt}, state_json = ${projection.stateJson}
+              WHERE controlled_thread_reservation_id =
+                ${activated.reservation.controlledThreadReservationId}
+            `;
+            yield* sql.unsafe(updateTrigger).unprepared;
+          }).pipe(Effect.orDie),
+        ),
+      );
+    }),
+  );
 });
 
 coordinatorLayer("Controlled thread materialization coordinator", (it) => {
@@ -20898,6 +20982,84 @@ layer("Agent Control worktree materialization", (it) => {
         0,
       );
     }),
+  );
+
+  it.effect("orders human takeover across the complete Ready reuse callback", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeIndependentControllerContexts();
+        const { cwd } = yield* makeRepository();
+        const projectId = ProjectId.make("worktree-ready-reuse-takeover");
+        const seeded = yield* seedPrepared(projectId, cwd).pipe(Effect.provide(harness.contextA));
+        yield* reserveLease(seeded.stageRun).pipe(Effect.provide(harness.contextA));
+        yield* harness.sqlA`
+          DELETE FROM main.agent_control_project_states WHERE project_id = ${projectId}
+        `;
+        const projectEngineA = Context.get(harness.contextA, AgentControlEngine);
+        const projectEngineB = Context.get(harness.contextB, AgentControlEngine);
+        const initial = yield* projectEngineA.getProjectState({ projectId });
+        const observed = yield* projectEngineA.dispatchHuman({
+          commandId: CommandId.make("worktree-ready-reuse-observe"),
+          projectId,
+          expectedRevision: initial.revision,
+          mode: "observe",
+        });
+        const ready = yield* harness.controllerA.reserveAndMaterialize({
+          commandId: CommandId.make("worktree-ready-reuse-materialize"),
+          projectId,
+          taskId: seeded.task.taskId,
+        });
+
+        const humanFirst = yield* projectEngineB.dispatchHuman({
+          commandId: CommandId.make("worktree-ready-reuse-human-first"),
+          projectId,
+          expectedRevision: observed.state.revision,
+          mode: "manual",
+        });
+        const humanFirstCallback = yield* Ref.make(false);
+        const rejected = yield* Effect.result(
+          harness.controllerA.useReadyWorktree(
+            { projectId, reservationId: ready.reservationId },
+            () => Ref.set(humanFirstCallback, true),
+          ),
+        );
+        assert.equal(rejected._tag, "Failure");
+        assert.isFalse(yield* Ref.get(humanFirstCallback));
+
+        const resumed = yield* projectEngineB.dispatchHuman({
+          commandId: CommandId.make("worktree-ready-reuse-resume-observe"),
+          projectId,
+          expectedRevision: humanFirst.state.revision,
+          mode: "observe",
+        });
+        const callbackEntered = yield* Deferred.make<void>();
+        const releaseCallback = yield* Deferred.make<void>();
+        const readyFirst = yield* harness.controllerA
+          .useReadyWorktree({ projectId, reservationId: ready.reservationId }, () =>
+            Deferred.succeed(callbackEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseCallback)),
+              Effect.as("callback-complete" as const),
+            ),
+          )
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(callbackEntered);
+        const takeover = yield* projectEngineB
+          .dispatchHuman({
+            commandId: CommandId.make("worktree-ready-reuse-ready-first"),
+            projectId,
+            expectedRevision: resumed.state.revision,
+            mode: "manual",
+          })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.yieldNow;
+        assert.isUndefined(takeover.pollUnsafe());
+
+        yield* Deferred.succeed(releaseCallback, undefined);
+        assert.equal(yield* Fiber.join(readyFirst), "callback-complete");
+        const takenOver = yield* Fiber.join(takeover);
+        assert.equal(takenOver.state.mode, "manual");
+      }),
+    ),
   );
 
   it.effect(

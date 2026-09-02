@@ -440,29 +440,60 @@ const writeNoCandidate = Effect.fn("AgentControlArmed.writeNoCandidate")(functio
       marker.marker_id AS "markerRecordId", marker.receipt_id AS "markerReceiptId",
       marker.marker_fingerprint AS "markerFingerprint", marker.committed_at AS "committedAt"
     FROM main.agent_control_armed_no_candidate_evidence evidence
-    JOIN main.agent_control_armed_no_candidate_receipts receipt
+    LEFT JOIN main.agent_control_armed_no_candidate_receipts receipt
       ON receipt.evidence_id = evidence.evidence_id AND receipt.receipt_id = evidence.receipt_id
      AND receipt.marker_id = evidence.marker_id
-    JOIN main.agent_control_armed_no_candidate_markers marker
+    LEFT JOIN main.agent_control_armed_no_candidate_markers marker
       ON marker.evidence_id = evidence.evidence_id AND marker.marker_id = evidence.marker_id
      AND marker.receipt_id = evidence.receipt_id
-    WHERE evidence.evidence_id = ${ids.evidenceId}
+    WHERE evidence.project_id = ${projectId}
+      AND evidence.github_intake_sequence = ${snapshot.epoch.githubIntakeSequence}
+      AND evidence.github_event_id = ${snapshot.epoch.githubEventId}
+      AND evidence.github_event_sequence = ${snapshot.epoch.githubEventSequence}
+      AND evidence.github_event_stream_version = ${snapshot.epoch.githubEventStreamVersion}
+      AND evidence.source_fingerprint = ${snapshot.epoch.sourceFingerprint}
+      AND evidence.reconcile_revision = ${snapshot.epoch.reconcileRevision}
+      AND evidence.task_frontier_sequence = ${snapshot.epoch.taskFrontierSequence}
+      AND evidence.task_frontier_revision = ${snapshot.epoch.taskFrontierRevision}
+      AND evidence.task_frontier_count = ${snapshot.epoch.taskFrontierCount}
+      AND evidence.task_frontier_fingerprint = ${snapshot.epoch.taskFrontierFingerprint}
   `;
   if (existing.length !== 0) {
     const row = existing[0];
     const existingPayload = decodeCanonicalPayload(row?.payloadJson, row?.payloadFingerprint);
     const taskFrontier = existingPayload?.taskFrontier;
+    const existingIds =
+      row !== undefined && isInt(row.projectRevision, 1)
+        ? {
+            evidenceId: deriveArmedNoCandidateIdentity("evidence", {
+              projectId,
+              projectRevision: row.projectRevision,
+              ...snapshot.epoch,
+            }),
+            receiptId: deriveArmedNoCandidateIdentity("receipt", {
+              projectId,
+              projectRevision: row.projectRevision,
+              ...snapshot.epoch,
+            }),
+            markerId: deriveArmedNoCandidateIdentity("marker", {
+              projectId,
+              projectRevision: row.projectRevision,
+              ...snapshot.epoch,
+            }),
+          }
+        : null;
     if (
       existing.length !== 1 ||
       row === undefined ||
-      row.evidenceId !== ids.evidenceId ||
-      row.receiptId !== ids.receiptId ||
-      row.markerId !== ids.markerId ||
+      existingIds === null ||
+      row.evidenceId !== existingIds.evidenceId ||
+      row.receiptId !== existingIds.receiptId ||
+      row.markerId !== existingIds.markerId ||
       row.projectId !== projectId ||
-      row.receiptRecordId !== ids.receiptId ||
-      row.receiptMarkerId !== ids.markerId ||
-      row.markerRecordId !== ids.markerId ||
-      row.markerReceiptId !== ids.receiptId ||
+      row.receiptRecordId !== existingIds.receiptId ||
+      row.receiptMarkerId !== existingIds.markerId ||
+      row.markerRecordId !== existingIds.markerId ||
+      row.markerReceiptId !== existingIds.receiptId ||
       typeof row.decidedAt !== "string" ||
       row.acceptedAt !== row.decidedAt ||
       row.committedAt !== row.decidedAt ||
@@ -489,9 +520,9 @@ const writeNoCandidate = Effect.fn("AgentControlArmed.writeNoCandidate")(functio
         canonicalJson({
           schemaVersion: 1,
           kind: "no-candidate",
-          evidenceId: ids.evidenceId,
-          receiptId: ids.receiptId,
-          markerId: ids.markerId,
+          evidenceId: existingIds.evidenceId,
+          receiptId: existingIds.receiptId,
+          markerId: existingIds.markerId,
           projectId,
           projectRevision: row.projectRevision,
           projectEventSequence: row.projectEventSequence,

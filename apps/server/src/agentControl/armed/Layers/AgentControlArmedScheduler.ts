@@ -364,7 +364,16 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
         ) {
           return yield* fail(projectId, "persistence", dispatched.cause, dispatch.expiresAt);
         }
-        return yield* fail(projectId, "mode-superseded", dispatched.cause);
+        // Source/reconcile/task authority can advance on another native
+        // connection after the claim transaction. Migration 064 rejects the
+        // stale system event; retry only after the immutable claim expires so
+        // a fresh epoch and fence are selected without spinning.
+        return yield* fail(
+          projectId,
+          "source-watermark-stale",
+          dispatched.cause,
+          dispatch.expiresAt,
+        );
       }
       event = yield* recoverActivationEvent(projectId, dispatch);
       if (event === null) return yield* fail(projectId, "authority-conflict");

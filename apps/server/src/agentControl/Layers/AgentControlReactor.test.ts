@@ -25,6 +25,7 @@ import { AgentControlTaskVerificationFinalizer } from "../task/Services/AgentCon
 import { AgentControlRunOnceController } from "../runOnce/Services/AgentControlRunOnceController.ts";
 import { AgentControlRunOnceError } from "../runOnce/model.ts";
 import { AgentControlArmedScheduler } from "../armed/Services/AgentControlArmedScheduler.ts";
+import { AgentControlArmedError } from "../armed/model.ts";
 import { AgentControlReactor } from "../Services/AgentControlReactor.ts";
 import { AgentControlImplementationStageFinalizer } from "../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlVerificationAdmission } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -84,15 +85,82 @@ const armedStubLayer = Layer.succeed(
     prepare: () => Effect.void,
   }),
 );
-const layer = AgentControlReactorLive.pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      evaluatorStubLayer,
-      finalizerStubLayer,
-      taskFinalizerStubLayer,
-      runOnceStubLayer,
-      armedStubLayer,
+const makeLayer = (armedLayer = armedStubLayer) =>
+  AgentControlReactorLive.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        evaluatorStubLayer,
+        finalizerStubLayer,
+        taskFinalizerStubLayer,
+        runOnceStubLayer,
+        armedLayer,
+      ),
     ),
+  );
+const layer = makeLayer();
+
+it.effect("fails closed and tears down the started scope on an Armed runtime failure", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const runtimeFailure = yield* Deferred.make<never, AgentControlArmedError>();
+      const cleaned = yield* Deferred.make<void>();
+      const failure = new AgentControlArmedError({
+        projectId: ProjectId.make("armed-runtime-failure"),
+        reason: "authority-conflict",
+      });
+      const reactorLayer = makeLayer(
+        Layer.succeed(
+          AgentControlArmedScheduler,
+          AgentControlArmedScheduler.of({
+            awaitFailure: Deferred.await(runtimeFailure),
+            recover: Effect.void,
+            processProject: () => Effect.void,
+            prepare: () => Effect.void,
+          }),
+        ),
+      ).pipe(
+        Layer.provide(
+          Layer.merge(
+            Layer.succeed(
+              AgentControlGithubObserveReactor,
+              AgentControlGithubObserveReactor.of({
+                start: () =>
+                  Effect.addFinalizer(() =>
+                    Deferred.succeed(cleaned, undefined).pipe(Effect.asVoid),
+                  ),
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.succeed(
+              AgentControlTaskIntakeReactor,
+              AgentControlTaskIntakeReactor.of({
+                start: () => Effect.void,
+                getStatus: () => Effect.die("unused"),
+              }),
+            ),
+          ),
+        ),
+      );
+      const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
+      const ownerScope = yield* Scope.make("sequential");
+      yield* reactor.start().pipe(Scope.provide(ownerScope));
+      assert.isFalse(yield* Deferred.isDone(cleaned));
+
+      yield* Deferred.fail(runtimeFailure, failure);
+      const observed = yield* Effect.flip(reactor.awaitFailure);
+      assert.strictEqual(observed, failure);
+      yield* Deferred.await(cleaned);
+
+      const retryScope = yield* Scope.make("sequential");
+      const retry = yield* Effect.result(reactor.start().pipe(Scope.provide(retryScope)));
+      assert.equal(retry._tag, "Failure");
+      if (retry._tag === "Failure") {
+        assert.equal(retry.failure._tag, "AgentControlReactorStartupError");
+        assert.equal(retry.failure.reason, "lifecycle-closed");
+      }
+      yield* Scope.close(retryScope, Exit.void);
+      yield* Scope.close(ownerScope, Exit.void);
+    }),
   ),
 );
 

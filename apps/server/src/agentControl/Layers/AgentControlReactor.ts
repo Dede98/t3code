@@ -58,6 +58,7 @@ const make = Effect.gen(function* () {
     attemptId: number,
     ownerScope: Scope.Scope,
     exit: Exit.Exit<unknown, unknown>,
+    terminal = false,
   ) =>
     lifecycleSemaphore.withPermits(1)(
       Effect.uninterruptible(
@@ -74,7 +75,7 @@ const make = Effect.gen(function* () {
           const closeExit = yield* Effect.exit(Scope.close(activeAttempt.scope, exit));
           if (activeAttempt?.id === attemptId && activeAttempt.ownerScope === ownerScope) {
             activeAttempt = null;
-            lifecycleState = closeDisposition === "retryable" ? "idle" : "closed";
+            lifecycleState = terminal || closeDisposition !== "retryable" ? "closed" : "idle";
           }
           if (Exit.isFailure(closeExit)) return yield* Effect.failCause(closeExit.cause);
         }),
@@ -145,6 +146,12 @@ const make = Effect.gen(function* () {
                   );
                 }
                 lifecycleState = "started";
+                yield* Effect.flip(armed.awaitFailure).pipe(
+                  Effect.flatMap((failure) =>
+                    closeAttempt(attemptId, ownerScope, Exit.fail(failure), true),
+                  ),
+                  Effect.forkIn(ownerScope, { startImmediately: true }),
+                );
                 return attempt as ActiveAttempt | null;
               }),
             ),
@@ -156,7 +163,7 @@ const make = Effect.gen(function* () {
       }),
   );
 
-  return AgentControlReactor.of({ start });
+  return AgentControlReactor.of({ awaitFailure: armed.awaitFailure, start });
 });
 
 export const layer = Layer.effect(AgentControlReactor, make);

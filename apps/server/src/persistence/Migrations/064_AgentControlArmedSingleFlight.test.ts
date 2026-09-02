@@ -117,7 +117,7 @@ const target064DdlFingerprints = {
   agent_control_armed_dispatch_states:
     "5a9e0ec2fc2e4f7082f54de8a185abdea2468729d551c59bef773ee55bb4fada",
   agent_control_armed_no_candidate_evidence:
-    "d685224119c6e1a95aa522fa6fd7c2e35ddcdc95a412c8852583a87d5d40a43e",
+    "3b1ce0cf25d2ac231cde248f46ac1736a612bb9a0c329452d3cdb6de4af3983c",
   agent_control_armed_no_candidate_evidence_no_delete:
     "5105238edd5a26136d97ca15356d413b3cd9ba0a7dceabdd7e25fbbc3b521c1a",
   agent_control_armed_no_candidate_evidence_no_update:
@@ -141,7 +141,7 @@ const target064DdlFingerprints = {
   agent_control_armed_no_candidate_receipts_no_update:
     "24c46012bc94f5355fc3f4a1bf8c12af73ecbed17eea51eab734383a3fa4f65b",
   agent_control_armed_system_activation_validate:
-    "4eb79b3eeabbcb6a7d31bff24124a93b9afd1a6ba7948924981735eea1060e54",
+    "0ef1a7cc2ab74395176ef9c40662b497244a3d5d0cef176d3b72df4c32333baa",
   agent_control_project_states: "4db227bf824894ae65b802e620a816e9e0937a7b292eb40109d41be77e8dd214",
   agent_control_run_once_activation_event_validate:
     "dcf7804b2c547c476300bb3dc234d28cf282e25679aabeed96c51d55d4491d40",
@@ -633,6 +633,27 @@ it.live("installs Armed authority on a fresh database and exposes it across WAL"
         { name: "armed_marker_id", type: "TEXT", notnull: 0 },
         { name: "origin_mode", type: "TEXT", notnull: 1 },
       ]);
+      const noCandidateEpochIndexInfo = yield* observer.sql<{
+        readonly name: string;
+        readonly seqno: number;
+      }>`
+        SELECT seqno, name
+        FROM pragma_index_info('sqlite_autoindex_agent_control_armed_no_candidate_evidence_4')
+        ORDER BY seqno
+      `;
+      assert.deepStrictEqual(noCandidateEpochIndexInfo, [
+        { seqno: 0, name: "project_id" },
+        { seqno: 1, name: "github_intake_sequence" },
+        { seqno: 2, name: "github_event_id" },
+        { seqno: 3, name: "github_event_sequence" },
+        { seqno: 4, name: "github_event_stream_version" },
+        { seqno: 5, name: "source_fingerprint" },
+        { seqno: 6, name: "reconcile_revision" },
+        { seqno: 7, name: "task_frontier_sequence" },
+        { seqno: 8, name: "task_frontier_revision" },
+        { seqno: 9, name: "task_frontier_count" },
+        { seqno: 10, name: "task_frontier_fingerprint" },
+      ]);
       const targetObjects = yield* observer.sql<{ readonly name: string; readonly sql: string }>`
         SELECT name, sql FROM main.sqlite_schema
         WHERE sql IS NOT NULL AND (
@@ -1086,20 +1107,30 @@ it.live(
         SELECT evidence.evidence_id AS "evidenceId", receipt.receipt_id AS "receiptRecordId",
           marker.marker_id AS "markerRecordId"
         FROM main.agent_control_armed_no_candidate_evidence evidence
-        JOIN main.agent_control_armed_no_candidate_receipts receipt
+        LEFT JOIN main.agent_control_armed_no_candidate_receipts receipt
           ON receipt.evidence_id = evidence.evidence_id AND receipt.receipt_id = evidence.receipt_id
          AND receipt.marker_id = evidence.marker_id
-        JOIN main.agent_control_armed_no_candidate_markers marker
+        LEFT JOIN main.agent_control_armed_no_candidate_markers marker
           ON marker.evidence_id = evidence.evidence_id AND marker.marker_id = evidence.marker_id
          AND marker.receipt_id = evidence.receipt_id
-        WHERE evidence.evidence_id = 'armed-no-candidate-plan-probe'
+        WHERE evidence.project_id = ${projectId}
+          AND evidence.github_intake_sequence = 1
+          AND evidence.github_event_id = 'armed-no-candidate-plan-probe'
+          AND evidence.github_event_sequence = 1
+          AND evidence.github_event_stream_version = 1
+          AND evidence.source_fingerprint = ${"a".repeat(64)}
+          AND evidence.reconcile_revision = 1
+          AND evidence.task_frontier_sequence = 0
+          AND evidence.task_frontier_revision = 0
+          AND evidence.task_frontier_count = 0
+          AND evidence.task_frontier_fingerprint = ${"b".repeat(64)}
       `;
-        assert.isTrue(noCandidatePlan.every((plan) => plan.detail.includes("SEARCH")));
         assert.isTrue(
           noCandidatePlan.some((plan) =>
-            plan.detail.includes("sqlite_autoindex_agent_control_armed_no_candidate_evidence_1"),
+            plan.detail.includes("sqlite_autoindex_agent_control_armed_no_candidate_evidence_4"),
           ),
         );
+        assert.isFalse(noCandidatePlan.some((plan) => plan.detail.includes("SCAN")));
         assert.isFalse(noCandidatePlan.some((plan) => plan.detail.includes("TEMP B-TREE")));
         assert.deepStrictEqual(yield* observer.sql`PRAGMA main.foreign_key_check`, []);
         assert.equal((yield* observer.sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");

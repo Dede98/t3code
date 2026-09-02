@@ -230,6 +230,35 @@ it.live("persists one decision per epoch and grants one claim across two WAL con
         [{ evidence: 1, receipts: 1, markers: 1 }],
       );
 
+      yield* first.sql`
+        UPDATE main.agent_control_project_states
+        SET mode = 'observe', revision = 3, last_event_sequence = last_event_sequence + 1,
+          updated_at = ${later}
+        WHERE project_id = ${projectId} AND mode = 'armed' AND revision = 2
+      `;
+      yield* first.sql`
+        UPDATE main.agent_control_project_states
+        SET mode = 'armed', revision = 4, last_event_sequence = last_event_sequence + 1,
+          updated_at = ${later}
+        WHERE project_id = ${projectId} AND mode = 'observe' AND revision = 3
+      `;
+      const rearmedSameEpoch = yield* claimArmedDispatch(second.sql, {
+        projectId,
+        ownerId: "controller-none-after-rearm",
+        claimedAt: later,
+        expiresAt,
+      });
+      assert.deepStrictEqual(rearmedSameEpoch, { _tag: "no-candidate", replayed: true });
+      assert.deepStrictEqual(
+        yield* first.sql`
+          SELECT
+            (SELECT count(*) FROM main.agent_control_armed_no_candidate_evidence) AS evidence,
+            (SELECT count(*) FROM main.agent_control_armed_no_candidate_receipts) AS receipts,
+            (SELECT count(*) FROM main.agent_control_armed_no_candidate_markers) AS markers
+        `,
+        [{ evidence: 1, receipts: 1, markers: 1 }],
+      );
+
       yield* insertCandidate(first.sql, githubSequence);
       const raced = yield* Effect.all(
         [
@@ -334,7 +363,7 @@ it.live("persists one decision per epoch and grants one claim across two WAL con
           ${fingerprintRunOnceModeCommand({
             commandId: staleCommandId,
             projectId,
-            expectedRevision: 2,
+            expectedRevision: 4,
             mode: "run-once",
           })},
           'system', 'project-controller', ${projectId}, 'accepted', ${nextSequence}, 3, 1,

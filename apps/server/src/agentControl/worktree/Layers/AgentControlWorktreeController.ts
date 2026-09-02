@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - no-follow pathname probes have no Effect FileSystem equivalent.
 import {
   CommandId,
+  AgentControlControlledThreadReservationId,
   type AgentControlTaskState,
   type AgentControlTaskId,
   AgentControlWorktreeAttentionCode,
@@ -56,6 +57,10 @@ import { deriveAgentControlStageRunLeaseId } from "../../stageRunLease/identity.
 import { deriveAgentControlSourceIdentityFingerprint } from "../../stageRun/identity.ts";
 import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
+import { loadAuthoritativeControlledThreadReservation } from "../../controlledThreadReservation/authoritative.ts";
+import { deriveAgentControlControlledThreadReservationId } from "../../controlledThreadReservation/identity.ts";
+import { AgentControlControlledThreadReservationEventStore } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationEventStore.ts";
+import { AgentControlControlledThreadReservationStateRepository } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationStateRepository.ts";
 import {
   deriveInitialPlanningFinalizationCommandId,
   deriveInitialPlanningFinalizationMarkerId,
@@ -305,6 +310,8 @@ const make = Effect.gen(function* () {
   const workflow = yield* GitWorkflowService;
   const guard = yield* AgentControlTaskConsumerGuard;
   const github = yield* AgentControlGithubStateRepository;
+  const controlledThreadEvents = yield* AgentControlControlledThreadReservationEventStore;
+  const controlledThreadStates = yield* AgentControlControlledThreadReservationStateRepository;
   const stageEvents = yield* AgentControlStageRunEventStore;
   const stageStates = yield* AgentControlStageRunStateRepository;
   const leaseEvents = yield* AgentControlStageRunLeaseEventStore;
@@ -3239,9 +3246,6 @@ const make = Effect.gen(function* () {
         ON receipt.finalization_command_id = result.finalization_command_id
       JOIN main.agent_control_initial_planning_finalization_markers marker
         ON marker.finalization_command_id = result.finalization_command_id
-      JOIN main.agent_control_controlled_thread_reservation_states controlled
-        ON controlled.controlled_thread_reservation_id =
-          result.controlled_thread_reservation_id
       WHERE result.project_id = ${projectId}
         AND result.task_id = ${taskId}
         AND result.stage_run_id = ${stageRun.stageRunId}
@@ -3260,23 +3264,6 @@ const make = Effect.gen(function* () {
         AND marker.result_evidence_id = result.result_evidence_id
         AND marker.handoff_id = result.handoff_id
         AND marker.committed_at = result.finalized_at
-        AND controlled.project_id = result.project_id
-        AND controlled.task_id = result.task_id
-        AND controlled.task_revision = result.task_revision
-        AND controlled.github_intake_sequence = result.github_intake_sequence
-        AND controlled.source_identity_fingerprint = result.source_identity_fingerprint
-        AND controlled.stage_run_id = result.stage_run_id
-        AND controlled.attempt_id = result.attempt_id
-        AND controlled.role_id = 'planning'
-        AND controlled.stage_kind = 'planning'
-        AND controlled.stage_ordinal = 1
-        AND controlled.attempt_ordinal = 1
-        AND controlled.lease_id = result.lease_id
-        AND controlled.fence_token = result.fence_token
-        AND controlled.thread_id = result.thread_id
-        AND controlled.worktree_reservation_id = ${reservationId}
-        AND controlled.status = 'bound'
-        AND controlled.revision = 3
     `.pipe(
       Effect.mapError(() =>
         error("internal-persistence-error", operation, projectId, taskId, reservationId),
@@ -3290,6 +3277,24 @@ const make = Effect.gen(function* () {
         error("source-snapshot-stale", operation, projectId, taskId, reservationId),
       ),
     );
+    const authoritativeControlledThread = yield* loadAuthoritativeControlledThreadReservation(
+      AgentControlControlledThreadReservationId.make(row.controlledThreadReservationId),
+      controlledThreadEvents,
+      controlledThreadStates,
+    ).pipe(
+      Effect.mapError((failure) =>
+        error(
+          failure._tag === "AgentControlPersistenceSqlError"
+            ? "internal-persistence-error"
+            : "source-snapshot-stale",
+          operation,
+          projectId,
+          taskId,
+          reservationId,
+        ),
+      ),
+    );
+    const controlledThread = Option.getOrNull(authoritativeControlledThread);
     const numericCoordinates = [
       row.taskRevision,
       row.githubIntakeSequence,
@@ -3326,6 +3331,24 @@ const make = Effect.gen(function* () {
       .digest("hex");
     if (
       numericCoordinates.some((value) => !isPositiveSafeInteger(value)) ||
+      controlledThread === null ||
+      controlledThread.projectId !== row.projectId ||
+      controlledThread.taskId !== row.taskId ||
+      controlledThread.taskRevision !== row.taskRevision ||
+      controlledThread.githubIntakeSequence !== row.githubIntakeSequence ||
+      controlledThread.sourceIdentityFingerprint !== row.sourceIdentityFingerprint ||
+      controlledThread.stageRunId !== row.stageRunId ||
+      controlledThread.attemptId !== row.attemptId ||
+      controlledThread.roleId !== "planning" ||
+      controlledThread.stageKind !== "planning" ||
+      controlledThread.stageOrdinal !== 1 ||
+      controlledThread.attemptOrdinal !== 1 ||
+      controlledThread.leaseId !== row.leaseId ||
+      controlledThread.fenceToken !== row.fenceToken ||
+      controlledThread.threadId !== row.threadId ||
+      controlledThread.worktreeReservationId !== reservationId ||
+      controlledThread.status !== "bound" ||
+      controlledThread.revision !== 3 ||
       row.taskRevision !== stageRun.taskRevision ||
       row.githubIntakeSequence !== stageRun.githubIntakeSequence ||
       row.sourceIdentityFingerprint !== stageRun.sourceIdentityFingerprint ||
@@ -3613,6 +3636,64 @@ const make = Effect.gen(function* () {
           const now = yield* DateTime.now;
           if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
             return yield* error("lease-expired", operation, projectId, taskId);
+          }
+          if (readyReuseReservationId !== null) {
+            const controlledThreadReservationId =
+              yield* deriveAgentControlControlledThreadReservationId({
+                projectId,
+                taskId,
+                taskRevision: task.revision,
+                githubIntakeSequence: task.githubIntakeSequence,
+                sourceIdentityFingerprint,
+                stageRunId: stageRun.stageRunId,
+                attemptId: stageRun.attemptId,
+                roleId: stageRun.roleId,
+                stageKind: stageRun.stageKind,
+                stageOrdinal: stageRun.stageOrdinal,
+                attemptOrdinal: stageRun.attemptOrdinal,
+              });
+            const controlledThread = yield* loadAuthoritativeControlledThreadReservation(
+              controlledThreadReservationId,
+              controlledThreadEvents,
+              controlledThreadStates,
+            ).pipe(
+              Effect.mapError((failure) =>
+                error(
+                  failure._tag === "AgentControlPersistenceSqlError"
+                    ? "internal-persistence-error"
+                    : "source-snapshot-stale",
+                  operation,
+                  projectId,
+                  taskId,
+                  readyReuseReservationId,
+                ),
+              ),
+            );
+            if (
+              Option.isSome(controlledThread) &&
+              (controlledThread.value.projectId !== projectId ||
+                controlledThread.value.taskId !== taskId ||
+                controlledThread.value.taskRevision !== task.revision ||
+                controlledThread.value.githubIntakeSequence !== task.githubIntakeSequence ||
+                controlledThread.value.sourceIdentityFingerprint !== sourceIdentityFingerprint ||
+                controlledThread.value.stageRunId !== stageRun.stageRunId ||
+                controlledThread.value.attemptId !== stageRun.attemptId ||
+                controlledThread.value.roleId !== "planning" ||
+                controlledThread.value.stageKind !== "planning" ||
+                controlledThread.value.stageOrdinal !== 1 ||
+                controlledThread.value.attemptOrdinal !== 1 ||
+                controlledThread.value.leaseId !== leaseState.leaseId ||
+                controlledThread.value.fenceToken !== leaseState.fenceToken ||
+                controlledThread.value.worktreeReservationId !== readyReuseReservationId)
+            ) {
+              return yield* error(
+                "source-snapshot-stale",
+                operation,
+                projectId,
+                taskId,
+                readyReuseReservationId,
+              );
+            }
           }
         } else {
           if (readyReuseReservationId === null) {
@@ -5734,131 +5815,134 @@ const make = Effect.gen(function* () {
     callback,
     options,
   ) =>
-    Effect.gen(function* () {
-      const state = yield* engine.loadAuthoritative(input.reservationId);
-      if (
-        state === null ||
-        state.projectId !== input.projectId ||
-        state.status !== "ready" ||
-        state.verifiedAt === null ||
-        state.ownershipFingerprint === null
-      ) {
-        return yield* error(
-          state === null ? "reservation-missing" : "state-not-available",
-          "materialize",
-          input.projectId,
-          state?.taskId ?? null,
-          input.reservationId,
-        );
-      }
-      const lock = yield* getLock(state.repositoryCommonDir);
-      return yield* lock.withPermit(
-        withAgentControlRepositoryLock({
-          repositoryCommonDir: state.repositoryCommonDir,
-          runtimeHolderId: holderId,
-          effect: Effect.gen(function* () {
-            if (options?.beforeInspection !== undefined) {
-              const replay = yield* options.beforeInspection;
-              if (Option.isSome(replay)) return replay.value;
-            }
-            const authoritative = yield* engine.loadAuthoritative(input.reservationId);
-            if (
-              authoritative === null ||
-              authoritative.projectId !== input.projectId ||
-              authoritative.status !== "ready"
-            ) {
-              return yield* error(
-                "state-not-available",
+    withAgentControlRunOnceProjectFence(
+      input.projectId,
+      Effect.gen(function* () {
+        const state = yield* engine.loadAuthoritative(input.reservationId);
+        if (
+          state === null ||
+          state.projectId !== input.projectId ||
+          state.status !== "ready" ||
+          state.verifiedAt === null ||
+          state.ownershipFingerprint === null
+        ) {
+          return yield* error(
+            state === null ? "reservation-missing" : "state-not-available",
+            "materialize",
+            input.projectId,
+            state?.taskId ?? null,
+            input.reservationId,
+          );
+        }
+        const lock = yield* getLock(state.repositoryCommonDir);
+        return yield* lock.withPermit(
+          withAgentControlRepositoryLock({
+            repositoryCommonDir: state.repositoryCommonDir,
+            runtimeHolderId: holderId,
+            effect: Effect.gen(function* () {
+              if (options?.beforeInspection !== undefined) {
+                const replay = yield* options.beforeInspection;
+                if (Option.isSome(replay)) return replay.value;
+              }
+              const authoritative = yield* engine.loadAuthoritative(input.reservationId);
+              if (
+                authoritative === null ||
+                authoritative.projectId !== input.projectId ||
+                authoritative.status !== "ready"
+              ) {
+                return yield* error(
+                  "state-not-available",
+                  "materialize",
+                  input.projectId,
+                  state.taskId,
+                  input.reservationId,
+                );
+              }
+              const canonical = yield* preflight(
+                authoritative.projectId,
+                authoritative.taskId,
+                "materialize",
+                authoritative.reservationId,
+              );
+              yield* ensureCanonicalBinding(canonical, authoritative, "materialize");
+              const initialAuthorityFingerprint = authorityFingerprint(canonical);
+              const observation = yield* inspect(authoritative, canonical, true);
+              if (
+                observation._tag !== "exact" ||
+                observation.ownershipFingerprint !== authoritative.ownershipFingerprint
+              ) {
+                return yield* error(
+                  observation._tag === "attention" &&
+                    observation.code === "repository-identity-mismatch"
+                    ? "repository-identity-mismatch"
+                    : "state-not-available",
+                  "materialize",
+                  input.projectId,
+                  authoritative.taskId,
+                  input.reservationId,
+                );
+              }
+              yield* controllerHooks.afterReadyInspection(authoritative.reservationId);
+              const secondAuthoritative = yield* engine.loadAuthoritative(input.reservationId);
+              if (
+                secondAuthoritative === null ||
+                secondAuthoritative.projectId !== authoritative.projectId ||
+                secondAuthoritative.revision !== authoritative.revision ||
+                secondAuthoritative.sequence !== authoritative.sequence ||
+                secondAuthoritative.status !== "ready" ||
+                secondAuthoritative.ownershipFingerprint !== authoritative.ownershipFingerprint
+              ) {
+                return yield* error(
+                  "state-not-available",
+                  "materialize",
+                  input.projectId,
+                  authoritative.taskId,
+                  input.reservationId,
+                );
+              }
+              const secondCanonical = yield* preflight(
+                authoritative.projectId,
+                authoritative.taskId,
+                "materialize",
+                authoritative.reservationId,
+              );
+              yield* ensureCanonicalBinding(secondCanonical, authoritative, "materialize");
+              if (authorityFingerprint(secondCanonical) !== initialAuthorityFingerprint) {
+                return yield* error(
+                  "source-snapshot-stale",
+                  "materialize",
+                  input.projectId,
+                  authoritative.taskId,
+                  input.reservationId,
+                );
+              }
+              return yield* Effect.uninterruptibleMask((restore) =>
+                Effect.gen(function* () {
+                  const callbackFiber = yield* Effect.scoped(callback(authoritative)).pipe(
+                    Effect.forkChild({ startImmediately: true }),
+                  );
+                  return yield* restore(Fiber.join(callbackFiber)).pipe(
+                    Effect.onExit(() => Fiber.interrupt(callbackFiber).pipe(Effect.asVoid)),
+                  );
+                }),
+              );
+            }),
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fs),
+            Effect.provideService(Path.Path, path),
+            Effect.catchTag("AgentControlRepositoryLockError", () =>
+              error(
+                "repository-lock-unavailable",
                 "materialize",
                 input.projectId,
                 state.taskId,
                 input.reservationId,
-              );
-            }
-            const canonical = yield* preflight(
-              authoritative.projectId,
-              authoritative.taskId,
-              "materialize",
-              authoritative.reservationId,
-            );
-            yield* ensureCanonicalBinding(canonical, authoritative, "materialize");
-            const initialAuthorityFingerprint = authorityFingerprint(canonical);
-            const observation = yield* inspect(authoritative, canonical, true);
-            if (
-              observation._tag !== "exact" ||
-              observation.ownershipFingerprint !== authoritative.ownershipFingerprint
-            ) {
-              return yield* error(
-                observation._tag === "attention" &&
-                  observation.code === "repository-identity-mismatch"
-                  ? "repository-identity-mismatch"
-                  : "state-not-available",
-                "materialize",
-                input.projectId,
-                authoritative.taskId,
-                input.reservationId,
-              );
-            }
-            yield* controllerHooks.afterReadyInspection(authoritative.reservationId);
-            const secondAuthoritative = yield* engine.loadAuthoritative(input.reservationId);
-            if (
-              secondAuthoritative === null ||
-              secondAuthoritative.projectId !== authoritative.projectId ||
-              secondAuthoritative.revision !== authoritative.revision ||
-              secondAuthoritative.sequence !== authoritative.sequence ||
-              secondAuthoritative.status !== "ready" ||
-              secondAuthoritative.ownershipFingerprint !== authoritative.ownershipFingerprint
-            ) {
-              return yield* error(
-                "state-not-available",
-                "materialize",
-                input.projectId,
-                authoritative.taskId,
-                input.reservationId,
-              );
-            }
-            const secondCanonical = yield* preflight(
-              authoritative.projectId,
-              authoritative.taskId,
-              "materialize",
-              authoritative.reservationId,
-            );
-            yield* ensureCanonicalBinding(secondCanonical, authoritative, "materialize");
-            if (authorityFingerprint(secondCanonical) !== initialAuthorityFingerprint) {
-              return yield* error(
-                "source-snapshot-stale",
-                "materialize",
-                input.projectId,
-                authoritative.taskId,
-                input.reservationId,
-              );
-            }
-            return yield* Effect.uninterruptibleMask((restore) =>
-              Effect.gen(function* () {
-                const callbackFiber = yield* Effect.scoped(callback(authoritative)).pipe(
-                  Effect.forkChild({ startImmediately: true }),
-                );
-                return yield* restore(Fiber.join(callbackFiber)).pipe(
-                  Effect.onExit(() => Fiber.interrupt(callbackFiber).pipe(Effect.asVoid)),
-                );
-              }),
-            );
-          }),
-        }).pipe(
-          Effect.provideService(FileSystem.FileSystem, fs),
-          Effect.provideService(Path.Path, path),
-          Effect.catchTag("AgentControlRepositoryLockError", () =>
-            error(
-              "repository-lock-unavailable",
-              "materialize",
-              input.projectId,
-              state.taskId,
-              input.reservationId,
+              ),
             ),
           ),
-        ),
-      );
-    });
+        );
+      }),
+    );
 
   const useReadyWorktreeForRunOnce: NonNullable<
     AgentControlWorktreeControllerShape["useReadyWorktreeForRunOnce"]
