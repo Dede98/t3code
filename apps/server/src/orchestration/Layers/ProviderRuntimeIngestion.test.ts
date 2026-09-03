@@ -41,7 +41,10 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
-import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
+import {
+  ProviderSessionDirectory,
+  type ProviderRuntimeBinding,
+} from "../../provider/Services/ProviderSessionDirectory.ts";
 import { ProviderSessionDirectoryLive } from "../../provider/Layers/ProviderSessionDirectory.ts";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
@@ -268,13 +271,16 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
       Layer.provideMerge(NodeServices.layer),
     );
-    runtime = ManagedRuntime.make(layer);
-    const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
-    const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
-    const providerSessionDirectory = await runtime.runPromise(
+    const currentRuntime = ManagedRuntime.make(layer);
+    runtime = currentRuntime;
+    const engine = await currentRuntime.runPromise(Effect.service(OrchestrationEngineService));
+    const snapshotQuery = await currentRuntime.runPromise(Effect.service(ProjectionSnapshotQuery));
+    const providerSessionDirectory = await currentRuntime.runPromise(
       Effect.service(ProviderSessionDirectory),
     );
-    const ingestion = await runtime.runPromise(Effect.service(ProviderRuntimeIngestionService));
+    const ingestion = await currentRuntime.runPromise(
+      Effect.service(ProviderRuntimeIngestionService),
+    );
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(ingestion.start().pipe(Scope.provide(scope)));
     const drain = () => Effect.runPromise(ingestion.drain);
@@ -339,7 +345,8 @@ describe("ProviderRuntimeIngestion", () => {
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       emit: provider.emit,
       setProviderSession: provider.setSession,
-      providerSessionDirectory,
+      upsertProviderSession: (binding: ProviderRuntimeBinding) =>
+        currentRuntime.runPromise(providerSessionDirectory.upsert(binding)),
       drain,
     };
   }
@@ -390,33 +397,29 @@ describe("ProviderRuntimeIngestion", () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-bind-new-instance"),
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-bind-new-instance"),
+      threadId: asThreadId("thread-1"),
+      session: {
         threadId: asThreadId("thread-1"),
-        session: {
-          threadId: asThreadId("thread-1"),
-          status: "ready",
-          providerName: ProviderDriverKind.make("codex"),
-          providerInstanceId: ProviderInstanceId.make("codex_work"),
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: now,
-        },
-        createdAt: now,
-      }),
-    );
-    await Effect.runPromise(
-      harness.providerSessionDirectory.upsert({
-        threadId: asThreadId("thread-1"),
-        provider: ProviderDriverKind.make("codex"),
+        status: "ready",
+        providerName: ProviderDriverKind.make("codex"),
         providerInstanceId: ProviderInstanceId.make("codex_work"),
         runtimeMode: "approval-required",
-        status: "running",
-      }),
-    );
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: now,
+      },
+      createdAt: now,
+    });
+    await harness.upsertProviderSession({
+      threadId: asThreadId("thread-1"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex_work"),
+      runtimeMode: "approval-required",
+      status: "running",
+    });
 
     harness.emit({
       type: "session.exited",
@@ -2913,6 +2916,16 @@ describe("ProviderRuntimeIngestion", () => {
         itemType: "command_execution",
         status: "inProgress",
         title: "Command run",
+        toolSurface: "computer",
+        toolIcon: {
+          _tag: "native-app",
+          app: { _tag: "app-id", appId: "com.apple.Terminal" },
+        },
+        toolSource: {
+          key: "native-app:com.apple.terminal",
+          name: "Terminal",
+          kind: "computer",
+        },
         detail: "Bash: vp test run",
         data: {
           toolName: "Bash",
@@ -2940,6 +2953,17 @@ describe("ProviderRuntimeIngestion", () => {
       itemType: "command_execution",
       toolCallId: "tool-call-9",
       status: "inProgress",
+      title: "Command run",
+      toolSurface: "computer",
+      toolIcon: {
+        _tag: "native-app",
+        app: { _tag: "app-id", appId: "com.apple.Terminal" },
+      },
+      toolSource: {
+        key: "native-app:com.apple.terminal",
+        name: "Terminal",
+        kind: "computer",
+      },
       detail: "Bash: vp test run",
       data: {
         toolName: "Bash",
