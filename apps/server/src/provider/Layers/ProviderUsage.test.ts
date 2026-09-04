@@ -3,6 +3,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
+  type ProviderUsageLimitsUpdate,
   ThreadId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
@@ -31,7 +32,7 @@ const threadId = ThreadId.make("thread-usage");
 function usageEvent(
   provider: "claudeAgent" | "codex",
   providerInstanceId: string,
-  rateLimits: unknown,
+  limits: ProviderUsageLimitsUpdate,
 ): ProviderRuntimeEvent {
   return {
     eventId: EventId.make(`event-${providerInstanceId}`),
@@ -40,7 +41,7 @@ function usageEvent(
     threadId,
     createdAt: "2026-07-14T10:00:00.000Z",
     type: "account.rate-limits.updated",
-    payload: { rateLimits },
+    payload: { limits },
   };
 }
 
@@ -88,28 +89,32 @@ describe("projectProviderUsageEvent", () => {
   it("merges Claude rolling windows for one provider instance", () => {
     const first = projectProviderUsageEvent(
       usageEvent("claudeAgent", "claude-work", {
-        type: "rate_limit_event",
-        rate_limit_info: {
-          status: "allowed_warning",
-          rateLimitType: "five_hour",
-          utilization: 0.42,
-          resetsAt: 1_752_490_800,
-          overageStatus: "allowed",
-          isUsingOverage: false,
-        },
+        windows: [
+          {
+            id: "five_hour",
+            kind: "session",
+            label: "5 hours",
+            usedPercent: 42,
+            resetsAt: "2025-07-14T12:20:00.000Z",
+            windowDurationMins: 300,
+          },
+        ],
       }),
     );
     expect(first).not.toBeNull();
 
     const merged = projectProviderUsageEvent(
       usageEvent("claudeAgent", "claude-work", {
-        type: "rate_limit_event",
-        rate_limit_info: {
-          status: "allowed",
-          rateLimitType: "seven_day",
-          utilization: 0.67,
-          resetsAt: 1_753_004_400,
-        },
+        windows: [
+          {
+            id: "seven_day",
+            kind: "weekly",
+            label: "Weekly",
+            usedPercent: 67,
+            resetsAt: "2025-07-20T11:00:00.000Z",
+            windowDurationMins: 10_080,
+          },
+        ],
       }),
       first ?? undefined,
     );
@@ -119,21 +124,29 @@ describe("projectProviderUsageEvent", () => {
       expect.objectContaining({ id: "five_hour", label: "5 hours", usedPercent: 42 }),
       expect.objectContaining({ id: "seven_day", label: "Weekly", usedPercent: 67 }),
     ]);
-    expect(merged?.overageStatus).toBe("allowed");
   });
 
-  it("projects Codex primary and weekly windows from the nested snapshot", () => {
+  it("projects normalized Codex primary and weekly windows", () => {
     const usage = projectProviderUsageEvent(
       usageEvent("codex", "codex-personal", {
-        rateLimits: {
-          primary: { usedPercent: 31, windowDurationMins: 300, resetsAt: 1_752_490_800 },
-          secondary: {
+        windows: [
+          {
+            id: "primary",
+            kind: "session",
+            label: "5 hours",
+            usedPercent: 31,
+            windowDurationMins: 300,
+            resetsAt: "2025-07-14T12:20:00.000Z",
+          },
+          {
+            id: "secondary",
+            kind: "weekly",
+            label: "Weekly",
             usedPercent: 74,
             windowDurationMins: 10_080,
-            resetsAt: 1_753_004_400,
+            resetsAt: "2025-07-20T11:00:00.000Z",
           },
-          rateLimitReachedType: null,
-        },
+        ],
       }),
     );
 

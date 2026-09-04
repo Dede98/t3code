@@ -37,26 +37,6 @@ function statusFromClaude(value: unknown): ProviderUsageStatus {
   return "allowed";
 }
 
-function claudeWindowMetadata(rateLimitType: string): {
-  readonly label: string;
-  readonly durationMinutes?: number;
-} {
-  switch (rateLimitType) {
-    case "five_hour":
-      return { label: "5 hours", durationMinutes: 300 };
-    case "seven_day":
-      return { label: "Weekly", durationMinutes: 10_080 };
-    case "seven_day_overage_included":
-      return { label: "Fable 5", durationMinutes: 10_080 };
-    case "seven_day_opus":
-      return { label: "Weekly Opus", durationMinutes: 10_080 };
-    case "seven_day_sonnet":
-      return { label: "Weekly Sonnet", durationMinutes: 10_080 };
-    default:
-      return { label: rateLimitType.replaceAll("_", " ") };
-  }
-}
-
 function headerResetToIso(value: string | undefined): string | null {
   if (!value) return null;
   const numericValue = Number(value);
@@ -261,54 +241,34 @@ export function projectProviderUsageEvent(
 ): ProviderUsageSnapshot | null {
   const providerInstanceId = event.providerInstanceId;
   if (event.type !== "account.rate-limits.updated" || providerInstanceId === undefined) return null;
-  if (event.provider === "codex") {
-    return projectCodexUsage({
-      providerInstanceId,
-      driver: event.provider,
-      observedAt: event.createdAt,
-      source: "runtime-event",
-      rateLimits: event.payload.rateLimits,
-      ...(previous ? { previous } : {}),
-    });
-  }
-  if (event.provider !== "claudeAgent") return null;
-  const raw = asRecord(event.payload.rateLimits);
-  const info = asRecord(raw?.rate_limit_info);
-  if (!info) return null;
-  const rateLimitType = typeof info.rateLimitType === "string" ? info.rateLimitType : null;
-  const utilization = finiteNumber(info.utilization);
   let windows = previous?.windows ?? [];
-  if (rateLimitType && rateLimitType !== "overage" && utilization !== null) {
-    const meta = claudeWindowMetadata(rateLimitType);
+  for (const update of event.payload.limits.windows) {
     windows = upsertWindow(windows, {
-      id: rateLimitType,
-      label: meta.label,
-      usedPercent: clampPercent(utilization <= 1 ? utilization * 100 : utilization),
-      resetsAt: epochToIso(info.resetsAt),
-      ...(meta.durationMinutes ? { durationMinutes: meta.durationMinutes } : {}),
+      id: update.id,
+      label: update.label,
+      usedPercent: clampPercent(update.usedPercent),
+      resetsAt: update.resetsAt ?? null,
+      ...(update.windowDurationMins !== undefined && update.windowDurationMins > 0
+        ? { durationMinutes: update.windowDurationMins }
+        : {}),
     });
   }
-  const isUsingOverage =
-    typeof (info.isUsingOverage ?? info.overageInUse) === "boolean"
-      ? ((info.isUsingOverage ?? info.overageInUse) as boolean)
-      : previous?.isUsingOverage;
+  if (event.payload.limits.windows.length === 0 && previous === undefined) return null;
+  const highestUsage = windows.reduce(
+    (highest, window) => Math.max(highest, window.usedPercent),
+    0,
+  );
   return {
     providerInstanceId,
     driver: event.provider,
     observedAt: event.createdAt,
     source: "runtime-event",
-    status: statusFromClaude(info.status),
+    status: highestUsage >= 100 ? "rejected" : highestUsage >= 90 ? "warning" : "allowed",
     windows,
-    ...(info.overageStatus !== undefined
-      ? { overageStatus: statusFromClaude(info.overageStatus) }
-      : previous?.overageStatus
-        ? { overageStatus: previous.overageStatus }
-        : {}),
-    ...(info.overageResetsAt !== undefined
-      ? { overageResetsAt: epochToIso(info.overageResetsAt) }
-      : previous?.overageResetsAt !== undefined
-        ? { overageResetsAt: previous.overageResetsAt }
-        : {}),
-    ...(isUsingOverage !== undefined ? { isUsingOverage } : {}),
+    ...(previous?.overageStatus ? { overageStatus: previous.overageStatus } : {}),
+    ...(previous?.overageResetsAt !== undefined
+      ? { overageResetsAt: previous.overageResetsAt }
+      : {}),
+    ...(previous?.isUsingOverage !== undefined ? { isUsingOverage: previous.isUsingOverage } : {}),
   };
 }
