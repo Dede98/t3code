@@ -22,6 +22,7 @@ import type {
   OrchestrationThreadDetailWindow,
   OrchestrationThreadShell,
   ProjectId,
+  ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -192,6 +193,16 @@ export interface ProjectionSnapshotQueryShape {
   readonly getThreadShellById: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, ProjectionRepositoryError>;
+
+  /** Read the active thread and session facts used to ingest provider events. */
+  readonly getThreadRuntimeContext: (threadId: ThreadId) => Effect.Effect<
+    Option.Option<
+      Pick<OrchestrationThreadShell, "id" | "title" | "session"> & {
+        readonly boundProviderInstanceId: ProviderInstanceId | null;
+      }
+    >,
+    ProjectionRepositoryError
+  >;
 
   /**
    * Read a single active thread detail snapshot by id.
