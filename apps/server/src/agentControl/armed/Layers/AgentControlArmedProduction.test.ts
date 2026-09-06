@@ -613,6 +613,7 @@ it.live(
           planningWakeupService,
         );
         const providerAdmissionRuntime = ProviderAdmissionRuntime.of({
+          awaitFailure: Effect.never,
           request: (request) =>
             Effect.succeed({
               _tag: "Admitted" as const,

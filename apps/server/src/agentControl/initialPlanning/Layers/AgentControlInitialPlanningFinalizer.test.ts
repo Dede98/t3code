@@ -452,6 +452,7 @@ const noopProviderAdmissionRelease: ProviderAdmissionReleaseAuthorityShape = {
   recover: Effect.void,
 };
 const admittedProviderRuntime = ProviderAdmissionRuntime.of({
+  awaitFailure: Effect.never,
   request: (request) =>
     Effect.succeed({
       _tag: "Admitted" as const,
@@ -5037,6 +5038,7 @@ it.effect("leaves verification delivery authority unchanged while provider admis
           coordinator,
           executorCalls,
           providerAdmissionRuntime: ProviderAdmissionRuntime.of({
+            awaitFailure: Effect.never,
             request: (request) =>
               Ref.update(admissionRequests, (count) => count + 1).pipe(
                 Effect.as({
@@ -6699,6 +6701,7 @@ it.effect("leaves implementation delivery authority unchanged while provider adm
           executorCalls,
           providerEvents,
           providerAdmissionRuntime: ProviderAdmissionRuntime.of({
+            awaitFailure: Effect.never,
             request: (request) =>
               Ref.update(admissionRequests, (count) => count + 1).pipe(
                 Effect.as({

@@ -215,10 +215,22 @@ it.live("commits one provider slot across two native WAL connections and preserv
       });
       assert.equal(admitted._tag, "Admitted");
       if (admitted._tag !== "Admitted") return;
-      const replayed = yield* secondStore.request({
+      const foreignOwner = yield* secondStore.request({
         request: request("first"),
         usage,
         ownerId: "owner-restart",
+        leaseExpiresAt: later,
+        now: at,
+      });
+      assert.deepStrictEqual(foreignOwner, {
+        _tag: "Waiting",
+        admissionId: admitted.permit.admissionId,
+        retryAt: later,
+      });
+      const replayed = yield* secondStore.request({
+        request: request("first"),
+        usage,
+        ownerId: "owner-first",
         leaseExpiresAt: later,
         now: at,
       });
@@ -292,6 +304,127 @@ it.live("commits one provider slot across two native WAL connections and preserv
       assert.equal((yield* second.sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "rejects projection revision, marker, and fence rewinds and audits persisted corruption",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-provider-rewind-" });
+        const filename = path.join(directory, "rewind.sqlite");
+        const db = yield* openDatabase(filename);
+        yield* Effect.addFinalizer(() => Scope.close(db.scope, Exit.void));
+        yield* runMigrations({ toMigrationInclusive: 65 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, db.sql),
+        );
+        const context = yield* Layer.buildWithScope(
+          Layer.fresh(ProviderAdmissionStoreLive).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, db.sql)),
+          ),
+          db.scope,
+        );
+        const store = Context.get(context, ProviderAdmissionStore);
+        const value = request("rewind");
+        const usage = providerAdmissionUsageEvidence({
+          providerInstanceId: value.providerInstanceId,
+          status: "allowed",
+          observedAt: at,
+          source: "refresh",
+          nextRelevantAt: null,
+        });
+        const first = yield* store.request({
+          request: value,
+          usage,
+          ownerId: "rewind-owner-1",
+          leaseExpiresAt: later,
+          now: at,
+        });
+        if (first._tag !== "Admitted") return yield* Effect.die("missing first permit");
+        const takeover = yield* store.request({
+          request: value,
+          usage,
+          ownerId: "rewind-owner-2",
+          leaseExpiresAt: afterTakeover,
+          now: afterExpiry,
+        });
+        if (takeover._tag !== "Admitted") return yield* Effect.die("missing takeover permit");
+
+        const oldMarker = yield* Effect.exit(db.sql`
+        UPDATE main.agent_control_provider_admission_current SET
+          owner_id=${first.permit.admissionOwnerId},
+          lease_expires_at=${first.permit.admissionLeaseExpiresAt},
+          provider_fence_token=${first.permit.providerFenceToken},
+          admission_marker_id=${first.permit.admissionMarkerId},
+          admission_marker_fingerprint=${first.permit.admissionMarkerFingerprint},
+          revision=revision+1,updated_at=${afterTakeover}
+        WHERE admission_id=${first.permit.admissionId}
+      `);
+        assert.isTrue(Exit.isFailure(oldMarker));
+        const lowerCapacityFence = yield* Effect.exit(db.sql`
+        UPDATE main.agent_control_provider_capacity_current SET
+          last_fence_token=${first.permit.providerFenceToken},
+          active_fence_token=${first.permit.providerFenceToken},
+          revision=revision+1,updated_at=${afterTakeover}
+        WHERE provider_instance_id=${String(value.providerInstanceId)}
+      `);
+        assert.isTrue(Exit.isFailure(lowerCapacityFence));
+
+        const waitingValue = request("revision", "codex-revision");
+        yield* store.request({
+          request: waitingValue,
+          usage: providerAdmissionUsageEvidence({
+            providerInstanceId: waitingValue.providerInstanceId,
+            status: "rejected",
+            observedAt: at,
+            source: "refresh",
+            nextRelevantAt: null,
+          }),
+          ownerId: "revision-owner",
+          leaseExpiresAt: later,
+          now: at,
+        });
+        const skippedRevision = yield* Effect.exit(db.sql`
+        UPDATE main.agent_control_provider_admission_current
+        SET revision=revision+2,updated_at=${later}
+        WHERE handoff_id=${waitingValue.handoffId}
+      `);
+        assert.isTrue(Exit.isFailure(skippedRevision));
+
+        const [trigger] = yield* db.sql<{ readonly source: string }>`
+        SELECT sql AS source FROM main.sqlite_schema
+        WHERE name='agent_control_provider_capacity_current_validate_update'
+      `;
+        assert.isDefined(trigger);
+        yield* db.sql.unsafe(
+          "DROP TRIGGER main.agent_control_provider_capacity_current_validate_update",
+        ).unprepared;
+        yield* db.sql`
+        UPDATE main.agent_control_provider_capacity_current SET
+          last_fence_token=${first.permit.providerFenceToken},
+          active_fence_token=${first.permit.providerFenceToken},
+          revision=revision+1,updated_at=${afterTakeover}
+        WHERE provider_instance_id=${String(value.providerInstanceId)}
+      `;
+        yield* db.sql.unsafe(trigger!.source).unprepared;
+
+        const auditScope = yield* Scope.make("sequential");
+        const audited = yield* Effect.exit(
+          Layer.buildWithScope(
+            Layer.fresh(ProviderAdmissionStoreLive).pipe(
+              Layer.provide(Layer.succeed(SqlClient.SqlClient, db.sql)),
+            ),
+            auditScope,
+          ),
+        );
+        assert.isTrue(Exit.isFailure(audited));
+        yield* Scope.close(auditScope, Exit.void);
+        assert.deepStrictEqual(yield* db.sql`PRAGMA main.foreign_key_check`, []);
+        assert.equal((yield* db.sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live("rolls back a faulted 065 and rejects a pre-existing partial schema", () =>

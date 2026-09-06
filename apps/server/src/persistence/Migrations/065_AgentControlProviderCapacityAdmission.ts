@@ -106,7 +106,7 @@ const createTables = Effect.gen(function* () {
       authority_kind TEXT NOT NULL CHECK (typeof(authority_kind)='text' AND authority_kind IN ('admission','session-entry','turn-entry','quarantine','supersede','release')),
       provider_instance_id TEXT NOT NULL CHECK (typeof(provider_instance_id)='text' AND length(provider_instance_id)>0),
       owner_id TEXT NOT NULL CHECK (typeof(owner_id)='text' AND length(owner_id)>0),
-      provider_fence_token INTEGER NOT NULL CHECK (typeof(provider_fence_token)='integer' AND provider_fence_token>=1),
+      provider_fence_token INTEGER NOT NULL CHECK (typeof(provider_fence_token)='integer' AND (provider_fence_token>=1 OR (authority_kind='supersede' AND provider_fence_token=0))),
       occurred_at TEXT NOT NULL CHECK (typeof(occurred_at)='text' AND occurred_at=strftime('%Y-%m-%dT%H:%M:%fZ', occurred_at)),
       terminal_runtime_event_id TEXT,
       terminal_event_type TEXT,
@@ -115,7 +115,8 @@ const createTables = Effect.gen(function* () {
       finalization_marker_fingerprint TEXT,
       payload_json BLOB NOT NULL CHECK (typeof(payload_json)='blob'),
       payload_fingerprint TEXT NOT NULL UNIQUE CHECK (${sha256Check("payload_fingerprint")}),
-      CHECK ((authority_kind='release' AND typeof(terminal_runtime_event_id)='text' AND length(terminal_runtime_event_id)>0 AND typeof(terminal_event_type)='text' AND length(terminal_event_type)>0 AND typeof(terminal_stream_version)='integer' AND terminal_stream_version>=1 AND typeof(finalization_marker_id)='text' AND length(finalization_marker_id)>0 AND ${sha256Check("finalization_marker_fingerprint")}) OR (authority_kind!='release' AND terminal_runtime_event_id IS NULL AND terminal_event_type IS NULL AND terminal_stream_version IS NULL AND finalization_marker_id IS NULL AND finalization_marker_fingerprint IS NULL)),
+      CHECK ((authority_kind='release' AND typeof(terminal_runtime_event_id)='text' AND length(terminal_runtime_event_id)>0 AND typeof(terminal_event_type)='text' AND length(terminal_event_type)>0 AND typeof(terminal_stream_version)='integer' AND terminal_stream_version>=1 AND typeof(finalization_marker_id)='text' AND length(finalization_marker_id)>0 AND ${sha256Check("finalization_marker_fingerprint")}) OR (authority_kind='supersede' AND (terminal_runtime_event_id IS NULL OR (typeof(terminal_runtime_event_id)='text' AND length(terminal_runtime_event_id)>0)) AND typeof(terminal_event_type)='text' AND length(terminal_event_type)>0 AND typeof(terminal_stream_version)='integer' AND terminal_stream_version>=1 AND typeof(finalization_marker_id)='text' AND length(finalization_marker_id)>0 AND ${sha256Check("finalization_marker_fingerprint")}) OR (authority_kind NOT IN ('release','supersede') AND terminal_runtime_event_id IS NULL AND terminal_event_type IS NULL AND terminal_stream_version IS NULL AND finalization_marker_id IS NULL AND finalization_marker_fingerprint IS NULL)),
+      UNIQUE(admission_id, authority_kind, provider_fence_token),
       FOREIGN KEY(admission_id) REFERENCES agent_control_provider_admission_intents(admission_id),
       FOREIGN KEY(receipt_id) REFERENCES agent_control_provider_authority_receipts(receipt_id) DEFERRABLE INITIALLY DEFERRED,
       FOREIGN KEY(marker_id) REFERENCES agent_control_provider_authority_markers(marker_id) DEFERRABLE INITIALLY DEFERRED
@@ -168,7 +169,11 @@ const createTables = Effect.gen(function* () {
       revision INTEGER NOT NULL CHECK (typeof(revision)='integer' AND revision>=1),
       updated_at TEXT NOT NULL CHECK (typeof(updated_at)='text' AND updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', updated_at)),
       CHECK (usage_eligible=CASE WHEN usage_status IN ('allowed','warning','unsupported') THEN 1 ELSE 0 END),
-      CHECK ((status='waiting' AND owner_id IS NULL AND lease_expires_at IS NULL AND provider_fence_token IS NULL AND admission_marker_id IS NULL AND admission_marker_fingerprint IS NULL) OR (status IN ('claimed','admitted','entered','quarantined','released','superseded') AND typeof(owner_id)='text' AND length(owner_id)>0 AND typeof(lease_expires_at)='text' AND typeof(provider_fence_token)='integer' AND provider_fence_token>=1 AND ((status='claimed' AND admission_marker_id IS NULL AND admission_marker_fingerprint IS NULL) OR (status!='claimed' AND typeof(admission_marker_id)='text' AND length(admission_marker_id)>64 AND ${sha256Check("admission_marker_fingerprint")})))),
+      CHECK (
+        (status='waiting' AND owner_id IS NULL AND lease_expires_at IS NULL AND provider_fence_token IS NULL AND admission_marker_id IS NULL AND admission_marker_fingerprint IS NULL)
+        OR (status='superseded' AND owner_id IS NULL AND lease_expires_at IS NULL AND provider_fence_token IS NULL AND admission_marker_id IS NULL AND admission_marker_fingerprint IS NULL)
+        OR (status IN ('claimed','admitted','entered','quarantined','released','superseded') AND typeof(owner_id)='text' AND length(owner_id)>0 AND typeof(lease_expires_at)='text' AND typeof(provider_fence_token)='integer' AND provider_fence_token>=1 AND ((status='claimed' AND admission_marker_id IS NULL AND admission_marker_fingerprint IS NULL) OR (status!='claimed' AND typeof(admission_marker_id)='text' AND length(admission_marker_id)>64 AND ${sha256Check("admission_marker_fingerprint")})))
+      ),
       FOREIGN KEY(admission_id) REFERENCES agent_control_provider_admission_intents(admission_id),
       FOREIGN KEY(usage_evidence_id) REFERENCES agent_control_provider_usage_evidence(evidence_id)
     ) STRICT
@@ -264,7 +269,13 @@ const createValidationTriggers = Effect.gen(function* () {
         AND json_extract(CAST(NEW.payload_json AS TEXT),'$.terminalStreamVersion')=NEW.terminal_stream_version
         AND json_extract(CAST(NEW.payload_json AS TEXT),'$.finalizationMarkerId')=NEW.finalization_marker_id
         AND json_extract(CAST(NEW.payload_json AS TEXT),'$.finalizationMarkerFingerprint')=NEW.finalization_marker_fingerprint)
-        OR NEW.authority_kind!='release')
+        OR (NEW.authority_kind='supersede'
+          AND json_extract(CAST(NEW.payload_json AS TEXT),'$.terminalRuntimeEventId') IS NEW.terminal_runtime_event_id
+          AND json_extract(CAST(NEW.payload_json AS TEXT),'$.terminalEventType')=NEW.terminal_event_type
+          AND json_extract(CAST(NEW.payload_json AS TEXT),'$.terminalStreamVersion')=NEW.terminal_stream_version
+          AND json_extract(CAST(NEW.payload_json AS TEXT),'$.finalizationMarkerId')=NEW.finalization_marker_id
+          AND json_extract(CAST(NEW.payload_json AS TEXT),'$.finalizationMarkerFingerprint')=NEW.finalization_marker_fingerprint)
+        OR NEW.authority_kind NOT IN ('release','supersede'))
     ) BEGIN SELECT RAISE(ABORT, 'provider authority evidence is inconsistent'); END
   `).unprepared;
   yield* sql.unsafe(`
@@ -294,12 +305,109 @@ const createValidationTriggers = Effect.gen(function* () {
   `).unprepared;
   for (const operation of ["INSERT", "UPDATE"] as const) {
     const suffix = operation === "INSERT" ? "insert" : "update";
+    const admissionTransition =
+      operation === "INSERT"
+        ? `NEW.revision=1 AND NEW.status='waiting'`
+        : `NEW.revision=OLD.revision+1
+          AND NEW.admission_id=OLD.admission_id
+          AND NEW.provider_instance_id=OLD.provider_instance_id
+          AND NEW.stage=OLD.stage
+          AND NEW.handoff_id=OLD.handoff_id
+          AND NEW.requested_at=OLD.requested_at
+          AND NEW.updated_at>=OLD.updated_at
+          AND (
+            (OLD.status='waiting' AND NEW.status='waiting')
+            OR (OLD.status='waiting' AND NEW.status='claimed'
+              AND NEW.usage_status=OLD.usage_status
+              AND NEW.usage_evidence_id=OLD.usage_evidence_id
+              AND NEW.usage_evidence_fingerprint=OLD.usage_evidence_fingerprint
+              AND NEW.next_deadline_at IS OLD.next_deadline_at)
+            OR (OLD.status='waiting' AND NEW.status='superseded'
+              AND NEW.usage_status=OLD.usage_status
+              AND NEW.usage_evidence_id=OLD.usage_evidence_id
+              AND NEW.usage_evidence_fingerprint=OLD.usage_evidence_fingerprint
+              AND NEW.next_deadline_at IS OLD.next_deadline_at)
+            OR (OLD.status='claimed' AND NEW.status='admitted'
+              AND NEW.owner_id=OLD.owner_id
+              AND NEW.lease_expires_at=OLD.lease_expires_at
+              AND NEW.provider_fence_token=OLD.provider_fence_token)
+            OR (OLD.status='admitted' AND NEW.status='admitted'
+              AND NEW.provider_fence_token=OLD.provider_fence_token+1)
+            OR (OLD.status='admitted' AND NEW.status IN ('entered','superseded')
+              AND NEW.owner_id=OLD.owner_id
+              AND NEW.lease_expires_at=OLD.lease_expires_at
+              AND NEW.provider_fence_token=OLD.provider_fence_token
+              AND NEW.admission_marker_id=OLD.admission_marker_id
+              AND NEW.admission_marker_fingerprint=OLD.admission_marker_fingerprint)
+            OR (OLD.status='entered' AND NEW.status IN ('quarantined','released')
+              AND NEW.owner_id=OLD.owner_id
+              AND NEW.lease_expires_at=OLD.lease_expires_at
+              AND NEW.provider_fence_token=OLD.provider_fence_token
+              AND NEW.admission_marker_id=OLD.admission_marker_id
+              AND NEW.admission_marker_fingerprint=OLD.admission_marker_fingerprint)
+            OR (OLD.status='quarantined' AND NEW.status='released'
+              AND NEW.owner_id=OLD.owner_id
+              AND NEW.lease_expires_at=OLD.lease_expires_at
+              AND NEW.provider_fence_token=OLD.provider_fence_token
+              AND NEW.admission_marker_id=OLD.admission_marker_id
+              AND NEW.admission_marker_fingerprint=OLD.admission_marker_fingerprint)
+          )
+          AND (OLD.status='waiting' AND NEW.status='waiting' OR (
+            NEW.usage_status=OLD.usage_status
+            AND NEW.usage_eligible=OLD.usage_eligible
+            AND NEW.usage_evidence_id=OLD.usage_evidence_id
+            AND NEW.usage_evidence_fingerprint=OLD.usage_evidence_fingerprint
+            AND NEW.next_deadline_at IS OLD.next_deadline_at
+          ))`;
+    const capacityTransition =
+      operation === "INSERT"
+        ? `NEW.revision=1 AND NEW.last_fence_token=0 AND NEW.active_admission_id IS NULL`
+        : `NEW.revision=OLD.revision+1
+          AND NEW.provider_instance_id=OLD.provider_instance_id
+          AND NEW.updated_at>=OLD.updated_at
+          AND (
+            (OLD.active_state IS NULL AND NEW.active_state='claimed'
+              AND NEW.last_fence_token=OLD.last_fence_token+1)
+            OR (OLD.active_state='claimed' AND NEW.active_state='admitted'
+              AND NEW.last_fence_token=OLD.last_fence_token
+              AND NEW.active_admission_id=OLD.active_admission_id
+              AND NEW.active_owner_id=OLD.active_owner_id
+              AND NEW.active_lease_expires_at=OLD.active_lease_expires_at
+              AND NEW.active_fence_token=OLD.active_fence_token)
+            OR (OLD.active_state='admitted' AND NEW.active_state='admitted'
+              AND NEW.last_fence_token=OLD.last_fence_token+1
+              AND NEW.active_admission_id=OLD.active_admission_id)
+            OR (OLD.active_state='admitted' AND NEW.active_state='entered'
+              AND NEW.last_fence_token=OLD.last_fence_token
+              AND NEW.active_admission_id=OLD.active_admission_id
+              AND NEW.active_owner_id=OLD.active_owner_id
+              AND NEW.active_lease_expires_at=OLD.active_lease_expires_at
+              AND NEW.active_fence_token=OLD.active_fence_token
+              AND NEW.active_marker_fingerprint=OLD.active_marker_fingerprint)
+            OR (OLD.active_state='entered' AND NEW.active_state='quarantined'
+              AND NEW.last_fence_token=OLD.last_fence_token
+              AND NEW.active_admission_id=OLD.active_admission_id
+              AND NEW.active_owner_id=OLD.active_owner_id
+              AND NEW.active_lease_expires_at=OLD.active_lease_expires_at
+              AND NEW.active_fence_token=OLD.active_fence_token
+              AND NEW.active_marker_fingerprint=OLD.active_marker_fingerprint)
+            OR (OLD.active_state IN ('admitted','entered','quarantined')
+              AND NEW.active_state IS NULL
+              AND NEW.last_fence_token=OLD.last_fence_token
+              AND EXISTS (
+                SELECT 1 FROM main.agent_control_provider_admission_current admission
+                WHERE admission.admission_id=OLD.active_admission_id
+                  AND admission.provider_instance_id=OLD.provider_instance_id
+                  AND admission.status IN ('released','superseded')
+              ))
+          )`;
     yield* sql.unsafe(`
       CREATE TRIGGER main.agent_control_provider_admission_current_validate_${suffix}
       BEFORE ${operation} ON agent_control_provider_admission_current
       WHEN NOT (
-        EXISTS (SELECT 1 FROM main.agent_control_provider_admission_intents intent WHERE intent.admission_id=NEW.admission_id AND intent.provider_instance_id=NEW.provider_instance_id AND intent.stage=NEW.stage AND intent.handoff_id=NEW.handoff_id AND intent.requested_at=NEW.requested_at)
-        AND EXISTS (SELECT 1 FROM main.agent_control_provider_usage_evidence usage WHERE usage.evidence_id=NEW.usage_evidence_id AND usage.admission_id=NEW.admission_id AND usage.status=NEW.usage_status AND usage.evidence_fingerprint=NEW.usage_evidence_fingerprint)
+        ${admissionTransition}
+        AND EXISTS (SELECT 1 FROM main.agent_control_provider_admission_intents intent WHERE intent.admission_id=NEW.admission_id AND intent.provider_instance_id=NEW.provider_instance_id AND intent.stage=NEW.stage AND intent.handoff_id=NEW.handoff_id AND intent.requested_at=NEW.requested_at)
+        AND EXISTS (SELECT 1 FROM main.agent_control_provider_usage_evidence usage WHERE usage.evidence_id=NEW.usage_evidence_id AND usage.admission_id=NEW.admission_id AND usage.provider_instance_id=NEW.provider_instance_id AND usage.status=NEW.usage_status AND usage.evidence_fingerprint=NEW.usage_evidence_fingerprint AND usage.next_relevant_at IS NEW.next_deadline_at)
         AND (NEW.admission_marker_id IS NULL OR EXISTS (
           SELECT 1 FROM main.agent_control_provider_authority_markers marker
           JOIN main.agent_control_provider_authority_evidence evidence
@@ -310,6 +418,12 @@ const createValidationTriggers = Effect.gen(function* () {
             AND marker.marker_fingerprint=NEW.admission_marker_fingerprint
             AND evidence.owner_id=NEW.owner_id
             AND evidence.provider_fence_token=NEW.provider_fence_token
+            AND NOT EXISTS (
+              SELECT 1 FROM main.agent_control_provider_authority_evidence newer
+              WHERE newer.admission_id=NEW.admission_id
+                AND newer.authority_kind='admission'
+                AND newer.provider_fence_token>evidence.provider_fence_token
+            )
         ))
         AND CASE NEW.status
           WHEN 'waiting' THEN NEW.admission_marker_id IS NULL
@@ -348,8 +462,9 @@ const createValidationTriggers = Effect.gen(function* () {
               ON evidence.evidence_id=marker.evidence_id
             WHERE marker.admission_id=NEW.admission_id
               AND marker.authority_kind='supersede'
-              AND evidence.owner_id=NEW.owner_id
-              AND evidence.provider_fence_token=NEW.provider_fence_token
+              AND ((NEW.provider_fence_token IS NULL AND evidence.provider_fence_token=0)
+                OR (evidence.owner_id=NEW.owner_id
+                  AND evidence.provider_fence_token=NEW.provider_fence_token))
           )
           ELSE 0
         END
@@ -359,7 +474,8 @@ const createValidationTriggers = Effect.gen(function* () {
       CREATE TRIGGER main.agent_control_provider_capacity_current_validate_${suffix}
       BEFORE ${operation} ON agent_control_provider_capacity_current
       WHEN NOT (
-        NEW.active_admission_id IS NULL OR EXISTS (
+        ${capacityTransition}
+        AND (NEW.active_admission_id IS NULL OR EXISTS (
           SELECT 1 FROM main.agent_control_provider_admission_current admission
           WHERE admission.admission_id=NEW.active_admission_id
             AND admission.provider_instance_id=NEW.provider_instance_id
@@ -368,7 +484,7 @@ const createValidationTriggers = Effect.gen(function* () {
             AND admission.lease_expires_at=NEW.active_lease_expires_at
             AND admission.provider_fence_token=NEW.active_fence_token
             AND admission.admission_marker_fingerprint IS NEW.active_marker_fingerprint
-        )
+        ))
       ) BEGIN SELECT RAISE(ABORT, 'provider capacity projection is inconsistent'); END
     `).unprepared;
   }
@@ -380,11 +496,11 @@ export type Migration065FaultPoint = "after-tables" | "after-indexes" | "after-t
 // fingerprint would not detect source/schema drift.
 export const EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS: Readonly<Record<string, string>> = {
   agent_control_provider_admission_current:
-    "e277b3c40e3f26dd5c92a79eb58ce077483f9ccc4cde7f91b3ad11bd8c63ba03",
+    "00e59faa5f0d4d16bd96b6bacd4c121545bfdab095d166a42174e8cfb10cdd96",
   agent_control_provider_admission_current_validate_insert:
-    "d5d6f5122810a3493f5e69c77dd31fd95cad780d8a735bf07633a89e1186d522",
+    "1767c5f6563e7cfe00443cda7a53d9316f67c02c0436a2a2fd140d76a22bcce2",
   agent_control_provider_admission_current_validate_update:
-    "db4b02c6a931167105ab6b59187b9ae5cabf204b3a45b3eb9d21faebed30c644",
+    "262a2e66c9eaa379d535ba94bede9f4cb294531a2e53713acf5f62c0a90fd9f6",
   agent_control_provider_admission_intent_validate:
     "dec0f149bd4ed3454c783f3d644f87bc7015f7dd0935a7d640694621a86fe897",
   agent_control_provider_admission_intents:
@@ -394,9 +510,9 @@ export const EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS: Readonly<Record<strin
   agent_control_provider_admission_intents_no_update:
     "c44a1d34a0e5dd8fa192e72d2b74a15525b9dc60ccd751d5d866d68a0ab13da1",
   agent_control_provider_authority_evidence:
-    "213ad2c7a514ecc6ae5cb434df5df75ee408bd0aaef97ade45a61fd5981e040c",
+    "94b9d513ca8efa92c4c85b9396bea40ef12214033a556b5eb20ed6f4ef7bf9c3",
   agent_control_provider_authority_evidence_validate:
-    "e6d71597c05722576eee559c3812e6136a2e04d87228483c7c813e410640a7a3",
+    "92d0cb899180b3ef6d57da6a8e0cca736a1c9d6ac5ea5e35a4d86e1a65135710",
   agent_control_provider_authority_evidence_no_delete:
     "bd15ac76694d03c42c34ccf2e3b4110dbae2fa912dab8f642fd4ea22777206ce",
   agent_control_provider_authority_evidence_no_update:
@@ -420,9 +536,9 @@ export const EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS: Readonly<Record<strin
   agent_control_provider_capacity_current:
     "bd078ed15f8e3d9d36e6e599ec1a6323f1ba72b4a5bc837de31019120bcd35f3",
   agent_control_provider_capacity_current_validate_insert:
-    "ca9449d5e0fd115630abf0c06b682ba49519ce1cad0e73997285a805d66abd00",
+    "15db37d9b75b2e54529c76b060ec275986c5fe028f6b578ebad8b16681bf9009",
   agent_control_provider_capacity_current_validate_update:
-    "d2780a80b37c79aa8d1056cf7ecd739f8d776e71f38ad0ec8b4d484926655d96",
+    "e9ee1f937a60e00bea949f33f4ee3eb00e214a8201da654e2e0b41a56e34f456",
   agent_control_provider_claim_history:
     "904e69ba21fce57a4e0b6f0a6da45f8f02267892e4b3f8c47287d088a2625e9d",
   agent_control_provider_claim_history_no_delete:

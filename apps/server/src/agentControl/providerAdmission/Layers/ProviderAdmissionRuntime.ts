@@ -1,7 +1,9 @@
 import { ProviderInstanceId, type ProviderUsageSnapshot } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -62,8 +64,10 @@ const make = Effect.gen(function* () {
   const initialPlanningWakeup = yield* AgentControlInitialPlanningWakeup;
   const implementationWakeup = yield* AgentControlImplementationTurnWakeup;
   const verificationWakeup = yield* AgentControlVerificationTurnWakeup;
+  const runtimeScope = yield* Effect.scope;
   const providerSignals = yield* PubSub.unbounded<string>();
   const deadlineSignals = yield* PubSub.unbounded<void>();
+  const runtimeFailure = yield* Deferred.make<never, ProviderAdmissionError>();
   const ownerId = yield* crypto.randomUUIDv4.pipe(
     Effect.orDie,
     Effect.map((uuid) => `provider-admission:${uuid}`),
@@ -75,6 +79,23 @@ const make = Effect.gen(function* () {
       : publication.stage === "implementation"
         ? implementationWakeup.wake(publication.handoffId)
         : verificationWakeup.wake(publication.handoffId);
+
+  const forkPump = <A>(operation: string, pump: Effect.Effect<A, ProviderAdmissionError>) =>
+    pump.pipe(
+      Effect.catchCause((cause) =>
+        cause.reasons.every(Cause.isInterruptReason)
+          ? Effect.void
+          : Deferred.fail(
+              runtimeFailure,
+              new ProviderAdmissionError({
+                operation,
+                reason: "persistence",
+                cause,
+              }),
+            ).pipe(Effect.asVoid),
+      ),
+      Effect.forkIn(runtimeScope, { startImmediately: true }),
+    );
 
   const inspect = (
     providerInstanceId: ProviderInstanceId,
@@ -123,21 +144,24 @@ const make = Effect.gen(function* () {
   const request: ProviderAdmissionRuntimeShape["request"] = Effect.fn(
     "ProviderAdmissionRuntime.request",
   )(function* (input) {
-    const observed = yield* inspect(input.providerInstanceId);
-    // A request is itself a fresh provider-bound Usage observation. Persist it
-    // for every existing waiter before retrying the requested identity, so a
-    // later allowed/warning snapshot cannot remain hidden behind the first
-    // rejected projection.
-    yield* store.recordUsage(String(input.providerInstanceId), observed);
     const now = yield* DateTime.now;
     const nowText = DateTime.formatIso(now);
-    const decision = yield* store.request({
+    const leaseExpiresAt = DateTime.formatIso(DateTime.addDuration(now, CLAIM_DURATION));
+    const persisted = yield* store.resume({
       request: input,
-      usage: observed,
       ownerId,
-      leaseExpiresAt: DateTime.formatIso(DateTime.addDuration(now, CLAIM_DURATION)),
+      leaseExpiresAt,
       now: nowText,
     });
+    const decision =
+      persisted ??
+      (yield* store.request({
+        request: input,
+        usage: yield* inspect(input.providerInstanceId),
+        ownerId,
+        leaseExpiresAt,
+        now: nowText,
+      }));
     yield* PubSub.publish(deadlineSignals, undefined);
     if (decision._tag === "Admitted") {
       yield* wake({
@@ -158,7 +182,7 @@ const make = Effect.gen(function* () {
   const providerSubscription = yield* PubSub.subscribe(providerSignals);
   yield* Effect.gen(function* () {
     while (true) yield* advanceProvider(yield* PubSub.take(providerSubscription));
-  }).pipe(Effect.forkScoped);
+  }).pipe((pump) => forkPump("capacity-pump", pump));
 
   // Subscribe before startup catch-up so an update cannot be lost between the
   // durable scan and live event consumption.
@@ -185,13 +209,14 @@ const make = Effect.gen(function* () {
         { discard: true },
       );
     }
-  }).pipe(Effect.forkScoped);
+  }).pipe((pump) => forkPump("usage-pump", pump));
 
   const deadlineSubscription = yield* PubSub.subscribe(deadlineSignals);
   yield* Effect.gen(function* () {
+    let lastFiredDeadline: string | null = null;
     while (true) {
       const deadline = yield* store.minimumDeadline;
-      if (deadline === null) {
+      if (deadline === null || deadline === lastFiredDeadline) {
         yield* PubSub.take(deadlineSubscription);
         continue;
       }
@@ -204,6 +229,10 @@ const make = Effect.gen(function* () {
         PubSub.take(deadlineSubscription).pipe(Effect.as("changed" as const)),
       );
       if (outcome === "changed") continue;
+      // A reset deadline is a one-shot wakeup for this runtime. If refreshing
+      // yields the same evidence, wait for a typed usage/deadline change rather
+      // than turning the expired deadline into a polling loop.
+      lastFiredDeadline = deadline;
       const waiting = yield* store.listWaiting;
       const providerIds = Array.from(
         new Set(waiting.map((publication) => publication.providerInstanceId)),
@@ -218,14 +247,19 @@ const make = Effect.gen(function* () {
         { discard: true },
       );
     }
-  }).pipe(Effect.forkScoped);
+  }).pipe((pump) => forkPump("deadline-pump", pump));
 
   const waitingProviders = Array.from(
     new Set((yield* store.listWaiting).map((publication) => publication.providerInstanceId)),
   );
   yield* Effect.forEach(waitingProviders, advanceProvider, { discard: true });
 
-  return ProviderAdmissionRuntime.of({ request, usageChanged, capacityReleased });
+  return ProviderAdmissionRuntime.of({
+    awaitFailure: Deferred.await(runtimeFailure),
+    request,
+    usageChanged,
+    capacityReleased,
+  });
 });
 
 export const ProviderAdmissionRuntimeLive = Layer.effect(ProviderAdmissionRuntime, make);

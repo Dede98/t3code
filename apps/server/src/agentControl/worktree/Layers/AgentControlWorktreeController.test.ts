@@ -3455,6 +3455,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           streamEvents: Stream.never,
         } satisfies ProviderServiceShape);
         const admittedProviderRuntime = ProviderAdmissionRuntime.of({
+          awaitFailure: Effect.never,
           request: (request) =>
             Effect.succeed({
               _tag: "Admitted" as const,
@@ -3524,6 +3525,7 @@ activationLayer("Controlled thread activation facade", (it) => {
             afterClaim: () => Effect.die(new Error("delivery claim preceded admission")),
           },
           ProviderAdmissionRuntime.of({
+            awaitFailure: Effect.never,
             request: (request) =>
               Ref.update(waitingAdmissionRequests, (count) => count + 1).pipe(
                 Effect.as({

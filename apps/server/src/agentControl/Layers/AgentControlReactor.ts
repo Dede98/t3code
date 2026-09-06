@@ -28,6 +28,7 @@ import {
 } from "../Services/AgentControlReactor.ts";
 import { alreadyActivated, type ReactorStartupActivation } from "../../reactorStartupActivation.ts";
 import { ProviderAdmissionReleaseAuthority } from "../providerAdmission/Services/ProviderAdmissionReleaseAuthority.ts";
+import { ProviderAdmissionRuntime } from "../providerAdmission/Services/ProviderAdmissionRuntime.ts";
 
 const make = Effect.gen(function* () {
   const githubObserve = yield* AgentControlGithubObserveReactor;
@@ -48,6 +49,13 @@ const make = Effect.gen(function* () {
   const providerAdmissionRelease = Option.getOrUndefined(
     yield* Effect.serviceOption(ProviderAdmissionReleaseAuthority),
   );
+  const providerAdmissionRuntime = Option.getOrUndefined(
+    yield* Effect.serviceOption(ProviderAdmissionRuntime),
+  );
+  const awaitFailure =
+    providerAdmissionRuntime === undefined
+      ? armed.awaitFailure
+      : Effect.raceFirst(armed.awaitFailure, providerAdmissionRuntime.awaitFailure);
   const lifecycleSemaphore = yield* Semaphore.make(1);
   let nextAttemptId = 0;
   let lifecycleState: "idle" | "starting" | "started" | "closing" | "closed" = "idle";
@@ -154,7 +162,7 @@ const make = Effect.gen(function* () {
                   );
                 }
                 lifecycleState = "started";
-                yield* Effect.flip(armed.awaitFailure).pipe(
+                yield* Effect.flip(awaitFailure).pipe(
                   Effect.flatMap((failure) =>
                     closeAttempt(attemptId, ownerScope, Exit.fail(failure), true),
                   ),
@@ -171,7 +179,7 @@ const make = Effect.gen(function* () {
       }),
   );
 
-  return AgentControlReactor.of({ awaitFailure: armed.awaitFailure, start });
+  return AgentControlReactor.of({ awaitFailure, start });
 });
 
 export const layer = Layer.effect(AgentControlReactor, make);

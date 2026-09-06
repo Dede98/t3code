@@ -12,6 +12,10 @@ import {
 } from "../../initialPlanning/eventEvidence.ts";
 import { decodePersistedOrchestrationMetadata } from "../../../orchestration/providerRuntimeMessageCorrelation.ts";
 import {
+  EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS,
+  PROVIDER_ADMISSION_SCHEMA_OBJECTS,
+} from "../../../persistence/Migrations/065_AgentControlProviderCapacityAdmission.ts";
+import {
   fingerprintProviderAdmissionDocument,
   providerAdmissionAuthorityId,
   providerAdmissionId,
@@ -64,6 +68,7 @@ interface CurrentRow {
   readonly requestedAt: string;
   readonly usageStatus: ProviderAdmissionUsageEvidence["status"];
   readonly usageEvidenceFingerprint: string;
+  readonly nextDeadlineAt: string | null;
   readonly ownerId: string | null;
   readonly leaseExpiresAt: string | null;
   readonly providerFenceToken: number | null;
@@ -123,6 +128,14 @@ interface FinalizationRow {
   readonly finalizationMarkerId: string;
   readonly finalizationMarkerFingerprint: string;
   readonly finalizedAt: string;
+}
+
+interface ProviderAdmissionAttemptInput {
+  readonly request: ProviderAdmissionRequest;
+  readonly usage?: ProviderAdmissionUsageEvidence;
+  readonly ownerId: string;
+  readonly leaseExpiresAt: string;
+  readonly now: string;
 }
 
 const intentDocument = (admissionId: string, request: ProviderAdmissionRequest) =>
@@ -200,6 +213,7 @@ const make = Effect.gen(function* () {
       SELECT admission_id AS "admissionId", provider_instance_id AS "providerInstanceId",
         stage, handoff_id AS "handoffId", status, requested_at AS "requestedAt",
         usage_status AS "usageStatus", usage_evidence_fingerprint AS "usageEvidenceFingerprint",
+        next_deadline_at AS "nextDeadlineAt",
         owner_id AS "ownerId", lease_expires_at AS "leaseExpiresAt",
         provider_fence_token AS "providerFenceToken", admission_marker_id AS "admissionMarkerId",
         admission_marker_fingerprint AS "admissionMarkerFingerprint"
@@ -382,9 +396,9 @@ const make = Effect.gen(function* () {
     };
   };
 
-  const request: ProviderAdmissionStoreShape["request"] = Effect.fn(
-    "ProviderAdmissionStore.request",
-  )(function* (input) {
+  const requestInternal = Effect.fn("ProviderAdmissionStore.requestInternal")(function* (
+    input: ProviderAdmissionAttemptInput,
+  ) {
     const admissionId = providerAdmissionId(input.request);
     return yield* sql
       .withTransaction(
@@ -394,6 +408,7 @@ const make = Effect.gen(function* () {
           const expectedIntentFingerprint = sha256Utf8(expectedIntentJson);
           let current = yield* readCurrent(admissionId);
           if (current === undefined) {
+            if (input.usage === undefined) return null;
             yield* sql`
             INSERT INTO main.agent_control_provider_admission_intents (
               admission_id,stage,project_id,task_id,stage_run_id,attempt_id,handoff_id,
@@ -455,6 +470,13 @@ const make = Effect.gen(function* () {
           }
           if (current.status === "admitted") {
             if (current.leaseExpiresAt !== null && current.leaseExpiresAt > input.now) {
+              if (current.ownerId !== input.ownerId) {
+                return {
+                  _tag: "Waiting",
+                  admissionId,
+                  retryAt: current.leaseExpiresAt,
+                } satisfies ProviderAdmissionDecision;
+              }
               const intent = yield* readIntent(admissionId);
               const permit = intent === undefined ? undefined : permitFromRows(current, intent);
               if (permit === undefined) {
@@ -479,7 +501,7 @@ const make = Effect.gen(function* () {
             return {
               _tag: "Waiting",
               admissionId,
-              retryAt: input.usage.nextRelevantAt,
+              retryAt: current.nextDeadlineAt,
             } satisfies ProviderAdmissionDecision;
           }
           let capacity = yield* readCapacity(String(input.request.providerInstanceId));
@@ -602,6 +624,22 @@ const make = Effect.gen(function* () {
         ),
       );
   });
+
+  const resume: ProviderAdmissionStoreShape["resume"] = (input) => requestInternal(input);
+  const request: ProviderAdmissionStoreShape["request"] = (input) =>
+    requestInternal(input).pipe(
+      Effect.flatMap((decision) =>
+        decision === null
+          ? Effect.fail(
+              fail(
+                "request-created-decision",
+                "authority-missing",
+                providerAdmissionId(input.request),
+              ),
+            )
+          : Effect.succeed(decision),
+      ),
+    );
 
   const admitOldest: ProviderAdmissionStoreShape["admitOldest"] = Effect.fn(
     "ProviderAdmissionStore.admitOldest",
@@ -1260,9 +1298,7 @@ const make = Effect.gen(function* () {
       finalization.leaseHolderId !== current.stageLeaseHolderId ||
       finalization.fenceToken !== current.stageFenceToken ||
       finalization.providerDeliveryId !== current.providerDeliveryId ||
-      finalization.providerInstanceId !== current.providerInstanceId ||
-      current.ownerId === null ||
-      current.providerFenceToken === null
+      finalization.providerInstanceId !== current.providerInstanceId
     ) {
       return yield* fail("release-binding", "authority-divergent", current.admissionId);
     }
@@ -1278,12 +1314,89 @@ const make = Effect.gen(function* () {
     });
     const correlation = metadata.value.providerRuntimeMessage;
     if (
-      correlation === undefined ||
-      correlation.providerInstanceId !== current.providerInstanceId ||
-      correlation.runtimeEventId !==
-        (finalization.terminalRuntimeEventId ?? correlation.runtimeEventId)
+      (correlation === undefined && finalization.terminalRuntimeEventId !== null) ||
+      (correlation !== undefined &&
+        (correlation.providerInstanceId !== current.providerInstanceId ||
+          correlation.runtimeEventId !==
+            (finalization.terminalRuntimeEventId ?? correlation.runtimeEventId)))
     ) {
       return yield* fail("release-runtime-binding", "authority-divergent", current.admissionId);
+    }
+    const finalizationDetails = {
+      attemptId: current.attemptId,
+      finalizationMarkerFingerprint: finalization.finalizationMarkerFingerprint,
+      finalizationMarkerId: finalization.finalizationMarkerId,
+      handoffId: current.handoffId,
+      projectId: current.projectId,
+      providerDeliveryId: current.providerDeliveryId,
+      stageFenceToken: current.stageFenceToken,
+      stageRunId: current.stageRunId,
+      taskId: current.taskId,
+      terminalOrchestrationEventId: finalization.terminalOrchestrationEventId,
+      terminalEventType: finalization.terminalEventType,
+      providerRuntimeEventType: correlation?.eventType ?? null,
+      terminalRuntimeEventId: correlation?.runtimeEventId ?? null,
+      terminalStreamVersion: finalization.terminalStreamVersion,
+    } as const;
+    if (
+      current.status === "waiting" ||
+      current.status === "admitted" ||
+      current.status === "superseded"
+    ) {
+      if (current.status === "admitted") {
+        const entryMarkers = yield* sql<{ readonly count: number }>`
+          SELECT count(*) AS count
+          FROM main.agent_control_provider_authority_markers
+          WHERE admission_id=${current.admissionId}
+            AND authority_kind IN ('session-entry','turn-entry')
+        `;
+        if (
+          current.ownerId === null ||
+          current.providerFenceToken === null ||
+          entryMarkers[0]?.count !== 0
+        ) {
+          return yield* fail("supersede-entry", "authority-divergent", current.admissionId);
+        }
+      }
+      const supersedeOwnerId =
+        current.ownerId ?? `provider-finalization:${finalization.finalizationMarkerId}`;
+      const supersedeFence = current.providerFenceToken ?? 0;
+      yield* appendAuthority({
+        admissionId: current.admissionId,
+        authorityKind: "supersede",
+        providerInstanceId: current.providerInstanceId,
+        ownerId: supersedeOwnerId,
+        providerFenceToken: supersedeFence,
+        occurredAt: finalization.finalizedAt,
+        ...(correlation === undefined
+          ? {}
+          : { terminalRuntimeEventId: correlation.runtimeEventId }),
+        terminalEventType: finalization.terminalEventType,
+        terminalStreamVersion: finalization.terminalStreamVersion,
+        finalizationMarkerId: finalization.finalizationMarkerId,
+        finalizationMarkerFingerprint: finalization.finalizationMarkerFingerprint,
+        details: finalizationDetails,
+      });
+      if (current.status !== "superseded") {
+        yield* sql`
+          UPDATE main.agent_control_provider_admission_current SET status='superseded',
+            revision=revision+1,updated_at=MAX(updated_at,${finalization.finalizedAt})
+          WHERE admission_id=${current.admissionId}
+        `;
+        if (current.status === "admitted") {
+          yield* sql`
+            UPDATE main.agent_control_provider_capacity_current SET
+              active_admission_id=NULL,active_state=NULL,active_owner_id=NULL,
+              active_lease_expires_at=NULL,active_fence_token=NULL,
+              active_marker_fingerprint=NULL,revision=revision+1,
+              updated_at=MAX(updated_at,${finalization.finalizedAt})
+            WHERE provider_instance_id=${current.providerInstanceId}
+              AND active_admission_id=${current.admissionId}
+              AND active_fence_token=${current.providerFenceToken}
+          `;
+        }
+      }
+      return current.providerInstanceId;
     }
     if (
       current.status !== "entered" &&
@@ -1291,6 +1404,12 @@ const make = Effect.gen(function* () {
       current.status !== "released"
     ) {
       return yield* fail("release-state", "authority-divergent", current.admissionId);
+    }
+    if (current.ownerId === null || current.providerFenceToken === null) {
+      return yield* fail("release-owner", "authority-divergent", current.admissionId);
+    }
+    if (correlation === undefined) {
+      return yield* fail("release-runtime-binding", "authority-divergent", current.admissionId);
     }
     yield* appendAuthority({
       admissionId: current.admissionId,
@@ -1304,27 +1423,12 @@ const make = Effect.gen(function* () {
       terminalStreamVersion: finalization.terminalStreamVersion,
       finalizationMarkerId: finalization.finalizationMarkerId,
       finalizationMarkerFingerprint: finalization.finalizationMarkerFingerprint,
-      details: {
-        attemptId: current.attemptId,
-        finalizationMarkerFingerprint: finalization.finalizationMarkerFingerprint,
-        finalizationMarkerId: finalization.finalizationMarkerId,
-        handoffId: current.handoffId,
-        projectId: current.projectId,
-        providerDeliveryId: current.providerDeliveryId,
-        stageFenceToken: current.stageFenceToken,
-        stageRunId: current.stageRunId,
-        taskId: current.taskId,
-        terminalOrchestrationEventId: finalization.terminalOrchestrationEventId,
-        terminalEventType: finalization.terminalEventType,
-        providerRuntimeEventType: correlation.eventType,
-        terminalRuntimeEventId: correlation.runtimeEventId,
-        terminalStreamVersion: finalization.terminalStreamVersion,
-      },
+      details: finalizationDetails,
     });
     if (current.status !== "released") {
       yield* sql`
           UPDATE main.agent_control_provider_admission_current SET status='released',
-            revision=revision+1,updated_at=${finalization.finalizedAt}
+            revision=revision+1,updated_at=MAX(updated_at,${finalization.finalizedAt})
           WHERE admission_id=${current.admissionId}
         `;
       yield* sql`
@@ -1332,7 +1436,7 @@ const make = Effect.gen(function* () {
             active_admission_id=NULL,active_state=NULL,active_owner_id=NULL,
             active_lease_expires_at=NULL,active_fence_token=NULL,
             active_marker_fingerprint=NULL,revision=revision+1,
-            updated_at=${finalization.finalizedAt}
+            updated_at=MAX(updated_at,${finalization.finalizedAt})
           WHERE provider_instance_id=${current.providerInstanceId}
             AND active_admission_id=${current.admissionId}
             AND active_fence_token=${current.providerFenceToken}
@@ -1368,7 +1472,7 @@ const make = Effect.gen(function* () {
         ON current.stage='implementation' AND implementation.handoff_id=current.handoff_id
       LEFT JOIN main.agent_control_verification_finalization_evidence verification
         ON current.stage='verification' AND verification.handoff_id=current.handoff_id
-      WHERE current.status IN ('entered','quarantined')
+      WHERE current.status IN ('waiting','admitted','entered','quarantined','superseded')
         AND typeof(current.status)='text'
         AND CASE current.stage
           WHEN 'initial-planning' THEN initial.handoff_id IS NOT NULL
@@ -1390,7 +1494,96 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const auditStartupAuthority = Effect.fn("ProviderAdmissionStore.auditStartupAuthority")(
+    function* () {
+      const objects = yield* sql<{ readonly name: string; readonly source: string }>`
+      SELECT name,sql AS source FROM main.sqlite_schema
+      WHERE name IN ${sql.in(PROVIDER_ADMISSION_SCHEMA_OBJECTS)} AND sql IS NOT NULL
+      ORDER BY name
+    `;
+      if (
+        objects.length !== PROVIDER_ADMISSION_SCHEMA_OBJECTS.length ||
+        objects.some(
+          (object) =>
+            EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS[object.name] !== sha256Utf8(object.source),
+        )
+      ) {
+        return yield* fail("startup-ddl-audit", "authority-divergent");
+      }
+      const admissionProblems = yield* sql<{ readonly count: number }>`
+      SELECT count(*) AS count
+      FROM main.agent_control_provider_admission_current current
+      LEFT JOIN main.agent_control_provider_admission_intents intent
+        ON intent.admission_id=current.admission_id
+      LEFT JOIN main.agent_control_provider_usage_evidence usage
+        ON usage.evidence_id=current.usage_evidence_id
+      WHERE intent.admission_id IS NULL
+        OR intent.provider_instance_id!=current.provider_instance_id
+        OR intent.stage!=current.stage OR intent.handoff_id!=current.handoff_id
+        OR intent.requested_at!=current.requested_at
+        OR usage.admission_id IS NULL OR usage.admission_id!=current.admission_id
+        OR usage.provider_instance_id!=current.provider_instance_id
+        OR usage.status!=current.usage_status
+        OR usage.evidence_fingerprint!=current.usage_evidence_fingerprint
+        OR usage.next_relevant_at IS NOT current.next_deadline_at
+        OR current.status='claimed'
+        OR (current.status IN ('admitted','entered','quarantined','released') AND NOT EXISTS (
+          SELECT 1
+          FROM main.agent_control_provider_authority_markers marker
+          JOIN main.agent_control_provider_authority_evidence evidence
+            ON evidence.evidence_id=marker.evidence_id
+          WHERE marker.marker_id=current.admission_marker_id
+            AND marker.admission_id=current.admission_id
+            AND marker.authority_kind='admission'
+            AND marker.marker_fingerprint=current.admission_marker_fingerprint
+            AND evidence.owner_id=current.owner_id
+            AND evidence.provider_fence_token=current.provider_fence_token
+            AND NOT EXISTS (
+              SELECT 1 FROM main.agent_control_provider_authority_evidence newer
+              WHERE newer.admission_id=current.admission_id
+                AND newer.authority_kind='admission'
+                AND newer.provider_fence_token>evidence.provider_fence_token
+            )
+        ))
+        OR (current.status='superseded' AND NOT EXISTS (
+          SELECT 1 FROM main.agent_control_provider_authority_markers marker
+          WHERE marker.admission_id=current.admission_id AND marker.authority_kind='supersede'
+        ))
+    `;
+      const capacityProblems = yield* sql<{ readonly count: number }>`
+      SELECT count(*) AS count
+      FROM main.agent_control_provider_capacity_current capacity
+      WHERE capacity.last_fence_token!=COALESCE((
+          SELECT MAX(history.provider_fence_token)
+          FROM main.agent_control_provider_claim_history history
+          WHERE history.provider_instance_id=capacity.provider_instance_id
+        ),0)
+        OR (capacity.active_admission_id IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM main.agent_control_provider_admission_current admission
+          WHERE admission.admission_id=capacity.active_admission_id
+            AND admission.provider_instance_id=capacity.provider_instance_id
+            AND admission.status=capacity.active_state
+            AND admission.owner_id=capacity.active_owner_id
+            AND admission.lease_expires_at=capacity.active_lease_expires_at
+            AND admission.provider_fence_token=capacity.active_fence_token
+            AND admission.admission_marker_fingerprint IS capacity.active_marker_fingerprint
+        ))
+        OR (capacity.active_admission_id IS NULL AND EXISTS (
+          SELECT 1 FROM main.agent_control_provider_admission_current admission
+          WHERE admission.provider_instance_id=capacity.provider_instance_id
+            AND admission.status IN ('admitted','entered','quarantined')
+        ))
+    `;
+      if (admissionProblems[0]?.count !== 0 || capacityProblems[0]?.count !== 0) {
+        return yield* fail("startup-projection-audit", "authority-divergent");
+      }
+    },
+  );
+
+  yield* auditStartupAuthority();
+
   return ProviderAdmissionStore.of({
+    resume,
     request,
     admitOldest,
     validateAndEnterInTransaction,

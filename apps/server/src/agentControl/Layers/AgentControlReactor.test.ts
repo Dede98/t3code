@@ -33,6 +33,8 @@ import { AgentControlVerificationStageStarter } from "../verificationTurn/Servic
 import { AgentControlVerificationTurnCoordinator } from "../verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
 import { AgentControlVerificationEvaluator } from "../verificationTurn/Services/AgentControlVerificationEvaluator.ts";
 import { AgentControlVerificationStageFinalizer } from "../verificationTurn/Services/AgentControlVerificationStageFinalizer.ts";
+import { ProviderAdmissionRuntime } from "../providerAdmission/Services/ProviderAdmissionRuntime.ts";
+import { ProviderAdmissionError } from "../providerAdmission/Services/ProviderAdmissionStore.ts";
 import { layer as AgentControlReactorLive } from "./AgentControlReactor.ts";
 import { makeReactorStartupAttempt } from "../../reactorStartupActivation.ts";
 
@@ -162,6 +164,73 @@ it.effect("fails closed and tears down the started scope on an Armed runtime fai
       yield* Scope.close(ownerScope, Exit.void);
     }),
   ),
+);
+
+it.effect(
+  "fails closed and tears down the started scope on a Provider Admission pump failure",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const runtimeFailure = yield* Deferred.make<never, ProviderAdmissionError>();
+        const cleaned = yield* Deferred.make<void>();
+        const failure = new ProviderAdmissionError({
+          operation: "usage-pump",
+          reason: "persistence",
+        });
+        const reactorLayer = makeLayer().pipe(
+          Layer.provide(
+            Layer.succeed(
+              ProviderAdmissionRuntime,
+              ProviderAdmissionRuntime.of({
+                awaitFailure: Deferred.await(runtimeFailure),
+                request: () => Effect.die("unused"),
+                usageChanged: () => Effect.die("unused"),
+                capacityReleased: () => Effect.die("unused"),
+              }),
+            ),
+          ),
+          Layer.provide(
+            Layer.merge(
+              Layer.succeed(
+                AgentControlGithubObserveReactor,
+                AgentControlGithubObserveReactor.of({
+                  start: () =>
+                    Effect.addFinalizer(() =>
+                      Deferred.succeed(cleaned, undefined).pipe(Effect.asVoid),
+                    ),
+                  getStatus: () => Effect.die("unused"),
+                }),
+              ),
+              Layer.succeed(
+                AgentControlTaskIntakeReactor,
+                AgentControlTaskIntakeReactor.of({
+                  start: () => Effect.void,
+                  getStatus: () => Effect.die("unused"),
+                }),
+              ),
+            ),
+          ),
+        );
+        const reactor = yield* AgentControlReactor.pipe(Effect.provide(reactorLayer));
+        const ownerScope = yield* Scope.make("sequential");
+        yield* reactor.start().pipe(Scope.provide(ownerScope));
+        assert.isFalse(yield* Deferred.isDone(cleaned));
+
+        yield* Deferred.fail(runtimeFailure, failure);
+        assert.strictEqual(yield* Effect.flip(reactor.awaitFailure), failure);
+        yield* Deferred.await(cleaned);
+
+        const retryScope = yield* Scope.make("sequential");
+        const retry = yield* Effect.result(reactor.start().pipe(Scope.provide(retryScope)));
+        assert.equal(retry._tag, "Failure");
+        if (retry._tag === "Failure") {
+          assert.equal(retry.failure._tag, "AgentControlReactorStartupError");
+          assert.equal(retry.failure.reason, "lifecycle-closed");
+        }
+        yield* Scope.close(retryScope, Exit.void);
+        yield* Scope.close(ownerScope, Exit.void);
+      }),
+    ),
 );
 
 it.effect("fails the relevant reactor composition visibly when the evaluator layer is absent", () =>

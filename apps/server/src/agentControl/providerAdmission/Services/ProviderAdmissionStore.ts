@@ -35,6 +35,12 @@ export interface ProviderAdmissionWakeup {
 }
 
 export interface ProviderAdmissionStoreShape {
+  readonly resume: (input: {
+    readonly request: ProviderAdmissionRequest;
+    readonly ownerId: string;
+    readonly leaseExpiresAt: string;
+    readonly now: string;
+  }) => Effect.Effect<ProviderAdmissionDecision | null, ProviderAdmissionError>;
   readonly request: (input: {
     readonly request: ProviderAdmissionRequest;
     readonly usage: ProviderAdmissionUsageEvidence;

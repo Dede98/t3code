@@ -22,7 +22,7 @@ export class AgentControlReactorStartupError extends Schema.TaggedErrorClass<Age
 /** Top-level lifecycle boundary for all Agent Control reactors. */
 export interface AgentControlReactorShape {
   /** First terminal fail-closed error from a started Agent Control runtime. */
-  readonly awaitFailure: Effect.Effect<never, AgentControlArmedError>;
+  readonly awaitFailure: Effect.Effect<never, AgentControlArmedError | ProviderAdmissionError>;
   readonly start: (
     activation?: ReactorStartupActivation,
   ) => Effect.Effect<

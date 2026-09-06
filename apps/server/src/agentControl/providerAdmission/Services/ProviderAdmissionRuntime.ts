@@ -9,6 +9,8 @@ import type {
 import type { ProviderAdmissionError } from "./ProviderAdmissionStore.ts";
 
 export interface ProviderAdmissionRuntimeShape {
+  /** First fail-closed failure from one of the durable admission pumps. */
+  readonly awaitFailure: Effect.Effect<never, ProviderAdmissionError>;
   readonly request: (
     input: ProviderAdmissionRequest,
   ) => Effect.Effect<ProviderAdmissionDecision, ProviderAdmissionError>;

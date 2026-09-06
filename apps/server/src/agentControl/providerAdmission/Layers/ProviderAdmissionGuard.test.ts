@@ -8,6 +8,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -237,13 +238,14 @@ const seedInitialPlanningFinalization = (
   database: NodeSqlite.DatabaseSync,
   permit: ProviderAdmissionPermit,
   finalizedAt: string,
+  ordinal = 1,
 ) => {
   const terminalEventId = `terminal-event-${permit.admissionId}`;
   const resultEvidenceId = `result-${permit.admissionId}`;
   const commandId = `finalize-${permit.admissionId}`;
-  const finalizationFingerprint = "b".repeat(64);
+  const finalizationFingerprint = `${"b".repeat(63)}${ordinal}`;
   const markerId = `finalization-marker-${permit.admissionId}`;
-  const markerFingerprint = "c".repeat(64);
+  const markerFingerprint = `${"c".repeat(63)}${ordinal}`;
   const stageEventId = `stage-terminal-${permit.admissionId}`;
   const leaseEventId = `lease-terminal-${permit.admissionId}`;
   database
@@ -268,7 +270,7 @@ const seedInitialPlanningFinalization = (
       finalizationFingerprint,
       "failed",
       permit.handoffId,
-      "d".repeat(64),
+      `${"d".repeat(63)}${ordinal}`,
       permit.projectId,
       permit.taskId,
       1,
@@ -290,19 +292,19 @@ const seedInitialPlanningFinalization = (
       1,
       finalizedAt,
       `started-event-${permit.admissionId}`,
-      1,
+      ordinal * 2 - 1,
       terminalEventId,
-      2,
+      ordinal * 2,
       null,
       null,
       null,
       null,
       null,
       stageEventId,
-      1,
+      ordinal,
       3,
       leaseEventId,
-      1,
+      ordinal,
       2,
       finalizedAt,
     );
@@ -320,9 +322,9 @@ const seedInitialPlanningFinalization = (
       permit.handoffId,
       "failed",
       stageEventId,
-      1,
+      ordinal,
       leaseEventId,
-      1,
+      ordinal,
       finalizedAt,
     );
   database
@@ -611,6 +613,7 @@ it.live("guards all stage effects, denies replay, and quarantines restart ambigu
           Layer.provideMerge(secondStoreLayer),
           Layer.provide(
             Layer.succeed(ProviderAdmissionRuntime, {
+              awaitFailure: Effect.never,
               request: () => Effect.die("not used"),
               usageChanged: () => Effect.die("not used"),
               capacityReleased: () => Effect.void,
@@ -866,7 +869,7 @@ it.live("guards all stage effects, denies replay, and quarantines restart ambigu
       const nextPermit = yield* secondStore.admitOldest({
         providerInstanceId: String(permits[0]!.providerInstanceId),
         ownerId: "release-successor-owner",
-        now: "2026-09-06T09:00:01.000Z",
+        now: "2098-09-06T09:00:01.000Z",
         leaseExpiresAt: leaseExpiry,
       });
       if (nextPermit === null) return yield* Effect.die("missing release successor");
@@ -940,6 +943,283 @@ it.live("guards all stage effects, denies replay, and quarantines restart ambigu
       }
       assert.deepStrictEqual(yield* secondSql`PRAGMA main.foreign_key_check`, []);
       assert.equal((yield* secondSql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("supersedes deadline-finalized waiting and admitted pre-entry work transactionally", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-admission-cancel-" });
+      const filename = path.join(directory, "cancel.sqlite");
+      const scope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+      const sqlContext = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
+      const sql = Context.get(sqlContext, SqlClient.SqlClient);
+      yield* sql`PRAGMA journal_mode=WAL`;
+      yield* runMigrations({ toMigrationInclusive: 65 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+      const storeContext = yield* Layer.buildWithScope(
+        Layer.fresh(ProviderAdmissionStoreLive).pipe(
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+        ),
+        scope,
+      );
+      const store = Context.get(storeContext, ProviderAdmissionStore);
+      const signals = yield* Ref.make<ReadonlyArray<string>>([]);
+      const releaseContext = yield* Layer.buildWithScope(
+        Layer.fresh(ProviderAdmissionReleaseAuthorityLive).pipe(
+          Layer.provide(Layer.succeed(ProviderAdmissionStore, store)),
+          Layer.provide(
+            Layer.succeed(
+              ProviderAdmissionRuntime,
+              ProviderAdmissionRuntime.of({
+                awaitFailure: Effect.never,
+                request: () => Effect.die("unused"),
+                usageChanged: () => Effect.die("unused"),
+                capacityReleased: (providerInstanceId) =>
+                  Ref.update(signals, (current) => [...current, providerInstanceId]),
+              }),
+            ),
+          ),
+        ),
+        scope,
+      );
+      const release = Context.get(releaseContext, ProviderAdmissionReleaseAuthority);
+      const makeRequest = (suffix: string, providerInstanceId: ProviderInstanceId) => {
+        const base = request("initial-planning", providerInstanceId);
+        return {
+          ...base,
+          projectId: `project-${suffix}`,
+          taskId: `task-${suffix}`,
+          stageRunId: `stage-${suffix}`,
+          attemptId: `attempt-${suffix}`,
+          handoffId: `handoff-${suffix}`,
+          providerDeliveryId: `delivery-${suffix}`,
+          threadId: `thread-${suffix}`,
+          stageLeaseId: `lease-${suffix}`,
+          stageLeaseHolderId: `holder-${suffix}`,
+        } satisfies ProviderAdmissionRequest;
+      };
+      const waitingRequest = makeRequest(
+        "deadline-waiting",
+        ProviderInstanceId.make("deadline-waiting-provider"),
+      );
+      const waitingDecision = yield* store.request({
+        request: waitingRequest,
+        usage: providerAdmissionUsageEvidence({
+          providerInstanceId: waitingRequest.providerInstanceId,
+          status: "rejected",
+          observedAt: at,
+          source: "refresh",
+          nextRelevantAt: leaseExpiry,
+        }),
+        ownerId: "waiting-owner",
+        leaseExpiresAt: leaseExpiry,
+        now: at,
+      });
+      assert.equal(waitingDecision._tag, "Waiting");
+      if (waitingDecision._tag !== "Waiting") return;
+      const waitingPermit: ProviderAdmissionPermit = {
+        ...waitingRequest,
+        admissionId: waitingDecision.admissionId,
+        admissionMarkerId: "not-admitted",
+        admissionMarkerFingerprint: "0".repeat(64),
+        admissionOwnerId: "not-admitted",
+        admissionLeaseExpiresAt: leaseExpiry,
+        providerFenceToken: 0,
+        usageEvidenceFingerprint: "0".repeat(64),
+      };
+      const admittedRequest = makeRequest(
+        "deadline-admitted",
+        ProviderInstanceId.make("deadline-admitted-provider"),
+      );
+      const admittedDecision = yield* store.request({
+        request: admittedRequest,
+        usage: providerAdmissionUsageEvidence({
+          providerInstanceId: admittedRequest.providerInstanceId,
+          status: "allowed",
+          observedAt: at,
+          source: "refresh",
+          nextRelevantAt: null,
+        }),
+        ownerId: "admitted-owner",
+        leaseExpiresAt: leaseExpiry,
+        now: at,
+      });
+      assert.equal(admittedDecision._tag, "Admitted");
+      if (admittedDecision._tag !== "Admitted") return;
+
+      const finalizationTriggers = yield* sql<{ readonly name: string; readonly source: string }>`
+        SELECT name,sql AS source FROM main.sqlite_schema
+        WHERE type='trigger' AND tbl_name IN (
+          'agent_control_initial_planning_result_evidence',
+          'agent_control_initial_planning_finalization_receipts',
+          'agent_control_initial_planning_finalization_markers'
+        ) AND sql IS NOT NULL
+        ORDER BY name
+      `;
+      for (const trigger of finalizationTriggers) {
+        yield* sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+      }
+      const fixtureDatabase = yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const database = new NodeSqlite.DatabaseSync(filename);
+          database.exec("PRAGMA foreign_keys=OFF");
+          return database;
+        }),
+        (database) => Effect.sync(() => database.close()),
+      );
+      const finalizedAt = "2026-09-06T09:00:00.000Z";
+      for (const [index, permit] of [waitingPermit, admittedDecision.permit].entries()) {
+        yield* sql`
+          INSERT INTO main.orchestration_events (
+            event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,
+            command_id,causation_event_id,correlation_id,actor_kind,payload_json,metadata_json
+          ) VALUES (
+            ${`terminal-event-${permit.admissionId}`},'thread',${permit.threadId},1,
+            'thread.session-set',${finalizedAt},${`terminal-command-${permit.admissionId}`},
+            NULL,${`terminal-command-${permit.admissionId}`},'server',
+            ${canonicalJson({
+              session: {
+                activeTurnId: null,
+                lastError: "planning deadline exceeded",
+                providerInstanceId: permit.providerInstanceId,
+                providerName: "codex",
+                runtimeMode: "approval-required",
+                status: "error",
+                threadId: permit.threadId,
+                updatedAt: finalizedAt,
+              },
+              threadId: permit.threadId,
+            })},
+            ${canonicalJson({})}
+          )
+        `;
+        yield* Effect.sync(() =>
+          seedInitialPlanningFinalization(fixtureDatabase, permit, finalizedAt, index + 1),
+        );
+      }
+
+      const rolledBack = yield* Effect.exit(
+        sql.withTransaction(
+          release
+            .releaseInTransaction({
+              stage: "initial-planning",
+              handoffId: waitingPermit.handoffId,
+              finalizedAt,
+            })
+            .pipe(Effect.andThen(Effect.fail("force-cancel-rollback"))),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(rolledBack));
+      assert.deepStrictEqual(
+        yield* sql<{ readonly status: string }>`
+          SELECT status FROM main.agent_control_provider_admission_current
+          WHERE admission_id=${waitingPermit.admissionId}
+        `,
+        [{ status: "waiting" }],
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT count(*) AS count FROM main.agent_control_provider_authority_markers
+          WHERE admission_id=${waitingPermit.admissionId} AND authority_kind='supersede'
+        `)[0]?.count,
+        0,
+      );
+      assert.deepStrictEqual(yield* Ref.get(signals), []);
+
+      const waitingProvider = yield* sql.withTransaction(
+        release.releaseInTransaction({
+          stage: "initial-planning",
+          handoffId: waitingPermit.handoffId,
+          finalizedAt,
+        }),
+      );
+      assert.deepStrictEqual(yield* Ref.get(signals), []);
+      yield* release.signalCommitted(waitingProvider);
+      assert.deepStrictEqual(yield* Ref.get(signals), [String(waitingPermit.providerInstanceId)]);
+      assert.equal(
+        yield* sql.withTransaction(
+          release.releaseInTransaction({
+            stage: "initial-planning",
+            handoffId: waitingPermit.handoffId,
+            finalizedAt,
+          }),
+        ),
+        waitingPermit.providerInstanceId,
+      );
+      const divergent = yield* Effect.exit(
+        sql.withTransaction(
+          release.releaseInTransaction({
+            stage: "initial-planning",
+            handoffId: waitingPermit.handoffId,
+            finalizedAt: "2026-09-06T09:00:01.000Z",
+          }),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(divergent));
+
+      const admittedProvider = yield* sql.withTransaction(
+        release.releaseInTransaction({
+          stage: "initial-planning",
+          handoffId: admittedDecision.permit.handoffId,
+          finalizedAt,
+        }),
+      );
+      yield* release.signalCommitted(admittedProvider);
+      assert.deepStrictEqual(
+        yield* sql<{
+          readonly status: string;
+          readonly activeAdmissionId: string | null;
+        }>`
+          SELECT admission.status,capacity.active_admission_id AS "activeAdmissionId"
+          FROM main.agent_control_provider_admission_current admission
+          JOIN main.agent_control_provider_capacity_current capacity
+            ON capacity.provider_instance_id=admission.provider_instance_id
+          WHERE admission.admission_id=${admittedDecision.permit.admissionId}
+        `,
+        [{ status: "superseded", activeAdmissionId: null }],
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT count(*) AS count FROM main.agent_control_provider_authority_markers
+          WHERE authority_kind='supersede'
+        `)[0]?.count,
+        2,
+      );
+      assert.equal(
+        (yield* store.request({
+          request: admittedRequest,
+          usage: providerAdmissionUsageEvidence({
+            providerInstanceId: admittedRequest.providerInstanceId,
+            status: "allowed",
+            observedAt: finalizedAt,
+            source: "runtime-event",
+            nextRelevantAt: null,
+          }),
+          ownerId: "new-owner",
+          leaseExpiresAt: leaseExpiry,
+          now: finalizedAt,
+        }))._tag,
+        "Waiting",
+      );
+
+      yield* Effect.sync(() => {
+        fixtureDatabase.exec(`
+          DELETE FROM main.agent_control_initial_planning_finalization_markers;
+          DELETE FROM main.agent_control_initial_planning_finalization_receipts;
+          DELETE FROM main.agent_control_initial_planning_result_evidence;
+        `);
+      });
+      for (const trigger of finalizationTriggers) {
+        yield* sql.unsafe(trigger.source).unprepared;
+      }
+      assert.deepStrictEqual(yield* sql`PRAGMA main.foreign_key_check`, []);
+      assert.equal((yield* sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

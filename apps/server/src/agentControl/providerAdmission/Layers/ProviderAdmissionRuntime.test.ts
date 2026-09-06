@@ -29,9 +29,13 @@ import { canonicalProviderModelSelectionEvidence } from "../../../provider/Servi
 import { ProviderUsage } from "../../../provider/Services/ProviderUsage.ts";
 import type { ProviderAdmissionRequest } from "../model.ts";
 import { ProviderAdmissionRuntime } from "../Services/ProviderAdmissionRuntime.ts";
-import { ProviderAdmissionStore } from "../Services/ProviderAdmissionStore.ts";
+import {
+  ProviderAdmissionError,
+  ProviderAdmissionStore,
+} from "../Services/ProviderAdmissionStore.ts";
 import { ProviderAdmissionRuntimeLive } from "./ProviderAdmissionRuntime.ts";
 import { ProviderAdmissionStoreLive } from "./ProviderAdmissionStore.ts";
+import { providerAdmissionUsageEvidence } from "../model.ts";
 
 type Observation =
   | { readonly _tag: "Unsupported"; readonly observedAt: string }
@@ -209,7 +213,18 @@ it.effect("binds all usage outcomes and wakes rejected admission from one global
       );
       assert.equal(
         (yield* runtime.request(request("unusable", unusableId, "verification")))._tag,
-        "Admitted",
+        "Waiting",
+      );
+      yield* TestClock.adjust("500 millis");
+      yield* runtime.usageChanged(
+        String(unusableId),
+        providerAdmissionUsageEvidence({
+          providerInstanceId: unusableId,
+          status: "allowed",
+          observedAt: "1970-01-01T00:00:00.500Z",
+          source: "runtime-event",
+          nextRelevantAt: null,
+        }),
       );
       assert.deepStrictEqual(
         yield* sql<{ readonly status: string }>`
@@ -224,7 +239,7 @@ it.effect("binds all usage outcomes and wakes rejected admission from one global
           snapshot: { ...snapshot(rejectedId, "allowed"), observedAt: reset },
         }),
       );
-      yield* TestClock.adjust("1 second");
+      yield* TestClock.adjust("500 millis");
       yield* Deferred.await(rejectedDeadlineWake);
       assert.isTrue((yield* Ref.get(wakeups)).includes("handoff-rejected"));
       const rejectedAfterWake = yield* sql<{
@@ -240,6 +255,170 @@ it.effect("binds all usage outcomes and wakes rejected admission from one global
       assert.equal(yield* store.minimumDeadline, null);
       assert.deepStrictEqual(yield* sql`PRAGMA main.foreign_key_check`, []);
       assert.equal((yield* sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "resumes persisted waiting work without polling Usage and admits only after new evidence",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-admission-resume-" });
+        const filename = path.join(directory, "resume.sqlite");
+        const sqlScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(sqlScope, Exit.void));
+        const sqlContext = yield* Layer.buildWithScope(
+          NodeSqliteClient.layer({ filename }),
+          sqlScope,
+        );
+        const sql = Context.get(sqlContext, SqlClient.SqlClient);
+        yield* sql`PRAGMA journal_mode=WAL`;
+        yield* runMigrations({ toMigrationInclusive: 65 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        );
+
+        const providerInstanceId = ProviderInstanceId.make("usage-recovery-no-poll");
+        const inspectCalls = yield* Ref.make(0);
+        const usageEvents = yield* PubSub.unbounded<never>();
+        const usageLayer = Layer.succeed(ProviderUsage, {
+          inspectForAdmission: () =>
+            Ref.updateAndGet(inspectCalls, (count) => count + 1).pipe(
+              Effect.as({
+                _tag: "Observed" as const,
+                snapshot: snapshot(providerInstanceId, "rejected"),
+              }),
+            ),
+          getSnapshot: Effect.succeed([]),
+          refresh: () => Effect.succeed({ refreshedAt: epoch, usage: [], failures: [] }),
+          subscribeEvents: PubSub.subscribe(usageEvents),
+        });
+        const wakeupLayers = Layer.mergeAll(
+          Layer.succeed(AgentControlInitialPlanningWakeup, {
+            wake: () => Effect.void,
+            stream: Stream.never,
+          }),
+          Layer.succeed(AgentControlImplementationTurnWakeup, {
+            wake: () => Effect.void,
+            stream: Stream.never,
+          }),
+          Layer.succeed(AgentControlVerificationTurnWakeup, {
+            wake: () => Effect.void,
+            stream: Stream.never,
+            subscribe: Effect.succeed(Stream.never),
+          }),
+        );
+        const buildRuntime = Effect.gen(function* () {
+          const scope = yield* Scope.make("sequential");
+          const storeLayer = Layer.fresh(ProviderAdmissionStoreLive).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+          );
+          const runtimeLayer = Layer.fresh(ProviderAdmissionRuntimeLive).pipe(
+            Layer.provideMerge(storeLayer),
+            Layer.provideMerge(usageLayer),
+            Layer.provide(wakeupLayers),
+          );
+          const context = yield* Layer.buildWithScope(runtimeLayer, scope);
+          return { runtime: Context.get(context, ProviderAdmissionRuntime), scope } as const;
+        });
+
+        const first = yield* buildRuntime;
+        assert.equal(
+          (yield* first.runtime.request(request("no-poll", providerInstanceId, "implementation")))
+            ._tag,
+          "Waiting",
+        );
+        assert.equal(yield* Ref.get(inspectCalls), 1);
+        yield* Scope.close(first.scope, Exit.void);
+
+        const restarted = yield* buildRuntime;
+        const recovered = yield* restarted.runtime.request(
+          request("no-poll", providerInstanceId, "implementation"),
+        );
+        assert.equal(recovered._tag, "Waiting");
+        assert.equal(yield* Ref.get(inspectCalls), 1);
+
+        yield* TestClock.adjust("1 second");
+        yield* restarted.runtime.usageChanged(
+          String(providerInstanceId),
+          providerAdmissionUsageEvidence({
+            providerInstanceId,
+            status: "allowed",
+            observedAt: reset,
+            source: "runtime-event",
+            nextRelevantAt: null,
+          }),
+        );
+        assert.equal(yield* Ref.get(inspectCalls), 1);
+        assert.deepStrictEqual(
+          yield* sql<{ readonly status: string }>`
+          SELECT status FROM main.agent_control_provider_admission_current
+          WHERE handoff_id='handoff-no-poll'
+        `,
+          [{ status: "admitted" }],
+        );
+        yield* Scope.close(restarted.scope, Exit.void);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("reports a capacity pump defect through the typed runtime failure channel", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const usageEvents = yield* PubSub.unbounded<never>();
+      const storeLayer = Layer.succeed(ProviderAdmissionStore, {
+        resume: () => Effect.die("unused"),
+        request: () => Effect.die("unused"),
+        validateAndEnterInTransaction: () => Effect.die("unused"),
+        admitOldest: () => Effect.die("injected-capacity-pump-defect"),
+        quarantine: () => Effect.die("unused"),
+        recordUsage: () => Effect.die("unused"),
+        listWaiting: Effect.succeed([]),
+        listEnteredWithoutRelease: Effect.succeed([]),
+        minimumDeadline: Effect.succeed(null),
+        releaseFromFinalizationInTransaction: () => Effect.die("unused"),
+        catchUpFinalized: Effect.succeed([]),
+      });
+      const usageLayer = Layer.succeed(ProviderUsage, {
+        inspectForAdmission: () => Effect.die("unused"),
+        getSnapshot: Effect.succeed([]),
+        refresh: () => Effect.succeed({ refreshedAt: epoch, usage: [], failures: [] }),
+        subscribeEvents: PubSub.subscribe(usageEvents),
+      });
+      const wakeupLayers = Layer.mergeAll(
+        Layer.succeed(AgentControlInitialPlanningWakeup, {
+          wake: () => Effect.void,
+          stream: Stream.never,
+        }),
+        Layer.succeed(AgentControlImplementationTurnWakeup, {
+          wake: () => Effect.void,
+          stream: Stream.never,
+        }),
+        Layer.succeed(AgentControlVerificationTurnWakeup, {
+          wake: () => Effect.void,
+          stream: Stream.never,
+          subscribe: Effect.succeed(Stream.never),
+        }),
+      );
+      const runtimeScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(runtimeScope, Exit.void));
+      const runtimeContext = yield* Layer.buildWithScope(
+        ProviderAdmissionRuntimeLive.pipe(
+          Layer.provideMerge(storeLayer),
+          Layer.provideMerge(usageLayer),
+          Layer.provide(wakeupLayers),
+        ),
+        runtimeScope,
+      );
+      const runtime = Context.get(runtimeContext, ProviderAdmissionRuntime);
+
+      yield* runtime.capacityReleased("defective-provider");
+      const failure = yield* Effect.flip(runtime.awaitFailure);
+      assert.instanceOf(failure, ProviderAdmissionError);
+      assert.equal(failure.operation, "capacity-pump");
+      assert.equal(failure.reason, "persistence");
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );
