@@ -913,6 +913,24 @@ it.live("guards all stage effects, denies replay, and quarantines restart ambigu
         [{ activeAdmissionId: nextPermit.admissionId }],
       );
 
+      const terminalRestartScope = yield* Scope.make("sequential");
+      const terminalRestartSqlContext = yield* Layer.buildWithScope(
+        NodeSqliteClient.layer({ filename }),
+        terminalRestartScope,
+      );
+      const terminalRestartSql = Context.get(terminalRestartSqlContext, SqlClient.SqlClient);
+      yield* terminalRestartSql`PRAGMA foreign_keys=ON`;
+      const terminalRestart = yield* Effect.exit(
+        Layer.buildWithScope(
+          Layer.fresh(ProviderAdmissionStoreLive).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, terminalRestartSql)),
+          ),
+          terminalRestartScope,
+        ),
+      );
+      assert.isTrue(Exit.isSuccess(terminalRestart));
+      yield* Scope.close(terminalRestartScope, Exit.void);
+
       // Remove the intentionally parent-less fixture deliveries before the FK
       // audit. Their production immutability triggers are restored immediately
       // afterwards, just as they were before guard execution.
@@ -945,6 +963,140 @@ it.live("guards all stage effects, denies replay, and quarantines restart ambigu
       assert.equal((yield* secondSql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "fails restart closed for entered and terminal projections without their complete authority chain",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-admission-forged-current-",
+        });
+
+        for (const status of ["entered", "quarantined", "released", "superseded"] as const) {
+          const filename = path.join(directory, `${status}.sqlite`);
+          const firstScope = yield* Scope.make("sequential");
+          const firstContext = yield* Layer.buildWithScope(
+            NodeSqliteClient.layer({ filename }),
+            firstScope,
+          );
+          const sql = Context.get(firstContext, SqlClient.SqlClient);
+          yield* sql`PRAGMA journal_mode=WAL`;
+          yield* runMigrations({ toMigrationInclusive: 65 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          );
+          const storeContext = yield* Layer.buildWithScope(
+            Layer.fresh(ProviderAdmissionStoreLive).pipe(
+              Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+            ),
+            firstScope,
+          );
+          const store = Context.get(storeContext, ProviderAdmissionStore);
+          const providerInstanceId = ProviderInstanceId.make(`forged-${status}`);
+          const value = request("initial-planning", providerInstanceId);
+          const decision = yield* store.request({
+            request: {
+              ...value,
+              projectId: `project-${status}`,
+              taskId: `task-${status}`,
+              stageRunId: `stage-${status}`,
+              attemptId: `attempt-${status}`,
+              handoffId: `handoff-${status}`,
+              providerDeliveryId: `delivery-${status}`,
+              threadId: `thread-${status}`,
+              stageLeaseId: `lease-${status}`,
+              stageLeaseHolderId: `holder-${status}`,
+            },
+            usage: providerAdmissionUsageEvidence({
+              providerInstanceId,
+              status: "allowed",
+              observedAt: at,
+              source: "refresh",
+              nextRelevantAt: null,
+            }),
+            ownerId: `owner-${status}`,
+            leaseExpiresAt: leaseExpiry,
+            now: at,
+          });
+          assert.equal(decision._tag, "Admitted");
+          if (decision._tag !== "Admitted") continue;
+
+          const validationTriggers = yield* sql<{
+            readonly name: string;
+            readonly source: string;
+          }>`
+            SELECT name,sql AS source FROM main.sqlite_schema
+            WHERE name IN (
+              'agent_control_provider_admission_current_validate_update',
+              'agent_control_provider_capacity_current_validate_update'
+            ) AND sql IS NOT NULL
+            ORDER BY name
+          `;
+          assert.equal(validationTriggers.length, 2);
+          for (const trigger of validationTriggers) {
+            yield* sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+          }
+          yield* sql`
+            UPDATE main.agent_control_provider_admission_current
+            SET status=${status},revision=revision+1,updated_at=${at}
+            WHERE admission_id=${decision.permit.admissionId}
+          `;
+          if (status === "entered" || status === "quarantined") {
+            yield* sql`
+              UPDATE main.agent_control_provider_capacity_current
+              SET active_state=${status},revision=revision+1,updated_at=${at}
+              WHERE provider_instance_id=${providerInstanceId}
+            `;
+          } else {
+            yield* sql`
+              UPDATE main.agent_control_provider_capacity_current SET
+                active_admission_id=NULL,active_state=NULL,active_owner_id=NULL,
+                active_lease_expires_at=NULL,active_fence_token=NULL,
+                active_marker_fingerprint=NULL,revision=revision+1,updated_at=${at}
+              WHERE provider_instance_id=${providerInstanceId}
+            `;
+          }
+          for (const trigger of validationTriggers) {
+            yield* sql.unsafe(trigger.source).unprepared;
+          }
+          assert.deepStrictEqual(
+            yield* sql<{ readonly name: string; readonly source: string }>`
+              SELECT name,sql AS source FROM main.sqlite_schema
+              WHERE name IN (
+                'agent_control_provider_admission_current_validate_update',
+                'agent_control_provider_capacity_current_validate_update'
+              ) AND sql IS NOT NULL
+              ORDER BY name
+            `,
+            validationTriggers,
+          );
+          assert.deepStrictEqual(yield* sql`PRAGMA main.foreign_key_check`, []);
+          assert.equal((yield* sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
+          yield* Scope.close(firstScope, Exit.void);
+
+          const restartScope = yield* Scope.make("sequential");
+          const restartSqlContext = yield* Layer.buildWithScope(
+            NodeSqliteClient.layer({ filename }),
+            restartScope,
+          );
+          const restartSql = Context.get(restartSqlContext, SqlClient.SqlClient);
+          yield* restartSql`PRAGMA foreign_keys=ON`;
+          const restarted = yield* Effect.exit(
+            Layer.buildWithScope(
+              Layer.fresh(ProviderAdmissionStoreLive).pipe(
+                Layer.provide(Layer.succeed(SqlClient.SqlClient, restartSql)),
+              ),
+              restartScope,
+            ),
+          );
+          assert.isTrue(Exit.isFailure(restarted), status);
+          yield* Scope.close(restartScope, Exit.void);
+        }
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live("supersedes deadline-finalized waiting and admitted pre-entry work transactionally", () =>
@@ -1207,6 +1359,24 @@ it.live("supersedes deadline-finalized waiting and admitted pre-entry work trans
         }))._tag,
         "Waiting",
       );
+
+      const supersedeRestartScope = yield* Scope.make("sequential");
+      const supersedeRestartSqlContext = yield* Layer.buildWithScope(
+        NodeSqliteClient.layer({ filename }),
+        supersedeRestartScope,
+      );
+      const supersedeRestartSql = Context.get(supersedeRestartSqlContext, SqlClient.SqlClient);
+      yield* supersedeRestartSql`PRAGMA foreign_keys=ON`;
+      const supersedeRestart = yield* Effect.exit(
+        Layer.buildWithScope(
+          Layer.fresh(ProviderAdmissionStoreLive).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, supersedeRestartSql)),
+          ),
+          supersedeRestartScope,
+        ),
+      );
+      assert.isTrue(Exit.isSuccess(supersedeRestart));
+      yield* Scope.close(supersedeRestartScope, Exit.void);
 
       yield* Effect.sync(() => {
         fixtureDatabase.exec(`

@@ -1031,6 +1031,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     rawInput: ProviderSessionStartInput,
     providerAdmissionPermit?: ProviderAdmissionPermit,
   ) {
+    let durableSessionEntryCommitted = false;
     const parsed = yield* decodeInputOrValidationError({
       operation: "ProviderService.startSession",
       schema: ProviderSessionStartInput,
@@ -1200,6 +1201,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           );
         }
         yield* enterProviderAdmission(providerAdmissionPermit, "session-start");
+        durableSessionEntryCommitted = true;
       }
       const sessionNative = yield* adapter
         .startSession({
@@ -1208,19 +1210,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
           ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
         })
-        .pipe(
-          Effect.onError(() =>
-            Effect.all(
-              [
-                clearMcpSession(threadId),
-                ...(providerAdmissionPermit === undefined
-                  ? []
-                  : [quarantineProviderAdmission(providerAdmissionPermit)]),
-              ],
-              { discard: true },
-            ),
-          ),
-        );
+        .pipe(Effect.onError(() => clearMcpSession(threadId)));
       const persistedSessionCreatedAt = canReusePersistedContinuation
         ? readPersistedSessionCreatedAt(persistedBinding?.runtimePayload)
         : undefined;
@@ -1301,6 +1291,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
       return sessionWithInstance;
     }).pipe(
+      Effect.onError(() =>
+        durableSessionEntryCommitted && providerAdmissionPermit !== undefined
+          ? quarantineProviderAdmission(providerAdmissionPermit)
+          : Effect.void,
+      ),
       withMetrics({
         counter: providerSessionsTotal,
         attributes: () =>
@@ -1431,7 +1426,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               }
               return yield* Effect.uninterruptibleMask((restore) =>
                 Effect.gen(function* () {
-                  yield* restore(enterProviderAdmission(permit, "turn-start"));
+                  yield* restore(
+                    enterProviderAdmission(permit, "turn-start").pipe(
+                      Effect.onError(() => quarantineProviderAdmission(permit)),
+                    ),
+                  );
                   yield* restore(boundary.beforeDeliveryCas());
                   yield* boundary.persistDeliveryAttempted(turnAttestation);
                   yield* restore(boundary.afterDeliveryCas());
@@ -1903,7 +1902,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   );
 
   return {
-    startSession: (threadId, input) => rebuildBarrier.withOperation(startSession(threadId, input)),
+    startSession: (threadId, input, authority) =>
+      rebuildBarrier.withOperation(startSession(threadId, input, authority)),
     sendTurn: (input) => rebuildBarrier.withOperation(sendTurn(input)),
     sendTurnAtPreInvokeBoundary: (input, boundary) =>
       rebuildBarrier.withOperation(sendTurnAtPreInvokeBoundary(input, boundary)),

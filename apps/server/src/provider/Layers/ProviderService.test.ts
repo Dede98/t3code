@@ -25,6 +25,7 @@ import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { it, assert, vi } from "@effect/vitest";
 
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
@@ -50,6 +51,7 @@ import {
 import {
   attestProviderNativeTurnConfiguration,
   attestProviderSessionNativeConfiguration,
+  canonicalProviderModelSelectionEvidence,
   ProviderContinuationSyncCapabilityError,
   type ProviderAdapterShape,
   type ProviderSessionAttestation,
@@ -73,6 +75,22 @@ import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
 import { ProviderAdmissionGuard } from "../../agentControl/providerAdmission/Services/ProviderAdmissionGuard.ts";
+import { ProviderAdmissionGuardLive } from "../../agentControl/providerAdmission/Layers/ProviderAdmissionGuard.ts";
+import { ProviderAdmissionStoreLive } from "../../agentControl/providerAdmission/Layers/ProviderAdmissionStore.ts";
+import {
+  providerAdmissionUsageEvidence,
+  type ProviderAdmissionRequest,
+} from "../../agentControl/providerAdmission/model.ts";
+import {
+  ProviderAdmissionError,
+  ProviderAdmissionStore,
+} from "../../agentControl/providerAdmission/Services/ProviderAdmissionStore.ts";
+import {
+  AgentControlTaskConsumerGuard,
+  type AgentControlTaskConsumerGuardShape,
+} from "../../agentControl/task/Services/AgentControlTaskConsumerGuard.ts";
+import { runMigrations } from "../../persistence/Migrations.ts";
+import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 
 const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const decodeUnknownJsonString = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
@@ -789,6 +807,386 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
     assert.include(failure.issue, "Provider instance 'codex_personal' is disabled");
     assert.equal(codex.startSession.mock.calls.length, 0);
   }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("durably quarantines invalid returned sessions and a failed second admission guard", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-quarantine-"));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(tempDir, "admission.sqlite");
+      const admissionScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(admissionScope, Exit.void));
+      const sqlContext = yield* Layer.buildWithScope(
+        NodeSqliteClient.layer({ filename }),
+        admissionScope,
+      );
+      const sql = Context.get(sqlContext, SqlClient.SqlClient);
+      yield* sql`PRAGMA journal_mode=WAL`;
+      yield* runMigrations({ toMigrationInclusive: 65 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+      const storeContext = yield* Layer.buildWithScope(
+        Layer.fresh(ProviderAdmissionStoreLive).pipe(
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+        ),
+        admissionScope,
+      );
+      const store = Context.get(storeContext, ProviderAdmissionStore);
+      const observedAt = "2026-09-06T10:00:00.000Z";
+      const expiresAt = "2099-09-06T10:00:00.000Z";
+      const makeAdmissionRequest = (
+        suffix: string,
+        providerInstanceId: ProviderInstanceId,
+      ): ProviderAdmissionRequest => {
+        const modelSelection = createModelSelection(providerInstanceId, "gpt-5.4");
+        const modelEvidence = canonicalProviderModelSelectionEvidence(modelSelection);
+        return {
+          stage: "initial-planning",
+          projectId: `project-${suffix}`,
+          taskId: `task-${suffix}`,
+          stageRunId: `stage-${suffix}`,
+          attemptId: `attempt-${suffix}`,
+          handoffId: `handoff-${suffix}`,
+          providerDeliveryId: `delivery-${suffix}`,
+          threadId: `thread-${suffix}`,
+          providerInstanceId,
+          stageLeaseId: `lease-${suffix}`,
+          stageLeaseHolderId: `holder-${suffix}`,
+          stageFenceToken: 1,
+          modelSelection,
+          modelSelectionJson: modelEvidence.modelSelectionJson,
+          modelSelectionFingerprint: modelEvidence.modelSelectionFingerprint,
+          requestedAt: observedAt,
+        };
+      };
+      const invalidProviderId = ProviderInstanceId.make("codex-invalid-return");
+      const secondGuardProviderId = ProviderInstanceId.make("codex-second-guard");
+      const invalidRequest = makeAdmissionRequest("invalid-return", invalidProviderId);
+      const secondGuardRequest = makeAdmissionRequest("second-guard", secondGuardProviderId);
+      const admit = (value: ProviderAdmissionRequest) =>
+        store.request({
+          request: value,
+          usage: providerAdmissionUsageEvidence({
+            providerInstanceId: value.providerInstanceId,
+            status: "allowed",
+            observedAt,
+            source: "refresh",
+            nextRelevantAt: null,
+          }),
+          ownerId: `owner-${value.handoffId}`,
+          leaseExpiresAt: expiresAt,
+          now: observedAt,
+        });
+      const invalidDecision = yield* admit(invalidRequest);
+      const secondGuardDecision = yield* admit(secondGuardRequest);
+      assert.equal(invalidDecision._tag, "Admitted");
+      assert.equal(secondGuardDecision._tag, "Admitted");
+      if (invalidDecision._tag !== "Admitted" || secondGuardDecision._tag !== "Admitted") return;
+
+      const deliveryTriggers = yield* sql<{ readonly name: string; readonly source: string }>`
+          SELECT name,sql AS source FROM main.sqlite_schema
+          WHERE type='trigger' AND tbl_name IN (
+            'agent_control_stage_run_states',
+            'agent_control_stage_run_lease_states',
+            'agent_control_initial_planning_deliveries'
+          ) AND sql IS NOT NULL
+          ORDER BY name
+        `;
+      for (const trigger of deliveryTriggers) {
+        yield* sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+      }
+      yield* sql`PRAGMA foreign_keys=OFF`;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          for (const value of [invalidRequest, secondGuardRequest]) {
+            yield* sql`
+            INSERT INTO main.agent_control_stage_run_states (
+              stage_run_id,project_id,task_id,attempt_id,role_id,stage_kind,stage_ordinal,
+              attempt_ordinal,status,task_revision,github_intake_sequence,
+              source_identity_fingerprint,state_json,created_at,updated_at,revision,last_event_sequence
+            ) VALUES (
+              ${value.stageRunId},${value.projectId},${value.taskId},${value.attemptId},
+              ${`role-${value.handoffId}`},'planning',1,1,'running',1,1,${"a".repeat(64)},
+              '{}',${observedAt},${observedAt},1,1
+            )
+          `;
+            yield* sql`
+            INSERT INTO main.agent_control_stage_run_lease_states (
+              lease_id,project_id,task_id,stage_run_id,attempt_id,task_revision,
+              github_intake_sequence,source_identity_fingerprint,holder_id,fence_token,
+              status,acquired_at,renewed_at,expires_at,released_at,state_json,revision,
+              last_event_sequence
+            ) VALUES (
+              ${value.stageLeaseId},${value.projectId},${value.taskId},${value.stageRunId},
+              ${value.attemptId},1,1,${"a".repeat(64)},${value.stageLeaseHolderId},
+              ${value.stageFenceToken},'reserved',${observedAt},${observedAt},${expiresAt},
+              NULL,'{}',1,1
+            )
+          `;
+            yield* sql`
+            INSERT INTO main.agent_control_initial_planning_deliveries (
+              provider_delivery_id,handoff_id,handoff_fingerprint,
+              controlled_thread_reservation_id,thread_id,turn_request_command_id,message_id,
+              provider_instance_id,state,revision,claim_owner_id,claim_generation,
+              claim_expires_at,attempt_count,next_attempt_at,planning_deadline_at,
+              provider_turn_id,provider_accepted_at,provider_session_created_at,
+              provider_resume_cursor_json,terminal_at,last_error_code,interrupt_requested,updated_at
+            ) VALUES (
+              ${value.providerDeliveryId},${value.handoffId},${
+                value === invalidRequest ? "b".repeat(64) : "c".repeat(64)
+              },
+              ${`reservation-${value.handoffId}`},${value.threadId},
+              ${`command-${value.handoffId}`},${`message-${value.handoffId}`},
+              ${value.providerInstanceId},'claimed',1,'delivery-owner',1,${expiresAt},0,NULL,
+              ${expiresAt},NULL,NULL,NULL,NULL,NULL,NULL,0,${observedAt}
+            )
+          `;
+          }
+        }),
+      );
+      for (const trigger of deliveryTriggers) {
+        yield* sql.unsafe(trigger.source).unprepared;
+      }
+      yield* sql`PRAGMA foreign_keys=ON`;
+
+      const taskGuard: AgentControlTaskConsumerGuardShape = {
+        inspectProject: () => Effect.die("not used"),
+        useTaskConsumable: (_projectId, _taskId, use) => use({} as never, {} as never),
+        useTaskConsumableInTransaction: (_projectId, _taskId, use) => use({} as never, {} as never),
+        useTaskForProviderEffectInTransaction: (_projectId, _taskId, use) =>
+          use({} as never, {} as never),
+      };
+      const guardContext = yield* Layer.buildWithScope(
+        Layer.fresh(ProviderAdmissionGuardLive).pipe(
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+          Layer.provide(Layer.succeed(ProviderAdmissionStore, store)),
+          Layer.provide(Layer.succeed(AgentControlTaskConsumerGuard, taskGuard)),
+        ),
+        admissionScope,
+      );
+      const productionGuard = Context.get(guardContext, ProviderAdmissionGuard);
+      const guardCalls: Array<string> = [];
+      const guardedAdmission = ProviderAdmissionGuard.of({
+        enter: (permit, boundary) =>
+          Effect.sync(() => guardCalls.push(`enter:${permit.admissionId}:${boundary}`)).pipe(
+            Effect.andThen(
+              permit.admissionId === secondGuardDecision.permit.admissionId &&
+                boundary === "turn-start"
+                ? Effect.fail(
+                    new ProviderAdmissionError({
+                      operation: "test-second-guard",
+                      reason: "project-inactive",
+                      admissionId: permit.admissionId,
+                    }),
+                  )
+                : productionGuard.enter(permit, boundary),
+            ),
+          ),
+        quarantineUnknown: (permit) =>
+          Effect.sync(() => guardCalls.push(`quarantine:${permit.admissionId}`)).pipe(
+            Effect.andThen(productionGuard.quarantineUnknown(permit)),
+          ),
+      });
+
+      const invalidAdapter = makeFakeCodexAdapter(CODEX_DRIVER, {
+        providerInstanceId: invalidProviderId,
+      });
+      const secondGuardAdapter = makeFakeCodexAdapter(CODEX_DRIVER, {
+        providerInstanceId: secondGuardProviderId,
+      });
+      const invalidNativeResult = (input: ProviderSessionStartInput) =>
+        Effect.succeed({
+          provider: CODEX_DRIVER,
+          providerInstanceId: ProviderInstanceId.make("codex-foreign-return"),
+          status: "ready" as const,
+          runtimeMode: input.runtimeMode,
+          threadId: input.threadId,
+          cwd: input.cwd ?? process.cwd(),
+          model: input.modelSelection?.model,
+          createdAt: observedAt,
+          updatedAt: observedAt,
+        });
+      invalidAdapter.startSession.mockImplementationOnce(invalidNativeResult);
+      const registry = makeCompatibleInstanceRegistry({
+        driverKind: CODEX_DRIVER,
+        continuationKey: "codex:test-capacity",
+        adapters: new Map([
+          [invalidProviderId, invalidAdapter.adapter],
+          [secondGuardProviderId, secondGuardAdapter.adapter],
+        ]),
+      });
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = Layer.mergeAll(
+        makeProviderServiceLive().pipe(
+          Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+          Layer.provide(directoryLayer),
+          Layer.provide(defaultServerSettingsLayer),
+          Layer.provide(Layer.succeed(ProviderAdmissionGuard, guardedAdmission)),
+          Layer.provideMerge(AnalyticsService.layerTest),
+          Layer.provide(
+            Layer.succeed(
+              ProviderEventLoggers.ProviderEventLoggers,
+              ProviderEventLoggers.NoOpProviderEventLoggers,
+            ),
+          ),
+        ),
+        directoryLayer,
+        runtimeRepositoryLayer,
+        NodeServices.layer,
+      );
+      const providerScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(providerScope, Exit.void));
+      const providerContext = yield* Layer.buildWithScope(providerLayer, providerScope);
+      const provider = Context.get(providerContext, ProviderService.ProviderService);
+
+      const invalidExit = yield* Effect.exit(
+        provider.startSession(
+          asThreadId(invalidRequest.threadId),
+          {
+            provider: CODEX_DRIVER,
+            providerInstanceId: invalidProviderId,
+            threadId: asThreadId(invalidRequest.threadId),
+            cwd: "/tmp/invalid-return",
+            modelSelection: invalidRequest.modelSelection,
+            runtimeMode: "approval-required",
+          },
+          { providerAdmissionPermit: invalidDecision.permit },
+        ),
+      );
+      assert.isTrue(Exit.isFailure(invalidExit));
+      assert.equal(invalidAdapter.startSession.mock.calls.length, 1);
+
+      yield* provider.startSession(
+        asThreadId(secondGuardRequest.threadId),
+        {
+          provider: CODEX_DRIVER,
+          providerInstanceId: secondGuardProviderId,
+          threadId: asThreadId(secondGuardRequest.threadId),
+          cwd: "/tmp/second-guard",
+          modelSelection: secondGuardRequest.modelSelection,
+          runtimeMode: "approval-required",
+        },
+        { providerAdmissionPermit: secondGuardDecision.permit },
+      );
+      assert.isTrue(
+        guardCalls.includes(`enter:${secondGuardDecision.permit.admissionId}:session-start`),
+      );
+      assert.deepStrictEqual(
+        yield* sql<{ readonly status: string }>`
+            SELECT status FROM main.agent_control_provider_admission_current
+            WHERE admission_id=${secondGuardDecision.permit.admissionId}
+          `,
+        [{ status: "entered" }],
+      );
+      const attestation = yield* provider.getSessionAttestation!(
+        asThreadId(secondGuardRequest.threadId),
+      );
+      assert.isDefined(attestation);
+      if (attestation === undefined) return;
+      const secondGuardExit = yield* Effect.exit(
+        provider.sendTurnAtPreInvokeBoundary!(
+          {
+            threadId: asThreadId(secondGuardRequest.threadId),
+            input: "must remain blocked",
+            attachments: [],
+            modelSelection: secondGuardRequest.modelSelection,
+            interactionMode: "plan",
+          },
+          {
+            expected: attestation,
+            providerAdmissionPermit: secondGuardDecision.permit,
+            beforeDeliveryCas: () => Effect.die("unexpected-before-cas"),
+            persistDeliveryAttempted: () => Effect.die("unexpected-delivery-cas"),
+            afterDeliveryCas: () => Effect.die("unexpected-after-cas"),
+          },
+        ),
+      );
+      assert.isTrue(Exit.isFailure(secondGuardExit));
+      assert.equal(secondGuardAdapter.sendTurn.mock.calls.length, 0);
+
+      for (const permit of [invalidDecision.permit, secondGuardDecision.permit]) {
+        assert.deepStrictEqual(
+          yield* sql<{
+            readonly status: string;
+            readonly activeState: string;
+          }>`
+              SELECT admission.status,capacity.active_state AS "activeState"
+              FROM main.agent_control_provider_admission_current admission
+              JOIN main.agent_control_provider_capacity_current capacity
+                ON capacity.provider_instance_id=admission.provider_instance_id
+              WHERE admission.admission_id=${permit.admissionId}
+            `,
+          [{ status: "quarantined", activeState: "quarantined" }],
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+              SELECT count(*) AS count
+              FROM main.agent_control_provider_authority_evidence evidence
+              JOIN main.agent_control_provider_authority_receipts receipt
+                ON receipt.evidence_id=evidence.evidence_id
+                AND receipt.receipt_id=evidence.receipt_id
+                AND receipt.marker_id=evidence.marker_id
+              JOIN main.agent_control_provider_authority_markers marker
+                ON marker.evidence_id=evidence.evidence_id
+                AND marker.receipt_id=evidence.receipt_id
+                AND marker.marker_id=evidence.marker_id
+              WHERE evidence.admission_id=${permit.admissionId}
+                AND evidence.authority_kind='quarantine'
+                AND receipt.authority_kind='quarantine'
+                AND marker.authority_kind='quarantine'
+            `)[0]?.count,
+          1,
+        );
+        const blockedRequest = makeAdmissionRequest(
+          `blocked-${permit.admissionId.slice(-8)}`,
+          permit.providerInstanceId,
+        );
+        assert.equal((yield* admit(blockedRequest))._tag, "Waiting");
+      }
+
+      const otherRequest = makeAdmissionRequest(
+        "other-provider-progress",
+        ProviderInstanceId.make("codex-other-progress"),
+      );
+      assert.equal((yield* admit(otherRequest))._tag, "Admitted");
+
+      invalidAdapter.startSession.mockImplementationOnce(invalidNativeResult);
+      const humanExit = yield* Effect.exit(
+        provider.startSession(asThreadId("thread-human-invalid-return"), {
+          provider: CODEX_DRIVER,
+          providerInstanceId: invalidProviderId,
+          threadId: asThreadId("thread-human-invalid-return"),
+          runtimeMode: "approval-required",
+        }),
+      );
+      assert.isTrue(Exit.isFailure(humanExit));
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+            SELECT count(*) AS count
+            FROM main.agent_control_provider_authority_markers
+            WHERE authority_kind='quarantine'
+          `)[0]?.count,
+        2,
+      );
+      const foreignKeyViolations = yield* sql<{ readonly table: string }>`
+          PRAGMA main.foreign_key_check
+        `;
+      assert.isFalse(
+        foreignKeyViolations.some((violation) =>
+          violation.table.startsWith("agent_control_provider_"),
+        ),
+      );
+      assert.equal((yield* sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 const routing = makeProviderServiceLayer();

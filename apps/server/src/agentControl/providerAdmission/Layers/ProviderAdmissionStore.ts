@@ -130,6 +130,34 @@ interface FinalizationRow {
   readonly finalizedAt: string;
 }
 
+interface AuthorityChainRow {
+  readonly authorityKind:
+    | "admission"
+    | "session-entry"
+    | "turn-entry"
+    | "quarantine"
+    | "supersede"
+    | "release";
+  readonly providerInstanceId: string;
+  readonly ownerId: string;
+  readonly providerFenceToken: number;
+  readonly occurredAt: string;
+  readonly terminalRuntimeEventId: string | null;
+  readonly terminalEventType: string | null;
+  readonly terminalStreamVersion: number | null;
+  readonly finalizationMarkerId: string | null;
+  readonly finalizationMarkerFingerprint: string | null;
+  readonly payloadStorageClass: unknown;
+  readonly payloadBytes: unknown;
+  readonly payloadFingerprint: string;
+  readonly evidenceId: string;
+  readonly receiptId: string;
+  readonly markerId: string;
+  readonly markerFingerprint: string;
+  readonly committedAt: string;
+  readonly markerSequence: number;
+}
+
 interface ProviderAdmissionAttemptInput {
   readonly request: ProviderAdmissionRequest;
   readonly usage?: ProviderAdmissionUsageEvidence;
@@ -356,6 +384,121 @@ const make = Effect.gen(function* () {
     `;
     return { markerId, markerFingerprint: fingerprint };
   });
+
+  const readCompleteAuthorityChains = (admissionId: string) =>
+    sql<AuthorityChainRow>`
+      SELECT evidence.authority_kind AS "authorityKind",
+        evidence.provider_instance_id AS "providerInstanceId",
+        evidence.owner_id AS "ownerId",
+        evidence.provider_fence_token AS "providerFenceToken",
+        evidence.occurred_at AS "occurredAt",
+        evidence.terminal_runtime_event_id AS "terminalRuntimeEventId",
+        evidence.terminal_event_type AS "terminalEventType",
+        evidence.terminal_stream_version AS "terminalStreamVersion",
+        evidence.finalization_marker_id AS "finalizationMarkerId",
+        evidence.finalization_marker_fingerprint AS "finalizationMarkerFingerprint",
+        typeof(evidence.payload_json) AS "payloadStorageClass",
+        CAST(evidence.payload_json AS BLOB) AS "payloadBytes",
+        evidence.payload_fingerprint AS "payloadFingerprint",
+        evidence.evidence_id AS "evidenceId",receipt.receipt_id AS "receiptId",
+        marker.marker_id AS "markerId",marker.marker_fingerprint AS "markerFingerprint",
+        marker.committed_at AS "committedAt",marker.rowid AS "markerSequence"
+      FROM main.agent_control_provider_authority_evidence evidence
+      JOIN main.agent_control_provider_authority_receipts receipt
+        ON receipt.receipt_id=evidence.receipt_id
+        AND receipt.evidence_id=evidence.evidence_id
+        AND receipt.marker_id=evidence.marker_id
+        AND receipt.admission_id=evidence.admission_id
+        AND receipt.authority_kind=evidence.authority_kind
+        AND receipt.status='accepted'
+        AND receipt.accepted_at=evidence.occurred_at
+      JOIN main.agent_control_provider_authority_markers marker
+        ON marker.marker_id=evidence.marker_id
+        AND marker.evidence_id=evidence.evidence_id
+        AND marker.receipt_id=evidence.receipt_id
+        AND marker.admission_id=evidence.admission_id
+        AND marker.authority_kind=evidence.authority_kind
+        AND marker.marker_fingerprint=evidence.payload_fingerprint
+        AND marker.committed_at=evidence.occurred_at
+      WHERE evidence.admission_id=${admissionId}
+        AND typeof(evidence.admission_id)='text'
+        AND typeof(evidence.authority_kind)='text'
+        AND typeof(evidence.provider_instance_id)='text'
+        AND typeof(evidence.owner_id)='text'
+        AND typeof(evidence.provider_fence_token)='integer'
+        AND typeof(evidence.occurred_at)='text'
+        AND typeof(evidence.payload_json)='blob'
+        AND typeof(evidence.payload_fingerprint)='text'
+        AND typeof(receipt.receipt_id)='text'
+        AND typeof(receipt.status)='text'
+        AND typeof(receipt.accepted_at)='text'
+        AND typeof(marker.marker_id)='text'
+        AND typeof(marker.marker_fingerprint)='text'
+        AND typeof(marker.committed_at)='text'
+      ORDER BY marker.committed_at,marker.marker_id
+    `;
+
+  const authorityChainMatches = (
+    chain: AuthorityChainRow,
+    input: {
+      readonly admissionId: string;
+      readonly authorityKind: AuthorityChainRow["authorityKind"];
+      readonly providerInstanceId: string;
+      readonly ownerId: string;
+      readonly providerFenceToken: number;
+      readonly details: Record<string, JsonValue>;
+    },
+  ): boolean => {
+    if (
+      chain.authorityKind !== input.authorityKind ||
+      chain.providerInstanceId !== input.providerInstanceId ||
+      chain.ownerId !== input.ownerId ||
+      chain.providerFenceToken !== input.providerFenceToken ||
+      chain.payloadStorageClass !== "blob" ||
+      chain.evidenceId !==
+        providerAdmissionAuthorityId(
+          input.authorityKind,
+          input.admissionId,
+          `${input.providerFenceToken}:evidence`,
+        ) ||
+      chain.receiptId !==
+        providerAdmissionAuthorityId(
+          input.authorityKind,
+          input.admissionId,
+          `${input.providerFenceToken}:receipt`,
+        ) ||
+      chain.markerId !==
+        providerAdmissionAuthorityId(
+          input.authorityKind,
+          input.admissionId,
+          `${input.providerFenceToken}:marker`,
+        ) ||
+      chain.committedAt !== chain.occurredAt
+    ) {
+      return false;
+    }
+    try {
+      const payload = decodeCanonicalUtf8Bytes(chain.payloadBytes);
+      const expected = canonicalJson(
+        authorityDocument({
+          admissionId: input.admissionId,
+          authorityKind: input.authorityKind,
+          providerInstanceId: input.providerInstanceId,
+          ownerId: input.ownerId,
+          providerFenceToken: input.providerFenceToken,
+          occurredAt: chain.occurredAt,
+          details: input.details,
+        }),
+      );
+      return (
+        payload === expected &&
+        sha256Utf8(payload) === chain.payloadFingerprint &&
+        chain.markerFingerprint === chain.payloadFingerprint
+      );
+    } catch {
+      return false;
+    }
+  };
 
   const permitFromRows = (
     current: CurrentRow,
@@ -1510,6 +1653,61 @@ const make = Effect.gen(function* () {
       ) {
         return yield* fail("startup-ddl-audit", "authority-divergent");
       }
+      const authorityCounts = yield* sql<{
+        readonly evidenceCount: number;
+        readonly receiptCount: number;
+        readonly markerCount: number;
+        readonly completeCount: number;
+      }>`
+        SELECT
+          (SELECT count(*) FROM main.agent_control_provider_authority_evidence) AS "evidenceCount",
+          (SELECT count(*) FROM main.agent_control_provider_authority_receipts) AS "receiptCount",
+          (SELECT count(*) FROM main.agent_control_provider_authority_markers) AS "markerCount",
+          (SELECT count(*)
+           FROM main.agent_control_provider_authority_evidence evidence
+           JOIN main.agent_control_provider_authority_receipts receipt
+             ON receipt.receipt_id=evidence.receipt_id
+             AND receipt.evidence_id=evidence.evidence_id
+             AND receipt.marker_id=evidence.marker_id
+             AND receipt.admission_id=evidence.admission_id
+             AND receipt.authority_kind=evidence.authority_kind
+             AND receipt.status='accepted'
+             AND receipt.accepted_at=evidence.occurred_at
+           JOIN main.agent_control_provider_authority_markers marker
+             ON marker.marker_id=evidence.marker_id
+             AND marker.evidence_id=evidence.evidence_id
+             AND marker.receipt_id=evidence.receipt_id
+             AND marker.admission_id=evidence.admission_id
+             AND marker.authority_kind=evidence.authority_kind
+             AND marker.marker_fingerprint=evidence.payload_fingerprint
+             AND marker.committed_at=evidence.occurred_at
+           WHERE typeof(evidence.evidence_id)='text'
+             AND typeof(evidence.receipt_id)='text'
+             AND typeof(evidence.marker_id)='text'
+             AND typeof(evidence.admission_id)='text'
+             AND typeof(evidence.authority_kind)='text'
+             AND typeof(evidence.provider_instance_id)='text'
+             AND typeof(evidence.owner_id)='text'
+             AND typeof(evidence.provider_fence_token)='integer'
+             AND typeof(evidence.occurred_at)='text'
+             AND typeof(evidence.payload_json)='blob'
+             AND typeof(evidence.payload_fingerprint)='text'
+             AND typeof(receipt.receipt_id)='text'
+             AND typeof(receipt.status)='text'
+             AND typeof(receipt.accepted_at)='text'
+             AND typeof(marker.marker_id)='text'
+             AND typeof(marker.marker_fingerprint)='text'
+             AND typeof(marker.committed_at)='text') AS "completeCount"
+      `;
+      const counts = authorityCounts[0];
+      if (
+        counts === undefined ||
+        counts.evidenceCount !== counts.completeCount ||
+        counts.receiptCount !== counts.completeCount ||
+        counts.markerCount !== counts.completeCount
+      ) {
+        return yield* fail("startup-authority-chain-audit", "authority-divergent");
+      }
       const admissionProblems = yield* sql<{ readonly count: number }>`
       SELECT count(*) AS count
       FROM main.agent_control_provider_admission_current current
@@ -1576,6 +1774,197 @@ const make = Effect.gen(function* () {
     `;
       if (admissionProblems[0]?.count !== 0 || capacityProblems[0]?.count !== 0) {
         return yield* fail("startup-projection-audit", "authority-divergent");
+      }
+
+      const currentIds = yield* sql<{ readonly admissionId: string }>`
+        SELECT admission_id AS "admissionId"
+        FROM main.agent_control_provider_admission_current
+        ORDER BY admission_id
+      `;
+      for (const { admissionId } of currentIds) {
+        const [current, intent, chains] = yield* Effect.all([
+          readCurrent(admissionId),
+          readIntent(admissionId),
+          readCompleteAuthorityChains(admissionId),
+        ]);
+        if (current === undefined || intent === undefined) {
+          return yield* fail("startup-authority-history-audit", "authority-divergent", admissionId);
+        }
+        const admissionChains = chains.filter((chain) => chain.authorityKind === "admission");
+        const entryChains = chains.filter(
+          (chain) =>
+            chain.authorityKind === "session-entry" || chain.authorityKind === "turn-entry",
+        );
+        const quarantineChains = chains.filter((chain) => chain.authorityKind === "quarantine");
+        const supersedeChains = chains.filter((chain) => chain.authorityKind === "supersede");
+        const releaseChains = chains.filter((chain) => chain.authorityKind === "release");
+        const newestMarkerSequence = chains.reduce(
+          (latest, chain) => Math.max(latest, chain.markerSequence),
+          0,
+        );
+        const isNewest = (chain: AuthorityChainRow) =>
+          chain.markerSequence === newestMarkerSequence;
+
+        for (const chain of [...admissionChains, ...entryChains]) {
+          const details =
+            chain.authorityKind === "admission"
+              ? {
+                  handoffId: intent.handoffId,
+                  providerDeliveryId: intent.providerDeliveryId,
+                  usageEvidenceFingerprint: current.usageEvidenceFingerprint,
+                }
+              : {
+                  handoffId: intent.handoffId,
+                  providerDeliveryId: intent.providerDeliveryId,
+                  stageFenceToken: intent.stageFenceToken,
+                };
+          if (
+            !authorityChainMatches(chain, {
+              admissionId,
+              authorityKind: chain.authorityKind,
+              providerInstanceId: current.providerInstanceId,
+              ownerId: chain.ownerId,
+              providerFenceToken: chain.providerFenceToken,
+              details,
+            })
+          ) {
+            return yield* fail(
+              "startup-authority-history-audit",
+              "authority-divergent",
+              admissionId,
+            );
+          }
+        }
+        for (const chain of quarantineChains) {
+          const matchesReason = (
+            ["external-outcome-unknown", "owner-lost-after-entry"] as const
+          ).some((reason) =>
+            authorityChainMatches(chain, {
+              admissionId,
+              authorityKind: "quarantine",
+              providerInstanceId: current.providerInstanceId,
+              ownerId: chain.ownerId,
+              providerFenceToken: chain.providerFenceToken,
+              details: { reason },
+            }),
+          );
+          if (!matchesReason) {
+            return yield* fail(
+              "startup-authority-history-audit",
+              "authority-divergent",
+              admissionId,
+            );
+          }
+        }
+
+        const currentAdmissionChain =
+          current.admissionMarkerId === null || current.providerFenceToken === null
+            ? undefined
+            : admissionChains.filter(
+                (chain) =>
+                  chain.markerId === current.admissionMarkerId &&
+                  chain.markerFingerprint === current.admissionMarkerFingerprint &&
+                  chain.providerInstanceId === current.providerInstanceId &&
+                  chain.ownerId === current.ownerId &&
+                  chain.providerFenceToken === current.providerFenceToken,
+              );
+        if (
+          (current.status === "admitted" ||
+            current.status === "entered" ||
+            current.status === "quarantined" ||
+            current.status === "released" ||
+            (current.status === "superseded" && current.admissionMarkerId !== null)) &&
+          currentAdmissionChain?.length !== 1
+        ) {
+          return yield* fail("startup-current-admission-audit", "authority-divergent", admissionId);
+        }
+        if (current.status === "waiting" && chains.length !== 0) {
+          return yield* fail("startup-waiting-history-audit", "authority-divergent", admissionId);
+        }
+        if (
+          current.status === "admitted" &&
+          (chains.length !== admissionChains.length ||
+            currentAdmissionChain?.[0] === undefined ||
+            !isNewest(currentAdmissionChain[0]))
+        ) {
+          return yield* fail("startup-admitted-history-audit", "authority-divergent", admissionId);
+        }
+        if (
+          current.status === "entered" &&
+          (entryChains.length < 1 ||
+            quarantineChains.length !== 0 ||
+            supersedeChains.length !== 0 ||
+            releaseChains.length !== 0 ||
+            !entryChains.some(
+              (chain) =>
+                chain.providerInstanceId === current.providerInstanceId &&
+                chain.ownerId === current.ownerId &&
+                chain.providerFenceToken === current.providerFenceToken &&
+                isNewest(chain),
+            ))
+        ) {
+          return yield* fail("startup-entered-history-audit", "authority-divergent", admissionId);
+        }
+        if (
+          current.status === "quarantined" &&
+          (entryChains.length < 1 ||
+            quarantineChains.length !== 1 ||
+            supersedeChains.length !== 0 ||
+            releaseChains.length !== 0 ||
+            !quarantineChains.some(
+              (chain) =>
+                chain.providerInstanceId === current.providerInstanceId &&
+                chain.ownerId === current.ownerId &&
+                chain.providerFenceToken === current.providerFenceToken &&
+                isNewest(chain),
+            ))
+        ) {
+          return yield* fail(
+            "startup-quarantined-history-audit",
+            "authority-divergent",
+            admissionId,
+          );
+        }
+        if (current.status !== "released" && current.status !== "superseded") continue;
+        if (
+          (current.status === "released" &&
+            (releaseChains.length !== 1 || supersedeChains.length !== 0)) ||
+          (current.status === "superseded" &&
+            (supersedeChains.length !== 1 ||
+              releaseChains.length !== 0 ||
+              entryChains.length !== 0))
+        ) {
+          return yield* fail("startup-terminal-history-audit", "authority-divergent", admissionId);
+        }
+        const terminalChain =
+          current.status === "released" ? releaseChains[0]! : supersedeChains[0]!;
+        if (
+          terminalChain.providerFenceToken !== (current.providerFenceToken ?? 0) ||
+          !isNewest(terminalChain)
+        ) {
+          return yield* fail(
+            "startup-terminal-authority-audit",
+            "authority-divergent",
+            admissionId,
+          );
+        }
+        // Replaying the existing terminal authority is a read-only semantic
+        // audit here: the complete-chain and fence checks above guarantee that
+        // appendAuthority finds the single committed marker instead of writing.
+        // This deliberately reuses the production release binding checks for
+        // finalization, terminal runtime provenance, and the canonical payload.
+        const releasedProvider = yield* releaseFromFinalizationInTransactionRaw({
+          stage: current.stage,
+          handoffId: current.handoffId,
+          finalizedAt: terminalChain.occurredAt,
+        });
+        if (releasedProvider !== current.providerInstanceId) {
+          return yield* fail(
+            "startup-terminal-authority-audit",
+            "authority-divergent",
+            admissionId,
+          );
+        }
       }
     },
   );
