@@ -76,6 +76,17 @@ export interface AgentControlTaskConsumerGuardShape {
     taskId: AgentControlTaskId,
     use: (task: AgentControlTaskState, gate: AgentControlTaskProjectGate) => Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, AgentControlTaskConsumerGuardError | E, R>;
+  /**
+   * Caller-owned transaction gate for an already admitted automated provider
+   * effect. Unlike the intake gate, this accepts only tasks that have entered
+   * the durable execution lifecycle. It still re-reads project mode and the
+   * authoritative task history in the caller's SQLite transaction.
+   */
+  readonly useTaskForProviderEffectInTransaction?: <A, E, R>(
+    projectId: ProjectId,
+    taskId: AgentControlTaskId,
+    use: (task: AgentControlTaskState, gate: AgentControlTaskProjectGate) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, AgentControlTaskConsumerGuardError | E, R>;
   /** Server-internal entry seam. Public prepare paths must never call this. */
   readonly useTaskSelectedForRunOnce?: <A, E, R>(
     runId: AgentControlRunOnceId,

@@ -29,6 +29,9 @@ import {
 import { AgentControlInitialPlanningConsumerHooks } from "../Services/AgentControlInitialPlanningConsumerHooks.ts";
 import { AgentControlInitialPlanningHandoffStore } from "../Services/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningWakeup } from "../Services/AgentControlInitialPlanningWakeup.ts";
+import { ProviderAdmissionRuntime } from "../../providerAdmission/Services/ProviderAdmissionRuntime.ts";
+import type { ProviderAdmissionPermit } from "../../providerAdmission/model.ts";
+import { canonicalProviderModelSelectionEvidence } from "../../../provider/Services/ProviderAdapter.ts";
 
 const CLAIM_DURATION = Duration.minutes(2);
 const RETRY_DELAY = Duration.seconds(30);
@@ -88,6 +91,9 @@ const make = Effect.gen(function* () {
   const providerRuntimeRepository = yield* ProviderSessionRuntimeRepository;
   const providerService = yield* ProviderService;
   const turnRequestExecutor = yield* ProviderTurnRequestExecutor;
+  const providerAdmission = Option.getOrUndefined(
+    yield* Effect.serviceOption(ProviderAdmissionRuntime),
+  );
   const ownerId = yield* crypto.randomUUIDv4.pipe(
     Effect.orDie,
     Effect.map((uuid) => `initial-planning-consumer:${uuid}`),
@@ -358,8 +364,42 @@ const make = Effect.gen(function* () {
   const hasExceptionalReasons = (cause: Cause.Cause<unknown>): boolean =>
     Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason);
 
+  const requestProviderAdmission = Effect.fn(
+    "AgentControlInitialPlanningConsumer.requestProviderAdmission",
+  )(function* (claim: AgentControlInitialPlanningClaim) {
+    const modelEvidence = canonicalProviderModelSelectionEvidence(claim.evidence.modelSelection);
+    if (providerAdmission === undefined) {
+      return yield* new ProviderAdapterRequestError({
+        provider: String(claim.evidence.providerInstanceId),
+        method: "provider-admission",
+        detail: "Durable provider admission authority is unavailable.",
+      });
+    }
+    return yield* providerAdmission
+      .request({
+        stage: "initial-planning",
+        projectId: String(claim.evidence.projectId),
+        taskId: claim.evidence.taskId,
+        stageRunId: claim.evidence.stageRunId,
+        attemptId: claim.evidence.attemptId,
+        handoffId: claim.evidence.handoffId,
+        providerDeliveryId: claim.evidence.providerDeliveryId,
+        threadId: String(claim.evidence.threadId),
+        providerInstanceId: claim.evidence.providerInstanceId,
+        stageLeaseId: claim.evidence.leaseId,
+        stageLeaseHolderId: claim.evidence.leaseHolderId,
+        stageFenceToken: claim.evidence.fenceToken,
+        modelSelection: claim.evidence.modelSelection,
+        modelSelectionJson: modelEvidence.modelSelectionJson,
+        modelSelectionFingerprint: modelEvidence.modelSelectionFingerprint,
+        requestedAt: claim.evidence.createdAt,
+      })
+      .pipe(Effect.orDie);
+  });
+
   const deliver = Effect.fn("AgentControlInitialPlanningConsumer.deliver")(function* (
     claim: AgentControlInitialPlanningClaim,
+    providerAdmissionPermit: ProviderAdmissionPermit,
   ) {
     const current = yield* DateTime.now;
     yield* hooks.beforeClaim(claim.evidence.handoffId);
@@ -381,6 +421,8 @@ const make = Effect.gen(function* () {
       interactionMode: "plan" as const,
       createdAt: DateTime.formatIso(current),
       providerDeliveryId: owned.evidence.providerDeliveryId,
+      durableDeliveryKind: "initial-planning" as const,
+      providerAdmissionPermit,
     };
     const prepareExit = yield* turnRequestExecutor
       .prepareTurnDelivery(deliveryInput)
@@ -534,9 +576,6 @@ const make = Effect.gen(function* () {
     if (claim.delivery.planningDeadlineAt <= (yield* nowIso)) {
       return yield* processDeadline(claim);
     }
-    if (claim.delivery.state === "pending") {
-      claim = yield* acceptTurn(claim);
-    }
     if (
       claim.delivery.state === "provider-started" ||
       claim.delivery.state === "interrupt-requested"
@@ -551,9 +590,13 @@ const make = Effect.gen(function* () {
     if (
       claim.delivery.state === "turn-accepted" ||
       claim.delivery.state === "retry-wait" ||
+      claim.delivery.state === "pending" ||
       claim.delivery.state === "claimed"
     ) {
-      yield* deliver(claim);
+      const admission = yield* requestProviderAdmission(claim);
+      if (admission._tag === "Waiting") return;
+      if (claim.delivery.state === "pending") claim = yield* acceptTurn(claim);
+      yield* deliver(claim, admission.permit);
     }
   });
 

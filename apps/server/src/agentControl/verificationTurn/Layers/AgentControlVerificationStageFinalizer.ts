@@ -67,6 +67,7 @@ import {
   type AgentControlVerificationStageFinalizerShape,
 } from "../Services/AgentControlVerificationStageFinalizer.ts";
 import { AgentControlVerificationStageFinalizerHooks } from "../Services/AgentControlVerificationStageFinalizerHooks.ts";
+import { ProviderAdmissionReleaseAuthority } from "../../providerAdmission/Services/ProviderAdmissionReleaseAuthority.ts";
 import { AgentControlVerificationTurnWakeup } from "../Services/AgentControlVerificationTurnWakeup.ts";
 import type { AgentControlVerificationClaim } from "../model.ts";
 
@@ -145,6 +146,9 @@ const make = Effect.gen(function* () {
   const leaseProjection = yield* AgentControlStageRunLeaseProjection;
   const leaseEngine = yield* AgentControlStageRunLeaseEngine;
   const hooks = yield* AgentControlVerificationStageFinalizerHooks;
+  const providerAdmissionRelease = Option.getOrUndefined(
+    yield* Effect.serviceOption(ProviderAdmissionReleaseAuthority),
+  );
 
   const error = (
     handoffId: string,
@@ -1739,8 +1743,23 @@ const make = Effect.gen(function* () {
         error(handoffId, "insert-finalization-marker", "persistence", cause),
       ),
     );
+    const releasedProviderInstanceId =
+      providerAdmissionRelease === undefined
+        ? null
+        : yield* providerAdmissionRelease
+            .releaseInTransaction({
+              stage: "verification",
+              handoffId,
+              finalizedAt,
+            })
+            .pipe(
+              Effect.mapError((cause) =>
+                error(handoffId, "provider-admission-release", "persistence", cause),
+              ),
+            );
     return {
       _tag: "Finalized",
+      releasedProviderInstanceId,
       publication: {
         handoffId,
         finalizationEvidenceId,
@@ -1790,6 +1809,9 @@ const make = Effect.gen(function* () {
     const transaction = transactionExit.value;
     if (transaction._tag !== "Finalized") return transaction;
     yield* hooks.afterCommit(handoffId);
+    yield* providerAdmissionRelease === undefined
+      ? Effect.void
+      : providerAdmissionRelease.signalCommitted(transaction.releasedProviderInstanceId);
     yield* Effect.uninterruptible(
       Effect.gen(function* () {
         yield* stageEngine.publishCommitted([transaction.publication.stageEvent]);

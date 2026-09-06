@@ -158,6 +158,8 @@ import {
   type AgentControlInitialPlanningConsumerHooksShape,
 } from "../../initialPlanning/Services/AgentControlInitialPlanningConsumerHooks.ts";
 import { AgentControlInitialPlanningHandoffStore } from "../../initialPlanning/Services/AgentControlInitialPlanningHandoffStore.ts";
+import { providerAdmissionId } from "../../providerAdmission/model.ts";
+import { ProviderAdmissionRuntime } from "../../providerAdmission/Services/ProviderAdmissionRuntime.ts";
 import { OrchestrationLayerLive } from "../../../orchestration/runtimeLayer.ts";
 import { agentControlThreadBindingEqualitySql } from "../../../orchestration/agentControlThreadBindingStorage.ts";
 import { ORCHESTRATION_PROJECTOR_NAMES } from "../../../orchestration/Layers/ProjectionPipeline.ts";
@@ -3452,8 +3454,28 @@ activationLayer("Controlled thread activation facade", (it) => {
           rollbackConversation: unsupportedProviderCall,
           streamEvents: Stream.never,
         } satisfies ProviderServiceShape);
+        const admittedProviderRuntime = ProviderAdmissionRuntime.of({
+          request: (request) =>
+            Effect.succeed({
+              _tag: "Admitted" as const,
+              permit: {
+                ...request,
+                admissionId: providerAdmissionId(request),
+                admissionMarkerId: `marker-${request.handoffId}`,
+                admissionMarkerFingerprint: sha256Utf8(`marker-${request.handoffId}`),
+                admissionOwnerId: "initial-planning-test-owner",
+                admissionLeaseExpiresAt: "2099-07-30T12:00:00.000Z",
+                providerFenceToken: 1,
+                usageEvidenceFingerprint: sha256Utf8(`usage-${request.handoffId}`),
+              },
+            }),
+          usageChanged: () => Effect.void,
+          capacityReleased: () => Effect.void,
+        });
         const buildConsumer = Effect.fn("buildInitialPlanningTestConsumer")(function* (
           hooks?: AgentControlInitialPlanningConsumerHooksShape,
+          providerAdmissionRuntime: ProviderAdmissionRuntime["Service"] = admittedProviderRuntime,
+          start = true,
         ) {
           const consumerScope = yield* Scope.make("parallel");
           yield* Effect.addFinalizer(() => Scope.close(consumerScope, Exit.void));
@@ -3471,6 +3493,7 @@ activationLayer("Controlled thread activation facade", (it) => {
             ),
             Effect.provideService(ProviderService, providerService),
             Effect.provideService(ProviderTurnRequestExecutor, executor),
+            Effect.provideService(ProviderAdmissionRuntime, providerAdmissionRuntime),
           );
           if (hooks !== undefined) {
             build = build.pipe(
@@ -3479,9 +3502,60 @@ activationLayer("Controlled thread activation facade", (it) => {
           }
           const context = yield* build;
           const consumer = Context.get(context, AgentControlInitialPlanningConsumer);
-          yield* consumer.start().pipe(Scope.provide(consumerScope));
+          if (start) yield* consumer.start().pipe(Scope.provide(consumerScope));
           return { consumer, consumerScope };
         });
+        const initialDeliveryBeforeAdmission = yield* sql`
+          SELECT typeof(provider_delivery_id) AS "idStorageClass",
+            hex(CAST(provider_delivery_id AS BLOB)) AS "idBytes",state,revision,
+            claim_owner_id AS "claimOwnerId",claim_generation AS "claimGeneration",
+            claim_expires_at AS "claimExpiresAt",attempt_count AS "attemptCount",
+            next_attempt_at AS "nextAttemptAt",provider_turn_id AS "providerTurnId",
+            provider_accepted_at AS "providerAcceptedAt",
+            provider_session_created_at AS "providerSessionCreatedAt",
+            terminal_at AS "terminalAt",last_error_code AS "lastErrorCode"
+          FROM main.agent_control_initial_planning_deliveries
+          WHERE handoff_id=${handoffId}
+        `;
+        const waitingAdmissionRequests = yield* Ref.make(0);
+        const waitingConsumer = yield* buildConsumer(
+          {
+            beforeClaim: () => Effect.die(new Error("delivery claim preceded admission")),
+            afterClaim: () => Effect.die(new Error("delivery claim preceded admission")),
+          },
+          ProviderAdmissionRuntime.of({
+            request: (request) =>
+              Ref.update(waitingAdmissionRequests, (count) => count + 1).pipe(
+                Effect.as({
+                  _tag: "Waiting" as const,
+                  admissionId: providerAdmissionId(request),
+                  retryAt: null,
+                }),
+              ),
+            usageChanged: () => Effect.void,
+            capacityReleased: () => Effect.void,
+          }),
+        );
+        yield* waitingConsumer.consumer.drain;
+        yield* Scope.close(waitingConsumer.consumerScope, Exit.void);
+        assert.equal(yield* Ref.get(waitingAdmissionRequests), 1);
+        assert.equal(yield* Ref.get(ensureCalls), 0);
+        assert.equal(yield* Ref.get(executeCalls), 0);
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT typeof(provider_delivery_id) AS "idStorageClass",
+              hex(CAST(provider_delivery_id AS BLOB)) AS "idBytes",state,revision,
+              claim_owner_id AS "claimOwnerId",claim_generation AS "claimGeneration",
+              claim_expires_at AS "claimExpiresAt",attempt_count AS "attemptCount",
+              next_attempt_at AS "nextAttemptAt",provider_turn_id AS "providerTurnId",
+              provider_accepted_at AS "providerAcceptedAt",
+              provider_session_created_at AS "providerSessionCreatedAt",
+              terminal_at AS "terminalAt",last_error_code AS "lastErrorCode"
+            FROM main.agent_control_initial_planning_deliveries
+            WHERE handoff_id=${handoffId}
+          `,
+          initialDeliveryBeforeAdmission,
+        );
         const consumerA = yield* buildConsumer();
         const consumerB = yield* buildConsumer();
 

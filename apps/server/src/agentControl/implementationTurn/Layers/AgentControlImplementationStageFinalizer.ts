@@ -64,6 +64,7 @@ import {
   type AgentControlImplementationStageFinalizerShape,
 } from "../Services/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlImplementationStageFinalizerHooks } from "../Services/AgentControlImplementationStageFinalizerHooks.ts";
+import { ProviderAdmissionReleaseAuthority } from "../../providerAdmission/Services/ProviderAdmissionReleaseAuthority.ts";
 import { AgentControlImplementationHandoffStore } from "../Services/AgentControlImplementationHandoffStore.ts";
 import { AgentControlImplementationStageStarter } from "../Services/AgentControlImplementationStageStarter.ts";
 import { AgentControlImplementationTurnWakeup } from "../Services/AgentControlImplementationTurnWakeup.ts";
@@ -130,6 +131,9 @@ const make = Effect.gen(function* () {
   const leaseProjection = yield* AgentControlStageRunLeaseProjection;
   const leaseEngine = yield* AgentControlStageRunLeaseEngine;
   const hooks = yield* AgentControlImplementationStageFinalizerHooks;
+  const providerAdmissionRelease = Option.getOrUndefined(
+    yield* Effect.serviceOption(ProviderAdmissionReleaseAuthority),
+  );
   const publications =
     yield* PubSub.unbounded<AgentControlImplementationStageFinalizationPublication>();
 
@@ -977,8 +981,24 @@ const make = Effect.gen(function* () {
       )
     `.pipe(Effect.mapError((cause) => failure(handoffId, "insert-marker", "persistence", cause)));
 
+    const releasedProviderInstanceId =
+      providerAdmissionRelease === undefined
+        ? null
+        : yield* providerAdmissionRelease
+            .releaseInTransaction({
+              stage: "implementation",
+              handoffId,
+              finalizedAt,
+            })
+            .pipe(
+              Effect.mapError((cause) =>
+                failure(handoffId, "provider-admission-release", "persistence", cause),
+              ),
+            );
+
     return {
       _tag: "Finalized",
+      releasedProviderInstanceId,
       publication: {
         handoffId,
         resultEvidenceId,
@@ -1077,6 +1097,9 @@ const make = Effect.gen(function* () {
       if (transaction._tag === "Replayed") return transaction;
       if (transaction._tag !== "Finalized") return transaction;
       yield* hooks.afterOuterCommit(handoffId);
+      yield* providerAdmissionRelease === undefined
+        ? Effect.void
+        : providerAdmissionRelease.signalCommitted(transaction.releasedProviderInstanceId);
       yield* Effect.uninterruptible(
         Effect.gen(function* () {
           yield* stageEngine.publishCommitted([transaction.publication.stageEvent]);

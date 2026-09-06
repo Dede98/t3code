@@ -37,6 +37,7 @@ import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
 import type { ProviderSessionAttestation, ProviderTurnAttestation } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
+import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
 
 /**
  * One finite provider-publication prefix shared by the two required startup
@@ -86,6 +87,7 @@ export interface ProviderServiceShape {
   readonly startSession: (
     threadId: ThreadId,
     input: ProviderSessionStartInput,
+    authority?: { readonly providerAdmissionPermit: ProviderAdmissionPermit },
   ) => Effect.Effect<ProviderSession, ProviderServiceError>;
 
   /**
@@ -99,6 +101,7 @@ export interface ProviderServiceShape {
     input: ProviderSendTurnInput,
     boundary: {
       readonly expected: ProviderSessionAttestation;
+      readonly providerAdmissionPermit: ProviderAdmissionPermit;
       readonly beforeDeliveryCas: () => Effect.Effect<void, ProviderServiceError>;
       readonly persistDeliveryAttempted: (
         attestation: ProviderTurnAttestation,

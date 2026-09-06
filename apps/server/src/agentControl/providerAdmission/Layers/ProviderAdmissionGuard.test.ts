@@ -1,0 +1,945 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeSqlite from "node:sqlite";
+import { ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
+import { assert, it } from "@effect/vitest";
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as Scope from "effect/Scope";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+
+import { runMigrations } from "../../../persistence/Migrations.ts";
+import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
+import { canonicalProviderModelSelectionEvidence } from "../../../provider/Services/ProviderAdapter.ts";
+import { canonicalJson } from "../../initialPlanning/eventEvidence.ts";
+import {
+  AgentControlTaskConsumerGuard,
+  type AgentControlTaskConsumerGuardShape,
+} from "../../task/Services/AgentControlTaskConsumerGuard.ts";
+import {
+  providerAdmissionUsageEvidence,
+  type ProviderAdmissionPermit,
+  type ProviderAdmissionRequest,
+  type ProviderAdmissionStage,
+} from "../model.ts";
+import { ProviderAdmissionGuard } from "../Services/ProviderAdmissionGuard.ts";
+import { ProviderAdmissionReleaseAuthority } from "../Services/ProviderAdmissionReleaseAuthority.ts";
+import { ProviderAdmissionRuntime } from "../Services/ProviderAdmissionRuntime.ts";
+import { ProviderAdmissionStore } from "../Services/ProviderAdmissionStore.ts";
+import { ProviderAdmissionGuardLive } from "./ProviderAdmissionGuard.ts";
+import { ProviderAdmissionReleaseAuthorityLive } from "./ProviderAdmissionReleaseAuthority.ts";
+import { ProviderAdmissionStoreLive } from "./ProviderAdmissionStore.ts";
+
+const at = "2026-09-06T08:00:00.000Z";
+const leaseExpiry = "2099-09-06T08:00:00.000Z";
+const sourceFingerprint = "a".repeat(64);
+
+const request = (
+  stage: ProviderAdmissionStage,
+  providerInstanceId: ProviderInstanceId,
+): ProviderAdmissionRequest => {
+  const suffix = stage;
+  const modelSelection: ModelSelection = { instanceId: providerInstanceId, model: "gpt-5.6" };
+  const model = canonicalProviderModelSelectionEvidence(modelSelection);
+  return {
+    stage,
+    projectId: `project-${suffix}`,
+    taskId: `task-${suffix}`,
+    stageRunId: `stage-${suffix}`,
+    attemptId: `attempt-${suffix}`,
+    handoffId: `handoff-${suffix}`,
+    providerDeliveryId: `delivery-${suffix}`,
+    threadId: `thread-${suffix}`,
+    providerInstanceId,
+    stageLeaseId: `lease-${suffix}`,
+    stageLeaseHolderId: `holder-${suffix}`,
+    stageFenceToken: stage === "initial-planning" ? 1 : stage === "implementation" ? 2 : 3,
+    modelSelection,
+    modelSelectionJson: model.modelSelectionJson,
+    modelSelectionFingerprint: model.modelSelectionFingerprint,
+    requestedAt: at,
+  };
+};
+
+const taskGuardShape: AgentControlTaskConsumerGuardShape = {
+  inspectProject: () => Effect.die("not used"),
+  useTaskConsumable: (_projectId, _taskId, use) => use({} as never, {} as never),
+  useTaskConsumableInTransaction: (_projectId, _taskId, use) => use({} as never, {} as never),
+  useTaskForProviderEffectInTransaction: (_projectId, _taskId, use) =>
+    use({} as never, {} as never),
+};
+
+const seedStageAndDelivery = (
+  sql: SqlClient.SqlClient,
+  value: ProviderAdmissionRequest,
+  includeDelivery = true,
+) =>
+  Effect.gen(function* () {
+    yield* sql`
+      INSERT INTO main.agent_control_stage_run_states (
+        stage_run_id,project_id,task_id,attempt_id,role_id,stage_kind,stage_ordinal,
+        attempt_ordinal,status,task_revision,github_intake_sequence,
+        source_identity_fingerprint,state_json,created_at,updated_at,revision,last_event_sequence
+      ) VALUES (
+        ${value.stageRunId},${value.projectId},${value.taskId},${value.attemptId},
+        ${`role-${value.stage}`},
+        ${value.stage === "initial-planning" ? "planning" : value.stage},1,1,'running',1,1,
+        ${sourceFingerprint},'{}',${at},${at},1,1
+      )
+    `;
+    yield* sql`
+      INSERT INTO main.agent_control_stage_run_lease_states (
+        lease_id,project_id,task_id,stage_run_id,attempt_id,task_revision,
+        github_intake_sequence,source_identity_fingerprint,holder_id,fence_token,
+        status,acquired_at,renewed_at,expires_at,released_at,state_json,revision,last_event_sequence
+      ) VALUES (
+        ${value.stageLeaseId},${value.projectId},${value.taskId},${value.stageRunId},
+        ${value.attemptId},1,1,${sourceFingerprint},${value.stageLeaseHolderId},
+        ${value.stageFenceToken},'reserved',${at},${at},${leaseExpiry},NULL,'{}',1,1
+      )
+    `;
+    if (!includeDelivery) return;
+    if (value.stage === "initial-planning") {
+      yield* sql`
+        INSERT INTO main.agent_control_initial_planning_deliveries (
+          provider_delivery_id,handoff_id,handoff_fingerprint,
+          controlled_thread_reservation_id,thread_id,turn_request_command_id,message_id,
+          provider_instance_id,state,revision,claim_owner_id,claim_generation,
+          claim_expires_at,attempt_count,next_attempt_at,planning_deadline_at,
+          provider_turn_id,provider_accepted_at,provider_session_created_at,
+          provider_resume_cursor_json,terminal_at,last_error_code,interrupt_requested,updated_at
+        ) VALUES (
+          ${value.providerDeliveryId},${value.handoffId},${"1".repeat(64)},
+          'reservation-initial','thread-initial-planning','command-initial','message-initial',
+          ${value.providerInstanceId},'claimed',1,'delivery-owner',1,${leaseExpiry},0,NULL,
+          ${leaseExpiry},NULL,NULL,NULL,NULL,NULL,NULL,0,${at}
+        )
+      `;
+      return;
+    }
+    const table =
+      value.stage === "implementation"
+        ? "agent_control_implementation_deliveries"
+        : "agent_control_verification_deliveries";
+    yield* sql.unsafe(
+      `INSERT INTO main.${table} (
+        provider_delivery_id,handoff_id,handoff_fingerprint,admission_marker_id,
+        materialization_evidence_id,controlled_thread_reservation_id,thread_id,
+        stage_run_id,attempt_id,lease_id,lease_holder_id,fence_token,
+        provider_instance_id,runtime_mode,model_selection_fingerprint,
+        turn_request_command_id,message_id,planning_thread_id,plan_id,state,revision,
+        claim_owner_id,claim_generation,claim_expires_at,attempt_count,next_attempt_at,
+        provider_turn_id,provider_accepted_at,provider_session_created_at,
+        provider_resume_cursor_json,terminal_at,last_error_code,interrupt_requested,updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        value.providerDeliveryId,
+        value.handoffId,
+        value.stage === "implementation" ? "2".repeat(64) : "3".repeat(64),
+        `stage-admission-${value.stage}`,
+        `materialization-${value.stage}`,
+        `reservation-${value.stage}`,
+        value.threadId,
+        value.stageRunId,
+        value.attemptId,
+        value.stageLeaseId,
+        value.stageLeaseHolderId,
+        value.stageFenceToken,
+        value.providerInstanceId,
+        value.stage === "implementation" ? "full-access" : "approval-required",
+        value.modelSelectionFingerprint,
+        `command-${value.stage}`,
+        `message-${value.stage}`,
+        `planning-thread-${value.stage}`,
+        `plan-${value.stage}`,
+        "claimed",
+        1,
+        "delivery-owner",
+        1,
+        leaseExpiry,
+        0,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        0,
+        at,
+      ],
+    );
+  });
+
+const seedNonInitialDelivery = (
+  database: NodeSqlite.DatabaseSync,
+  value: ProviderAdmissionRequest,
+) => {
+  const table =
+    value.stage === "implementation"
+      ? "agent_control_implementation_deliveries"
+      : "agent_control_verification_deliveries";
+  database
+    .prepare(
+      `INSERT INTO main.${table} (
+        provider_delivery_id,handoff_id,handoff_fingerprint,admission_marker_id,
+        materialization_evidence_id,controlled_thread_reservation_id,thread_id,
+        stage_run_id,attempt_id,lease_id,lease_holder_id,fence_token,
+        provider_instance_id,runtime_mode,model_selection_fingerprint,
+        turn_request_command_id,message_id,planning_thread_id,plan_id,state,revision,
+        claim_owner_id,claim_generation,claim_expires_at,attempt_count,next_attempt_at,
+        provider_turn_id,provider_accepted_at,provider_session_created_at,
+        provider_resume_cursor_json,terminal_at,last_error_code,interrupt_requested,updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    )
+    .run(
+      value.providerDeliveryId,
+      value.handoffId,
+      value.stage === "implementation" ? "2".repeat(64) : "3".repeat(64),
+      `stage-admission-${value.stage}`,
+      `materialization-${value.stage}`,
+      `reservation-${value.stage}`,
+      value.threadId,
+      value.stageRunId,
+      value.attemptId,
+      value.stageLeaseId,
+      value.stageLeaseHolderId,
+      value.stageFenceToken,
+      value.providerInstanceId,
+      value.stage === "implementation" ? "full-access" : "approval-required",
+      value.modelSelectionFingerprint,
+      `command-${value.stage}`,
+      `message-${value.stage}`,
+      `planning-thread-${value.stage}`,
+      `plan-${value.stage}`,
+      "claimed",
+      1,
+      "delivery-owner",
+      1,
+      leaseExpiry,
+      0,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      0,
+      at,
+    );
+};
+
+const seedInitialPlanningFinalization = (
+  database: NodeSqlite.DatabaseSync,
+  permit: ProviderAdmissionPermit,
+  finalizedAt: string,
+) => {
+  const terminalEventId = `terminal-event-${permit.admissionId}`;
+  const resultEvidenceId = `result-${permit.admissionId}`;
+  const commandId = `finalize-${permit.admissionId}`;
+  const finalizationFingerprint = "b".repeat(64);
+  const markerId = `finalization-marker-${permit.admissionId}`;
+  const markerFingerprint = "c".repeat(64);
+  const stageEventId = `stage-terminal-${permit.admissionId}`;
+  const leaseEventId = `lease-terminal-${permit.admissionId}`;
+  database
+    .prepare(
+      `INSERT INTO main.agent_control_initial_planning_result_evidence (
+        result_evidence_id,finalization_command_id,finalization_fingerprint,outcome,
+        handoff_id,handoff_fingerprint,project_id,task_id,task_revision,
+        github_intake_sequence,source_identity_fingerprint,controlled_thread_reservation_id,
+        thread_id,stage_run_id,attempt_id,lease_id,lease_holder_id,fence_token,
+        provider_delivery_id,provider_instance_id,provider_turn_id,runtime_mode,
+        model_selection_fingerprint,delivery_terminal_state,delivery_revision,terminal_at,
+        orchestration_started_event_id,orchestration_started_sequence,
+        orchestration_terminal_event_id,orchestration_terminal_sequence,
+        plan_id,plan_event_id,plan_event_sequence,proposed_plan_json,proposed_plan_digest,
+        stage_event_id,stage_event_sequence,stage_event_stream_version,
+        lease_event_id,lease_event_sequence,lease_event_stream_version,finalized_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    )
+    .run(
+      resultEvidenceId,
+      commandId,
+      finalizationFingerprint,
+      "failed",
+      permit.handoffId,
+      "d".repeat(64),
+      permit.projectId,
+      permit.taskId,
+      1,
+      1,
+      sourceFingerprint,
+      `reservation-${permit.admissionId}`,
+      permit.threadId,
+      permit.stageRunId,
+      permit.attemptId,
+      permit.stageLeaseId,
+      permit.stageLeaseHolderId,
+      permit.stageFenceToken,
+      permit.providerDeliveryId,
+      permit.providerInstanceId,
+      `provider-turn-${permit.admissionId}`,
+      "approval-required",
+      permit.modelSelectionFingerprint,
+      "failed",
+      1,
+      finalizedAt,
+      `started-event-${permit.admissionId}`,
+      1,
+      terminalEventId,
+      2,
+      null,
+      null,
+      null,
+      null,
+      null,
+      stageEventId,
+      1,
+      3,
+      leaseEventId,
+      1,
+      2,
+      finalizedAt,
+    );
+  database
+    .prepare(
+      `INSERT INTO main.agent_control_initial_planning_finalization_receipts (
+        finalization_command_id,finalization_fingerprint,result_evidence_id,handoff_id,
+        outcome,stage_event_id,stage_event_sequence,lease_event_id,lease_event_sequence,accepted_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    )
+    .run(
+      commandId,
+      finalizationFingerprint,
+      resultEvidenceId,
+      permit.handoffId,
+      "failed",
+      stageEventId,
+      1,
+      leaseEventId,
+      1,
+      finalizedAt,
+    );
+  database
+    .prepare(
+      `INSERT INTO main.agent_control_initial_planning_finalization_markers (
+        marker_id,marker_fingerprint,finalization_command_id,result_evidence_id,
+        handoff_id,committed_at
+      ) VALUES (?,?,?,?,?,?)`,
+    )
+    .run(markerId, markerFingerprint, commandId, resultEvidenceId, permit.handoffId, finalizedAt);
+};
+
+const seedVerificationFinalization = (
+  database: NodeSqlite.DatabaseSync,
+  permit: ProviderAdmissionPermit,
+  finalizedAt: string,
+  terminalRuntimeEventId: string,
+) => {
+  const evidenceId = `verification-finalization-evidence-${permit.admissionId}`;
+  const receiptId = `verification-finalization-receipt-${permit.admissionId}`;
+  const markerId = `verification-finalization-marker-${permit.admissionId}`;
+  const commandId = `verification-finalization-command-${permit.admissionId}`;
+  const finalizationFingerprint = "e".repeat(64);
+  database
+    .prepare(
+      `INSERT INTO main.agent_control_verification_finalization_evidence (
+        finalization_evidence_id,receipt_id,marker_id,finalization_command_id,
+        finalization_fingerprint,finalization_json,handoff_id,handoff_fingerprint,
+        project_id,task_id,task_revision,github_intake_sequence,source_identity_fingerprint,
+        stage_run_id,attempt_id,lease_id,lease_holder_id,fence_token,provider_delivery_id,
+        provider_instance_id,provider_turn_id,delivery_revision,delivery_terminal_state,
+        terminal_runtime_event_id,terminal_at,start_evidence_id,start_receipt_id,start_marker_id,
+        evaluation_authority,evaluation_id,evaluation_evidence_id,evaluation_receipt_id,
+        evaluation_marker_id,evaluation_disposition,verification_verdict,invalid_output_code,
+        outcome,terminal_cause,stage_event_id,stage_event_sequence,stage_event_stream_version,
+        lease_event_id,lease_event_sequence,lease_event_stream_version,finalized_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    )
+    .run(
+      evidenceId,
+      receiptId,
+      markerId,
+      commandId,
+      finalizationFingerprint,
+      "{}",
+      permit.handoffId,
+      "f".repeat(64),
+      permit.projectId,
+      permit.taskId,
+      1,
+      1,
+      sourceFingerprint,
+      permit.stageRunId,
+      permit.attemptId,
+      permit.stageLeaseId,
+      permit.stageLeaseHolderId,
+      Math.max(3, permit.stageFenceToken),
+      permit.providerDeliveryId,
+      permit.providerInstanceId,
+      `provider-turn-${permit.admissionId}`,
+      1,
+      "failed",
+      terminalRuntimeEventId,
+      finalizedAt,
+      `verification-start-evidence-${permit.admissionId}`,
+      `verification-start-receipt-${permit.admissionId}`,
+      `verification-start-marker-${permit.admissionId}`,
+      "not-applicable",
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      "failed",
+      "provider-delivery-failed",
+      `verification-stage-event-${permit.admissionId}`,
+      1,
+      3,
+      `verification-lease-event-${permit.admissionId}`,
+      1,
+      2,
+      finalizedAt,
+    );
+  database
+    .prepare(
+      `INSERT INTO main.agent_control_verification_finalization_receipts (
+        receipt_id,marker_id,finalization_evidence_id,finalization_command_id,
+        finalization_fingerprint,handoff_id,outcome,terminal_cause,stage_event_id,
+        stage_event_sequence,lease_event_id,lease_event_sequence,status,accepted_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    )
+    .run(
+      receiptId,
+      markerId,
+      evidenceId,
+      commandId,
+      finalizationFingerprint,
+      permit.handoffId,
+      "failed",
+      "provider-delivery-failed",
+      `verification-stage-event-${permit.admissionId}`,
+      1,
+      `verification-lease-event-${permit.admissionId}`,
+      1,
+      "accepted",
+      finalizedAt,
+    );
+  database
+    .prepare(
+      `INSERT INTO main.agent_control_verification_finalization_markers (
+        marker_id,marker_fingerprint,receipt_id,finalization_evidence_id,
+        finalization_command_id,finalization_fingerprint,handoff_id,committed_at
+      ) VALUES (?,?,?,?,?,?,?,?)`,
+    )
+    .run(
+      markerId,
+      "a".repeat(64),
+      receiptId,
+      evidenceId,
+      commandId,
+      finalizationFingerprint,
+      permit.handoffId,
+      finalizedAt,
+    );
+};
+
+it.live("guards all stage effects, denies replay, and quarantines restart ambiguity", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-admission-guard-" });
+      const filename = path.join(directory, "guard.sqlite");
+      const firstScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void));
+      const firstContext = yield* Layer.buildWithScope(
+        NodeSqliteClient.layer({ filename }),
+        firstScope,
+      );
+      const sql = Context.get(firstContext, SqlClient.SqlClient);
+      yield* sql`PRAGMA journal_mode=WAL`;
+      yield* runMigrations({ toMigrationInclusive: 65 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+      const storeContext = yield* Layer.buildWithScope(
+        Layer.fresh(ProviderAdmissionStoreLive).pipe(
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+        ),
+        firstScope,
+      );
+      const store = Context.get(storeContext, ProviderAdmissionStore);
+      const values = [
+        request("initial-planning", ProviderInstanceId.make("guard-initial")),
+        request("implementation", ProviderInstanceId.make("guard-implementation")),
+        request("verification", ProviderInstanceId.make("guard-verification")),
+      ];
+      const permits: Array<ProviderAdmissionPermit> = [];
+      for (const value of values) {
+        const decision = yield* store.request({
+          request: value,
+          usage: providerAdmissionUsageEvidence({
+            providerInstanceId: value.providerInstanceId,
+            status: "allowed",
+            observedAt: at,
+            source: "refresh",
+            nextRelevantAt: null,
+          }),
+          ownerId: `owner-${value.stage}`,
+          leaseExpiresAt: leaseExpiry,
+          now: at,
+        });
+        assert.equal(decision._tag, "Admitted");
+        if (decision._tag === "Admitted") permits.push(decision.permit);
+      }
+      assert.equal(permits.length, 3);
+
+      const deliveryTriggers = yield* sql<{ readonly name: string; readonly source: string }>`
+        SELECT name,sql AS source FROM main.sqlite_schema
+        WHERE type='trigger' AND tbl_name IN (
+          'agent_control_stage_run_states',
+          'agent_control_stage_run_lease_states',
+          'agent_control_initial_planning_deliveries',
+          'agent_control_implementation_deliveries',
+          'agent_control_verification_deliveries'
+        ) AND sql IS NOT NULL
+        ORDER BY name
+      `;
+      for (const trigger of deliveryTriggers) {
+        yield* sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+      }
+      // Existing tables, STRICT/check constraints, and the native DML boundary
+      // remain active. Fixture-only parent FKs and transition triggers are
+      // suspended, then every exact trigger source is restored before guard use.
+      yield* sql`PRAGMA foreign_keys=OFF`;
+      const fixtureDatabase = yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const database = new NodeSqlite.DatabaseSync(filename);
+          database.exec("PRAGMA foreign_keys=OFF");
+          return database;
+        }),
+        (database) => Effect.sync(() => database.close()),
+      );
+      for (const value of values) {
+        yield* sql.withTransaction(
+          seedStageAndDelivery(sql, value, value.stage === "initial-planning"),
+        );
+        if (value.stage !== "initial-planning") {
+          yield* Effect.sync(() => seedNonInitialDelivery(fixtureDatabase, value));
+        }
+      }
+      for (const trigger of deliveryTriggers) {
+        yield* sql.unsafe(trigger.source).unprepared;
+      }
+      yield* sql`PRAGMA foreign_keys=ON`;
+
+      const guardContext = yield* Layer.buildWithScope(
+        Layer.fresh(ProviderAdmissionGuardLive).pipe(
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+          Layer.provide(Layer.succeed(ProviderAdmissionStore, store)),
+          Layer.provide(Layer.succeed(AgentControlTaskConsumerGuard, taskGuardShape)),
+        ),
+        firstScope,
+      );
+      const guard = Context.get(guardContext, ProviderAdmissionGuard);
+      for (const permit of permits) {
+        const table =
+          permit.stage === "initial-planning"
+            ? "agent_control_initial_planning_deliveries"
+            : permit.stage === "implementation"
+              ? "agent_control_implementation_deliveries"
+              : "agent_control_verification_deliveries";
+        const before = yield* sql.unsafe(
+          `SELECT state,revision,claim_generation,attempt_count FROM main.${table}
+           WHERE provider_delivery_id=?`,
+          [permit.providerDeliveryId],
+        );
+        yield* guard.enter(permit, "session-start");
+        const replay = yield* Effect.exit(guard.enter(permit, "session-start"));
+        assert.isTrue(Exit.isFailure(replay));
+        yield* guard.enter(permit, "turn-start");
+        assert.deepStrictEqual(
+          yield* sql.unsafe(
+            `SELECT state,revision,claim_generation,attempt_count FROM main.${table}
+             WHERE provider_delivery_id=?`,
+            [permit.providerDeliveryId],
+          ),
+          before,
+        );
+        assert.equal(
+          (yield* sql<{ readonly count: number }>`
+            SELECT count(*) AS count FROM main.agent_control_provider_authority_markers
+            WHERE admission_id=${permit.admissionId}
+              AND authority_kind IN ('session-entry','turn-entry')
+          `)[0]?.count,
+          2,
+        );
+      }
+
+      const wrongProvider = yield* Effect.exit(
+        guard.enter(
+          { ...permits[0]!, providerInstanceId: ProviderInstanceId.make("foreign-provider") },
+          "turn-start",
+        ),
+      );
+      const wrongModel = yield* Effect.exit(
+        guard.enter({ ...permits[0]!, modelSelectionFingerprint: "0".repeat(64) }, "turn-start"),
+      );
+      assert.isTrue(Exit.isFailure(wrongProvider));
+      assert.isTrue(Exit.isFailure(wrongModel));
+
+      const secondScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(secondScope, Exit.void));
+      const secondSqlContext = yield* Layer.buildWithScope(
+        NodeSqliteClient.layer({ filename }),
+        secondScope,
+      );
+      const secondSql = Context.get(secondSqlContext, SqlClient.SqlClient);
+      yield* secondSql`PRAGMA foreign_keys=ON`;
+      const secondStoreLayer = Layer.fresh(ProviderAdmissionStoreLive).pipe(
+        Layer.provide(Layer.succeed(SqlClient.SqlClient, secondSql)),
+      );
+      const releaseContext = yield* Layer.buildWithScope(
+        Layer.fresh(ProviderAdmissionReleaseAuthorityLive).pipe(
+          Layer.provideMerge(secondStoreLayer),
+          Layer.provide(
+            Layer.succeed(ProviderAdmissionRuntime, {
+              request: () => Effect.die("not used"),
+              usageChanged: () => Effect.die("not used"),
+              capacityReleased: () => Effect.void,
+            }),
+          ),
+        ),
+        secondScope,
+      );
+      const releaseAuthority = Context.get(releaseContext, ProviderAdmissionReleaseAuthority);
+      const secondStore = Context.get(releaseContext, ProviderAdmissionStore);
+      yield* releaseAuthority.recover;
+      assert.deepStrictEqual(
+        yield* secondSql<{ readonly status: string }>`
+          SELECT status FROM main.agent_control_provider_admission_current
+          ORDER BY provider_instance_id
+        `,
+        [{ status: "quarantined" }, { status: "quarantined" }, { status: "quarantined" }],
+      );
+      const blocked = yield* Context.get(releaseContext, ProviderAdmissionStore).request({
+        request: {
+          ...request("implementation", ProviderInstanceId.make("guard-initial")),
+          projectId: "project-blocked",
+          taskId: "task-blocked",
+          stageRunId: "stage-blocked",
+          attemptId: "attempt-blocked",
+          handoffId: "handoff-blocked",
+          providerDeliveryId: "delivery-blocked",
+          threadId: "thread-blocked",
+          stageLeaseId: "lease-blocked",
+          stageLeaseHolderId: "holder-blocked",
+        },
+        usage: providerAdmissionUsageEvidence({
+          providerInstanceId: ProviderInstanceId.make("guard-initial"),
+          status: "allowed",
+          observedAt: at,
+          source: "refresh",
+          nextRelevantAt: null,
+        }),
+        ownerId: "owner-blocked",
+        leaseExpiresAt: leaseExpiry,
+        now: at,
+      });
+      assert.equal(blocked._tag, "Waiting");
+
+      const finalizationTriggers = yield* secondSql<{
+        readonly name: string;
+        readonly source: string;
+      }>`
+        SELECT name,sql AS source FROM main.sqlite_schema
+        WHERE type='trigger' AND tbl_name IN (
+          'agent_control_initial_planning_result_evidence',
+          'agent_control_initial_planning_finalization_receipts',
+          'agent_control_initial_planning_finalization_markers',
+          'agent_control_verification_finalization_evidence',
+          'agent_control_verification_finalization_receipts',
+          'agent_control_verification_finalization_markers'
+        ) AND sql IS NOT NULL
+        ORDER BY name
+      `;
+      for (const trigger of finalizationTriggers) {
+        yield* secondSql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+      }
+      const finalizedAt = "2026-09-06T09:00:00.000Z";
+      const releasePermit = permits[0]!;
+      const terminalEventId = `terminal-event-${releasePermit.admissionId}`;
+      const terminalCommandId = `terminal-command-${releasePermit.admissionId}`;
+      const terminalMetadata = canonicalJson({
+        providerRuntimeMessage: {
+          eventType: "turn.completed",
+          providerInstanceId: releasePermit.providerInstanceId,
+          providerItemId: null,
+          providerTurnId: `provider-turn-${releasePermit.admissionId}`,
+          runtimeEventId: `runtime-terminal-${releasePermit.admissionId}`,
+        },
+      });
+      const terminalPayload = canonicalJson({
+        session: {
+          activeTurnId: null,
+          lastError: "provider failed",
+          providerInstanceId: releasePermit.providerInstanceId,
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          status: "error",
+          threadId: releasePermit.threadId,
+          updatedAt: finalizedAt,
+        },
+        threadId: releasePermit.threadId,
+      });
+      yield* secondSql`
+        INSERT INTO main.orchestration_events (
+          event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,
+          command_id,causation_event_id,correlation_id,actor_kind,payload_json,metadata_json
+        ) VALUES (
+          ${terminalEventId},'thread',${releasePermit.threadId},1,'thread.session-set',
+          ${finalizedAt},${terminalCommandId},NULL,${terminalCommandId},'provider',${terminalPayload},
+          ${terminalMetadata}
+        )
+      `;
+      yield* Effect.sync(() =>
+        seedInitialPlanningFinalization(fixtureDatabase, releasePermit, finalizedAt),
+      );
+      const verificationPermit = permits[2]!;
+      const verificationTerminalEventId = `terminal-event-${verificationPermit.admissionId}`;
+      const verificationTerminalMetadata = canonicalJson({
+        providerRuntimeMessage: {
+          eventType: "turn.completed",
+          providerInstanceId: verificationPermit.providerInstanceId,
+          providerItemId: null,
+          providerTurnId: `provider-turn-${verificationPermit.admissionId}`,
+          runtimeEventId: `foreign-runtime-event-${verificationPermit.admissionId}`,
+        },
+      });
+      const verificationTerminalPayload = canonicalJson({
+        session: {
+          activeTurnId: null,
+          lastError: "provider failed",
+          providerInstanceId: verificationPermit.providerInstanceId,
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          status: "error",
+          threadId: verificationPermit.threadId,
+          updatedAt: finalizedAt,
+        },
+        threadId: verificationPermit.threadId,
+      });
+      yield* secondSql`
+        INSERT INTO main.orchestration_events (
+          event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,
+          command_id,causation_event_id,correlation_id,actor_kind,payload_json,metadata_json
+        ) VALUES (
+          ${verificationTerminalEventId},'thread',${verificationPermit.threadId},1,
+          'thread.session-set',${finalizedAt},
+          ${`terminal-command-${verificationPermit.admissionId}`},NULL,
+          ${`terminal-command-${verificationPermit.admissionId}`},'provider',
+          ${verificationTerminalPayload},${verificationTerminalMetadata}
+        )
+      `;
+      yield* Effect.sync(() =>
+        seedVerificationFinalization(
+          fixtureDatabase,
+          verificationPermit,
+          finalizedAt,
+          verificationTerminalEventId,
+        ),
+      );
+      for (const trigger of finalizationTriggers) {
+        yield* secondSql.unsafe(trigger.source).unprepared;
+      }
+
+      const foreignRuntimeEvent = yield* Effect.exit(
+        secondSql.withTransaction(
+          secondStore.releaseFromFinalizationInTransaction({
+            stage: "verification",
+            handoffId: verificationPermit.handoffId,
+            finalizedAt,
+          }),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(foreignRuntimeEvent));
+      assert.deepStrictEqual(
+        yield* secondSql<{ readonly status: string }>`
+          SELECT status FROM main.agent_control_provider_admission_current
+          WHERE admission_id=${verificationPermit.admissionId}
+        `,
+        [{ status: "quarantined" }],
+      );
+      assert.equal(
+        (yield* secondSql<{ readonly count: number }>`
+          SELECT count(*) AS count FROM main.agent_control_provider_authority_markers
+          WHERE admission_id=${verificationPermit.admissionId} AND authority_kind='release'
+        `)[0]?.count,
+        0,
+      );
+
+      const wrongTerminal = yield* Effect.exit(
+        secondSql.withTransaction(
+          secondStore.releaseFromFinalizationInTransaction({
+            stage: "initial-planning",
+            handoffId: permits[0]!.handoffId,
+            finalizedAt: "2026-09-06T09:00:01.000Z",
+          }),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(wrongTerminal));
+      const rolledBack = yield* Effect.exit(
+        secondSql.withTransaction(
+          secondStore
+            .releaseFromFinalizationInTransaction({
+              stage: "initial-planning",
+              handoffId: permits[0]!.handoffId,
+              finalizedAt,
+            })
+            .pipe(Effect.andThen(Effect.fail("force-outer-rollback"))),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(rolledBack));
+      assert.deepStrictEqual(
+        yield* secondSql<{ readonly status: string }>`
+          SELECT status FROM main.agent_control_provider_admission_current
+          WHERE admission_id=${permits[0]!.admissionId}
+        `,
+        [{ status: "quarantined" }],
+      );
+      assert.equal(
+        (yield* secondSql<{ readonly count: number }>`
+          SELECT count(*) AS count FROM main.agent_control_provider_authority_markers
+          WHERE admission_id=${permits[0]!.admissionId} AND authority_kind='release'
+        `)[0]?.count,
+        0,
+      );
+      assert.equal(
+        yield* secondSql.withTransaction(
+          secondStore.releaseFromFinalizationInTransaction({
+            stage: "initial-planning",
+            handoffId: permits[0]!.handoffId,
+            finalizedAt,
+          }),
+        ),
+        permits[0]!.providerInstanceId,
+      );
+      assert.equal(
+        yield* secondSql.withTransaction(
+          secondStore.releaseFromFinalizationInTransaction({
+            stage: "initial-planning",
+            handoffId: permits[0]!.handoffId,
+            finalizedAt,
+          }),
+        ),
+        permits[0]!.providerInstanceId,
+      );
+      assert.deepStrictEqual(
+        yield* secondSql<{
+          readonly status: string;
+          readonly activeAdmissionId: string | null;
+          readonly lastFenceToken: number;
+        }>`
+          SELECT admission.status,capacity.active_admission_id AS "activeAdmissionId",
+            capacity.last_fence_token AS "lastFenceToken"
+          FROM main.agent_control_provider_admission_current admission
+          JOIN main.agent_control_provider_capacity_current capacity
+            ON capacity.provider_instance_id=admission.provider_instance_id
+          WHERE admission.admission_id=${permits[0]!.admissionId}
+        `,
+        [{ status: "released", activeAdmissionId: null, lastFenceToken: 1 }],
+      );
+      assert.equal(
+        (yield* secondSql<{ readonly count: number }>`
+          SELECT count(*) AS count FROM main.agent_control_provider_authority_markers
+          WHERE admission_id=${permits[0]!.admissionId} AND authority_kind='release'
+        `)[0]?.count,
+        1,
+      );
+      const nextPermit = yield* secondStore.admitOldest({
+        providerInstanceId: String(permits[0]!.providerInstanceId),
+        ownerId: "release-successor-owner",
+        now: "2026-09-06T09:00:01.000Z",
+        leaseExpiresAt: leaseExpiry,
+      });
+      if (nextPermit === null) return yield* Effect.die("missing release successor");
+      assert.equal(nextPermit.handoffId, "handoff-blocked");
+      assert.equal(nextPermit.providerFenceToken, 2);
+      assert.deepStrictEqual(
+        yield* secondSql<{
+          readonly activeAdmissionId: string | null;
+          readonly activeFenceToken: number | null;
+          readonly lastFenceToken: number;
+        }>`
+          SELECT active_admission_id AS "activeAdmissionId",
+            active_fence_token AS "activeFenceToken",last_fence_token AS "lastFenceToken"
+          FROM main.agent_control_provider_capacity_current
+          WHERE provider_instance_id=${String(permits[0]!.providerInstanceId)}
+        `,
+        [
+          {
+            activeAdmissionId: nextPermit.admissionId,
+            activeFenceToken: 2,
+            lastFenceToken: 2,
+          },
+        ],
+      );
+      assert.equal(
+        yield* secondSql.withTransaction(
+          secondStore.releaseFromFinalizationInTransaction({
+            stage: "initial-planning",
+            handoffId: permits[0]!.handoffId,
+            finalizedAt,
+          }),
+        ),
+        permits[0]!.providerInstanceId,
+      );
+      assert.deepStrictEqual(
+        yield* secondSql<{ readonly activeAdmissionId: string | null }>`
+          SELECT active_admission_id AS "activeAdmissionId"
+          FROM main.agent_control_provider_capacity_current
+          WHERE provider_instance_id=${String(permits[0]!.providerInstanceId)}
+        `,
+        [{ activeAdmissionId: nextPermit.admissionId }],
+      );
+
+      // Remove the intentionally parent-less fixture deliveries before the FK
+      // audit. Their production immutability triggers are restored immediately
+      // afterwards, just as they were before guard execution.
+      for (const trigger of deliveryTriggers) {
+        yield* secondSql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+      }
+      for (const trigger of finalizationTriggers) {
+        yield* secondSql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+      }
+      yield* Effect.sync(() => {
+        fixtureDatabase.exec(`
+          DELETE FROM main.agent_control_initial_planning_finalization_markers;
+          DELETE FROM main.agent_control_initial_planning_finalization_receipts;
+          DELETE FROM main.agent_control_initial_planning_result_evidence;
+          DELETE FROM main.agent_control_verification_finalization_markers;
+          DELETE FROM main.agent_control_verification_finalization_receipts;
+          DELETE FROM main.agent_control_verification_finalization_evidence;
+          DELETE FROM main.agent_control_initial_planning_deliveries;
+          DELETE FROM main.agent_control_implementation_deliveries;
+          DELETE FROM main.agent_control_verification_deliveries;
+        `);
+      });
+      for (const trigger of deliveryTriggers) {
+        yield* secondSql.unsafe(trigger.source).unprepared;
+      }
+      for (const trigger of finalizationTriggers) {
+        yield* secondSql.unsafe(trigger.source).unprepared;
+      }
+      assert.deepStrictEqual(yield* secondSql`PRAGMA main.foreign_key_check`, []);
+      assert.equal((yield* secondSql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);

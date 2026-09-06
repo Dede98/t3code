@@ -10,6 +10,7 @@ import type { AgentControlTaskIntakeStartupError } from "../task/Services/AgentC
 import type { AgentControlVerificationAdmissionError } from "../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
 import type { AgentControlRunOnceError } from "../runOnce/model.ts";
 import type { AgentControlArmedError } from "../armed/model.ts";
+import type { ProviderAdmissionError } from "../providerAdmission/Services/ProviderAdmissionStore.ts";
 
 export class AgentControlReactorStartupError extends Schema.TaggedErrorClass<AgentControlReactorStartupError>()(
   "AgentControlReactorStartupError",
@@ -31,6 +32,7 @@ export interface AgentControlReactorShape {
     | AgentControlVerificationAdmissionError
     | AgentControlRunOnceError
     | AgentControlArmedError
+    | ProviderAdmissionError
     | AgentControlReactorStartupError,
     Scope.Scope
   >;

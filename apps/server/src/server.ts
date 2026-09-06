@@ -25,6 +25,7 @@ import {
   AgentControlControlledThreadReservationLayerLive,
   AgentControlRunOnceControllerLayerLive,
   AgentControlRuntimeLayerLive,
+  AgentControlTaskConsumerGuardLayerLive,
   AgentControlWorktreeControllerLayerLive,
 } from "./agentControl/runtimeLayer.ts";
 import { AgentControlControlledThreadActivationLive } from "./agentControl/controlledThreadReservation/Layers/AgentControlControlledThreadActivation.ts";
@@ -52,6 +53,10 @@ import { AgentControlVerificationTurnWakeupLive } from "./agentControl/verificat
 import { AgentControlVerificationTurnCoordinatorHooksNoop } from "./agentControl/verificationTurn/Services/AgentControlVerificationTurnCoordinatorHooks.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningWakeupLive } from "./agentControl/initialPlanning/Layers/AgentControlInitialPlanningWakeup.ts";
+import { ProviderAdmissionStoreLive } from "./agentControl/providerAdmission/Layers/ProviderAdmissionStore.ts";
+import { ProviderAdmissionGuardLive } from "./agentControl/providerAdmission/Layers/ProviderAdmissionGuard.ts";
+import { ProviderAdmissionRuntimeLive } from "./agentControl/providerAdmission/Layers/ProviderAdmissionRuntime.ts";
+import { ProviderAdmissionReleaseAuthorityLive } from "./agentControl/providerAdmission/Layers/ProviderAdmissionReleaseAuthority.ts";
 import { layer as AgentControlGithubObserveReactorLive } from "./agentControl/github/Layers/AgentControlGithubObserveReactor.ts";
 import { layer as AgentControlTaskIntakeReactorLive } from "./agentControl/task/Layers/AgentControlTaskIntakeReactor.ts";
 import { AgentControlTaskVerificationFinalizerLive } from "./agentControl/task/Layers/AgentControlTaskVerificationFinalizer.ts";
@@ -253,12 +258,23 @@ const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
 // `create()`; `ProviderEventLoggersLive` owns the shared native/canonical
 // NDJSON writers and is provided at the outer runtime layer so both
 // `ProviderService` and the per-instance drivers read the same logger pair.
+const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));
+const ProviderAdmissionStoreLayerLive = ProviderAdmissionStoreLive.pipe(
+  Layer.provide(PersistenceLayerLive),
+);
+const ProviderAdmissionTaskGuardLayerLive = AgentControlTaskConsumerGuardLayerLive.pipe(
+  Layer.provide(PersistenceLayerLive),
+);
+const ProviderAdmissionGuardLayerLive = ProviderAdmissionGuardLive.pipe(
+  Layer.provideMerge(ProviderAdmissionStoreLayerLive),
+  Layer.provide(ProviderAdmissionTaskGuardLayerLive),
+);
 const ProviderLayerLive = ProviderServiceLive.pipe(
   Layer.provideMerge(ProviderAdapterRegistryLive),
   Layer.provideMerge(ProviderSessionDirectoryLayerLive),
+  Layer.provide(ProviderAdmissionGuardLayerLive),
 );
 
-const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));
 const ServerSettingsLayerLive = ServerSettings.layer.pipe(Layer.provide(ServerSecretStore.layer));
 const ClaudeSessionStoreLayerLive = ClaudeSessionStoreLive.pipe(
   Layer.provide(PersistenceLayerLive),
@@ -374,6 +390,17 @@ const CloudManagedEndpointRuntimeLive = Layer.mergeAll(
 );
 
 const ProviderUsageLayerLive = ProviderUsageLive.pipe(Layer.provideMerge(ProviderLayerLive));
+const ProviderAdmissionRuntimeLayerLive = ProviderAdmissionRuntimeLive.pipe(
+  Layer.provideMerge(ProviderAdmissionStoreLayerLive),
+  Layer.provideMerge(ProviderUsageLayerLive),
+  Layer.provideMerge(InitialPlanningWakeupLayerLive),
+  Layer.provideMerge(ImplementationTurnWakeupLayerLive),
+  Layer.provide(VerificationTurnWakeupLayerLive),
+);
+const ProviderAdmissionReleaseAuthorityLayerLive = ProviderAdmissionReleaseAuthorityLive.pipe(
+  Layer.provideMerge(ProviderAdmissionStoreLayerLive),
+  Layer.provide(ProviderAdmissionRuntimeLayerLive),
+);
 
 const ProviderThreadContinuationSyncLayerLive = ProviderThreadContinuationSyncLive.pipe(
   Layer.provideMerge(ProviderAdapterRegistryLive),
@@ -389,13 +416,17 @@ const ProviderRuntimeServicesLayerLive = Layer.merge(
   ProviderThreadContinuationSyncLayerLive,
 ).pipe(Layer.provideMerge(ProviderCoordinationLayerLive));
 
-const RuntimeCoreDependenciesBaseLive = ReactorLayerLive.pipe(
+const RuntimeCoreDependenciesAdmissionLive = ReactorLayerLive.pipe(
   // Core Services
   Layer.provideMerge(CheckpointingLayerLive),
   Layer.provideMerge(SourceControlProviderRegistryLayerLive),
   Layer.provideMerge(GitLayerLive),
   Layer.provideMerge(VcsLayerLive),
   Layer.provideMerge(ProviderRuntimeServicesLayerLive),
+  Layer.provideMerge(ProviderAdmissionRuntimeLayerLive),
+  Layer.provideMerge(ProviderAdmissionReleaseAuthorityLayerLive),
+);
+const RuntimeCoreDependenciesBaseLive = RuntimeCoreDependenciesAdmissionLive.pipe(
   Layer.provideMerge(Layer.mergeAll(TerminalLayerLive, PreviewLayerLive)),
   Layer.provideMerge(Keybindings.layer),
   Layer.provideMerge(ProviderRegistryLive),

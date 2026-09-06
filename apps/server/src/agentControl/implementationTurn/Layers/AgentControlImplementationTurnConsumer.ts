@@ -28,6 +28,8 @@ import {
   makeAgentControlImplementationCandidateEvidenceError,
 } from "../Services/AgentControlImplementationHandoffStore.ts";
 import { AgentControlImplementationTurnWakeup } from "../Services/AgentControlImplementationTurnWakeup.ts";
+import { ProviderAdmissionRuntime } from "../../providerAdmission/Services/ProviderAdmissionRuntime.ts";
+import type { ProviderAdmissionPermit } from "../../providerAdmission/model.ts";
 
 const CLAIM_DURATION = Duration.minutes(2);
 const RETRY_DELAY = Duration.seconds(30);
@@ -80,6 +82,9 @@ const make = Effect.gen(function* () {
   const snapshots = yield* ProjectionSnapshotQuery;
   const provider = yield* ProviderService;
   const executor = yield* ProviderTurnRequestExecutor;
+  const providerAdmission = Option.getOrUndefined(
+    yield* Effect.serviceOption(ProviderAdmissionRuntime),
+  );
   const ownerId = yield* crypto.randomUUIDv4.pipe(
     Effect.orDie,
     Effect.map((uuid) => `implementation-consumer:${uuid}`),
@@ -229,8 +234,41 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const requestProviderAdmission = Effect.fn(
+    "AgentControlImplementationTurnConsumer.requestProviderAdmission",
+  )(function* (claim: AgentControlImplementationClaim) {
+    if (providerAdmission === undefined) {
+      return yield* new ProviderAdapterRequestError({
+        provider: String(claim.evidence.providerInstanceId),
+        method: "provider-admission",
+        detail: "Durable provider admission authority is unavailable.",
+      });
+    }
+    return yield* providerAdmission
+      .request({
+        stage: "implementation",
+        projectId: String(claim.evidence.projectId),
+        taskId: claim.evidence.taskId,
+        stageRunId: claim.evidence.stageRunId,
+        attemptId: claim.evidence.attemptId,
+        handoffId: claim.evidence.handoffId,
+        providerDeliveryId: claim.evidence.providerDeliveryId,
+        threadId: String(claim.evidence.threadId),
+        providerInstanceId: claim.evidence.providerInstanceId,
+        stageLeaseId: claim.evidence.leaseId,
+        stageLeaseHolderId: claim.evidence.leaseHolderId,
+        stageFenceToken: claim.evidence.fenceToken,
+        modelSelection: claim.evidence.modelSelection,
+        modelSelectionJson: claim.evidence.modelSelectionJson,
+        modelSelectionFingerprint: claim.evidence.modelSelectionFingerprint,
+        requestedAt: claim.evidence.createdAt,
+      })
+      .pipe(Effect.orDie);
+  });
+
   const deliver = Effect.fn("AgentControlImplementationTurnConsumer.deliver")(function* (
     claim: AgentControlImplementationClaim,
+    providerAdmissionPermit: ProviderAdmissionPermit,
   ) {
     const current = yield* DateTime.now;
     yield* hooks.beforeClaim(claim.evidence.handoffId);
@@ -253,6 +291,7 @@ const make = Effect.gen(function* () {
         createdAt: DateTime.formatIso(current),
         providerDeliveryId: owned.evidence.providerDeliveryId,
         durableDeliveryKind: "implementation",
+        providerAdmissionPermit,
       })
       .pipe(Effect.exit);
     if (Exit.isFailure(prepared)) {
@@ -377,7 +416,6 @@ const make = Effect.gen(function* () {
       ) {
         return;
       }
-      if (claim.delivery.state === "pending") claim = yield* acceptTurn(claim);
       if (claim.delivery.state === "delivery-attempted") {
         yield* reconcileAttempted(claim);
         return;
@@ -385,9 +423,13 @@ const make = Effect.gen(function* () {
       if (
         claim.delivery.state === "turn-accepted" ||
         claim.delivery.state === "retry-wait" ||
+        claim.delivery.state === "pending" ||
         claim.delivery.state === "claimed"
       ) {
-        yield* deliver(claim);
+        const admission = yield* requestProviderAdmission(claim);
+        if (admission._tag === "Waiting") return;
+        if (claim.delivery.state === "pending") claim = yield* acceptTurn(claim);
+        yield* deliver(claim, admission.permit);
       }
     },
   );

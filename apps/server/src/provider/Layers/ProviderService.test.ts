@@ -52,6 +52,7 @@ import {
   attestProviderSessionNativeConfiguration,
   ProviderContinuationSyncCapabilityError,
   type ProviderAdapterShape,
+  type ProviderSessionAttestation,
 } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
@@ -70,6 +71,8 @@ import {
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
+import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
+import { ProviderAdmissionGuard } from "../../agentControl/providerAdmission/Services/ProviderAdmissionGuard.ts";
 
 const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const decodeUnknownJsonString = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
@@ -86,6 +89,37 @@ const claudeAgentInstanceId = ProviderInstanceId.make("claudeAgent");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
+
+const makeTestProviderAdmissionPermit = (
+  attestation: ProviderSessionAttestation,
+): ProviderAdmissionPermit => ({
+  admissionId: `admission:${String(attestation.threadId)}`,
+  admissionMarkerId: `admission-marker:${String(attestation.threadId)}`,
+  admissionMarkerFingerprint: "admission-marker-fingerprint",
+  stage: "initial-planning",
+  projectId: "project-provider-service-test",
+  taskId: "task-provider-service-test",
+  stageRunId: "stage-run-provider-service-test",
+  attemptId: "attempt-provider-service-test",
+  handoffId: "handoff-provider-service-test",
+  providerDeliveryId: "delivery-provider-service-test",
+  threadId: String(attestation.threadId),
+  providerInstanceId: attestation.providerInstanceId,
+  stageLeaseId: "stage-lease-provider-service-test",
+  stageLeaseHolderId: "stage-lease-holder-provider-service-test",
+  stageFenceToken: 1,
+  admissionOwnerId: "admission-owner-provider-service-test",
+  admissionLeaseExpiresAt: "2099-01-01T00:00:00.000Z",
+  providerFenceToken: 1,
+  modelSelectionJson: attestation.modelSelectionJson,
+  modelSelectionFingerprint: attestation.modelSelectionFingerprint,
+  usageEvidenceFingerprint: "usage-evidence-fingerprint",
+});
+
+const providerAdmissionGuardTestLayer = Layer.succeed(ProviderAdmissionGuard, {
+  enter: () => Effect.void,
+  quarantineUnknown: () => Effect.void,
+});
 
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
@@ -404,6 +438,7 @@ function makeProviderServiceLayer(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(providerAdmissionGuardTestLayer),
         Layer.provideMerge(AnalyticsService.layerTest),
         Layer.provide(
           Layer.succeed(
@@ -1266,6 +1301,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         },
         {
           expected: attestation,
+          providerAdmissionPermit: makeTestProviderAdmissionPermit(attestation),
           beforeDeliveryCas: () => Effect.sync(() => order.push("before-cas")).pipe(Effect.asVoid),
           persistDeliveryAttempted: (actual) =>
             Effect.sync(() => {
@@ -1303,6 +1339,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
           },
           {
             expected: { ...attestation, cwd: "/tmp/different-cwd" },
+            providerAdmissionPermit: makeTestProviderAdmissionPermit(attestation),
             beforeDeliveryCas: () => Effect.die("unexpected-before-cas"),
             persistDeliveryAttempted: () => Effect.die("unexpected-cas"),
             afterDeliveryCas: () => Effect.die("unexpected-after-cas"),
@@ -1335,6 +1372,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         },
         {
           expected: attestation,
+          providerAdmissionPermit: makeTestProviderAdmissionPermit(attestation),
           beforeDeliveryCas: () =>
             Effect.sync(() => lockWaitOrder.push("before-cas")).pipe(Effect.asVoid),
           persistDeliveryAttempted: () =>
@@ -1368,6 +1406,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
             },
             {
               expected: attestation,
+              providerAdmissionPermit: makeTestProviderAdmissionPermit(attestation),
               beforeDeliveryCas: () =>
                 checkpoint === "before-cas"
                   ? fail()
@@ -1444,6 +1483,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
             },
             {
               expected: attestation,
+              providerAdmissionPermit: makeTestProviderAdmissionPermit(attestation),
               beforeDeliveryCas: () => Effect.sync(() => entryOrder.push("before-cas")),
               afterDeliveryCas: () => Effect.sync(() => entryOrder.push("after-cas")),
               persistDeliveryAttempted: () => Effect.sync(() => entryOrder.push("cas")),
@@ -1490,6 +1530,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         },
         {
           expected: attestation,
+          providerAdmissionPermit: makeTestProviderAdmissionPermit(attestation),
           beforeDeliveryCas: () => Effect.sync(() => pendingOrder.push("before-cas")),
           afterDeliveryCas: () => Effect.sync(() => pendingOrder.push("after-cas")),
           persistDeliveryAttempted: () => Effect.sync(() => pendingOrder.push("cas")),
@@ -1536,6 +1577,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
           },
           {
             expected: attestation,
+            providerAdmissionPermit: makeTestProviderAdmissionPermit(attestation),
             beforeDeliveryCas: () => Effect.sync(() => nativeInvocationOrder.push("before-cas")),
             persistDeliveryAttempted: () => Effect.sync(() => nativeInvocationOrder.push("cas")),
             afterDeliveryCas: () => Effect.sync(() => nativeInvocationOrder.push("after-cas")),
@@ -1582,6 +1624,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
           },
           {
             expected: attestation,
+            providerAdmissionPermit: makeTestProviderAdmissionPermit(attestation),
             beforeDeliveryCas: () =>
               Effect.sync(() => adapterFailureOrder.push("before-cas")).pipe(Effect.asVoid),
             persistDeliveryAttempted: () =>
@@ -1621,6 +1664,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
           },
           {
             expected: attestation,
+            providerAdmissionPermit: makeTestProviderAdmissionPermit(attestation),
             beforeDeliveryCas: () => Effect.sync(() => externalDefectOrder.push("before-cas")),
             persistDeliveryAttempted: () => Effect.sync(() => externalDefectOrder.push("cas")),
             afterDeliveryCas: () => Effect.sync(() => externalDefectOrder.push("after-cas")),
@@ -1657,6 +1701,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         },
         {
           expected: attestation,
+          providerAdmissionPermit: makeTestProviderAdmissionPermit(attestation),
           beforeDeliveryCas: () =>
             Effect.sync(() => interruptedOrder.push("before-cas")).pipe(Effect.asVoid),
           persistDeliveryAttempted: () =>

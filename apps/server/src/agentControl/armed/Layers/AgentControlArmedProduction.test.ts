@@ -84,6 +84,9 @@ import {
 } from "../../runtimeLayer.ts";
 import { AgentControlRunOnceControllerLive } from "../../runOnce/Layers/AgentControlRunOnceController.ts";
 import { AgentControlRunOnceController } from "../../runOnce/Services/AgentControlRunOnceController.ts";
+import { providerAdmissionId } from "../../providerAdmission/model.ts";
+import { ProviderAdmissionRuntime } from "../../providerAdmission/Services/ProviderAdmissionRuntime.ts";
+import { ProviderAdmissionReleaseAuthority } from "../../providerAdmission/Services/ProviderAdmissionReleaseAuthority.ts";
 import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
 import { AgentControlTaskIntakeReactor } from "../../task/Services/AgentControlTaskIntakeReactor.ts";
 import { AgentControlTaskReconcileStateRepository } from "../../task/Services/AgentControlTaskReconcileState.ts";
@@ -609,6 +612,37 @@ it.live(
           AgentControlInitialPlanningWakeup,
           planningWakeupService,
         );
+        const providerAdmissionRuntime = ProviderAdmissionRuntime.of({
+          request: (request) =>
+            Effect.succeed({
+              _tag: "Admitted" as const,
+              permit: {
+                ...request,
+                admissionId: providerAdmissionId(request),
+                admissionMarkerId: `marker-${request.handoffId}`,
+                admissionMarkerFingerprint: "a".repeat(64),
+                admissionOwnerId: "armed-production-test-owner",
+                admissionLeaseExpiresAt: "2099-01-01T00:00:00.000Z",
+                providerFenceToken: 1,
+                usageEvidenceFingerprint: "b".repeat(64),
+              },
+            }),
+          usageChanged: () => Effect.void,
+          capacityReleased: () => Effect.void,
+        });
+        const providerAdmissionRelease = ProviderAdmissionReleaseAuthority.of({
+          releaseInTransaction: () => Effect.succeed(null),
+          signalCommitted: () => Effect.void,
+          recover: Effect.void,
+        });
+        const providerAdmissionRuntimeLayer = Layer.succeed(
+          ProviderAdmissionRuntime,
+          providerAdmissionRuntime,
+        );
+        const providerAdmissionReleaseLayer = Layer.succeed(
+          ProviderAdmissionReleaseAuthority,
+          providerAdmissionRelease,
+        );
         const planningConsumer = Layer.fresh(AgentControlInitialPlanningConsumerLive).pipe(
           Layer.provideMerge(planningStore),
           Layer.provideMerge(planningWakeup),
@@ -616,6 +650,7 @@ it.live(
           Layer.provideMerge(projectionTurns),
           Layer.provideMerge(providerRuntime),
           Layer.provideMerge(providerServiceLayer),
+          Layer.provideMerge(providerAdmissionRuntimeLayer),
           Layer.provideMerge(coreServices),
           Layer.provideMerge(NodeServices.layer),
         );
@@ -623,6 +658,7 @@ it.live(
           Layer.provideMerge(planningStore),
           Layer.provideMerge(planningWakeup),
           Layer.provideMerge(coreServices),
+          Layer.provideMerge(providerAdmissionReleaseLayer),
           Layer.provideMerge(sqlLayer),
           Layer.provideMerge(NodeServices.layer),
         );
@@ -654,6 +690,7 @@ it.live(
           Layer.provideMerge(executor),
           Layer.provideMerge(projectionTurns),
           Layer.provideMerge(providerServiceLayer),
+          Layer.provideMerge(providerAdmissionRuntimeLayer),
           Layer.provideMerge(coreServices),
           Layer.provideMerge(sqlLayer),
           Layer.provideMerge(NodeServices.layer),
@@ -672,6 +709,7 @@ it.live(
           Layer.provideMerge(implementationWakeup),
           Layer.provideMerge(implementationStarter),
           Layer.provideMerge(coreServices),
+          Layer.provideMerge(providerAdmissionReleaseLayer),
           Layer.provideMerge(sqlLayer),
           Layer.provideMerge(NodeServices.layer),
         );
@@ -704,6 +742,7 @@ it.live(
           Layer.provideMerge(executor),
           Layer.provideMerge(projectionTurns),
           Layer.provideMerge(providerServiceLayer),
+          Layer.provideMerge(providerAdmissionRuntimeLayer),
           Layer.provideMerge(coreServices),
           Layer.provideMerge(sqlLayer),
           Layer.provideMerge(NodeServices.layer),
@@ -725,6 +764,7 @@ it.live(
           Layer.provideMerge(verificationWakeup),
           Layer.provideMerge(verificationEvaluator),
           Layer.provideMerge(coreServices),
+          Layer.provideMerge(providerAdmissionReleaseLayer),
           Layer.provideMerge(sqlLayer),
           Layer.provideMerge(NodeServices.layer),
         );

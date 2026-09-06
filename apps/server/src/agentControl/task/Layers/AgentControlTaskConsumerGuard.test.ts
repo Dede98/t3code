@@ -613,6 +613,36 @@ sqlite("AgentControl task consumer guard", (it) => {
     }),
   );
 
+  it.effect("revalidates active provider tasks and rejects Human takeover before effect", () =>
+    Effect.gen(function* () {
+      const activeTask = task(5);
+      const activeGuard = yield* makeGuard({ tasks: [activeTask] });
+      const useForProviderEffect = activeGuard.useTaskForProviderEffectInTransaction;
+      assert.isDefined(useForProviderEffect);
+      const accepted = yield* useForProviderEffect!(
+        projectId,
+        activeTask.taskId,
+        (selected, gate) => Effect.succeed({ selected, gate }),
+      );
+      assert.equal(accepted.selected.status, "candidate");
+      assert.isTrue(accepted.gate.sequenceCurrent);
+
+      for (const testCase of [
+        { expected: "mode-inactive", input: { mode: "manual" as const } },
+        { expected: "task-sequence-mismatch", input: { sourceSequence: 6 } },
+      ] as const) {
+        const guard = yield* makeGuard({ ...testCase.input, tasks: [activeTask] });
+        const result = yield* Effect.result(
+          guard.useTaskForProviderEffectInTransaction!(projectId, activeTask.taskId, () =>
+            Effect.die("provider effect must remain fenced"),
+          ),
+        );
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.equal(result.failure.reason, testCase.expected);
+      }
+    }),
+  );
+
   it.effect("loads the concrete task canonically and rejects every task-local mismatch", () =>
     Effect.gen(function* () {
       const otherProject = ProjectId.make("task-consumer-guard-other");

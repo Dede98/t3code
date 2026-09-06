@@ -488,6 +488,60 @@ const make = Effect.gen(function* () {
         return yield* useValidatedTask(projectId, taskId, gate, use);
       });
 
+  const useTaskForProviderEffectInTransaction: NonNullable<
+    AgentControlTaskConsumerGuardShape["useTaskForProviderEffectInTransaction"]
+  > = (projectId, taskId, use) =>
+    Effect.gen(function* () {
+      const gate = yield* loadConsumableGate(projectId, taskId);
+      const taskHistory = yield* loadAuthoritativeTaskProjectHistory(
+        projectId,
+        taskEvents,
+        tasks,
+      ).pipe(
+        Effect.mapError((failure) =>
+          guardError(
+            projectId,
+            failure._tag === "AgentControlPersistenceSqlError"
+              ? "internal-persistence-error"
+              : "task-projection-corrupt",
+          ),
+        ),
+      );
+      const matchingTasks = taskHistory.filter((task) => task.taskId === taskId);
+      if (matchingTasks.length === 0) return yield* guardError(projectId, "task-missing");
+      if (matchingTasks.length !== 1) {
+        return yield* guardError(projectId, "task-projection-corrupt");
+      }
+      const task = matchingTasks[0]!;
+      if (task.source.projectId !== projectId) {
+        return yield* guardError(projectId, "task-project-mismatch");
+      }
+      if (
+        task.status !== "candidate" &&
+        task.status !== "queued" &&
+        task.status !== "running" &&
+        task.status !== "waiting"
+      ) {
+        return yield* guardError(projectId, "task-status-inactive");
+      }
+      if (task.sourceGate !== "eligible") {
+        return yield* guardError(projectId, "task-source-ineligible");
+      }
+      if (task.githubIntakeSequence !== gate.currentSourceSequence || !gate.sequenceCurrent) {
+        return yield* guardError(projectId, "task-sequence-mismatch");
+      }
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const callbackFiber = yield* use(task, gate).pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+          return yield* restore(Fiber.join(callbackFiber)).pipe(
+            Effect.onExit(() => Fiber.interrupt(callbackFiber).pipe(Effect.asVoid)),
+          );
+        }),
+      );
+    });
+
   const useTaskConsumable: AgentControlTaskConsumerGuardShape["useTaskConsumable"] = (
     projectId,
     taskId,
@@ -521,6 +575,7 @@ const make = Effect.gen(function* () {
     inspectProject,
     useTaskConsumable,
     useTaskConsumableInTransaction,
+    useTaskForProviderEffectInTransaction,
     useTaskSelectedForRunOnce,
     useTaskSelectedForRunOnceInTransaction,
   });

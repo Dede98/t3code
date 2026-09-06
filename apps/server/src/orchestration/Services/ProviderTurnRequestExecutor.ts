@@ -12,6 +12,7 @@ import type { OrchestrationDispatchError } from "../Errors.ts";
 import type { ProviderServiceError } from "../../provider/Errors.ts";
 import type { ProviderSessionAttestation } from "../../provider/Services/ProviderAdapter.ts";
 import type { ProviderTurnAttestation } from "../../provider/Services/ProviderAdapter.ts";
+import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
 import * as Schema from "effect/Schema";
 
 export interface ProviderTurnRequestExecutorInput {
@@ -25,12 +26,15 @@ export interface ProviderTurnRequestExecutorInput {
   readonly providerDeliveryId?: string;
   /** Closed durable owner for provider session evidence. */
   readonly durableDeliveryKind?: "initial-planning" | "implementation" | "verification";
+  /** Internal durable authority. Automated deliveries fail closed without it. */
+  readonly providerAdmissionPermit?: ProviderAdmissionPermit;
 }
 
 export interface PreparedProviderTurnRequest {
   readonly input: ProviderSendTurnInput;
   readonly providerDeliveryId?: string;
   readonly durableDeliveryKind?: "initial-planning" | "implementation" | "verification";
+  readonly providerAdmissionPermit?: ProviderAdmissionPermit;
   readonly sessionAttestation?: ProviderSessionAttestation;
   readonly sessionResumeCursorJson?: string;
   readonly entryState?: {
@@ -62,7 +66,10 @@ export interface ProviderTurnRequestExecutorShape {
   readonly ensureSessionForThread: (
     threadId: ThreadId,
     createdAt: string,
-    options?: { readonly modelSelection?: ModelSelection },
+    options?: {
+      readonly modelSelection?: ModelSelection;
+      readonly providerAdmissionPermit?: ProviderAdmissionPermit;
+    },
   ) => Effect.Effect<ThreadId, ProviderServiceError | OrchestrationDispatchError>;
   readonly execute: (
     input: ProviderTurnRequestExecutorInput,

@@ -10,6 +10,13 @@ import type * as PubSub from "effect/PubSub";
 import type * as Scope from "effect/Scope";
 
 export interface ProviderUsageShape {
+  readonly inspectForAdmission?: (
+    providerInstanceId: ProviderInstanceId,
+  ) => Effect.Effect<
+    | { readonly _tag: "Unsupported"; readonly observedAt: string }
+    | { readonly _tag: "Observed"; readonly snapshot: ProviderUsageSnapshot }
+    | { readonly _tag: "SupportedUnusable"; readonly observedAt: string }
+  >;
   readonly getSnapshot: Effect.Effect<ReadonlyArray<ProviderUsageSnapshot>>;
   readonly refresh: (
     providerInstanceIds?: ReadonlyArray<ProviderInstanceId>,

@@ -2,6 +2,7 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 
@@ -26,6 +27,7 @@ import {
   type AgentControlReactorShape,
 } from "../Services/AgentControlReactor.ts";
 import { alreadyActivated, type ReactorStartupActivation } from "../../reactorStartupActivation.ts";
+import { ProviderAdmissionReleaseAuthority } from "../providerAdmission/Services/ProviderAdmissionReleaseAuthority.ts";
 
 const make = Effect.gen(function* () {
   const githubObserve = yield* AgentControlGithubObserveReactor;
@@ -43,6 +45,9 @@ const make = Effect.gen(function* () {
   const verificationEvaluator = yield* AgentControlVerificationEvaluator;
   const verificationStageFinalizer = yield* AgentControlVerificationStageFinalizer;
   const verificationTurnCoordinator = yield* AgentControlVerificationTurnCoordinator;
+  const providerAdmissionRelease = Option.getOrUndefined(
+    yield* Effect.serviceOption(ProviderAdmissionReleaseAuthority),
+  );
   const lifecycleSemaphore = yield* Semaphore.make(1);
   let nextAttemptId = 0;
   let lifecycleState: "idle" | "starting" | "started" | "closing" | "closed" = "idle";
@@ -111,6 +116,9 @@ const make = Effect.gen(function* () {
                 const started = yield* Effect.exit(
                   restore(
                     Effect.gen(function* () {
+                      if (providerAdmissionRelease !== undefined) {
+                        yield* providerAdmissionRelease.recover;
+                      }
                       yield* githubObserve.start();
                       yield* taskIntake.start();
                       yield* initialPlanningFinalizer.start();

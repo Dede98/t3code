@@ -54,6 +54,11 @@ import { AgentControlStageRunLeaseProjection } from "../../stageRunLease/Service
 import { AgentControlStageRunLeaseStateRepository } from "../../stageRunLease/Services/AgentControlStageRunLeaseStateRepository.ts";
 import { AgentControlProjectionStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import {
+  ProviderAdmissionReleaseAuthority,
+  type ProviderAdmissionReleaseAuthorityShape,
+} from "../../providerAdmission/Services/ProviderAdmissionReleaseAuthority.ts";
+import { ProviderAdmissionError } from "../../providerAdmission/Services/ProviderAdmissionStore.ts";
+import {
   deriveVerificationEvaluationEvidenceId,
   deriveVerificationEvaluationId,
   deriveVerificationEvaluationMarkerId,
@@ -813,12 +818,18 @@ const defaultHooks: AgentControlVerificationStageFinalizerHooksShape = {
   afterCommit: () => Effect.void,
   afterPublication: () => Effect.void,
 };
+const noopProviderAdmissionRelease: ProviderAdmissionReleaseAuthorityShape = {
+  releaseInTransaction: () => Effect.succeed(null),
+  signalCommitted: () => Effect.void,
+  recover: Effect.void,
+};
 
 const buildRuntime = (
   filename: string,
   claim: AgentControlVerificationClaim,
   scope: Scope.Scope,
   hooks: AgentControlVerificationStageFinalizerHooksShape = defaultHooks,
+  providerAdmissionRelease: ProviderAdmissionReleaseAuthorityShape = noopProviderAdmissionRelease,
 ) =>
   Effect.gen(function* () {
     const sqlContext = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
@@ -923,6 +934,7 @@ const buildRuntime = (
       Layer.succeed(AgentControlVerificationHandoffStore, store),
       Layer.succeed(AgentControlVerificationEvaluator, evaluator),
       Layer.succeed(AgentControlVerificationStageFinalizerHooks, hooks),
+      Layer.succeed(ProviderAdmissionReleaseAuthority, providerAdmissionRelease),
     );
     const finalizer = Context.get(
       yield* Layer.buildWithScope(
@@ -973,7 +985,42 @@ it.live.each([
         const filename = `${directory}/state.sqlite`;
         const claim = yield* makeClaim(outcome, outcome);
         yield* seedAuthority(filename, claim, outcome);
-        const runtime = yield* buildRuntime(filename, claim, scope);
+        const releaseCalls = yield* Ref.make(0);
+        const releaseSignals = yield* Ref.make<ReadonlyArray<string | null>>([]);
+        const markerCountFromFreshConnection = () => {
+          const observer = new NodeSqlite.DatabaseSync(filename);
+          try {
+            return Number(
+              (
+                observer
+                  .prepare(
+                    `SELECT count(*) AS count
+                     FROM main.agent_control_verification_finalization_markers
+                     WHERE handoff_id=?`,
+                  )
+                  .get(claim.evidence.handoffId) as { readonly count: number }
+              ).count,
+            );
+          } finally {
+            observer.close();
+          }
+        };
+        const runtime = yield* buildRuntime(filename, claim, scope, defaultHooks, {
+          releaseInTransaction: ({ stage, handoffId }) =>
+            Effect.gen(function* () {
+              assert.equal(stage, "verification");
+              assert.equal(handoffId, claim.evidence.handoffId);
+              assert.equal(markerCountFromFreshConnection(), 0);
+              yield* Ref.update(releaseCalls, (count) => count + 1);
+              return "provider-release-verification";
+            }),
+          signalCommitted: (providerInstanceId) =>
+            Effect.gen(function* () {
+              assert.equal(markerCountFromFreshConnection(), 1);
+              yield* Ref.update(releaseSignals, (current) => [...current, providerInstanceId]);
+            }),
+          recover: Effect.void,
+        });
         const result = yield* runtime.finalizer.processHandoff(claim.evidence.handoffId);
         assert.equal(result._tag, "Finalized");
         assert.deepStrictEqual(yield* counts(runtime.sql), [
@@ -993,8 +1040,70 @@ it.live.each([
         );
         assert.equal(yield* Ref.get(runtime.stagePublications), 1);
         assert.equal(yield* Ref.get(runtime.leasePublications), 1);
+        assert.equal(yield* Ref.get(releaseCalls), 1);
+        assert.deepStrictEqual(yield* Ref.get(releaseSignals), ["provider-release-verification"]);
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("rolls the finalization boundary back when provider release rejects", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "verification-finalizer-release-rollback-",
+      });
+      const filename = `${directory}/state.sqlite`;
+      const claim = yield* makeClaim("release-rollback", "delivery-failed");
+      yield* seedAuthority(filename, claim, "delivery-failed");
+      const scope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+      const releaseSignals = yield* Ref.make(0);
+      const runtime = yield* buildRuntime(filename, claim, scope, defaultHooks, {
+        releaseInTransaction: () =>
+          Effect.fail(
+            new ProviderAdmissionError({
+              operation: "verification-finalizer-test",
+              reason: "authority-divergent",
+            }),
+          ),
+        signalCommitted: () => Ref.update(releaseSignals, (count) => count + 1),
+        recover: Effect.void,
+      });
+      const stateBefore = yield* runtime.sql<{
+        readonly lease: string;
+        readonly stage: string;
+      }>`
+        SELECT stage.status AS stage,lease.status AS lease
+        FROM main.agent_control_stage_run_states stage
+        JOIN main.agent_control_stage_run_lease_states lease
+          ON lease.stage_run_id=stage.stage_run_id
+      `;
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(runtime.finalizer.processHandoff(claim.evidence.handoffId)),
+        ),
+      );
+      assert.deepStrictEqual(yield* counts(runtime.sql), [
+        { events: 0, evidence: 0, receipts: 0, markers: 0 },
+      ]);
+      assert.deepStrictEqual(
+        yield* runtime.sql<{
+          readonly lease: string;
+          readonly stage: string;
+        }>`
+          SELECT stage.status AS stage,lease.status AS lease
+          FROM main.agent_control_stage_run_states stage
+          JOIN main.agent_control_stage_run_lease_states lease
+            ON lease.stage_run_id=stage.stage_run_id
+        `,
+        stateBefore,
+      );
+      assert.equal(yield* Ref.get(runtime.stagePublications), 0);
+      assert.equal(yield* Ref.get(runtime.leasePublications), 0);
+      assert.equal(yield* Ref.get(releaseSignals), 0);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live("targets MAIN authority when TEMP shadows every Stage and Lease persistence seam", () =>

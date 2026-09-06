@@ -56,6 +56,11 @@ import {
   providerTurnMetricAttributes,
   withMetrics,
 } from "../../observability/Metrics.ts";
+import { withAgentControlRunOnceProjectFence } from "../../agentControl/runOnce/context.ts";
+import { withProviderAdmissionEffectFence } from "../../agentControl/providerAdmission/context.ts";
+import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
+import { ProviderAdmissionGuard } from "../../agentControl/providerAdmission/Services/ProviderAdmissionGuard.ts";
+import { ProjectId } from "@t3tools/contracts";
 import {
   type ProviderAdapterError,
   ProviderAdapterRequestError,
@@ -314,6 +319,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
   const threadOperationLock = yield* ProviderThreadOperationLock;
+  const admissionGuard = Option.getOrUndefined(yield* Effect.serviceOption(ProviderAdmissionGuard));
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const runtimeEventPublicationPubSub =
     yield* PubSub.unbounded<ProviderService.ProviderRuntimeEventPublication>();
@@ -321,6 +327,40 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const nextRuntimeEventDrainId = yield* Ref.make(0);
   const sessionAttestations = new Map<ThreadId, ProviderSessionAttestation>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+  const enterProviderAdmission = (
+    permit: ProviderAdmissionPermit,
+    boundary: "session-start" | "turn-start",
+  ): Effect.Effect<void, ProviderValidationError> =>
+    admissionGuard === undefined
+      ? Effect.fail(
+          toValidationError(
+            "ProviderService.providerAdmission",
+            "Durable provider admission guard is unavailable.",
+          ),
+        )
+      : admissionGuard
+          .enter(permit, boundary)
+          .pipe(
+            Effect.mapError((cause) =>
+              toValidationError(
+                "ProviderService.providerAdmission",
+                "Durable provider admission authority rejected the provider effect.",
+                cause,
+              ),
+            ),
+          );
+  const quarantineProviderAdmission = (permit: ProviderAdmissionPermit) =>
+    admissionGuard === undefined
+      ? Effect.void
+      : admissionGuard.quarantineUnknown(permit).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("provider.admission.quarantine-failed", {
+              admissionId: permit.admissionId,
+              providerInstanceId: permit.providerInstanceId,
+              cause,
+            }),
+          ),
+        );
   const recordSessionAttestation = Effect.fn("ProviderService.recordSessionAttestation")(function* (
     session: ProviderSessionWithAttestation,
   ) {
@@ -986,259 +1026,303 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
-  const startSessionUnlocked: ProviderServiceMethod<"startSession"> = Effect.fn("startSession")(
-    function* (threadId, rawInput) {
-      const parsed = yield* decodeInputOrValidationError({
-        operation: "ProviderService.startSession",
-        schema: ProviderSessionStartInput,
-        payload: rawInput,
-      });
+  const startSessionUnlocked = Effect.fn("startSession")(function* (
+    threadId: ThreadId,
+    rawInput: ProviderSessionStartInput,
+    providerAdmissionPermit?: ProviderAdmissionPermit,
+  ) {
+    const parsed = yield* decodeInputOrValidationError({
+      operation: "ProviderService.startSession",
+      schema: ProviderSessionStartInput,
+      payload: rawInput,
+    });
 
-      const resolvedInstanceId = yield* requireProviderInstanceId(
-        "ProviderService.startSession",
-        parsed,
-      );
-      let metricProvider = parsed.provider ?? String(resolvedInstanceId);
-      yield* Effect.annotateCurrentSpan({
-        "provider.operation": "start-session",
-        "provider.instance_id": resolvedInstanceId,
-        "provider.thread_id": threadId,
-        "provider.runtime_mode": parsed.runtimeMode,
-      });
-      return yield* Effect.gen(function* () {
-        const instanceInfo = yield* registry.getInstanceInfo(resolvedInstanceId);
-        const resolvedProvider = instanceInfo.driverKind;
-        metricProvider = resolvedProvider;
-        if (parsed.provider !== undefined && parsed.provider !== resolvedProvider) {
-          return yield* toValidationError(
-            "ProviderService.startSession",
-            `Provider instance '${resolvedInstanceId}' belongs to driver '${resolvedProvider}', not '${parsed.provider}'.`,
-          );
-        }
-        const input = {
-          ...parsed,
-          threadId,
-          provider: resolvedProvider,
-        };
-        if (!instanceInfo.enabled) {
-          return yield* toValidationError(
-            "ProviderService.startSession",
-            `Provider instance '${resolvedInstanceId}' is disabled in T3 Code settings.`,
-          );
-        }
-        const persistedBinding = Option.getOrUndefined(
-          yield* directory.getBinding(threadId).pipe(
-            Effect.catchIf(isProviderSessionBindingDecodeError, (error) =>
-              Effect.logWarning("provider.session.binding.quarantined", {
-                threadId,
-                persistedProvider: parsed.provider,
-                operation: "start-session",
-                reason: error.reason,
-                detail: error.detail,
-              }).pipe(
-                Effect.andThen(
-                  increment(providerSessionBindingsQuarantinedTotal, {
-                    operation: "start-session",
-                    reason: error.reason ?? "decode-failed",
-                  }),
-                ),
-                Effect.as(Option.none()),
-              ),
-            ),
-          ),
+    const resolvedInstanceId = yield* requireProviderInstanceId(
+      "ProviderService.startSession",
+      parsed,
+    );
+    let metricProvider = parsed.provider ?? String(resolvedInstanceId);
+    yield* Effect.annotateCurrentSpan({
+      "provider.operation": "start-session",
+      "provider.instance_id": resolvedInstanceId,
+      "provider.thread_id": threadId,
+      "provider.runtime_mode": parsed.runtimeMode,
+    });
+    return yield* Effect.gen(function* () {
+      const instanceInfo = yield* registry.getInstanceInfo(resolvedInstanceId);
+      const resolvedProvider = instanceInfo.driverKind;
+      metricProvider = resolvedProvider;
+      if (parsed.provider !== undefined && parsed.provider !== resolvedProvider) {
+        return yield* toValidationError(
+          "ProviderService.startSession",
+          `Provider instance '${resolvedInstanceId}' belongs to driver '${resolvedProvider}', not '${parsed.provider}'.`,
         );
-        const persistedBindingInstanceId = persistedBinding?.providerInstanceId;
-        const persistedSourceInfo =
-          persistedBindingInstanceId !== undefined &&
-          persistedBindingInstanceId !== resolvedInstanceId &&
-          persistedBinding?.provider === resolvedProvider
-            ? Option.getOrUndefined(
-                yield* registry.getInstanceInfo(persistedBindingInstanceId).pipe(Effect.option),
-              )
-            : undefined;
-        const canReusePersistedContinuation =
-          persistedBindingInstanceId === resolvedInstanceId ||
-          (persistedSourceInfo !== undefined &&
-            persistedSourceInfo.driverKind === resolvedProvider &&
-            persistedSourceInfo.continuationIdentity.continuationKey ===
-              instanceInfo.continuationIdentity.continuationKey);
-        const effectiveResumeCursor =
-          input.resumeCursor ??
-          (canReusePersistedContinuation ? persistedBinding?.resumeCursor : undefined);
-        const effectiveCwd =
-          input.cwd ??
-          (canReusePersistedContinuation
-            ? readPersistedCwd(persistedBinding?.runtimePayload)
-            : undefined);
-        yield* Effect.annotateCurrentSpan({
-          "provider.kind": resolvedProvider,
-          "provider.resume_cursor.source":
-            input.resumeCursor !== undefined
-              ? "request"
-              : effectiveResumeCursor !== undefined && canReusePersistedContinuation
-                ? "persisted"
-                : "none",
-          "provider.resume_cursor.present": effectiveResumeCursor !== undefined,
-          "provider.cwd.source":
-            input.cwd !== undefined
-              ? "request"
-              : effectiveCwd !== undefined && canReusePersistedContinuation
-                ? "persisted"
-                : "none",
-          "provider.cwd.effective": effectiveCwd ?? "",
-        });
-        const isCompatibleCrossInstanceSwitch =
-          persistedBindingInstanceId !== undefined &&
-          persistedBindingInstanceId !== resolvedInstanceId &&
-          persistedSourceInfo !== undefined &&
-          canReusePersistedContinuation;
-        if (
-          isCompatibleCrossInstanceSwitch &&
-          resolvedProvider === "claudeAgent" &&
-          (effectiveResumeCursor === undefined || effectiveResumeCursor === null)
-        ) {
-          return yield* new ProviderAdapterRequestError({
-            provider: resolvedProvider,
-            method: "thread/continuation/sync",
-            detail:
-              "Compatible Claude account switching requires persisted resume state before the target provider can start.",
-          });
-        }
-        if (isCompatibleCrossInstanceSwitch && effectiveResumeCursor !== undefined) {
-          const sourceAdapter = yield* registry.getByInstance(persistedBindingInstanceId);
-          if (resolvedProvider === "claudeAgent" && sourceAdapter.syncContinuation === undefined) {
-            return yield* new ProviderAdapterRequestError({
-              provider: sourceAdapter.provider,
-              method: "thread/continuation/sync",
-              detail:
-                "Compatible Claude account switching requires the source provider's continuation sync capability.",
-            });
-          }
-          // Codex-compatible instances can resume directly from their shared
-          // CODEX_HOME. They intentionally do not implement the Claude-only
-          // local transcript import capability.
-          if (sourceAdapter.syncContinuation !== undefined) {
-            yield* sourceAdapter
-              .syncContinuation({
-                threadId,
-                resumeCursor: effectiveResumeCursor,
-                ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
-              })
-              .pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapterRequestError({
-                      provider: sourceAdapter.provider,
-                      method: "thread/continuation/sync",
-                      detail: cause.message,
-                      cause,
-                    }),
-                ),
-              );
-          }
-        }
-        const adapter = yield* registry.getByInstance(resolvedInstanceId);
-        yield* prepareMcpSession(threadId, resolvedInstanceId);
-        const sessionNative = yield* adapter
-          .startSession({
-            ...input,
-            providerInstanceId: resolvedInstanceId,
-            ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
-            ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
-          })
-          .pipe(Effect.onError(() => clearMcpSession(threadId)));
-        const persistedSessionCreatedAt = canReusePersistedContinuation
-          ? readPersistedSessionCreatedAt(persistedBinding?.runtimePayload)
-          : undefined;
-        const session =
-          effectiveResumeCursor !== undefined &&
-          persistedSessionCreatedAt !== undefined &&
-          sessionNative.initialPlanningAttestation !== undefined
-            ? attestProviderSessionNativeConfiguration(
-                { ...sessionNative, createdAt: persistedSessionCreatedAt },
-                sessionNative.initialPlanningAttestation.effectiveModelSelection,
-              )
-            : sessionNative;
-
-        if (session.provider !== adapter.provider) {
-          yield* clearMcpSession(threadId);
-          return yield* toValidationError(
-            "ProviderService.startSession",
-            `Adapter/provider mismatch: requested '${adapter.provider}', received '${session.provider}'.`,
-          );
-        }
-        if (session.providerInstanceId === undefined) {
-          yield* clearMcpSession(threadId);
-          return yield* toValidationError(
-            "ProviderService.startSession",
-            `Adapter '${adapter.provider}' returned a session without a provider instance id.`,
-          );
-        }
-        if (session.providerInstanceId !== resolvedInstanceId) {
-          yield* clearMcpSession(threadId);
-          return yield* toValidationError(
-            "ProviderService.startSession",
-            `Adapter/provider instance mismatch: requested '${resolvedInstanceId}', received '${session.providerInstanceId}'.`,
-          );
-        }
-        const sessionWithInstance: ProviderSessionWithInstance = {
-          ...session,
-          providerInstanceId: session.providerInstanceId,
-        };
-
-        yield* recordSessionAttestation(sessionWithInstance);
-        yield* upsertSessionBinding(sessionWithInstance, threadId, {
-          modelSelection: input.modelSelection,
-        }).pipe(
-          Effect.onError(() =>
-            adapter.stopSession(threadId).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("provider.session.rollback-target-failed", {
-                  threadId,
-                  provider: adapter.provider,
-                  providerInstanceId: resolvedInstanceId,
-                  cause,
+      }
+      const input = {
+        ...parsed,
+        threadId,
+        provider: resolvedProvider,
+      };
+      if (!instanceInfo.enabled) {
+        return yield* toValidationError(
+          "ProviderService.startSession",
+          `Provider instance '${resolvedInstanceId}' is disabled in T3 Code settings.`,
+        );
+      }
+      const persistedBinding = Option.getOrUndefined(
+        yield* directory.getBinding(threadId).pipe(
+          Effect.catchIf(isProviderSessionBindingDecodeError, (error) =>
+            Effect.logWarning("provider.session.binding.quarantined", {
+              threadId,
+              persistedProvider: parsed.provider,
+              operation: "start-session",
+              reason: error.reason,
+              detail: error.detail,
+            }).pipe(
+              Effect.andThen(
+                increment(providerSessionBindingsQuarantinedTotal, {
+                  operation: "start-session",
+                  reason: error.reason ?? "decode-failed",
                 }),
               ),
-              Effect.andThen(
-                persistedBinding
-                  ? prepareMcpSession(threadId, persistedBinding.providerInstanceId)
-                  : clearMcpSession(threadId),
+              Effect.as(Option.none()),
+            ),
+          ),
+        ),
+      );
+      const persistedBindingInstanceId = persistedBinding?.providerInstanceId;
+      const persistedSourceInfo =
+        persistedBindingInstanceId !== undefined &&
+        persistedBindingInstanceId !== resolvedInstanceId &&
+        persistedBinding?.provider === resolvedProvider
+          ? Option.getOrUndefined(
+              yield* registry.getInstanceInfo(persistedBindingInstanceId).pipe(Effect.option),
+            )
+          : undefined;
+      const canReusePersistedContinuation =
+        persistedBindingInstanceId === resolvedInstanceId ||
+        (persistedSourceInfo !== undefined &&
+          persistedSourceInfo.driverKind === resolvedProvider &&
+          persistedSourceInfo.continuationIdentity.continuationKey ===
+            instanceInfo.continuationIdentity.continuationKey);
+      const effectiveResumeCursor =
+        input.resumeCursor ??
+        (canReusePersistedContinuation ? persistedBinding?.resumeCursor : undefined);
+      const effectiveCwd =
+        input.cwd ??
+        (canReusePersistedContinuation
+          ? readPersistedCwd(persistedBinding?.runtimePayload)
+          : undefined);
+      yield* Effect.annotateCurrentSpan({
+        "provider.kind": resolvedProvider,
+        "provider.resume_cursor.source":
+          input.resumeCursor !== undefined
+            ? "request"
+            : effectiveResumeCursor !== undefined && canReusePersistedContinuation
+              ? "persisted"
+              : "none",
+        "provider.resume_cursor.present": effectiveResumeCursor !== undefined,
+        "provider.cwd.source":
+          input.cwd !== undefined
+            ? "request"
+            : effectiveCwd !== undefined && canReusePersistedContinuation
+              ? "persisted"
+              : "none",
+        "provider.cwd.effective": effectiveCwd ?? "",
+      });
+      const isCompatibleCrossInstanceSwitch =
+        persistedBindingInstanceId !== undefined &&
+        persistedBindingInstanceId !== resolvedInstanceId &&
+        persistedSourceInfo !== undefined &&
+        canReusePersistedContinuation;
+      if (
+        isCompatibleCrossInstanceSwitch &&
+        resolvedProvider === "claudeAgent" &&
+        (effectiveResumeCursor === undefined || effectiveResumeCursor === null)
+      ) {
+        return yield* new ProviderAdapterRequestError({
+          provider: resolvedProvider,
+          method: "thread/continuation/sync",
+          detail:
+            "Compatible Claude account switching requires persisted resume state before the target provider can start.",
+        });
+      }
+      if (isCompatibleCrossInstanceSwitch && effectiveResumeCursor !== undefined) {
+        const sourceAdapter = yield* registry.getByInstance(persistedBindingInstanceId);
+        if (resolvedProvider === "claudeAgent" && sourceAdapter.syncContinuation === undefined) {
+          return yield* new ProviderAdapterRequestError({
+            provider: sourceAdapter.provider,
+            method: "thread/continuation/sync",
+            detail:
+              "Compatible Claude account switching requires the source provider's continuation sync capability.",
+          });
+        }
+        // Codex-compatible instances can resume directly from their shared
+        // CODEX_HOME. They intentionally do not implement the Claude-only
+        // local transcript import capability.
+        if (sourceAdapter.syncContinuation !== undefined) {
+          yield* sourceAdapter
+            .syncContinuation({
+              threadId,
+              resumeCursor: effectiveResumeCursor,
+              ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapterRequestError({
+                    provider: sourceAdapter.provider,
+                    method: "thread/continuation/sync",
+                    detail: cause.message,
+                    cause,
+                  }),
               ),
+            );
+        }
+      }
+      const adapter = yield* registry.getByInstance(resolvedInstanceId);
+      yield* prepareMcpSession(threadId, resolvedInstanceId);
+      if (providerAdmissionPermit !== undefined) {
+        const modelEvidence =
+          input.modelSelection === undefined
+            ? undefined
+            : canonicalProviderModelSelectionEvidence(input.modelSelection);
+        if (
+          String(threadId) !== providerAdmissionPermit.threadId ||
+          resolvedInstanceId !== providerAdmissionPermit.providerInstanceId ||
+          modelEvidence?.modelSelectionJson !== providerAdmissionPermit.modelSelectionJson ||
+          modelEvidence.modelSelectionFingerprint !==
+            providerAdmissionPermit.modelSelectionFingerprint
+        ) {
+          return yield* toValidationError(
+            "ProviderService.startSession",
+            "Durable provider admission permit does not match the selected provider session.",
+          );
+        }
+        yield* enterProviderAdmission(providerAdmissionPermit, "session-start");
+      }
+      const sessionNative = yield* adapter
+        .startSession({
+          ...input,
+          providerInstanceId: resolvedInstanceId,
+          ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
+          ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
+        })
+        .pipe(
+          Effect.onError(() =>
+            Effect.all(
+              [
+                clearMcpSession(threadId),
+                ...(providerAdmissionPermit === undefined
+                  ? []
+                  : [quarantineProviderAdmission(providerAdmissionPermit)]),
+              ],
+              { discard: true },
             ),
           ),
         );
-        // The persisted binding is the routing authority. Commit the target
-        // before stopping old adapters so failed target setup remains
-        // rollback-safe and late events from the old instance are stale.
-        yield* stopStaleSessionsForThread({
-          threadId,
-          currentInstanceId: resolvedInstanceId,
-        });
-        yield* analytics.record("provider.session.started", {
-          provider: sessionWithInstance.provider,
-          runtimeMode: input.runtimeMode,
-          hasResumeCursor: sessionWithInstance.resumeCursor !== undefined,
-          hasCwd: typeof effectiveCwd === "string" && effectiveCwd.trim().length > 0,
-          hasModel:
-            typeof input.modelSelection?.model === "string" &&
-            input.modelSelection.model.trim().length > 0,
-        });
+      const persistedSessionCreatedAt = canReusePersistedContinuation
+        ? readPersistedSessionCreatedAt(persistedBinding?.runtimePayload)
+        : undefined;
+      const session =
+        effectiveResumeCursor !== undefined &&
+        persistedSessionCreatedAt !== undefined &&
+        sessionNative.initialPlanningAttestation !== undefined
+          ? attestProviderSessionNativeConfiguration(
+              { ...sessionNative, createdAt: persistedSessionCreatedAt },
+              sessionNative.initialPlanningAttestation.effectiveModelSelection,
+            )
+          : sessionNative;
 
-        return sessionWithInstance;
+      if (session.provider !== adapter.provider) {
+        yield* clearMcpSession(threadId);
+        return yield* toValidationError(
+          "ProviderService.startSession",
+          `Adapter/provider mismatch: requested '${adapter.provider}', received '${session.provider}'.`,
+        );
+      }
+      if (session.providerInstanceId === undefined) {
+        yield* clearMcpSession(threadId);
+        return yield* toValidationError(
+          "ProviderService.startSession",
+          `Adapter '${adapter.provider}' returned a session without a provider instance id.`,
+        );
+      }
+      if (session.providerInstanceId !== resolvedInstanceId) {
+        yield* clearMcpSession(threadId);
+        return yield* toValidationError(
+          "ProviderService.startSession",
+          `Adapter/provider instance mismatch: requested '${resolvedInstanceId}', received '${session.providerInstanceId}'.`,
+        );
+      }
+      const sessionWithInstance: ProviderSessionWithInstance = {
+        ...session,
+        providerInstanceId: session.providerInstanceId,
+      };
+
+      yield* recordSessionAttestation(sessionWithInstance);
+      yield* upsertSessionBinding(sessionWithInstance, threadId, {
+        modelSelection: input.modelSelection,
       }).pipe(
-        withMetrics({
-          counter: providerSessionsTotal,
-          attributes: () =>
-            providerMetricAttributes(metricProvider, {
-              operation: "start",
-            }),
-        }),
+        Effect.onError(() =>
+          adapter.stopSession(threadId).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("provider.session.rollback-target-failed", {
+                threadId,
+                provider: adapter.provider,
+                providerInstanceId: resolvedInstanceId,
+                cause,
+              }),
+            ),
+            Effect.andThen(
+              persistedBinding
+                ? prepareMcpSession(threadId, persistedBinding.providerInstanceId)
+                : clearMcpSession(threadId),
+            ),
+          ),
+        ),
       );
-    },
-  );
-  const startSession: ProviderServiceMethod<"startSession"> = (threadId, input) =>
-    threadOperationLock.withLock(threadId, startSessionUnlocked(threadId, input));
+      // The persisted binding is the routing authority. Commit the target
+      // before stopping old adapters so failed target setup remains
+      // rollback-safe and late events from the old instance are stale.
+      yield* stopStaleSessionsForThread({
+        threadId,
+        currentInstanceId: resolvedInstanceId,
+      });
+      yield* analytics.record("provider.session.started", {
+        provider: sessionWithInstance.provider,
+        runtimeMode: input.runtimeMode,
+        hasResumeCursor: sessionWithInstance.resumeCursor !== undefined,
+        hasCwd: typeof effectiveCwd === "string" && effectiveCwd.trim().length > 0,
+        hasModel:
+          typeof input.modelSelection?.model === "string" &&
+          input.modelSelection.model.trim().length > 0,
+      });
+
+      return sessionWithInstance;
+    }).pipe(
+      withMetrics({
+        counter: providerSessionsTotal,
+        attributes: () =>
+          providerMetricAttributes(metricProvider, {
+            operation: "start",
+          }),
+      }),
+    );
+  });
+  const startSession: ProviderServiceMethod<"startSession"> = (threadId, input, authority) => {
+    const permit = authority?.providerAdmissionPermit;
+    const operation = threadOperationLock.withLock(
+      threadId,
+      startSessionUnlocked(threadId, input, permit),
+    );
+    return permit === undefined
+      ? operation
+      : withAgentControlRunOnceProjectFence(
+          ProjectId.make(permit.projectId),
+          withProviderAdmissionEffectFence(permit.providerInstanceId, operation),
+        );
+  };
 
   const sendTurnUnlocked = Effect.fn("sendTurn")(function* (
     parsed: ProviderSendTurnInput,
@@ -1333,29 +1417,44 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   `Initial Planning adapter '${routed.adapter.provider}' returned invalid native turn attestation.`,
                 );
               }
+              const permit = boundary.providerAdmissionPermit;
+              if (
+                String(input.threadId) !== permit.threadId ||
+                routed.instanceId !== permit.providerInstanceId ||
+                canonicalTurnEvidence.modelSelectionJson !== permit.modelSelectionJson ||
+                canonicalTurnEvidence.modelSelectionFingerprint !== permit.modelSelectionFingerprint
+              ) {
+                return yield* toValidationError(
+                  "ProviderService.sendTurn",
+                  "Durable provider admission permit does not match the prepared provider turn.",
+                );
+              }
               return yield* Effect.uninterruptibleMask((restore) =>
                 Effect.gen(function* () {
+                  yield* restore(enterProviderAdmission(permit, "turn-start"));
                   yield* restore(boundary.beforeDeliveryCas());
                   yield* boundary.persistDeliveryAttempted(turnAttestation);
                   yield* restore(boundary.afterDeliveryCas());
                   return yield* restore(
-                    preparedTurn.invoke({
-                      adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
-                      nativeInvocationStarted: () =>
-                        Effect.sync(() => boundary.onNativeInvocationStarted?.()),
-                      startExternal: (operation) =>
-                        Effect.gen(function* () {
-                          const externalOperation = yield* Effect.sync(operation);
-                          boundary.onExternalOperationStarted?.();
-                          const fiber = yield* externalOperation.pipe(
-                            Effect.forkChild({
-                              startImmediately: true,
-                              uninterruptible: false,
-                            }),
-                          );
-                          return yield* Fiber.join(fiber);
-                        }),
-                    }),
+                    preparedTurn
+                      .invoke({
+                        adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
+                        nativeInvocationStarted: () =>
+                          Effect.sync(() => boundary.onNativeInvocationStarted?.()),
+                        startExternal: (operation) =>
+                          Effect.gen(function* () {
+                            const externalOperation = yield* Effect.sync(operation);
+                            boundary.onExternalOperationStarted?.();
+                            const fiber = yield* externalOperation.pipe(
+                              Effect.forkChild({
+                                startImmediately: true,
+                                uninterruptible: false,
+                              }),
+                            );
+                            return yield* Fiber.join(fiber);
+                          }),
+                      })
+                      .pipe(Effect.onError(() => quarantineProviderAdmission(permit))),
                   );
                 }),
               );
@@ -1420,9 +1519,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           operation: "ProviderService.sendTurn",
         }).pipe(Effect.map((route) => ({ input, route }))),
       ),
-      Effect.flatMap(({ input, route }) =>
-        threadOperationLock.withLock(input.threadId, sendTurnUnlocked(input, boundary, route)),
-      ),
+      Effect.flatMap(({ input, route }) => {
+        const permit = boundary.providerAdmissionPermit;
+        return withAgentControlRunOnceProjectFence(
+          ProjectId.make(permit.projectId),
+          withProviderAdmissionEffectFence(
+            permit.providerInstanceId,
+            threadOperationLock.withLock(input.threadId, sendTurnUnlocked(input, boundary, route)),
+          ),
+        );
+      }),
     );
   const getSessionAttestation: NonNullable<
     ProviderService.ProviderService["Service"]["getSessionAttestation"]

@@ -153,6 +153,26 @@ export const makeProviderUsage = Effect.fn("makeProviderUsage")(function* (
   );
 
   return ProviderUsage.ProviderUsage.of({
+    inspectForAdmission: (providerInstanceId) =>
+      Effect.gen(function* () {
+        const observedAt = DateTime.formatIso(yield* DateTime.now);
+        const adapter = yield* Effect.result(adapterRegistry.getByInstance(providerInstanceId));
+        if (adapter._tag === "Failure") {
+          return { _tag: "SupportedUnusable" as const, observedAt };
+        }
+        if (adapter.success.readUsage === undefined) {
+          return { _tag: "Unsupported" as const, observedAt };
+        }
+        const usage = yield* Effect.result(readProviderUsage(providerInstanceId));
+        if (
+          usage._tag === "Failure" ||
+          Option.isNone(usage.success) ||
+          usage.success.value.providerInstanceId !== providerInstanceId
+        ) {
+          return { _tag: "SupportedUnusable" as const, observedAt };
+        }
+        return { _tag: "Observed" as const, snapshot: usage.success.value };
+      }),
     getSnapshot: Ref.get(snapshots).pipe(Effect.map((state) => Array.from(state.values()))),
     refresh: (requestedIds) =>
       Effect.gen(function* () {

@@ -48,6 +48,7 @@ import {
   type AgentControlInitialPlanningFinalizerResult,
 } from "../Services/AgentControlInitialPlanningFinalizer.ts";
 import { AgentControlInitialPlanningFinalizerHooks } from "../Services/AgentControlInitialPlanningFinalizerHooks.ts";
+import { ProviderAdmissionReleaseAuthority } from "../../providerAdmission/Services/ProviderAdmissionReleaseAuthority.ts";
 import { AgentControlInitialPlanningHandoffStore } from "../Services/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningWakeup } from "../Services/AgentControlInitialPlanningWakeup.ts";
 import { loadAuthoritativeStageRunState } from "../../stageRunLease/authoritative.ts";
@@ -383,6 +384,9 @@ const make = Effect.gen(function* () {
   const leaseProjection = yield* AgentControlStageRunLeaseProjection;
   const leaseEngine = yield* AgentControlStageRunLeaseEngine;
   const hooks = yield* AgentControlInitialPlanningFinalizerHooks;
+  const providerAdmissionRelease = Option.getOrUndefined(
+    yield* Effect.serviceOption(ProviderAdmissionReleaseAuthority),
+  );
   const publications =
     yield* PubSub.unbounded<AgentControlInitialPlanningFinalizationPublication>();
 
@@ -1666,6 +1670,25 @@ const make = Effect.gen(function* () {
             ${resultEvidenceId}, ${evidence.handoffId}, ${delivery.terminalAt}
           )
         `;
+          const releasedProviderInstanceId =
+            providerAdmissionRelease === undefined
+              ? null
+              : yield* providerAdmissionRelease
+                  .releaseInTransaction({
+                    stage: "initial-planning",
+                    handoffId: evidence.handoffId,
+                    finalizedAt: delivery.terminalAt!,
+                  })
+                  .pipe(
+                    Effect.mapError((cause) =>
+                      finalizerError(
+                        evidence.handoffId,
+                        "provider-admission-release",
+                        "persistence",
+                        cause,
+                      ),
+                    ),
+                  );
           yield* hooks.beforeTransactionComplete({
             ...observation,
             stageRevision: currentStage.revision,
@@ -1673,6 +1696,7 @@ const make = Effect.gen(function* () {
           });
           return {
             _tag: "Finalized" as const,
+            releasedProviderInstanceId,
             observation,
             publication: {
               handoffId: evidence.handoffId,
@@ -1718,6 +1742,9 @@ const make = Effect.gen(function* () {
       return { _tag: "Started" as const, event: transaction.event };
     }
     yield* hooks.afterNativeCommit(transaction.observation);
+    yield* providerAdmissionRelease === undefined
+      ? Effect.void
+      : providerAdmissionRelease.signalCommitted(transaction.releasedProviderInstanceId);
     yield* Effect.uninterruptible(
       Effect.gen(function* () {
         yield* stageEngine.publishCommitted(transaction.publication.stageEvents);

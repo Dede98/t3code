@@ -335,15 +335,21 @@ const make = Effect.gen(function* () {
           projects: project ? [project] : [],
         });
         const startProviderSession = (input?: { readonly resumeCursor?: unknown }) =>
-          providerService.startSession(threadId, {
+          providerService.startSession(
             threadId,
-            provider: preferredProvider,
-            providerInstanceId: desiredInstanceId,
-            ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
-            modelSelection: desiredModelSelection,
-            ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
-            runtimeMode: desiredRuntimeMode,
-          });
+            {
+              threadId,
+              provider: preferredProvider,
+              providerInstanceId: desiredInstanceId,
+              ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+              modelSelection: desiredModelSelection,
+              ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
+              runtimeMode: desiredRuntimeMode,
+            },
+            options?.providerAdmissionPermit === undefined
+              ? undefined
+              : { providerAdmissionPermit: options.providerAdmissionPermit },
+          );
         const bindSessionToThread = (session: ProviderSession) =>
           Effect.gen(function* () {
             if (session.providerInstanceId === undefined) {
@@ -458,6 +464,39 @@ const make = Effect.gen(function* () {
       return yield* Effect.die(
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
+    }
+    const durable =
+      input.providerDeliveryId !== undefined || input.durableDeliveryKind !== undefined;
+    const admissionPermit = input.providerAdmissionPermit;
+    if (durable && admissionPermit === undefined) {
+      return yield* new ProviderAdapterRequestError({
+        provider: providerErrorLabelFromInstanceHint({
+          instanceId: String(input.modelSelection?.instanceId ?? thread.modelSelection.instanceId),
+        }),
+        method: "thread.turn.start",
+        detail:
+          "Automated durable provider delivery requires a committed capacity admission permit.",
+      });
+    }
+    if (admissionPermit !== undefined) {
+      const selection = input.modelSelection ?? thread.modelSelection;
+      const modelEvidence = canonicalProviderModelSelectionEvidence(selection);
+      if (
+        input.providerDeliveryId !== admissionPermit.providerDeliveryId ||
+        String(input.threadId) !== admissionPermit.threadId ||
+        selection.instanceId !== admissionPermit.providerInstanceId ||
+        modelEvidence.modelSelectionJson !== admissionPermit.modelSelectionJson ||
+        modelEvidence.modelSelectionFingerprint !== admissionPermit.modelSelectionFingerprint ||
+        input.durableDeliveryKind !== admissionPermit.stage
+      ) {
+        return yield* new ProviderAdapterRequestError({
+          provider: providerErrorLabelFromInstanceHint({
+            instanceId: String(selection.instanceId),
+          }),
+          method: "thread.turn.start",
+          detail: "Durable provider delivery conflicts with its capacity admission permit.",
+        });
+      }
     }
     let sessionResumeCursorJson: string | undefined;
     const sessionsBefore = yield* providerService.listSessions();
@@ -730,11 +769,10 @@ const make = Effect.gen(function* () {
       }
     }
 
-    yield* ensureSessionForThread(
-      input.threadId,
-      input.createdAt,
-      input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection },
-    );
+    yield* ensureSessionForThread(input.threadId, input.createdAt, {
+      ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+      ...(admissionPermit === undefined ? {} : { providerAdmissionPermit: admissionPermit }),
+    });
     if (input.modelSelection !== undefined) {
       if (!Equal.equals(thread.modelSelection, input.modelSelection)) {
         yield* orchestrationEngine.dispatch({
@@ -916,6 +954,7 @@ const make = Effect.gen(function* () {
         : {
             providerDeliveryId: input.providerDeliveryId,
             durableDeliveryKind,
+            ...(admissionPermit === undefined ? {} : { providerAdmissionPermit: admissionPermit }),
             ...(sessionAttestation === undefined ? {} : { sessionAttestation }),
             ...(sessionResumeCursorJson === undefined ? {} : { sessionResumeCursorJson }),
           }),
@@ -925,6 +964,15 @@ const make = Effect.gen(function* () {
   const sendPreparedTurn: ProviderTurnRequestExecutorShape["sendPreparedTurn"] = Effect.fn(
     "ProviderTurnRequestExecutor.sendPreparedTurn",
   )(function* (prepared) {
+    if (prepared.durableDeliveryKind !== undefined) {
+      return yield* new ProviderAdapterRequestError({
+        provider: providerErrorLabelFromInstanceHint({
+          instanceId: String(prepared.input.modelSelection?.instanceId ?? "unknown"),
+        }),
+        method: "thread.turn.start",
+        detail: "Durable provider delivery must use the guarded pre-invoke boundary.",
+      });
+    }
     return yield* providerService.sendTurn(prepared.input);
   });
 
@@ -933,7 +981,12 @@ const make = Effect.gen(function* () {
       function* (prepared, boundary) {
         const sendAtBoundary = providerService.sendTurnAtPreInvokeBoundary;
         const attestation = prepared.sessionAttestation;
-        if (sendAtBoundary === undefined || attestation === undefined) {
+        const providerAdmissionPermit = prepared.providerAdmissionPermit;
+        if (
+          sendAtBoundary === undefined ||
+          attestation === undefined ||
+          providerAdmissionPermit === undefined
+        ) {
           return yield* new ProviderTurnDeliveryError({
             certainty: "not-attempted",
             cause: new Error("Initial Planning provider pre-invoke boundary is unavailable."),
@@ -946,6 +999,7 @@ const make = Effect.gen(function* () {
         };
         const result = yield* sendAtBoundary(prepared.input, {
           expected: attestation,
+          providerAdmissionPermit,
           beforeDeliveryCas: boundary.beforeDeliveryCas,
           persistDeliveryAttempted: boundary.persistDeliveryAttempted,
           afterDeliveryCas: boundary.afterDeliveryCas,

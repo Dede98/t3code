@@ -191,6 +191,12 @@ import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControl
 import { AgentControlWorktreeEventStore } from "../../worktree/Services/AgentControlWorktreeEventStore.ts";
 import { AgentControlWorktreeStateRepository } from "../../worktree/Services/AgentControlWorktreeStateRepository.ts";
 import {
+  ProviderAdmissionReleaseAuthority,
+  type ProviderAdmissionReleaseAuthorityShape,
+} from "../../providerAdmission/Services/ProviderAdmissionReleaseAuthority.ts";
+import { ProviderAdmissionRuntime } from "../../providerAdmission/Services/ProviderAdmissionRuntime.ts";
+import { providerAdmissionId } from "../../providerAdmission/model.ts";
+import {
   deriveAgentControlWorktreePathKeys,
   deriveAgentControlWorktreeReservationId,
 } from "../../worktree/identity.ts";
@@ -440,6 +446,29 @@ const noopImplementationStageFinalizerHooks: AgentControlImplementationStageFina
   afterOuterCommit: () => Effect.void,
   afterPublication: () => Effect.void,
 };
+const noopProviderAdmissionRelease: ProviderAdmissionReleaseAuthorityShape = {
+  releaseInTransaction: () => Effect.succeed(null),
+  signalCommitted: () => Effect.void,
+  recover: Effect.void,
+};
+const admittedProviderRuntime = ProviderAdmissionRuntime.of({
+  request: (request) =>
+    Effect.succeed({
+      _tag: "Admitted" as const,
+      permit: {
+        ...request,
+        admissionId: providerAdmissionId(request),
+        admissionMarkerId: `marker-${request.handoffId}`,
+        admissionMarkerFingerprint: fixtureFingerprint(`marker-${request.handoffId}`),
+        admissionOwnerId: "test-admission-owner",
+        admissionLeaseExpiresAt: expiresAt,
+        providerFenceToken: 1,
+        usageEvidenceFingerprint: fixtureFingerprint(`usage-${request.handoffId}`),
+      },
+    }),
+  usageChanged: () => Effect.void,
+  capacityReleased: () => Effect.void,
+});
 const noopVerificationAdmissionHooks: AgentControlVerificationAdmissionHooksShape = {
   afterFinalizerSubscriptionAcquired: () => Effect.void,
   afterStageRunSubscriptionAcquired: () => Effect.void,
@@ -584,6 +613,7 @@ const buildFinalizer = Effect.fn("buildInitialPlanningFinalizerHarness")(functio
   scope: Scope.Closeable,
   hooks: AgentControlInitialPlanningFinalizerHooksShape = noopHooks,
   runtimeHolderId = "runtime-holder",
+  providerAdmissionRelease: ProviderAdmissionReleaseAuthorityShape = noopProviderAdmissionRelease,
 ) {
   const sqlLayer = Layer.succeed(SqlClient.SqlClient, sql);
   const build = <I, E>(layer: Layer.Layer<I, E, never>) => Layer.buildWithScope(layer, scope);
@@ -685,6 +715,7 @@ const buildFinalizer = Effect.fn("buildInitialPlanningFinalizerHarness")(functio
     Layer.succeed(AgentControlStageRunLeaseEngine, leaseEngine),
     Layer.succeed(OrchestrationEngineService, orchestrationEngine),
     Layer.succeed(AgentControlInitialPlanningFinalizerHooks, hooks),
+    Layer.succeed(ProviderAdmissionReleaseAuthority, providerAdmissionRelease),
   );
   const finalizerContext = yield* build(
     Layer.fresh(AgentControlInitialPlanningFinalizerLive).pipe(Layer.provide(dependencies)),
@@ -2221,6 +2252,7 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
     readonly responseLoss?: boolean;
     readonly hooks?: AgentControlImplementationTurnConsumerHooksShape;
     readonly store?: AgentControlImplementationHandoffStore["Service"];
+    readonly providerAdmissionRuntime?: ProviderAdmissionRuntime["Service"];
   }) {
     const store = input.store ?? input.coordinator.handoffStore;
     const provider = ProviderService.of({
@@ -2344,6 +2376,10 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
             Layer.succeed(ProviderService, provider),
             Layer.succeed(ProviderTurnRequestExecutor, executor),
             Layer.succeed(
+              ProviderAdmissionRuntime,
+              input.providerAdmissionRuntime ?? admittedProviderRuntime,
+            ),
+            Layer.succeed(
               AgentControlImplementationTurnConsumerHooks,
               AgentControlImplementationTurnConsumerHooks.of(
                 input.hooks ?? noopImplementationConsumerHooks,
@@ -2409,6 +2445,7 @@ const buildImplementationStageFinalizer = Effect.fn("buildImplementationStageFin
     readonly planningFinalizer: FinalizerHarness;
     readonly starter: AgentControlImplementationStageStarterShape;
     readonly hooks?: AgentControlImplementationStageFinalizerHooksShape;
+    readonly providerAdmissionRelease?: ProviderAdmissionReleaseAuthorityShape;
   }) {
     const context = yield* Layer.buildWithScope(
       Layer.fresh(AgentControlImplementationStageFinalizerLive).pipe(
@@ -2438,6 +2475,10 @@ const buildImplementationStageFinalizer = Effect.fn("buildImplementationStageFin
               AgentControlImplementationStageFinalizerHooks.of(
                 input.hooks ?? noopImplementationStageFinalizerHooks,
               ),
+            ),
+            Layer.succeed(
+              ProviderAdmissionReleaseAuthority,
+              input.providerAdmissionRelease ?? noopProviderAdmissionRelease,
             ),
           ),
         ),
@@ -2867,6 +2908,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
     readonly executorService?: ProviderTurnRequestExecutor["Service"];
     readonly hooks?: AgentControlVerificationTurnConsumerHooksShape;
     readonly providerTurnId?: TurnId;
+    readonly providerAdmissionRuntime?: ProviderAdmissionRuntime["Service"];
   }) {
     const providerEvents =
       input.providerEvents ?? (yield* PubSub.unbounded<ProviderRuntimeEvent>());
@@ -3014,6 +3056,10 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
             Layer.succeed(ProjectionSnapshotQuery, input.coordinator.snapshots),
             Layer.succeed(ProviderService, provider),
             Layer.succeed(ProviderTurnRequestExecutor, executor),
+            Layer.succeed(
+              ProviderAdmissionRuntime,
+              input.providerAdmissionRuntime ?? admittedProviderRuntime,
+            ),
             Layer.succeed(
               AgentControlVerificationTurnConsumerHooks,
               AgentControlVerificationTurnConsumerHooks.of(
@@ -3457,6 +3503,7 @@ const prepareImplementationStageFinalizationCandidate = Effect.fn(
   startStage = true,
   taskOverride?: AgentControlTaskState,
   completePlanningParents = false,
+  providerAdmissionRelease: ProviderAdmissionReleaseAuthorityShape = noopProviderAdmissionRelease,
 ) {
   const prepared = (yield* prepareImplementationDeliveryRecoveryCandidates(
     database,
@@ -3512,6 +3559,7 @@ const prepareImplementationStageFinalizationCandidate = Effect.fn(
     coordinator: prepared.coordinator,
     planningFinalizer,
     starter,
+    providerAdmissionRelease,
   });
   return { ...prepared, claim, starter, finalizer };
 });
@@ -4923,6 +4971,109 @@ it.effect.each<{
         }),
       ),
     ),
+);
+
+it.effect("leaves verification delivery authority unchanged while provider admission waits", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const suffix = "verification-provider-admission-waiting";
+        const database = yield* makeSharedDatabase();
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const prepared = yield* prepareSucceededImplementationFinalization(
+          database,
+          planningFinalizer,
+          suffix,
+        );
+        const verificationAdmission = yield* buildVerificationAdmission({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          planningFinalizer,
+          implementationFinalizer: prepared.setup.finalizer.finalizer,
+          handoffStore: prepared.setup.coordinator.handoffStore,
+          admissionHarness: prepared.setup.candidate.admissionHarness,
+        });
+        yield* verificationAdmission.admission.processResultEvidence(
+          prepared.implementation.resultEvidenceId,
+        );
+        const coordinator = yield* buildVerificationTurnCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          admission: verificationAdmission.admission,
+          planningFinalizer,
+          admissionHarness: prepared.setup.candidate.admissionHarness,
+          task: prepared.setup.candidate.task,
+          worktree: prepared.setup.candidate.worktree,
+          orchestration: prepared.setup.coordinator.orchestration,
+          snapshots: prepared.setup.coordinator.snapshots,
+        });
+        yield* coordinator.coordinator.processHandoff(prepared.implementation.resultEvidenceId);
+        const [handoff] = yield* database.sqlA<{ readonly handoffId: string }>`
+          SELECT accepted.handoff_id AS "handoffId"
+          FROM main.agent_control_verification_handoff_accepted accepted
+          JOIN main.agent_control_verification_materialization_evidence materialization
+            ON materialization.materialization_evidence_id=accepted.materialization_evidence_id
+          WHERE materialization.implementation_result_evidence_id=
+            ${prepared.implementation.resultEvidenceId}
+        `;
+        assert.isDefined(handoff);
+        const deliveryBefore = yield* database.sqlB`
+          SELECT typeof(provider_delivery_id) AS "idStorageClass",
+            hex(CAST(provider_delivery_id AS BLOB)) AS "idBytes",state,revision,
+            claim_owner_id AS "claimOwnerId",claim_generation AS "claimGeneration",
+            claim_expires_at AS "claimExpiresAt",attempt_count AS "attemptCount",
+            next_attempt_at AS "nextAttemptAt",provider_turn_id AS "providerTurnId",
+            provider_accepted_at AS "providerAcceptedAt",
+            provider_session_created_at AS "providerSessionCreatedAt",
+            terminal_at AS "terminalAt",last_error_code AS "lastErrorCode"
+          FROM main.agent_control_verification_deliveries
+          WHERE handoff_id=${handoff!.handoffId}
+        `;
+        const executorCalls = yield* Ref.make(0);
+        const admissionRequests = yield* Ref.make(0);
+        const consumer = yield* buildVerificationTurnConsumer({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          coordinator,
+          executorCalls,
+          providerAdmissionRuntime: ProviderAdmissionRuntime.of({
+            request: (request) =>
+              Ref.update(admissionRequests, (count) => count + 1).pipe(
+                Effect.as({
+                  _tag: "Waiting" as const,
+                  admissionId: providerAdmissionId(request),
+                  retryAt: null,
+                }),
+              ),
+            usageChanged: () => Effect.void,
+            capacityReleased: () => Effect.void,
+          }),
+          hooks: {
+            ...noopVerificationConsumerHooks,
+            beforeClaim: () => Effect.die(new Error("delivery claim preceded admission")),
+          },
+        });
+        yield* consumer.processHandoff(handoff!.handoffId);
+        assert.equal(yield* Ref.get(admissionRequests), 1);
+        assert.equal(yield* Ref.get(executorCalls), 0);
+        assert.deepStrictEqual(
+          yield* database.sqlB`
+            SELECT typeof(provider_delivery_id) AS "idStorageClass",
+              hex(CAST(provider_delivery_id AS BLOB)) AS "idBytes",state,revision,
+              claim_owner_id AS "claimOwnerId",claim_generation AS "claimGeneration",
+              claim_expires_at AS "claimExpiresAt",attempt_count AS "attemptCount",
+              next_attempt_at AS "nextAttemptAt",provider_turn_id AS "providerTurnId",
+              provider_accepted_at AS "providerAcceptedAt",
+              provider_session_created_at AS "providerSessionCreatedAt",
+              terminal_at AS "terminalAt",last_error_code AS "lastErrorCode"
+            FROM main.agent_control_verification_deliveries
+            WHERE handoff_id=${handoff!.handoffId}
+          `,
+          deliveryBefore,
+        );
+      }),
+    ),
+  ),
 );
 
 it.effect(
@@ -6514,6 +6665,79 @@ it.effect("revalidates task authority after turn acceptance and before provider 
   ),
 );
 
+it.effect("leaves implementation delivery authority unchanged while provider admission waits", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const [candidate] = yield* prepareImplementationDeliveryRecoveryCandidates(
+          database,
+          finalizer,
+          ["implementation-provider-admission-waiting"],
+        );
+        assert.isDefined(candidate);
+        const executorCalls = yield* Ref.make(0);
+        const admissionRequests = yield* Ref.make(0);
+        const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+        const deliveryBefore = yield* database.sqlB`
+          SELECT typeof(provider_delivery_id) AS "idStorageClass",
+            hex(CAST(provider_delivery_id AS BLOB)) AS "idBytes",
+            state,revision,claim_owner_id AS "claimOwnerId",
+            claim_generation AS "claimGeneration",claim_expires_at AS "claimExpiresAt",
+            attempt_count AS "attemptCount",next_attempt_at AS "nextAttemptAt",
+            provider_turn_id AS "providerTurnId",provider_accepted_at AS "providerAcceptedAt",
+            provider_session_created_at AS "providerSessionCreatedAt",
+            terminal_at AS "terminalAt",last_error_code AS "lastErrorCode"
+          FROM main.agent_control_implementation_deliveries
+          WHERE handoff_id=${candidate!.handoffId}
+        `;
+        const consumer = yield* buildImplementationConsumer({
+          sql: database.sqlB,
+          scope: database.scopeB,
+          coordinator: candidate!.coordinator,
+          executorCalls,
+          providerEvents,
+          providerAdmissionRuntime: ProviderAdmissionRuntime.of({
+            request: (request) =>
+              Ref.update(admissionRequests, (count) => count + 1).pipe(
+                Effect.as({
+                  _tag: "Waiting" as const,
+                  admissionId: providerAdmissionId(request),
+                  retryAt: null,
+                }),
+              ),
+            usageChanged: () => Effect.void,
+            capacityReleased: () => Effect.void,
+          }),
+          hooks: {
+            ...noopImplementationConsumerHooks,
+            beforeClaim: () => Effect.die(new Error("delivery claim preceded admission")),
+          },
+        });
+        yield* consumer.consumer.processHandoff(candidate!.handoffId);
+        assert.equal(yield* Ref.get(admissionRequests), 1);
+        assert.equal(yield* Ref.get(executorCalls), 0);
+        assert.deepStrictEqual(
+          yield* database.sqlB`
+            SELECT typeof(provider_delivery_id) AS "idStorageClass",
+              hex(CAST(provider_delivery_id AS BLOB)) AS "idBytes",
+              state,revision,claim_owner_id AS "claimOwnerId",
+              claim_generation AS "claimGeneration",claim_expires_at AS "claimExpiresAt",
+              attempt_count AS "attemptCount",next_attempt_at AS "nextAttemptAt",
+              provider_turn_id AS "providerTurnId",provider_accepted_at AS "providerAcceptedAt",
+              provider_session_created_at AS "providerSessionCreatedAt",
+              terminal_at AS "terminalAt",last_error_code AS "lastErrorCode"
+            FROM main.agent_control_implementation_deliveries
+            WHERE handoff_id=${candidate!.handoffId}
+          `,
+          deliveryBefore,
+        );
+      }),
+    ),
+  ),
+);
+
 it.effect.each<{ readonly exceptional: "defect" | "interrupt" }>([
   { exceptional: "defect" },
   { exceptional: "interrupt" },
@@ -7867,20 +8091,63 @@ it.effect(
         const database = yield* makeSharedDatabase();
         const afterCommitCounts = yield* Ref.make<ReadonlyArray<number>>([]);
         const publicationCount = yield* Ref.make(0);
-        const harness = yield* buildFinalizer(database.sqlA, database.scopeA, {
-          ...noopHooks,
-          afterNativeCommit: () =>
-            database.sqlA<{ readonly count: number }>`
+        const releaseCalls = yield* Ref.make(0);
+        const releaseSignals = yield* Ref.make<ReadonlyArray<string | null>>([]);
+        const harness = yield* buildFinalizer(
+          database.sqlA,
+          database.scopeA,
+          {
+            ...noopHooks,
+            afterNativeCommit: () =>
+              database.sqlA<{ readonly count: number }>`
             SELECT COUNT(*) AS count
             FROM agent_control_initial_planning_finalization_receipts
           `.pipe(
-              Effect.flatMap((rows) =>
-                Ref.update(afterCommitCounts, (current) => [...current, rows[0]!.count]),
+                Effect.flatMap((rows) =>
+                  Ref.update(afterCommitCounts, (current) => [...current, rows[0]!.count]),
+                ),
+                Effect.orDie,
               ),
-              Effect.orDie,
-            ),
-          afterPublication: () => Ref.update(publicationCount, (count) => count + 1),
-        });
+            afterPublication: () => Ref.update(publicationCount, (count) => count + 1),
+          },
+          "runtime-holder",
+          {
+            releaseInTransaction: ({ stage, handoffId }) =>
+              Effect.gen(function* () {
+                assert.equal(stage, "initial-planning");
+                assert.equal(
+                  (yield* database.sqlA<{ readonly count: number }>`
+                  SELECT count(*) AS count
+                  FROM agent_control_initial_planning_finalization_markers
+                  WHERE handoff_id=${handoffId}
+                `.pipe(Effect.orDie))[0]?.count,
+                  1,
+                );
+                assert.equal(
+                  (yield* database.sqlB<{ readonly count: number }>`
+                  SELECT count(*) AS count
+                  FROM agent_control_initial_planning_finalization_markers
+                  WHERE handoff_id=${handoffId}
+                `.pipe(Effect.orDie))[0]?.count,
+                  0,
+                );
+                yield* Ref.update(releaseCalls, (count) => count + 1);
+                return "provider-release-initial";
+              }),
+            signalCommitted: (providerInstanceId) =>
+              Effect.gen(function* () {
+                assert.equal(
+                  (yield* database.sqlB<{ readonly count: number }>`
+                  SELECT count(*) AS count
+                  FROM agent_control_initial_planning_finalization_markers
+                `.pipe(Effect.orDie))[0]?.count,
+                  1,
+                );
+                yield* Ref.update(releaseSignals, (current) => [...current, providerInstanceId]);
+              }),
+            recover: Effect.void,
+          },
+        );
         const seeded = yield* seedPlanning(database.sqlA, harness, "plan-first");
         yield* appendProviderStart(database.sqlA, seeded, "plan-first");
         const started = yield* harness.finalizer.processHandoff(seeded.evidence.handoffId);
@@ -7904,6 +8171,8 @@ it.effect(
         });
         assert.deepStrictEqual(yield* Ref.get(afterCommitCounts), [0, 1]);
         assert.equal(yield* Ref.get(publicationCount), 2);
+        assert.equal(yield* Ref.get(releaseCalls), 1);
+        assert.deepStrictEqual(yield* Ref.get(releaseSignals), ["provider-release-initial"]);
         assert.deepStrictEqual(
           (yield* Ref.get(harness.stagePublished)).map((event) => event.type),
           ["agentControl.stageRun.planningStarted", "agentControl.stageRun.planningSucceeded"],
@@ -24373,11 +24642,56 @@ it.effect.each<{
           const suffix = `implementation-finalization-${deliveryState}`;
           const database = yield* makeSharedDatabase();
           const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const releaseCalls = yield* Ref.make(0);
+          const releaseSignals = yield* Ref.make<ReadonlyArray<string | null>>([]);
+          const releasedHandoff = yield* Ref.make<string | null>(null);
           const setup = yield* prepareImplementationStageFinalizationCandidate(
             database,
             planningFinalizer,
             suffix,
             deliveryState !== "completed",
+            undefined,
+            false,
+            {
+              releaseInTransaction: ({ stage, handoffId }) =>
+                Effect.gen(function* () {
+                  assert.equal(stage, "implementation");
+                  assert.equal(
+                    (yield* database.sqlA<{ readonly count: number }>`
+                      SELECT count(*) AS count
+                      FROM agent_control_implementation_stage_finalization_markers
+                      WHERE handoff_id=${handoffId}
+                    `.pipe(Effect.orDie))[0]?.count,
+                    1,
+                  );
+                  assert.equal(
+                    (yield* database.sqlB<{ readonly count: number }>`
+                      SELECT count(*) AS count
+                      FROM agent_control_implementation_stage_finalization_markers
+                      WHERE handoff_id=${handoffId}
+                    `.pipe(Effect.orDie))[0]?.count,
+                    0,
+                  );
+                  yield* Ref.update(releaseCalls, (count) => count + 1);
+                  yield* Ref.set(releasedHandoff, handoffId);
+                  return "provider-release-implementation";
+                }),
+              signalCommitted: (providerInstanceId) =>
+                Effect.gen(function* () {
+                  const handoffId = yield* Ref.get(releasedHandoff);
+                  assert.notEqual(handoffId, null);
+                  assert.equal(
+                    (yield* database.sqlB<{ readonly count: number }>`
+                      SELECT count(*) AS count
+                      FROM agent_control_implementation_stage_finalization_markers
+                      WHERE handoff_id=${handoffId}
+                    `.pipe(Effect.orDie))[0]?.count,
+                    1,
+                  );
+                  yield* Ref.update(releaseSignals, (current) => [...current, providerInstanceId]);
+                }),
+              recover: Effect.void,
+            },
           );
           const runningClaim = Option.getOrThrow(
             yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
@@ -24471,6 +24785,10 @@ it.effect.each<{
           );
           assert.equal((yield* Ref.get(planningFinalizer.stagePublished)).length, 1);
           assert.equal((yield* Ref.get(planningFinalizer.leasePublished)).length, 1);
+          assert.equal(yield* Ref.get(releaseCalls), 1);
+          assert.deepStrictEqual(yield* Ref.get(releaseSignals), [
+            "provider-release-implementation",
+          ]);
           const resultRows = yield* database.sqlB<{
             readonly resultEvidenceId: string;
             readonly outcome: string;
