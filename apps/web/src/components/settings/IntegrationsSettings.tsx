@@ -20,7 +20,6 @@ import {
   DEFAULT_BROWSER_RECORDING_FRAME_RATE,
   DEFAULT_BROWSER_VIEWPORT,
   DEFAULT_PREVIEW_APPEARANCE,
-  DEFAULT_UNIFIED_SETTINGS,
   DEFAULT_PREVIEW_ZOOM_FACTOR,
   FILL_PREVIEW_VIEWPORT,
   type ExternalMcpHeader,
@@ -36,6 +35,7 @@ import {
   type PreviewViewportSetting,
 } from "@t3tools/contracts";
 import { PREVIEW_VIEWPORT_PRESETS } from "@t3tools/shared/previewViewport";
+import { Link } from "@tanstack/react-router";
 import { InfoIcon, MoreVertical, Plus as PlusIcon, Trash2Icon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
@@ -90,8 +90,8 @@ import {
   persistClientSettingsUpdate,
   useClientSettings,
   useClientSettingsHydrated,
-  usePrimarySettings,
   useUpdatePrimarySettings,
+  usePrimarySettings,
 } from "~/hooks/useSettings";
 
 import {
@@ -556,39 +556,20 @@ function BrowserLinkTargetSetting({ disabled }: { readonly disabled: boolean }) 
 }
 
 function AgentBrowserAccessSetting() {
-  const settings = usePrimarySettings();
-  const updateSettings = useUpdatePrimarySettings();
-
   return (
     <SettingsRow
-      serverScoped
       {...searchableSetting("agent-browser-access")}
-      description="Allow agents to use the preview browser. Off hides browser tools from agents, not you."
-      status={
-        settings.enableAgentBrowserAccess
-          ? undefined
-          : "Applies to sessions started from now on; a running agent keeps the tools it was given."
-      }
-      resetAction={
-        settings.enableAgentBrowserAccess !== DEFAULT_UNIFIED_SETTINGS.enableAgentBrowserAccess ? (
-          <SettingResetButton
-            label="agent browser access"
-            onClick={() =>
-              updateSettings({
-                enableAgentBrowserAccess: DEFAULT_UNIFIED_SETTINGS.enableAgentBrowserAccess,
-              })
-            }
-          />
-        ) : null
-      }
+      description="Choose whether agents can use the preview browser for all projects or a specific project."
       control={
-        <Switch
-          checked={settings.enableAgentBrowserAccess}
-          onCheckedChange={(checked) =>
-            updateSettings({ enableAgentBrowserAccess: Boolean(checked) })
+        <Button
+          render={
+            <Link to="/settings/projects" search={{ project: undefined, machine: undefined }} />
           }
-          aria-label="Allow agent browser access"
-        />
+          size="sm"
+          variant="outline"
+        >
+          Project settings
+        </Button>
       }
     />
   );
@@ -1007,11 +988,6 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
       .then(setSources)
       .catch(() => setSources((previous) => previous ?? []));
   }, []);
-
-  // Loaded once so the first open is instant instead of flashing a spinner.
-  useEffect(() => {
-    loadSources();
-  }, [loadSources]);
 
   // Runs one import for the wizard. A new profile is registered only once the
   // import succeeds — the cookies land in its partition first — so a blocked

@@ -74,6 +74,7 @@ const makeHarness = Effect.fn("ServerUsageTest.makeHarness")(function* (
           ...input,
           buckets: [
             {
+              sourceId: "codex",
               day: input.sinceDay,
               provider: "codex",
               model: "custom-model",
