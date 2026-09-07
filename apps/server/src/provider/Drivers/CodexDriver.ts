@@ -22,7 +22,6 @@
  * @module provider/Drivers/CodexDriver
  */
 import { CodexSettings, ProviderDriverKind } from "@t3tools/contracts";
-import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -36,7 +35,7 @@ import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
-import { ProviderAdapterRequestError, ProviderDriverError } from "../Errors.ts";
+import { ProviderDriverError } from "../Errors.ts";
 import { makeCodexAdapter } from "../Layers/CodexAdapter.ts";
 import { resolveExternalMcpServers } from "../ExternalMcpServers.ts";
 import {
@@ -47,7 +46,6 @@ import {
   checkCodexProviderStatus,
   makePendingCodexProvider,
   probeCodexSkillsForCwd,
-  readCodexRateLimits,
   withCodexAppServerClient,
 } from "../Layers/CodexProvider.ts";
 import { resolveCodexLaunchArgs } from "../Layers/codexLaunchArgs.ts";
@@ -55,7 +53,6 @@ import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import * as ModelManifest from "../ModelManifest.ts";
 import type { ProviderDriver, ProviderInstance } from "../ProviderDriver.ts";
-import { projectCodexUsage } from "../providerUsageProjection.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import {
@@ -77,7 +74,6 @@ import {
   resolveCodexTranscriptDirPath,
 } from "./CodexHomeLayout.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
-const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 
 const DRIVER_KIND = ProviderDriverKind.make("codex");
 // The standalone installer lays out `<CODEX_HOME>/packages/standalone/…`;
@@ -188,7 +184,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       // here; the registry only has to worry about snapshot-build and
       // spawner-availability failures surfaced from `checkCodexProviderStatus`
       // below.
-      const baseAdapter = yield* makeCodexAdapter(effectiveConfig, {
+      const adapter = yield* makeCodexAdapter(effectiveConfig, {
         instanceId,
         environment: processEnv,
         resolveExternalMcpServers: serverSettings.getSettings.pipe(
@@ -198,48 +194,6 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
       });
       const textGeneration = yield* makeCodexTextGeneration(effectiveConfig, processEnv);
-      const adapter = {
-        ...baseAdapter,
-        readUsage: () =>
-          Effect.gen(function* () {
-            const rateLimits = yield* readCodexRateLimits({
-              binaryPath: effectiveConfig.binaryPath,
-              homePath: effectiveConfig.homePath,
-              cwd: process.cwd(),
-              environment: processEnv,
-            });
-            const observedAt = DateTime.formatIso(yield* DateTime.now);
-            const usage = projectCodexUsage({
-              providerInstanceId: instanceId,
-              driver: DRIVER_KIND,
-              observedAt,
-              source: "refresh",
-              rateLimits,
-            });
-            if (usage === null) {
-              return yield* new ProviderAdapterRequestError({
-                provider: DRIVER_KIND,
-                method: "account/rateLimits/read",
-                detail: "Codex returned no usage windows.",
-              });
-            }
-            return usage;
-          }).pipe(
-            Effect.scoped,
-            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-            Effect.mapError((cause) =>
-              isProviderAdapterRequestError(cause)
-                ? cause
-                : new ProviderAdapterRequestError({
-                    provider: DRIVER_KIND,
-                    method: "account/rateLimits/read",
-                    detail: cause instanceof Error ? cause.message : "Codex usage refresh failed.",
-                    cause,
-                  }),
-            ),
-          ),
-      };
-
       // Build a managed snapshot whose settings never change — mutations come
       // in as instance rebuilds from the registry rather than in-place
       // updates. Pre-provide `ChildProcessSpawner` so the check fits

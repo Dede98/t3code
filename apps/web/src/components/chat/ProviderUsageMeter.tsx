@@ -1,144 +1,153 @@
-import type { ProviderUsageSnapshot, ProviderUsageWindow } from "@t3tools/contracts";
+import type { EnvironmentId, ServerProvider } from "@t3tools/contracts";
 import { Link } from "@tanstack/react-router";
+import { limitsNotice, remainingPercent } from "@t3tools/shared/usageLimits";
 import { GaugeIcon } from "lucide-react";
+import { useState } from "react";
 
-import { cn } from "~/lib/utils";
-import { formatProviderUsageResetAt } from "../providerUsageFormatting";
+import { serverEnvironment } from "../../state/server";
+import { useAtomCommand } from "../../state/use-atom-command";
+import { LimitWindows, ResetCredits } from "../usage/UsageLimits";
+import { readUsagePagePreferences, saveUsagePagePreferences } from "../usage/usagePagePreferences";
+import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
-
-export function selectPrimaryUsageWindow(usage: ProviderUsageSnapshot): ProviderUsageWindow | null {
-  const warningWindow = usage.windows
-    .filter((window) => window.usedPercent > 90)
-    .toSorted((left, right) => right.usedPercent - left.usedPercent)[0];
-  return (
-    warningWindow ??
-    usage.windows.find((window) => window.id === "five_hour") ??
-    usage.windows.find(
-      (window) =>
-        window.id === "primary" &&
-        (window.durationMinutes === undefined || window.durationMinutes < 1_440),
-    ) ??
-    usage.windows.find((window) => window.id === "seven_day") ??
-    usage.windows.find((window) => window.id === "primary") ??
-    usage.windows.find((window) => window.id === "secondary") ??
-    null
-  );
-}
-
-function usageColor(percent: number): string {
-  if (percent >= 100) return "var(--color-red-500)";
-  if (percent >= 70) return "var(--color-amber-500)";
-  return "var(--color-blue-500)";
-}
-
-function UsageProgress(props: { window: ProviderUsageWindow }) {
-  const percent = Math.round(props.window.usedPercent);
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-center justify-between gap-3 text-[11px]">
-        <span className="font-medium text-muted-foreground">{props.window.label}</span>
-        <span className="tabular-nums text-muted-foreground/75">{percent}% used</span>
-      </div>
-      <div
-        className="h-1.5 overflow-hidden rounded-full bg-muted/60"
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={percent}
-        aria-label={`${props.window.label} usage`}
-      >
-        <div
-          className="h-full rounded-full transition-[width,background-color] duration-500 motion-reduce:transition-none"
-          style={{ width: `${props.window.usedPercent}%`, backgroundColor: usageColor(percent) }}
-        />
-      </div>
-      <span className="text-[10px] text-muted-foreground/55">
-        {formatProviderUsageResetAt(props.window.resetsAt)}
-      </span>
-    </div>
-  );
-}
+import { selectPrimaryUsageWindow } from "./providerUsageAvailability";
 
 export function ProviderUsageMeter(props: {
-  usage: ProviderUsageSnapshot | null;
+  provider: ServerProvider;
+  environmentId: EnvironmentId | null;
   providerDisplayName: string;
 }) {
-  const primary = props.usage ? selectPrimaryUsageWindow(props.usage) : null;
-  const percent = primary ? Math.round(primary.usedPercent) : null;
-  const showWindowLabel = primary !== null && primary.usedPercent > 90;
+  const refreshProviders = useAtomCommand(serverEnvironment.refreshProviders, {
+    reportFailure: false,
+  });
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const limits = props.provider.usageLimits;
+  const [openedAt, setOpenedAt] = useState(Date.now);
+  const now = Math.max(openedAt, limits ? Date.parse(limits.checkedAt) : openedAt);
+  const primary = selectPrimaryUsageWindow(limits, now);
+  const notice = limits ? limitsNotice(limits) : "Waiting for provider limits.";
+  const percent = primary ? remainingPercent(primary) : null;
+  const label = primary
+    ? `${primary.usedPercent > 90 ? `${primary.label} ` : ""}${percent}% left`
+    : "Limits —";
+
+  // Drivers without subscription limits (including API-key accounts) have no quota meter.
+  if (
+    !props.provider.enabled ||
+    limits?.unavailable?.reason === "unsupported" ||
+    (!limits && props.provider.driver !== "codex" && props.provider.driver !== "claudeAgent")
+  )
+    return null;
+
+  const refresh = async () => {
+    if (!props.environmentId || refreshing) return;
+    setRefreshing(true);
+    setRefreshError(null);
+    try {
+      const result = await refreshProviders({
+        environmentId: props.environmentId,
+        input: { instanceId: props.provider.instanceId },
+      });
+      if (result._tag === "Failure") setRefreshError("Could not refresh limits.");
+    } finally {
+      setOpenedAt(Date.now());
+      setRefreshing(false);
+    }
+  };
 
   return (
-    <Popover>
+    <Popover
+      onOpenChange={(open) => {
+        if (open) setOpenedAt(Date.now());
+      }}
+    >
       <PopoverTrigger
         render={
           <button
             type="button"
-            className={cn(
-              "inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md border border-transparent px-1.5 text-[11px] tabular-nums text-muted-foreground outline-none transition-colors",
-              "hover:bg-accent hover:text-foreground data-[pressed]:bg-accent",
-              "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",
-            )}
-            aria-label={
-              percent === null
-                ? `${props.providerDisplayName} session usage unavailable`
-                : `${props.providerDisplayName} ${primary?.label ?? "session"} usage ${percent}% used`
-            }
+            className="inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 text-[11px] tabular-nums text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={`${props.providerDisplayName} subscription limits: ${label}`}
           >
             <GaugeIcon
               className="size-3.5"
-              style={percent === null ? undefined : { color: usageColor(percent) }}
+              style={
+                primary && primary.usedPercent > 90
+                  ? {
+                      color:
+                        primary.usedPercent >= 100
+                          ? "var(--color-red-500)"
+                          : "var(--color-amber-500)",
+                    }
+                  : undefined
+              }
             />
-            <span>
-              {percent === null ? "--" : `${showWindowLabel ? `${primary.label} ` : ""}${percent}%`}
-            </span>
+            <span>{label}</span>
           </button>
         }
       />
-      <PopoverPopup side="top" align="end" className="w-72 max-w-none p-0">
-        <div className="flex flex-col gap-3 p-3">
+      <PopoverPopup
+        side="top"
+        align="end"
+        className="w-[min(26rem,calc(100vw-2rem))] max-w-none p-3"
+      >
+        <div className="flex flex-col gap-3">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <div className="text-xs font-medium text-foreground">{props.providerDisplayName}</div>
-              <div className="text-[10px] text-muted-foreground/55">Provider usage</div>
+              <div className="text-xs font-medium">{props.providerDisplayName}</div>
+              <div className="text-[10px] text-muted-foreground">Subscription limits</div>
             </div>
-            {props.usage ? (
-              <span
-                className={cn(
-                  "text-[10px] font-medium capitalize",
-                  props.usage.status === "rejected"
-                    ? "text-red-500"
-                    : props.usage.status === "warning"
-                      ? "text-amber-500"
-                      : "text-muted-foreground/60",
-                )}
-              >
-                {props.usage.status}
-              </span>
-            ) : null}
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={refreshing || !props.environmentId}
+              onClick={() => void refresh()}
+            >
+              {refreshing ? "Refreshing…" : "Refresh"}
+            </Button>
           </div>
-          {props.usage ? (
-            props.usage.windows.map((window) => <UsageProgress key={window.id} window={window} />)
-          ) : (
-            <div className="py-2 text-xs text-muted-foreground/60">
-              Waiting for usage data from the provider.
-            </div>
-          )}
-          {props.usage?.overageStatus ? (
-            <div className="flex items-center justify-between border-border/60 border-t pt-2 text-[11px]">
-              <span className="text-muted-foreground/60">Overage</span>
-              <span className="capitalize text-muted-foreground/80">
-                {props.usage.isUsingOverage ? "In use" : props.usage.overageStatus}
-              </span>
-            </div>
+          {notice ? (
+            <p className="text-xs text-muted-foreground">{notice}</p>
+          ) : limits ? (
+            <LimitWindows
+              driver={props.provider.driver}
+              windows={limits.windows}
+              now={now}
+              compact
+            />
           ) : null}
-          <div className="flex items-center justify-between border-border/60 border-t pt-2 text-[10px] text-muted-foreground/50">
+          {!notice && limits && !primary ? (
+            <p className="text-xs text-muted-foreground">
+              Reset time passed. Refresh to check the current limits.
+            </p>
+          ) : null}
+          {refreshError ? (
+            <p role="status" className="text-xs text-destructive">
+              {refreshError}
+            </p>
+          ) : null}
+          {limits?.resetCredits && props.environmentId ? (
+            <ResetCredits
+              environmentId={props.environmentId}
+              input={{ instanceId: props.provider.instanceId }}
+              credits={limits.resetCredits}
+              now={now}
+            />
+          ) : null}
+          <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-2 text-[10px] text-muted-foreground">
             <span>
-              {props.usage
-                ? `Updated ${new Date(props.usage.observedAt).toLocaleTimeString()}`
-                : "No usage event received"}
+              {limits
+                ? `Updated ${new Date(limits.checkedAt).toLocaleTimeString()}`
+                : "No limits received"}
             </span>
-            <Link to="/usage" className="text-muted-foreground/75 hover:text-foreground">
-              View all usage
+            <Link
+              to="/usage"
+              onClick={() =>
+                saveUsagePagePreferences({ ...readUsagePagePreferences(), metric: "limits" })
+              }
+              className="hover:text-foreground"
+            >
+              View all limits
             </Link>
           </div>
         </div>

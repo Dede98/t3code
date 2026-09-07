@@ -2,7 +2,7 @@ import {
   ANTIGRAVITY_DEFAULT_MODEL,
   type ProviderInstanceId,
   type ProviderDriverKind,
-  type ProviderUsageSnapshot,
+  type ServerProvider,
   type ResolvedKeybindingsConfig,
 } from "@t3tools/contracts";
 import { memo, useEffect, useMemo, useState } from "react";
@@ -40,7 +40,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
   instanceEntries: ReadonlyArray<ProviderInstanceEntry>;
   keybindings?: ResolvedKeybindingsConfig;
   modelOptionsByInstance: ReadonlyMap<ProviderInstanceId, ReadonlyArray<ModelEsque>>;
-  providerUsageByInstance?: ReadonlyMap<ProviderInstanceId, ProviderUsageSnapshot>;
+  providerStatuses?: ReadonlyArray<ServerProvider>;
   activeProviderIconClassName?: string;
   instanceIndicatorBackground?: string;
   size?: ComposerControlSize;
@@ -236,9 +236,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
           instanceEntries={props.instanceEntries}
           {...(props.keybindings ? { keybindings: props.keybindings } : {})}
           modelOptionsByInstance={props.modelOptionsByInstance}
-          {...(props.providerUsageByInstance
-            ? { providerUsageByInstance: props.providerUsageByInstance }
-            : {})}
+          {...(props.providerStatuses ? { providerStatuses: props.providerStatuses } : {})}
           terminalOpen={props.terminalOpen ?? false}
           onRequestClose={() => setIsMenuOpen(false)}
           {...(props.onOpenProviderSetup ? { onOpenProviderSetup: props.onOpenProviderSetup } : {})}

@@ -12,7 +12,6 @@ import type {
   RuntimeMode,
   ScopedThreadRef,
   ServerProvider,
-  ProviderUsageSnapshot,
   ThreadId,
 } from "@t3tools/contracts";
 import {
@@ -829,7 +828,6 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { serverEnvironment } from "../../state/server";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
-import { useProviderUsage } from "../../state/server";
 
 const WORKSPACE_SNAPSHOT_RETRY_COOLDOWN_MS = 10_000;
 
@@ -1050,9 +1048,9 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
 const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(props: {
   compact: boolean;
   activeContextWindow: ContextWindowSnapshot | null;
-  activeThreadProviderDisplayName: string | null;
-  activeProviderUsage: ProviderUsageSnapshot | null;
-  showProviderUsage: boolean;
+  usageProviderDisplayName: string | null;
+  usageProvider: ServerProvider | null;
+  environmentId: EnvironmentId | null;
   activeThreadModelDisplayName: string | null;
   isPreparingWorktree: boolean;
   pendingAction: {
@@ -1090,10 +1088,12 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
           compactDisabledReason={props.compactDisabledReason}
         />
       ) : null}
-      {props.showProviderUsage && props.activeThreadProviderDisplayName ? (
+      {props.usageProvider && props.usageProviderDisplayName ? (
         <ProviderUsageMeter
-          usage={props.activeProviderUsage}
-          providerDisplayName={props.activeThreadProviderDisplayName}
+          key={JSON.stringify([props.environmentId, props.usageProvider.instanceId])}
+          provider={props.usageProvider}
+          environmentId={props.environmentId}
+          providerDisplayName={props.usageProviderDisplayName}
         />
       ) : null}
       <ComposerPrimaryActions
@@ -1797,19 +1797,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Context window
   // ------------------------------------------------------------------
-  const providerUsage = useProviderUsage(environmentId);
-  const usageProviderInstanceId = activeThread?.session?.providerInstanceId ?? selectedInstanceId;
-  const activeProviderUsage = useMemo(
-    () => providerUsage.data?.get(usageProviderInstanceId) ?? null,
-    [providerUsage.data, usageProviderInstanceId],
-  );
+  const usageProviderInstanceId = selectedInstanceId;
+  const usageProviderStatus =
+    providerStatuses.find((provider) => provider.instanceId === usageProviderInstanceId) ?? null;
   const usageProvider = resolveProviderDriverKindForInstanceSelection(
     providerInstanceEntries,
     providerStatuses,
     usageProviderInstanceId,
   );
-  const showProviderUsage = usageProvider === "claudeAgent" || usageProvider === "codex";
-  const activeThreadProviderDisplayName = useMemo(() => {
+  const usageProviderDisplayName = useMemo(() => {
     const entry = providerInstanceEntries.find(
       (candidate) => candidate.instanceId === usageProviderInstanceId,
     );
@@ -4021,7 +4017,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         instanceEntries={providerInstanceEntries}
         keybindings={keybindings}
         modelOptionsByInstance={modelOptionsByInstance}
-        {...(providerUsage.data ? { providerUsageByInstance: providerUsage.data } : {})}
+        providerStatuses={providerStatuses}
         size={composerControlsInStrip ? "xs" : "sm"}
         triggerClassName={
           composerControlsInStrip
@@ -5598,9 +5594,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     activeContextWindow={
                       settings.contextWindowMeterEnabled ? activeContextWindow : null
                     }
-                    activeThreadProviderDisplayName={activeThreadProviderDisplayName}
-                    activeProviderUsage={activeProviderUsage}
-                    showProviderUsage={showProviderUsage}
+                    usageProviderDisplayName={usageProviderDisplayName}
+                    usageProvider={usageProviderStatus}
+                    environmentId={environmentId}
                     activeThreadModelDisplayName={activeThreadModelDisplayName}
                     pendingAction={pendingPrimaryAction}
                     isRunning={phase === "running"}

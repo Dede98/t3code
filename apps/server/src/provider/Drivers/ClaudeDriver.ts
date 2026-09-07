@@ -67,7 +67,6 @@ import {
   makeClaudeThreadContinuationGroupKey,
   resolveClaudeTranscriptDirPath,
 } from "./ClaudeHome.ts";
-import { readClaudeUsage } from "../usage/ClaudeUsage.ts";
 import { discoverClaudeSkills } from "./ClaudeSkills.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
@@ -175,21 +174,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         scopedLimitNames,
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
       };
-      const baseAdapter = yield* makeClaudeAdapter(effectiveConfig, adapterOptions);
-      const adapter = {
-        ...baseAdapter,
-        readUsage: () =>
-          readClaudeUsage({
-            providerInstanceId: instanceId,
-            config: effectiveConfig,
-            environment: processEnv,
-          }).pipe(
-            Effect.provideService(Path.Path, path),
-            Effect.provideService(FileSystem.FileSystem, fileSystem),
-            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-            Effect.provideService(HttpClient.HttpClient, httpClient),
-          ),
-      };
+      const adapter = yield* makeClaudeAdapter(effectiveConfig, adapterOptions);
       const textGeneration = yield* makeClaudeTextGeneration(
         effectiveConfig,
         processEnv,
@@ -292,7 +277,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         displayName,
         accentColor,
         enabled,
-        snapshot,
+        snapshot: {
+          ...snapshot,
+          // An explicit refresh must read usage now, even inside the health-probe TTL.
+          refresh: Cache.invalidate(capabilitiesProbeCache, capabilitiesCacheKey).pipe(
+            Effect.andThen(snapshot.refresh),
+          ),
+        },
         snapshotForCwd,
         adapter,
         textGeneration,

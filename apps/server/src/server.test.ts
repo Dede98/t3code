@@ -34,7 +34,6 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadContinuationSyncError,
-  type ProviderUsageStreamEvent,
   type ProviderInstallState,
   ProviderSetupError,
   ResolvedKeybindingRule,
@@ -787,17 +786,13 @@ const buildAppUnderTest = (options?: {
             ...options?.layers?.providerRegistry,
           }),
           Layer.mock(ProviderUsage.ProviderUsage)({
-            getSnapshot: Effect.succeed([]),
             refresh: () =>
               Effect.succeed({
                 refreshedAt: "2026-01-01T00:00:00.000Z",
                 usage: [],
                 failures: [],
               }),
-            subscribeEvents: Effect.flatMap(
-              PubSub.unbounded<ProviderUsageStreamEvent>(),
-              (pubsub) => PubSub.subscribe(pubsub),
-            ),
+            stream: Stream.empty,
           }),
           Layer.mock(ProviderThreadContinuationSync.ProviderThreadContinuationSync)({
             sync: (input) =>

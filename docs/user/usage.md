@@ -54,6 +54,11 @@ Filter with the environment dropdown to see what a single machine has.
 
 If a window looks stale, refresh Limits to re-check every provider and hub.
 
+On web and desktop, the composer also shows the selected account’s remaining subscription quota.
+Open the meter to inspect or refresh that account’s limits and use available reset credits.
+Warnings in the model picker highlight low quota; they do not disable models, since a scoped
+limit or paid extra usage can still allow a turn.
+
 Pick `/usage-limits` from the composer's command menu, or send it as a message, to check the
 current model's limits without leaving the conversation. The result opens above the composer and
 closes when you dismiss it or send your next message. It uses the same snapshot as **Usage → Limits**, so it does not run the agent or refresh

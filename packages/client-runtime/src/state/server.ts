@@ -1,8 +1,5 @@
 import {
   type EnvironmentId,
-  type ProviderInstanceId,
-  type ProviderUsageSnapshot,
-  type ProviderUsageStreamEvent,
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
@@ -351,24 +348,6 @@ export function resolveServerUpdateProgressResult<E>(
     return Effect.failCause(streamExit.cause);
   }
   return Effect.fail(new ServerUpdateProgressIncompleteError({ targetVersion }));
-}
-
-export type ProviderUsageProjection = ReadonlyMap<ProviderInstanceId, ProviderUsageSnapshot>;
-
-export function applyProviderUsageEvent(
-  current: ProviderUsageProjection,
-  event: ProviderUsageStreamEvent,
-): ProviderUsageProjection {
-  if (event.type === "snapshot") {
-    return new Map(event.usage.map((usage) => [usage.providerInstanceId, usage]));
-  }
-  const next = new Map(current);
-  if (event.type === "updated") {
-    next.set(event.usage.providerInstanceId, event.usage);
-  } else {
-    next.delete(event.providerInstanceId);
-  }
-  return next;
 }
 
 export function projectServerConfig(
@@ -1079,25 +1058,6 @@ export function createServerEnvironmentAtoms<R, E>(
     }),
     configProjection,
     welcome,
-    providerUsage: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
-      label: "environment-data:server:provider-usage",
-      tag: WS_METHODS.subscribeProviderUsage,
-      transform: (stream) =>
-        stream.pipe(
-          Stream.scan(
-            new Map<ProviderInstanceId, ProviderUsageSnapshot>() as ProviderUsageProjection,
-            applyProviderUsageEvent,
-          ),
-        ),
-    }),
-    refreshProviderUsage: createEnvironmentRpcCommand(runtime, {
-      label: "environment-data:server:refresh-provider-usage",
-      tag: WS_METHODS.refreshProviderUsage,
-      concurrency: {
-        mode: "singleFlight",
-        key: ({ environmentId }) => environmentId,
-      },
-    }),
     consumeResetCredit: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:consume-reset-credit",
       tag: WS_METHODS.providerConsumeResetCredit,

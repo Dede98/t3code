@@ -2834,18 +2834,7 @@ const makeWsRpcLayer = (
         [WS_METHODS.subscribeProviderUsage]: (_input) =>
           observeRpcStreamEffect(
             WS_METHODS.subscribeProviderUsage,
-            Effect.gen(function* () {
-              const updates = yield* providerUsage.subscribeEvents;
-              const snapshot = yield* providerUsage.getSnapshot;
-              return Stream.concat(
-                Stream.make({
-                  version: 1 as const,
-                  type: "snapshot" as const,
-                  usage: snapshot,
-                }),
-                Stream.fromSubscription(updates),
-              );
-            }),
+            Effect.succeed(providerUsage.stream),
             { "rpc.aggregate": "server" },
           ),
         [WS_METHODS.refreshProviderUsage]: (input) =>

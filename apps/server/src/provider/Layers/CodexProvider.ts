@@ -407,13 +407,6 @@ export const withCodexAppServerClient = Effect.fn("withCodexAppServerClient")(fu
   return { client, initialize };
 });
 
-export const readCodexRateLimits = Effect.fn("readCodexRateLimits")(function* (
-  input: CodexAppServerInput,
-) {
-  const { client } = yield* withCodexAppServerClient(input);
-  return yield* client.request("account/rateLimits/read", undefined);
-});
-
 const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(function* (input: {
   readonly binaryPath: string;
   readonly homePath?: string;

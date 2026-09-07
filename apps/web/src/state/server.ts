@@ -9,7 +9,6 @@ import {
   type ServerSettings,
 } from "@t3tools/contracts";
 import { createServerEnvironmentAtoms } from "@t3tools/client-runtime/state/server";
-import type { ProviderUsageProjection } from "@t3tools/client-runtime/state/server";
 import { createEnvironmentServerConfigsAtom } from "@t3tools/client-runtime/state/shell";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import * as Option from "effect/Option";
@@ -19,7 +18,6 @@ import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { primaryEnvironmentIdAtom } from "./primaryEnvironment";
 import { environmentSession } from "./session";
-import { useEnvironmentQuery, type EnvironmentQueryView } from "./query";
 
 // Opted in for every environment, not just the primary one. Only the primary
 // environment's themes are rendered, but which environment is primary changes
@@ -37,14 +35,6 @@ export const environmentServerConfigsAtom = createEnvironmentServerConfigsAtom({
   catalogValueAtom: environmentCatalog.catalogValueAtom,
   serverConfigValueAtom: serverEnvironment.configValueAtom,
 });
-
-export function useProviderUsage(
-  environmentId: import("@t3tools/contracts").EnvironmentId | null,
-): EnvironmentQueryView<ProviderUsageProjection> {
-  return useEnvironmentQuery(
-    environmentId === null ? null : serverEnvironment.providerUsage({ environmentId, input: {} }),
-  );
-}
 
 interface PrimaryServerState {
   readonly config: ServerConfig | null;

@@ -1,6 +1,6 @@
 import { type ProviderInstanceId } from "@t3tools/contracts";
 import { memo, useLayoutEffect, useRef, useState } from "react";
-import { CircleAlertIcon, SparklesIcon, StarIcon, TriangleAlertIcon } from "lucide-react";
+import { SparklesIcon, StarIcon, TriangleAlertIcon } from "lucide-react";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { cn } from "~/lib/utils";
@@ -34,7 +34,6 @@ const SELECTED_INDICATOR_CLASS =
 const BADGE_BASE_CLASS =
   "pointer-events-none absolute -right-0.5 top-0.5 z-10 flex size-3.5 items-center justify-center rounded-full bg-transparent shadow-sm ";
 const NEW_BADGE_CLASS = `${BADGE_BASE_CLASS} text-update-foreground `;
-const UNAVAILABLE_BADGE_CLASS = `${BADGE_BASE_CLASS} text-red-500`;
 const WARNING_BADGE_CLASS = `${BADGE_BASE_CLASS} text-amber-500`;
 
 /** Opens toward the rail so the list stays readable (not over the model names). */
@@ -56,7 +55,6 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
   showFavorites?: boolean;
   /** Instance ids shown in the rail but unavailable for the current picker context. */
   disabledInstanceIds?: ReadonlySet<ProviderInstanceId>;
-  usageUnavailableInstanceIds?: ReadonlySet<ProviderInstanceId>;
   /** Non-ready instances whose selected unavailable model remains reachable. */
   selectableUnavailableInstanceIds?: ReadonlySet<ProviderInstanceId>;
   getDisabledInstanceTooltip?: (entry: ProviderInstanceEntry) => string;
@@ -142,8 +140,6 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
           {props.instanceEntries.map((entry) => {
             const isUnavailable = !isProviderInstancePickerReady(entry);
             const isContextDisabled = props.disabledInstanceIds?.has(entry.instanceId) ?? false;
-            const isUsageUnavailable =
-              props.usageUnavailableInstanceIds?.has(entry.instanceId) ?? false;
             const isUsageWarning = props.usageWarningInstanceIds?.has(entry.instanceId) ?? false;
             const unavailableSelectionIsReachable =
               props.selectableUnavailableInstanceIds?.has(entry.instanceId) ?? false;
@@ -211,14 +207,9 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
                     ? { badgeClassName: "h-3 min-w-3 px-0.5 text-[7px]" }
                     : {})}
                 />
-                {showNewBadge && !isUsageUnavailable && !isUsageWarning ? (
+                {showNewBadge && !isUsageWarning ? (
                   <span className={NEW_BADGE_CLASS} aria-hidden>
                     <SparklesIcon className="size-2" />
-                  </span>
-                ) : null}
-                {isUsageUnavailable ? (
-                  <span className={UNAVAILABLE_BADGE_CLASS} aria-hidden>
-                    <CircleAlertIcon className="size-3" />
                   </span>
                 ) : null}
                 {isUsageWarning ? (

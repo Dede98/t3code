@@ -2,7 +2,7 @@ import {
   ANTIGRAVITY_DEFAULT_MODEL,
   type ProviderInstanceId,
   type ProviderDriverKind,
-  type ProviderUsageSnapshot,
+  type ServerProvider,
   type ResolvedKeybindingsConfig,
 } from "@t3tools/contracts";
 import { resolveSelectableModel } from "@t3tools/shared/model";
@@ -151,7 +151,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
    * model set but are free to diverge via customModels).
    */
   modelOptionsByInstance: ReadonlyMap<ProviderInstanceId, ReadonlyArray<ModelEsque>>;
-  providerUsageByInstance?: ReadonlyMap<ProviderInstanceId, ProviderUsageSnapshot>;
+  providerStatuses?: ReadonlyArray<ServerProvider>;
   terminalOpen: boolean;
   onRequestClose?: () => void;
   onOpenProviderSetup?: (instanceId: ProviderInstanceId) => void;
@@ -231,27 +231,12 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
   const updateSettings = useUpdateClientSettings();
   const usageAttentionByInstance = useMemo(() => {
     const attentionByInstance = new Map<ProviderInstanceId, ProviderUsageAttention>();
-    for (const [instanceId, usage] of props.providerUsageByInstance ?? []) {
-      const attention = getProviderUsageAttention(usage);
-      if (attention) attentionByInstance.set(instanceId, attention);
+    for (const provider of props.providerStatuses ?? []) {
+      const attention = getProviderUsageAttention(provider.usageLimits);
+      if (attention) attentionByInstance.set(provider.instanceId, attention);
     }
     return attentionByInstance;
-  }, [props.providerUsageByInstance]);
-  const usageUnavailableReasons = useMemo(() => {
-    const reasons = new Map<ProviderInstanceId, string>();
-    for (const [instanceId, attention] of usageAttentionByInstance) {
-      if (attention.severity === "unavailable") reasons.set(instanceId, attention.reason);
-    }
-    return reasons;
-  }, [usageAttentionByInstance]);
-  const getEffectiveModelDisabledReason = useCallback(
-    (instanceId: ProviderInstanceId, model: string): string | null =>
-      usageUnavailableReasons.get(instanceId) ??
-      getModelDisabledReason?.(instanceId, model) ??
-      null,
-    [getModelDisabledReason, usageUnavailableReasons],
-  );
-
+  }, [props.providerStatuses]);
   const focusSearchInput = useCallback(() => {
     searchInputRef.current?.focus({ preventScroll: true });
   }, []);
@@ -390,15 +375,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     }
     return disabled;
   }, [instanceEntries, isLocked, matchesLockedProvider]);
-  const disabledInstanceIds = useMemo(() => {
-    const disabled = new Set(lockedDisabledInstanceIds ?? []);
-    for (const instanceId of usageUnavailableReasons.keys()) disabled.add(instanceId);
-    return disabled.size > 0 ? disabled : undefined;
-  }, [lockedDisabledInstanceIds, usageUnavailableReasons]);
-  const usageUnavailableInstanceIds = useMemo(
-    () => new Set(usageUnavailableReasons.keys()),
-    [usageUnavailableReasons],
-  );
+  const disabledInstanceIds = lockedDisabledInstanceIds;
   const usageWarningInstanceIds = useMemo(() => {
     const instanceIds = new Set<ProviderInstanceId>();
     for (const [instanceId, attention] of usageAttentionByInstance) {
@@ -592,7 +569,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
 
   const handleModelSelect = useCallback(
     (modelSlug: string, instanceId: ProviderInstanceId) => {
-      if (getEffectiveModelDisabledReason(instanceId, modelSlug)) {
+      if (getModelDisabledReason?.(instanceId, modelSlug)) {
         return;
       }
       const options = modelOptionsByInstance.get(instanceId);
@@ -611,12 +588,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
         onInstanceModelChange(instanceId, resolvedModel);
       }
     },
-    [
-      entryByInstanceId,
-      getEffectiveModelDisabledReason,
-      modelOptionsByInstance,
-      onInstanceModelChange,
-    ],
+    [entryByInstanceId, getModelDisabledReason, modelOptionsByInstance, onInstanceModelChange],
   );
 
   const toggleFavorite = useCallback(
@@ -640,7 +612,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     >();
     let selectableModelIndex = 0;
     for (const model of visibleModels) {
-      if (getEffectiveModelDisabledReason(model.instanceId, model.slug)) {
+      if (getModelDisabledReason?.(model.instanceId, model.slug)) {
         continue;
       }
       const jumpCommand = modelPickerJumpCommandForIndex(selectableModelIndex);
@@ -651,7 +623,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
       selectableModelIndex += 1;
     }
     return mapping;
-  }, [getEffectiveModelDisabledReason, visibleModels]);
+  }, [getModelDisabledReason, visibleModels]);
   const modelJumpModelKeys = useMemo(
     () => [...modelJumpCommandByKey.keys()],
     [modelJumpCommandByKey],
@@ -792,11 +764,8 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
             {...(disabledInstanceIds
               ? {
                   disabledInstanceIds,
-                  usageUnavailableInstanceIds,
                   getDisabledInstanceTooltip: (entry: ProviderInstanceEntry) =>
-                    usageUnavailableReasons.has(entry.instanceId)
-                      ? `${entry.displayName} — ${usageUnavailableReasons.get(entry.instanceId)}`
-                      : `${entry.displayName} is unavailable in this thread. Start a new thread to switch providers.`,
+                    `${entry.displayName} is unavailable in this thread. Start a new thread to switch providers.`,
                 }
               : {})}
             usageWarningInstanceIds={usageWarningInstanceIds}
@@ -934,10 +903,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                     if (!model) {
                       return null;
                     }
-                    const disabledReason = getEffectiveModelDisabledReason(
-                      model.instanceId,
-                      model.slug,
-                    );
+                    const disabledReason = getModelDisabledReason?.(model.instanceId, model.slug);
                     return (
                       <ModelListRow
                         key={modelKey}
@@ -957,7 +923,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                         showNewBadge={model.badge === "new"}
                         unavailable={model.isUnavailable === true}
                         jumpLabel={modelJumpLabelByKey.get(modelKey) ?? null}
-                        disabledReason={disabledReason}
+                        disabledReason={disabledReason ?? null}
                         usageAttention={usageAttentionByInstance.get(model.instanceId) ?? null}
                         onToggleFavorite={() => toggleFavorite(model.instanceId, model.slug)}
                       />
