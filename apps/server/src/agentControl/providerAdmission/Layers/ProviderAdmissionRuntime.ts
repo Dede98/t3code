@@ -214,6 +214,19 @@ const make = Effect.gen(function* () {
   const deadlineSubscription = yield* PubSub.subscribe(deadlineSignals);
   yield* Effect.gen(function* () {
     const firedDeadlineKeys = new Set<string>();
+    const waitUntilDeadline = Effect.fn("ProviderAdmissionRuntime.waitUntilDeadline")(function* (
+      deadline: string,
+    ) {
+      const delay = Math.max(
+        0,
+        DateTime.toEpochMillis(DateTime.makeUnsafe(deadline)) - (yield* Clock.currentTimeMillis),
+      );
+      if (delay === 0) return "deadline" as const;
+      return yield* Effect.raceFirst(
+        Effect.sleep(Duration.millis(delay)).pipe(Effect.as("deadline" as const)),
+        PubSub.take(deadlineSubscription).pipe(Effect.as("changed" as const)),
+      );
+    });
     while (true) {
       const deadline = yield* store.minimumDeadline;
       if (deadline === null) {
@@ -221,18 +234,9 @@ const make = Effect.gen(function* () {
         yield* PubSub.take(deadlineSubscription);
         continue;
       }
-      const delay = Math.max(
-        0,
-        DateTime.toEpochMillis(DateTime.makeUnsafe(deadline)) - (yield* Clock.currentTimeMillis),
-      );
-      if (delay > 0) {
-        const outcome = yield* Effect.raceFirst(
-          Effect.sleep(Duration.millis(delay)).pipe(Effect.as("deadline" as const)),
-          PubSub.take(deadlineSubscription).pipe(Effect.as("changed" as const)),
-        );
-        if (outcome === "changed") continue;
-      }
-      const due = yield* store.listDueDeadlines(DateTime.formatIso(yield* DateTime.now));
+      if ((yield* waitUntilDeadline(deadline)) === "changed") continue;
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const due = yield* store.listDueDeadlines(now);
       const dueKeys = new Set(
         due.map(
           (publication) =>
@@ -248,12 +252,16 @@ const make = Effect.gen(function* () {
         firedDeadlineKeys.add(key);
         return true;
       });
-      // Each persisted deadline identity fires once. An unchanged rejected
-      // usage reset or an owner that never resumes therefore waits for a typed
-      // authority signal, while a newly committed row at the same timestamp
-      // still receives its own deterministic wakeup.
+      // Each persisted deadline identity fires once. Once every currently due
+      // identity has fired, schedule the next strictly later persisted deadline;
+      // only an authority with no later deadline waits for a typed change signal.
       if (unfired.length === 0) {
-        yield* PubSub.take(deadlineSubscription);
+        const futureDeadline = yield* store.minimumDeadlineAfter(now);
+        if (futureDeadline === null) {
+          yield* PubSub.take(deadlineSubscription);
+          continue;
+        }
+        yield* waitUntilDeadline(futureDeadline);
         continue;
       }
       yield* Effect.forEach(

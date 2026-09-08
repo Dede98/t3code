@@ -90,6 +90,9 @@ export interface ProviderAdmissionStoreShape {
     ProviderAdmissionError
   >;
   readonly minimumDeadline: Effect.Effect<string | null, ProviderAdmissionError>;
+  readonly minimumDeadlineAfter: (
+    after: string,
+  ) => Effect.Effect<string | null, ProviderAdmissionError>;
   readonly releaseFromFinalizationInTransaction: (input: {
     readonly stage: ProviderAdmissionStage;
     readonly handoffId: string;

@@ -84,6 +84,32 @@ ORDER BY lease_expires_at, provider_instance_id, admission_id
 LIMIT 1
 `.trim();
 
+export const PROVIDER_ADMISSION_MINIMUM_WAITING_DEADLINE_AFTER_SQL = `
+SELECT next_deadline_at AS deadline
+FROM main.agent_control_provider_admission_current
+INDEXED BY idx_agent_control_provider_admission_deadline
+WHERE status = 'waiting'
+  AND typeof(status) = 'text'
+  AND next_deadline_at IS NOT NULL
+  AND typeof(next_deadline_at) = 'text'
+  AND next_deadline_at > ?
+ORDER BY next_deadline_at, provider_instance_id, admission_id
+LIMIT 1
+`.trim();
+
+export const PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_AFTER_SQL = `
+SELECT lease_expires_at AS deadline
+FROM main.agent_control_provider_admission_current
+INDEXED BY idx_agent_control_provider_admission_lease_deadline
+WHERE status = 'admitted'
+  AND typeof(status) = 'text'
+  AND lease_expires_at IS NOT NULL
+  AND typeof(lease_expires_at) = 'text'
+  AND lease_expires_at > ?
+ORDER BY lease_expires_at, provider_instance_id, admission_id
+LIMIT 1
+`.trim();
+
 export const PROVIDER_ADMISSION_DUE_WAITING_DEADLINES_SQL = `
 SELECT admission_id AS "admissionId",stage,handoff_id AS "handoffId",
   provider_instance_id AS "providerInstanceId",next_deadline_at AS "deadlineAt",
@@ -1419,6 +1445,26 @@ const make = Effect.gen(function* () {
     Effect.mapError((cause) => fail("minimum-deadline", "persistence", undefined, cause)),
   );
 
+  const minimumDeadlineAfter: ProviderAdmissionStoreShape["minimumDeadlineAfter"] = (after) =>
+    Effect.all([
+      sql.unsafe<{ readonly deadline: string }>(
+        PROVIDER_ADMISSION_MINIMUM_WAITING_DEADLINE_AFTER_SQL,
+        [after],
+      ),
+      sql.unsafe<{ readonly deadline: string }>(
+        PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_AFTER_SQL,
+        [after],
+      ),
+    ]).pipe(
+      Effect.map(([waiting, admitted]) => {
+        const deadlines = [waiting[0]?.deadline, admitted[0]?.deadline].filter(
+          (deadline): deadline is string => deadline !== undefined,
+        );
+        return deadlines.length === 0 ? null : deadlines.sort()[0]!;
+      }),
+      Effect.mapError((cause) => fail("minimum-deadline-after", "persistence", undefined, cause)),
+    );
+
   const loadFinalization = Effect.fn("ProviderAdmissionStore.loadFinalization")(function* (
     stage: ProviderAdmissionStage,
     handoffId: string,
@@ -2285,6 +2331,7 @@ const make = Effect.gen(function* () {
     listDueDeadlines,
     listEnteredWithoutRelease,
     minimumDeadline,
+    minimumDeadlineAfter,
     releaseFromFinalizationInTransaction,
     catchUpFinalized,
   });

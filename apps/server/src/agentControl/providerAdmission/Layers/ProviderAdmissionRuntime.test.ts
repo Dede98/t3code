@@ -24,11 +24,16 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { AgentControlImplementationTurnWakeup } from "../../implementationTurn/Services/AgentControlImplementationTurnWakeup.ts";
 import { AgentControlInitialPlanningWakeup } from "../../initialPlanning/Services/AgentControlInitialPlanningWakeup.ts";
 import { AgentControlVerificationTurnWakeup } from "../../verificationTurn/Services/AgentControlVerificationTurnWakeup.ts";
+import {
+  AgentControlTaskConsumerGuard,
+  type AgentControlTaskConsumerGuardShape,
+} from "../../task/Services/AgentControlTaskConsumerGuard.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { canonicalProviderModelSelectionEvidence } from "../../../provider/Services/ProviderAdapter.ts";
 import { ProviderUsage } from "../../../provider/Services/ProviderUsage.ts";
 import type { ProviderAdmissionRequest } from "../model.ts";
+import { ProviderAdmissionGuard } from "../Services/ProviderAdmissionGuard.ts";
 import { ProviderAdmissionRuntime } from "../Services/ProviderAdmissionRuntime.ts";
 import {
   ProviderAdmissionError,
@@ -38,10 +43,13 @@ import { ProviderAdmissionRuntimeLive } from "./ProviderAdmissionRuntime.ts";
 import {
   PROVIDER_ADMISSION_DUE_ADMITTED_DEADLINES_SQL,
   PROVIDER_ADMISSION_DUE_WAITING_DEADLINES_SQL,
+  PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_AFTER_SQL,
   PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_SQL,
+  PROVIDER_ADMISSION_MINIMUM_WAITING_DEADLINE_AFTER_SQL,
   PROVIDER_ADMISSION_MINIMUM_WAITING_DEADLINE_SQL,
   ProviderAdmissionStoreLive,
 } from "./ProviderAdmissionStore.ts";
+import { ProviderAdmissionGuardLive } from "./ProviderAdmissionGuard.ts";
 import { providerAdmissionUsageEvidence } from "../model.ts";
 
 type Observation =
@@ -52,6 +60,14 @@ type Observation =
 const driver = ProviderDriverKind.make("codex");
 const epoch = "1970-01-01T00:00:00.000Z";
 const reset = "1970-01-01T00:00:01.000Z";
+
+const taskGuardShape: AgentControlTaskConsumerGuardShape = {
+  inspectProject: () => Effect.die("not used"),
+  useTaskConsumable: (_projectId, _taskId, use) => use({} as never, {} as never),
+  useTaskConsumableInTransaction: (_projectId, _taskId, use) => use({} as never, {} as never),
+  useTaskForProviderEffectInTransaction: (_projectId, _taskId, use) =>
+    use({} as never, {} as never),
+};
 
 const snapshot = (
   providerInstanceId: ProviderInstanceId,
@@ -122,6 +138,7 @@ it.effect("binds all usage outcomes and wakes rejected admission from one global
       const allowedId = ProviderInstanceId.make("usage-allowed");
       const warningId = ProviderInstanceId.make("usage-warning");
       const rejectedId = ProviderInstanceId.make("usage-rejected");
+      const staleRejectedId = ProviderInstanceId.make("usage-rejected-stale");
       const unsupportedId = ProviderInstanceId.make("usage-unsupported");
       const unusableId = ProviderInstanceId.make("usage-unusable");
       const observations = yield* Ref.make(
@@ -129,6 +146,10 @@ it.effect("binds all usage outcomes and wakes rejected admission from one global
           [allowedId, { _tag: "Observed", snapshot: snapshot(allowedId, "allowed") }],
           [warningId, { _tag: "Observed", snapshot: snapshot(warningId, "warning") }],
           [rejectedId, { _tag: "Observed", snapshot: snapshot(rejectedId, "rejected", reset) }],
+          [
+            staleRejectedId,
+            { _tag: "Observed", snapshot: snapshot(staleRejectedId, "rejected", reset) },
+          ],
           [unsupportedId, { _tag: "Unsupported", observedAt: epoch }],
           [unusableId, { _tag: "SupportedUnusable", observedAt: epoch }],
         ]),
@@ -191,6 +212,10 @@ it.effect("binds all usage outcomes and wakes rejected admission from one global
         "Waiting",
       );
       assert.equal(
+        (yield* runtime.request(request("rejected-stale", staleRejectedId, "implementation")))._tag,
+        "Waiting",
+      );
+      assert.equal(
         (yield* runtime.request(request("unusable", unusableId, "verification")))._tag,
         "Waiting",
       );
@@ -207,6 +232,7 @@ it.effect("binds all usage outcomes and wakes rejected admission from one global
         [
           ["usage-allowed", "allowed"],
           ["usage-rejected", "rejected"],
+          ["usage-rejected-stale", "rejected"],
           ["usage-unsupported", "unsupported"],
           ["usage-unusable", "supported-unusable"],
           ["usage-warning", "warning"],
@@ -259,7 +285,16 @@ it.effect("binds all usage outcomes and wakes rejected admission from one global
         `;
       assert.equal(rejectedAfterWake[0]?.status, "admitted");
       assert.match(rejectedAfterWake[0]?.markerId ?? "", /^provider-admission:/u);
-      assert.equal(yield* store.minimumDeadline, "1970-01-01T00:02:00.000Z");
+      assert.equal(yield* store.minimumDeadline, reset);
+      assert.equal(yield* store.minimumDeadlineAfter(reset), "1970-01-01T00:02:00.000Z");
+      assert.deepStrictEqual(
+        yield* sql<{ readonly status: string; readonly nextDeadlineAt: string }>`
+          SELECT status,next_deadline_at AS "nextDeadlineAt"
+          FROM main.agent_control_provider_admission_current
+          WHERE handoff_id='handoff-rejected-stale'
+        `,
+        [{ status: "waiting", nextDeadlineAt: reset }],
+      );
       assert.deepStrictEqual(yield* sql`PRAGMA main.foreign_key_check`, []);
       assert.equal((yield* sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
     }),
@@ -396,12 +431,17 @@ it.effect(
           Effect.provideService(SqlClient.SqlClient, firstSql.sql),
         );
 
-        const providerInstanceId = ProviderInstanceId.make("lease-deadline-shared");
-        const parallelProviderInstanceId = ProviderInstanceId.make("lease-deadline-parallel");
+        const providerInstanceId = ProviderInstanceId.make("lease-deadline-entered");
+        const parallelProviderInstanceId = ProviderInstanceId.make("lease-deadline-takeover");
         const restartProviderInstanceId = ProviderInstanceId.make("lease-deadline-restart");
         const originalRequest = request(
-          "lease-deadline-shared",
+          "lease-deadline-entered",
           providerInstanceId,
+          "initial-planning",
+        );
+        const parallelRequest = request(
+          "lease-deadline-takeover",
+          parallelProviderInstanceId,
           "implementation",
         );
         const restartRequest = request(
@@ -420,16 +460,19 @@ it.effect(
           refresh: () => Effect.succeed({ refreshedAt: epoch, usage: [], failures: [] }),
           subscribeEvents: PubSub.subscribe(usageEvents),
         });
-        const captureLeaseWakeup = yield* Ref.make(false);
+        const captureParallelWakeup = yield* Ref.make(false);
         const captureRestartWakeup = yield* Ref.make(false);
-        const leaseWakeup = yield* Deferred.make<void>();
+        const parallelWakeup = yield* Deferred.make<void>();
         const restartWakeup = yield* Deferred.make<void>();
         const wakeups = yield* Ref.make<Array<string>>([]);
         const wake = (handoffId: string) =>
           Effect.gen(function* () {
             yield* Ref.update(wakeups, (current) => [...current, handoffId]);
-            if (handoffId === originalRequest.handoffId && (yield* Ref.get(captureLeaseWakeup))) {
-              yield* Deferred.succeed(leaseWakeup, undefined);
+            if (
+              handoffId === parallelRequest.handoffId &&
+              (yield* Ref.get(captureParallelWakeup))
+            ) {
+              yield* Deferred.succeed(parallelWakeup, undefined);
             }
             if (handoffId === restartRequest.handoffId && (yield* Ref.get(captureRestartWakeup))) {
               yield* Deferred.succeed(restartWakeup, undefined);
@@ -471,6 +514,76 @@ it.effect(
         assert.equal(firstDecision.permit.providerFenceToken, 1);
         yield* Scope.close(first.scope, Exit.void);
 
+        const guardTriggers = yield* firstSql.sql<{
+          readonly name: string;
+          readonly source: string;
+        }>`
+          SELECT name,sql AS source FROM main.sqlite_schema
+          WHERE type='trigger' AND tbl_name IN (
+            'agent_control_stage_run_states',
+            'agent_control_stage_run_lease_states',
+            'agent_control_initial_planning_deliveries'
+          ) AND sql IS NOT NULL
+          ORDER BY name
+        `;
+        for (const trigger of guardTriggers) {
+          yield* firstSql.sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+        }
+        yield* firstSql.sql`PRAGMA foreign_keys=OFF`;
+        yield* firstSql.sql.withTransaction(
+          Effect.gen(function* () {
+            yield* firstSql.sql`
+              INSERT INTO main.agent_control_stage_run_states (
+                stage_run_id,project_id,task_id,attempt_id,role_id,stage_kind,stage_ordinal,
+                attempt_ordinal,status,task_revision,github_intake_sequence,
+                source_identity_fingerprint,state_json,created_at,updated_at,revision,
+                last_event_sequence
+              ) VALUES (
+                ${originalRequest.stageRunId},${originalRequest.projectId},
+                ${originalRequest.taskId},${originalRequest.attemptId},
+                'role-lease-deadline','planning',1,1,'running',1,1,${"a".repeat(64)},'{}',
+                ${epoch},${epoch},1,1
+              )
+            `;
+            yield* firstSql.sql`
+              INSERT INTO main.agent_control_stage_run_lease_states (
+                lease_id,project_id,task_id,stage_run_id,attempt_id,task_revision,
+                github_intake_sequence,source_identity_fingerprint,holder_id,fence_token,
+                status,acquired_at,renewed_at,expires_at,released_at,state_json,revision,
+                last_event_sequence
+              ) VALUES (
+                ${originalRequest.stageLeaseId},${originalRequest.projectId},
+                ${originalRequest.taskId},${originalRequest.stageRunId},
+                ${originalRequest.attemptId},1,1,${"a".repeat(64)},
+                ${originalRequest.stageLeaseHolderId},${originalRequest.stageFenceToken},
+                'reserved',${epoch},${epoch},'2099-01-01T00:00:00.000Z',NULL,'{}',1,1
+              )
+            `;
+            yield* firstSql.sql`
+              INSERT INTO main.agent_control_initial_planning_deliveries (
+                provider_delivery_id,handoff_id,handoff_fingerprint,
+                controlled_thread_reservation_id,thread_id,turn_request_command_id,message_id,
+                provider_instance_id,state,revision,claim_owner_id,claim_generation,
+                claim_expires_at,attempt_count,next_attempt_at,planning_deadline_at,
+                provider_turn_id,provider_accepted_at,provider_session_created_at,
+                provider_resume_cursor_json,terminal_at,last_error_code,interrupt_requested,
+                updated_at
+              ) VALUES (
+                ${originalRequest.providerDeliveryId},${originalRequest.handoffId},
+                ${"b".repeat(64)},'reservation-lease-deadline',${originalRequest.threadId},
+                'command-lease-deadline','message-lease-deadline',
+                ${originalRequest.providerInstanceId},'claimed',1,'delivery-owner',1,
+                '2099-01-01T00:00:00.000Z',0,NULL,'2099-01-01T00:00:00.000Z',
+                NULL,NULL,NULL,NULL,NULL,NULL,0,${epoch}
+              )
+            `;
+          }),
+        );
+        for (const trigger of guardTriggers) {
+          yield* firstSql.sql.unsafe(trigger.source).unprepared;
+        }
+        yield* firstSql.sql`PRAGMA foreign_keys=ON`;
+
         const second = yield* buildRuntime(secondSql.sql);
         const beforeExpiry = yield* second.runtime.request(originalRequest);
         assert.deepStrictEqual(beforeExpiry, {
@@ -478,25 +591,51 @@ it.effect(
           admissionId: firstDecision.permit.admissionId,
           retryAt: firstDecision.permit.admissionLeaseExpiresAt,
         });
-        yield* Ref.set(captureLeaseWakeup, true);
-        yield* TestClock.adjust("119999 millis");
-        assert.isTrue(Option.isNone(yield* Deferred.poll(leaseWakeup)));
-        assert.equal((yield* second.runtime.request(originalRequest))._tag, "Waiting");
-
-        const parallel = yield* second.runtime.request(
-          request("lease-deadline-parallel", parallelProviderInstanceId, "initial-planning"),
-        );
+        yield* TestClock.adjust("30 seconds");
+        const parallel = yield* second.runtime.request(parallelRequest);
         assert.equal(parallel._tag, "Admitted");
-        yield* TestClock.adjust("1 millis");
-        yield* Deferred.await(leaseWakeup);
-        const takeover = yield* second.runtime.request(originalRequest);
+        if (parallel._tag !== "Admitted") return;
+        assert.equal(parallel.permit.providerFenceToken, 1);
+        yield* Ref.set(captureParallelWakeup, true);
+
+        const guardContext = yield* Layer.buildWithScope(
+          Layer.fresh(ProviderAdmissionGuardLive).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, secondSql.sql)),
+            Layer.provide(Layer.succeed(ProviderAdmissionStore, second.store)),
+            Layer.provide(Layer.succeed(AgentControlTaskConsumerGuard, taskGuardShape)),
+          ),
+          second.scope,
+        );
+        const guard = Context.get(guardContext, ProviderAdmissionGuard);
+        yield* guard.enter(firstDecision.permit, "session-start");
+        assert.deepStrictEqual(
+          yield* secondSql.sql<{ readonly status: string }>`
+            SELECT status FROM main.agent_control_provider_admission_current
+            WHERE admission_id=${firstDecision.permit.admissionId}
+          `,
+          [{ status: "entered" }],
+        );
+
+        yield* TestClock.adjust("90 seconds");
+        assert.isTrue(Option.isNone(yield* Deferred.poll(parallelWakeup)));
+        assert.equal(
+          (yield* Ref.get(wakeups)).filter((handoffId) => handoffId === parallelRequest.handoffId)
+            .length,
+          1,
+        );
+        yield* TestClock.adjust("30 seconds");
+        yield* Deferred.await(parallelWakeup);
+        assert.equal(
+          (yield* Ref.get(wakeups)).filter((handoffId) => handoffId === parallelRequest.handoffId)
+            .length,
+          2,
+        );
+
+        const takeover = yield* second.runtime.request(parallelRequest);
         assert.equal(takeover._tag, "Admitted");
         if (takeover._tag !== "Admitted") return;
-        assert.equal(
-          takeover.permit.providerFenceToken,
-          firstDecision.permit.providerFenceToken + 1,
-        );
-        assert.notEqual(takeover.permit.admissionMarkerId, firstDecision.permit.admissionMarkerId);
+        assert.equal(takeover.permit.providerFenceToken, parallel.permit.providerFenceToken + 1);
+        assert.notEqual(takeover.permit.admissionMarkerId, parallel.permit.admissionMarkerId);
         assert.deepStrictEqual(
           yield* secondSql.sql<{ readonly count: number }>`
             SELECT count(*) AS count
@@ -505,6 +644,11 @@ it.effect(
           `,
           [{ count: 2 }],
         );
+        assert.deepStrictEqual(yield* second.runtime.request(originalRequest), {
+          _tag: "Waiting",
+          admissionId: firstDecision.permit.admissionId,
+          retryAt: null,
+        });
         assert.deepStrictEqual(
           yield* secondSql.sql<{ readonly count: number }>`
             SELECT count(*) AS count
@@ -548,6 +692,16 @@ it.effect(
             "idx_agent_control_provider_admission_lease_deadline",
           ],
           [
+            PROVIDER_ADMISSION_MINIMUM_WAITING_DEADLINE_AFTER_SQL,
+            ["2100-01-01T00:00:00.000Z"],
+            "idx_agent_control_provider_admission_deadline",
+          ],
+          [
+            PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_AFTER_SQL,
+            ["2100-01-01T00:00:00.000Z"],
+            "idx_agent_control_provider_admission_lease_deadline",
+          ],
+          [
             PROVIDER_ADMISSION_DUE_WAITING_DEADLINES_SQL,
             ["2100-01-01T00:00:00.000Z"],
             "idx_agent_control_provider_admission_deadline",
@@ -565,6 +719,18 @@ it.effect(
           assert.isTrue(plan.some((row) => row.detail.includes(index)));
           assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
           assert.isFalse(plan.some((row) => row.detail.startsWith("SCAN ")));
+        }
+        for (const trigger of guardTriggers) {
+          yield* firstSql.sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+        }
+        yield* firstSql.sql.withTransaction(
+          firstSql.sql`
+            DELETE FROM main.agent_control_initial_planning_deliveries
+            WHERE provider_delivery_id=${originalRequest.providerDeliveryId}
+          `,
+        );
+        for (const trigger of guardTriggers) {
+          yield* firstSql.sql.unsafe(trigger.source).unprepared;
         }
         assert.deepStrictEqual(yield* secondSql.sql`PRAGMA main.foreign_key_check`, []);
         assert.equal((yield* secondSql.sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
@@ -589,6 +755,7 @@ it.effect("reports a capacity pump defect through the typed runtime failure chan
         listDueDeadlines: () => Effect.succeed([]),
         listEnteredWithoutRelease: Effect.succeed([]),
         minimumDeadline: Effect.succeed(null),
+        minimumDeadlineAfter: () => Effect.succeed(null),
         releaseFromFinalizationInTransaction: () => Effect.die("unused"),
         catchUpFinalized: Effect.succeed([]),
       });
