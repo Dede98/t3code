@@ -136,7 +136,7 @@ const makeTestProviderAdmissionPermit = (
 
 const providerAdmissionGuardTestLayer = Layer.succeed(ProviderAdmissionGuard, {
   enter: () => Effect.void,
-  quarantineUnknown: () => Effect.void,
+  quarantineIfEntered: () => Effect.void,
 });
 
 type LegacyProviderRuntimeEvent = {
@@ -866,6 +866,15 @@ it.live("durably quarantines invalid returned sessions and a failed second admis
       const secondGuardProviderId = ProviderInstanceId.make("codex-second-guard");
       const invalidRequest = makeAdmissionRequest("invalid-return", invalidProviderId);
       const secondGuardRequest = makeAdmissionRequest("second-guard", secondGuardProviderId);
+      const casCases = (["before", "persist", "after"] as const).map((phase) => {
+        const providerInstanceId = ProviderInstanceId.make(`codex-${phase}-cas`);
+        return {
+          phase,
+          providerInstanceId,
+          request: makeAdmissionRequest(`${phase}-cas`, providerInstanceId),
+          adapter: makeFakeCodexAdapter(CODEX_DRIVER, { providerInstanceId }),
+        };
+      });
       const admit = (value: ProviderAdmissionRequest) =>
         store.request({
           request: value,
@@ -882,9 +891,16 @@ it.live("durably quarantines invalid returned sessions and a failed second admis
         });
       const invalidDecision = yield* admit(invalidRequest);
       const secondGuardDecision = yield* admit(secondGuardRequest);
+      const casDecisions = yield* Effect.forEach(casCases, ({ request }) => admit(request));
       assert.equal(invalidDecision._tag, "Admitted");
       assert.equal(secondGuardDecision._tag, "Admitted");
-      if (invalidDecision._tag !== "Admitted" || secondGuardDecision._tag !== "Admitted") return;
+      assert.isTrue(casDecisions.every((decision) => decision._tag === "Admitted"));
+      if (
+        invalidDecision._tag !== "Admitted" ||
+        secondGuardDecision._tag !== "Admitted" ||
+        !casDecisions.every((decision) => decision._tag === "Admitted")
+      )
+        return;
 
       const deliveryTriggers = yield* sql<{ readonly name: string; readonly source: string }>`
           SELECT name,sql AS source FROM main.sqlite_schema
@@ -901,7 +917,11 @@ it.live("durably quarantines invalid returned sessions and a failed second admis
       yield* sql`PRAGMA foreign_keys=OFF`;
       yield* sql.withTransaction(
         Effect.gen(function* () {
-          for (const value of [invalidRequest, secondGuardRequest]) {
+          for (const [valueIndex, value] of [
+            invalidRequest,
+            secondGuardRequest,
+            ...casCases.map(({ request }) => request),
+          ].entries()) {
             yield* sql`
             INSERT INTO main.agent_control_stage_run_states (
               stage_run_id,project_id,task_id,attempt_id,role_id,stage_kind,stage_ordinal,
@@ -935,9 +955,9 @@ it.live("durably quarantines invalid returned sessions and a failed second admis
               provider_turn_id,provider_accepted_at,provider_session_created_at,
               provider_resume_cursor_json,terminal_at,last_error_code,interrupt_requested,updated_at
             ) VALUES (
-              ${value.providerDeliveryId},${value.handoffId},${
-                value === invalidRequest ? "b".repeat(64) : "c".repeat(64)
-              },
+              ${value.providerDeliveryId},${value.handoffId},${(valueIndex + 11)
+                .toString(16)
+                .repeat(64)},
               ${`reservation-${value.handoffId}`},${value.threadId},
               ${`command-${value.handoffId}`},${`message-${value.handoffId}`},
               ${value.providerInstanceId},'claimed',1,'delivery-owner',1,${expiresAt},0,NULL,
@@ -969,25 +989,33 @@ it.live("durably quarantines invalid returned sessions and a failed second admis
       );
       const productionGuard = Context.get(guardContext, ProviderAdmissionGuard);
       const guardCalls: Array<string> = [];
+      let secondGuardTurnEntries = 0;
       const guardedAdmission = ProviderAdmissionGuard.of({
         enter: (permit, boundary) =>
-          Effect.sync(() => guardCalls.push(`enter:${permit.admissionId}:${boundary}`)).pipe(
-            Effect.andThen(
+          Effect.gen(function* () {
+            guardCalls.push(`enter:${permit.admissionId}:${boundary}`);
+            if (
               permit.admissionId === secondGuardDecision.permit.admissionId &&
-                boundary === "turn-start"
-                ? Effect.fail(
-                    new ProviderAdmissionError({
-                      operation: "test-second-guard",
-                      reason: "project-inactive",
-                      admissionId: permit.admissionId,
-                    }),
-                  )
-                : productionGuard.enter(permit, boundary),
-            ),
-          ),
-        quarantineUnknown: (permit) =>
+              boundary === "turn-start"
+            ) {
+              secondGuardTurnEntries += 1;
+            }
+            if (
+              permit.admissionId === secondGuardDecision.permit.admissionId &&
+              boundary === "turn-start" &&
+              secondGuardTurnEntries === 2
+            ) {
+              return yield* new ProviderAdmissionError({
+                operation: "test-second-guard",
+                reason: "project-inactive",
+                admissionId: permit.admissionId,
+              });
+            }
+            yield* productionGuard.enter(permit, boundary);
+          }),
+        quarantineIfEntered: (permit) =>
           Effect.sync(() => guardCalls.push(`quarantine:${permit.admissionId}`)).pipe(
-            Effect.andThen(productionGuard.quarantineUnknown(permit)),
+            Effect.andThen(productionGuard.quarantineIfEntered(permit)),
           ),
       });
 
@@ -997,6 +1025,26 @@ it.live("durably quarantines invalid returned sessions and a failed second admis
       const secondGuardAdapter = makeFakeCodexAdapter(CODEX_DRIVER, {
         providerInstanceId: secondGuardProviderId,
       });
+      let nativePreparationEffects = 0;
+      let nativeTurnInvocations = 0;
+      secondGuardAdapter.setPrepareTurn((input) =>
+        input.modelSelection === undefined
+          ? Effect.die("missing model selection")
+          : Effect.sync(() => {
+              nativePreparationEffects += 1;
+              return {
+                attestation: attestProviderNativeTurnConfiguration(input.modelSelection!),
+                invoke: () =>
+                  Effect.sync(() => {
+                    nativeTurnInvocations += 1;
+                    return {
+                      threadId: input.threadId,
+                      turnId: TurnId.make("turn-should-not-start"),
+                    };
+                  }),
+              };
+            }),
+      );
       const invalidNativeResult = (input: ProviderSessionStartInput) =>
         Effect.succeed({
           provider: CODEX_DRIVER,
@@ -1016,6 +1064,9 @@ it.live("durably quarantines invalid returned sessions and a failed second admis
         adapters: new Map([
           [invalidProviderId, invalidAdapter.adapter],
           [secondGuardProviderId, secondGuardAdapter.adapter],
+          ...casCases.map(
+            ({ providerInstanceId, adapter }) => [providerInstanceId, adapter.adapter] as const,
+          ),
         ]),
       });
       const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
@@ -1103,16 +1154,90 @@ it.live("durably quarantines invalid returned sessions and a failed second admis
           {
             expected: attestation,
             providerAdmissionPermit: secondGuardDecision.permit,
-            beforeDeliveryCas: () => Effect.die("unexpected-before-cas"),
-            persistDeliveryAttempted: () => Effect.die("unexpected-delivery-cas"),
-            afterDeliveryCas: () => Effect.die("unexpected-after-cas"),
+            beforeDeliveryCas: () => Effect.void,
+            persistDeliveryAttempted: () => Effect.void,
+            afterDeliveryCas: () => Effect.void,
           },
         ),
       );
       assert.isTrue(Exit.isFailure(secondGuardExit));
       assert.equal(secondGuardAdapter.sendTurn.mock.calls.length, 0);
+      assert.equal(
+        secondGuardTurnEntries,
+        2,
+        Exit.isFailure(secondGuardExit) ? Cause.pretty(secondGuardExit.cause) : undefined,
+      );
+      assert.equal(nativePreparationEffects, 1);
+      assert.equal(nativeTurnInvocations, 0);
 
-      for (const permit of [invalidDecision.permit, secondGuardDecision.permit]) {
+      for (const [index, casCase] of casCases.entries()) {
+        const decision = casDecisions[index]!;
+        if (decision._tag !== "Admitted") return;
+        yield* provider.startSession(
+          asThreadId(casCase.request.threadId),
+          {
+            provider: CODEX_DRIVER,
+            providerInstanceId: casCase.providerInstanceId,
+            threadId: asThreadId(casCase.request.threadId),
+            cwd: `/tmp/${casCase.phase}-cas`,
+            modelSelection: casCase.request.modelSelection,
+            runtimeMode: "approval-required",
+          },
+          { providerAdmissionPermit: decision.permit },
+        );
+        const casAttestation = yield* provider.getSessionAttestation!(
+          asThreadId(casCase.request.threadId),
+        );
+        assert.isDefined(casAttestation);
+        if (casAttestation === undefined) return;
+        const calls = { before: 0, persist: 0, after: 0 };
+        const casExit = yield* Effect.exit(
+          provider.sendTurnAtPreInvokeBoundary!(
+            {
+              threadId: asThreadId(casCase.request.threadId),
+              input: `fail ${casCase.phase} CAS`,
+              attachments: [],
+              modelSelection: casCase.request.modelSelection,
+              interactionMode: "plan",
+            },
+            {
+              expected: casAttestation,
+              providerAdmissionPermit: decision.permit,
+              beforeDeliveryCas: () =>
+                Effect.sync(() => {
+                  calls.before += 1;
+                  if (casCase.phase === "before") throw new Error("before CAS failed");
+                }),
+              persistDeliveryAttempted: () =>
+                Effect.sync(() => {
+                  calls.persist += 1;
+                  if (casCase.phase === "persist") throw new Error("persist CAS failed");
+                }),
+              afterDeliveryCas: () =>
+                Effect.sync(() => {
+                  calls.after += 1;
+                  if (casCase.phase === "after") throw new Error("after CAS failed");
+                }),
+            },
+          ),
+        );
+        assert.isTrue(Exit.isFailure(casExit));
+        assert.deepStrictEqual(calls, {
+          before: 1,
+          persist: casCase.phase === "before" ? 0 : 1,
+          after: casCase.phase === "after" ? 1 : 0,
+        });
+        assert.equal(casCase.adapter.sendTurn.mock.calls.length, 0);
+      }
+
+      const quarantinedPermits = [
+        invalidDecision.permit,
+        secondGuardDecision.permit,
+        ...casDecisions.flatMap((decision) =>
+          decision._tag === "Admitted" ? [decision.permit] : [],
+        ),
+      ];
+      for (const permit of quarantinedPermits) {
         assert.deepStrictEqual(
           yield* sql<{
             readonly status: string;
@@ -1174,7 +1299,7 @@ it.live("durably quarantines invalid returned sessions and a failed second admis
             FROM main.agent_control_provider_authority_markers
             WHERE authority_kind='quarantine'
           `)[0]?.count,
-        2,
+        quarantinedPermits.length,
       );
       const foreignKeyViolations = yield* sql<{ readonly table: string }>`
           PRAGMA main.foreign_key_check
@@ -3032,6 +3157,151 @@ it.effect("reuses persisted resume state for a compatible cross-instance cold st
       assert.deepEqual(source.stopSession.mock.calls, [[threadId]]);
     }).pipe(Effect.provide(providerLayer));
   }),
+);
+
+it.effect(
+  "revalidates session authority after native continuation sync and quarantines takeover",
+  () =>
+    Effect.gen(function* () {
+      const sourceInstanceId = ProviderInstanceId.make("claude_guard_source");
+      const targetInstanceId = ProviderInstanceId.make("claude_guard_target");
+      const continuationKey = "claude:guarded-sync:v1";
+      const source = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER, {
+        providerInstanceId: sourceInstanceId,
+      });
+      const target = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER, {
+        providerInstanceId: targetInstanceId,
+      });
+      const threadId = asThreadId("thread-guarded-compatible-switch");
+      const modelSelection = createModelSelection(targetInstanceId, "claude-sonnet");
+      const modelEvidence = canonicalProviderModelSelectionEvidence(modelSelection);
+      const permit: ProviderAdmissionPermit = {
+        admissionId: "provider-admission:guarded-compatible-switch",
+        admissionMarkerId: "provider-admission-marker:guarded-compatible-switch",
+        admissionMarkerFingerprint: "a".repeat(64),
+        stage: "initial-planning",
+        projectId: "project-guarded-compatible-switch",
+        taskId: "task-guarded-compatible-switch",
+        stageRunId: "stage-guarded-compatible-switch",
+        attemptId: "attempt-guarded-compatible-switch",
+        handoffId: "handoff-guarded-compatible-switch",
+        providerDeliveryId: "delivery-guarded-compatible-switch",
+        threadId: String(threadId),
+        providerInstanceId: targetInstanceId,
+        stageLeaseId: "lease-guarded-compatible-switch",
+        stageLeaseHolderId: "holder-guarded-compatible-switch",
+        stageFenceToken: 1,
+        admissionOwnerId: "owner-guarded-compatible-switch",
+        admissionLeaseExpiresAt: "2099-09-06T10:00:00.000Z",
+        providerFenceToken: 1,
+        modelSelectionJson: modelEvidence.modelSelectionJson,
+        modelSelectionFingerprint: modelEvidence.modelSelectionFingerprint,
+        usageEvidenceFingerprint: "b".repeat(64),
+      };
+      const lifecycle: Array<string> = [];
+      let authorityCurrent = true;
+      const sourceAdapter = {
+        ...source.adapter,
+        syncContinuation: () =>
+          Effect.sync(() => {
+            lifecycle.push("native-sync");
+            authorityCurrent = false;
+            return "imported" as const;
+          }),
+      } satisfies ProviderAdapterShape<ProviderAdapterError>;
+      const guardedAdmission = ProviderAdmissionGuard.of({
+        enter: (_permit, boundary) =>
+          Effect.sync(() => lifecycle.push(`guard:${boundary}`)).pipe(
+            Effect.andThen(
+              authorityCurrent
+                ? Effect.void
+                : Effect.fail(
+                    new ProviderAdmissionError({
+                      operation: "test-session-takeover",
+                      reason: "project-inactive",
+                      admissionId: permit.admissionId,
+                    }),
+                  ),
+            ),
+          ),
+        quarantineIfEntered: () =>
+          Effect.sync(() => {
+            lifecycle.push("quarantine");
+          }),
+      });
+      const registry = makeCompatibleInstanceRegistry({
+        driverKind: CLAUDE_AGENT_DRIVER,
+        continuationKey,
+        adapters: new Map([
+          [sourceInstanceId, sourceAdapter],
+          [targetInstanceId, target.adapter],
+        ]),
+      });
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = Layer.mergeAll(
+        makeProviderServiceLive().pipe(
+          Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+          Layer.provide(directoryLayer),
+          Layer.provide(defaultServerSettingsLayer),
+          Layer.provide(AnalyticsService.layerTest),
+          Layer.provide(Layer.succeed(ProviderAdmissionGuard, guardedAdmission)),
+          Layer.provide(
+            Layer.succeed(
+              ProviderEventLoggers.ProviderEventLoggers,
+              ProviderEventLoggers.NoOpProviderEventLoggers,
+            ),
+          ),
+        ),
+        directoryLayer,
+      );
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const sourceSession = yield* provider.startSession(threadId, {
+          provider: CLAUDE_AGENT_DRIVER,
+          providerInstanceId: sourceInstanceId,
+          threadId,
+          cwd: "/tmp/guarded-compatible-switch",
+          runtimeMode: "full-access",
+        });
+        target.startSession.mockClear();
+        const sessionDirectory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        yield* sessionDirectory.upsert({
+          threadId,
+          provider: CLAUDE_AGENT_DRIVER,
+          providerInstanceId: sourceInstanceId,
+          resumeCursor: sourceSession.resumeCursor,
+        });
+
+        const result = yield* Effect.exit(
+          provider.startSession(
+            threadId,
+            {
+              provider: CLAUDE_AGENT_DRIVER,
+              providerInstanceId: targetInstanceId,
+              threadId,
+              cwd: "/tmp/guarded-compatible-switch",
+              modelSelection,
+              runtimeMode: "full-access",
+            },
+            { providerAdmissionPermit: permit },
+          ),
+        );
+        assert.isTrue(Exit.isFailure(result));
+        assert.deepStrictEqual(lifecycle, [
+          "guard:session-start",
+          "native-sync",
+          "guard:session-start",
+          "quarantine",
+        ]);
+        assert.equal(target.startSession.mock.calls.length, 0);
+      }).pipe(Effect.provide(providerLayer));
+    }),
 );
 
 it.effect(

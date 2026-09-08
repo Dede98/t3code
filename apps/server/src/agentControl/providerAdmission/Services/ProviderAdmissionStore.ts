@@ -64,6 +64,10 @@ export interface ProviderAdmissionStoreShape {
     readonly reason: "external-outcome-unknown" | "owner-lost-after-entry";
     readonly observedAt: string;
   }) => Effect.Effect<void, ProviderAdmissionError>;
+  readonly quarantineIfEntered: (input: {
+    readonly permit: ProviderAdmissionPermit;
+    readonly observedAt: string;
+  }) => Effect.Effect<void, ProviderAdmissionError>;
   readonly recordUsage: (
     providerInstanceId: string,
     evidence: ProviderAdmissionUsageEvidence,

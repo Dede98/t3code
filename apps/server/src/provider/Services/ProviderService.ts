@@ -113,6 +113,10 @@ export interface ProviderServiceShape {
     },
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
 
+  readonly quarantineAdmissionIfEntered?: (
+    permit: ProviderAdmissionPermit,
+  ) => Effect.Effect<void, ProviderServiceError>;
+
   readonly getSessionAttestation?: (
     threadId: ThreadId,
   ) => Effect.Effect<ProviderSessionAttestation | undefined>;

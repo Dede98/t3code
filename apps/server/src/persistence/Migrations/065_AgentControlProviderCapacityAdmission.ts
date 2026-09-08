@@ -36,8 +36,10 @@ export const PROVIDER_ADMISSION_SCHEMA_OBJECTS = [
   "agent_control_provider_authority_marker_validate",
   "agent_control_provider_admission_current_validate_insert",
   "agent_control_provider_admission_current_validate_update",
+  "agent_control_provider_admission_current_no_delete",
   "agent_control_provider_capacity_current_validate_insert",
   "agent_control_provider_capacity_current_validate_update",
+  "agent_control_provider_capacity_current_no_delete",
 ] as const;
 
 const sha256Check = (column: string) =>
@@ -218,6 +220,11 @@ const createAppendOnlyTriggers = Effect.gen(function* () {
     ).unprepared;
     yield* sql.unsafe(
       `CREATE TRIGGER main.agent_control_provider_${table}_no_delete BEFORE DELETE ON agent_control_provider_${table} BEGIN SELECT RAISE(ABORT, 'provider admission history is append-only'); END`,
+    ).unprepared;
+  }
+  for (const table of ["admission_current", "capacity_current"] as const) {
+    yield* sql.unsafe(
+      `CREATE TRIGGER main.agent_control_provider_${table}_no_delete BEFORE DELETE ON agent_control_provider_${table} BEGIN SELECT RAISE(ABORT, 'provider admission projection cannot be deleted'); END`,
     ).unprepared;
   }
 });
@@ -501,6 +508,8 @@ export const EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS: Readonly<Record<strin
     "1767c5f6563e7cfe00443cda7a53d9316f67c02c0436a2a2fd140d76a22bcce2",
   agent_control_provider_admission_current_validate_update:
     "262a2e66c9eaa379d535ba94bede9f4cb294531a2e53713acf5f62c0a90fd9f6",
+  agent_control_provider_admission_current_no_delete:
+    "e0162fe23c71227178e41f49162672af7fd37d2e698b18a35898c5c8e2a73220",
   agent_control_provider_admission_intent_validate:
     "dec0f149bd4ed3454c783f3d644f87bc7015f7dd0935a7d640694621a86fe897",
   agent_control_provider_admission_intents:
@@ -539,6 +548,8 @@ export const EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS: Readonly<Record<strin
     "15db37d9b75b2e54529c76b060ec275986c5fe028f6b578ebad8b16681bf9009",
   agent_control_provider_capacity_current_validate_update:
     "e9ee1f937a60e00bea949f33f4ee3eb00e214a8201da654e2e0b41a56e34f456",
+  agent_control_provider_capacity_current_no_delete:
+    "678fb6431a40ac2159ef744a5af00248a0370beaa5e0ae9a3d52a56c9a87980b",
   agent_control_provider_claim_history:
     "904e69ba21fce57a4e0b6f0a6da45f8f02267892e4b3f8c47287d088a2625e9d",
   agent_control_provider_claim_history_no_delete:

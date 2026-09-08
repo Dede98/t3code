@@ -107,6 +107,17 @@ interface CapacityRow {
   readonly activeMarkerFingerprint: string | null;
 }
 
+interface ClaimRow {
+  readonly claimId: string;
+  readonly admissionId: string;
+  readonly providerInstanceId: string;
+  readonly ownerId: string;
+  readonly providerFenceToken: number;
+  readonly claimedAt: string;
+  readonly leaseExpiresAt: string;
+  readonly claimFingerprint: string;
+}
+
 interface FinalizationRow {
   readonly handoffId: string;
   readonly projectId: string;
@@ -611,6 +622,20 @@ const make = Effect.gen(function* () {
           if (current === undefined) {
             return yield* fail("request-current", "authority-missing", admissionId);
           }
+          let capacity = yield* readCapacity(String(input.request.providerInstanceId));
+          if (capacity === undefined) {
+            yield* sql`
+              INSERT INTO main.agent_control_provider_capacity_current (
+                provider_instance_id,last_fence_token,active_admission_id,active_state,
+                active_owner_id,active_lease_expires_at,active_fence_token,
+                active_marker_fingerprint,revision,updated_at
+              ) VALUES (${String(input.request.providerInstanceId)},0,NULL,NULL,NULL,NULL,NULL,NULL,1,${input.now})
+            `;
+            capacity = yield* readCapacity(String(input.request.providerInstanceId));
+          }
+          if (capacity === undefined) {
+            return yield* fail("request-capacity", "authority-missing", admissionId);
+          }
           if (current.status === "admitted") {
             if (current.leaseExpiresAt !== null && current.leaseExpiresAt > input.now) {
               if (current.ownerId !== input.ownerId) {
@@ -647,19 +672,6 @@ const make = Effect.gen(function* () {
               retryAt: current.nextDeadlineAt,
             } satisfies ProviderAdmissionDecision;
           }
-          let capacity = yield* readCapacity(String(input.request.providerInstanceId));
-          if (capacity === undefined) {
-            yield* sql`
-            INSERT INTO main.agent_control_provider_capacity_current (
-              provider_instance_id,last_fence_token,active_admission_id,active_state,
-              active_owner_id,active_lease_expires_at,active_fence_token,
-              active_marker_fingerprint,revision,updated_at
-            ) VALUES (${String(input.request.providerInstanceId)},0,NULL,NULL,NULL,NULL,NULL,NULL,1,${input.now})
-          `;
-            capacity = yield* readCapacity(String(input.request.providerInstanceId));
-          }
-          if (capacity === undefined)
-            return yield* fail("request-capacity", "authority-missing", admissionId);
           const takeoverAdmitted = current.status === "admitted";
           let fence: number;
           if (capacity.activeAdmissionId !== null) {
@@ -1016,24 +1028,36 @@ const make = Effect.gen(function* () {
       return yield* fail("pre-effect-delivery", "authority-divergent", input.permit.admissionId);
     }
     const kind = input.boundary === "session-start" ? "session-entry" : "turn-entry";
-    const existingBoundary = yield* sql<{ readonly count: number }>`
-      SELECT count(*) AS count
-      FROM main.agent_control_provider_authority_markers marker
-      JOIN main.agent_control_provider_authority_evidence evidence
-        ON evidence.evidence_id=marker.evidence_id
-      WHERE marker.admission_id=${input.permit.admissionId}
-        AND marker.authority_kind=${kind}
-        AND evidence.provider_fence_token=${input.permit.providerFenceToken}
-        AND typeof(marker.admission_id)='text'
-        AND typeof(marker.authority_kind)='text'
-        AND typeof(evidence.provider_fence_token)='integer'
-    `;
-    if (existingBoundary[0]?.count !== 0) {
-      return yield* fail(
-        "pre-effect-boundary-replay",
-        "authority-divergent",
-        input.permit.admissionId,
-      );
+    const existingBoundaries = (yield* readCompleteAuthorityChains(
+      input.permit.admissionId,
+    )).filter(
+      (chain) =>
+        chain.authorityKind === kind &&
+        chain.providerFenceToken === input.permit.providerFenceToken,
+    );
+    if (existingBoundaries.length !== 0) {
+      if (
+        existingBoundaries.length !== 1 ||
+        !authorityChainMatches(existingBoundaries[0]!, {
+          admissionId: input.permit.admissionId,
+          authorityKind: kind,
+          providerInstanceId: String(input.permit.providerInstanceId),
+          ownerId: input.permit.admissionOwnerId,
+          providerFenceToken: input.permit.providerFenceToken,
+          details: {
+            handoffId: input.permit.handoffId,
+            providerDeliveryId: input.permit.providerDeliveryId,
+            stageFenceToken: input.permit.stageFenceToken,
+          },
+        })
+      ) {
+        return yield* fail(
+          "pre-effect-boundary-replay",
+          "authority-divergent",
+          input.permit.admissionId,
+        );
+      }
+      return;
     }
     yield* appendAuthority({
       admissionId: input.permit.admissionId,
@@ -1114,6 +1138,80 @@ const make = Effect.gen(function* () {
           isProviderAdmissionError(cause)
             ? cause
             : fail("quarantine", "persistence", input.permit.admissionId, cause),
+        ),
+      );
+  });
+
+  const quarantineIfEntered: ProviderAdmissionStoreShape["quarantineIfEntered"] = Effect.fn(
+    "ProviderAdmissionStore.quarantineIfEntered",
+  )(function* (input) {
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const current = yield* readCurrent(input.permit.admissionId);
+          if (current === undefined) {
+            return yield* fail(
+              "quarantine-if-entered",
+              "authority-missing",
+              input.permit.admissionId,
+            );
+          }
+          const matchesPermit =
+            current.providerInstanceId === String(input.permit.providerInstanceId) &&
+            current.ownerId === input.permit.admissionOwnerId &&
+            current.leaseExpiresAt === input.permit.admissionLeaseExpiresAt &&
+            current.providerFenceToken === input.permit.providerFenceToken &&
+            current.admissionMarkerId === input.permit.admissionMarkerId &&
+            current.admissionMarkerFingerprint === input.permit.admissionMarkerFingerprint;
+          if (!matchesPermit) {
+            return yield* fail(
+              "quarantine-if-entered",
+              "authority-divergent",
+              input.permit.admissionId,
+            );
+          }
+          if (
+            current.status === "admitted" ||
+            current.status === "quarantined" ||
+            current.status === "released" ||
+            current.status === "superseded"
+          ) {
+            return;
+          }
+          if (current.status !== "entered") {
+            return yield* fail(
+              "quarantine-if-entered",
+              "authority-divergent",
+              input.permit.admissionId,
+            );
+          }
+          yield* appendAuthority({
+            admissionId: input.permit.admissionId,
+            authorityKind: "quarantine",
+            providerInstanceId: String(input.permit.providerInstanceId),
+            ownerId: input.permit.admissionOwnerId,
+            providerFenceToken: input.permit.providerFenceToken,
+            occurredAt: input.observedAt,
+            details: { reason: "external-outcome-unknown" },
+          });
+          yield* sql`
+            UPDATE main.agent_control_provider_admission_current SET status='quarantined',
+              revision=revision+1,updated_at=${input.observedAt}
+            WHERE admission_id=${input.permit.admissionId}
+          `;
+          yield* sql`
+            UPDATE main.agent_control_provider_capacity_current SET active_state='quarantined',
+              revision=revision+1,updated_at=${input.observedAt}
+            WHERE provider_instance_id=${String(input.permit.providerInstanceId)}
+              AND active_admission_id=${input.permit.admissionId}
+          `;
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          isProviderAdmissionError(cause)
+            ? cause
+            : fail("quarantine-if-entered", "persistence", input.permit.admissionId, cause),
         ),
       );
   });
@@ -1710,12 +1808,12 @@ const make = Effect.gen(function* () {
       }
       const admissionProblems = yield* sql<{ readonly count: number }>`
       SELECT count(*) AS count
-      FROM main.agent_control_provider_admission_current current
-      LEFT JOIN main.agent_control_provider_admission_intents intent
-        ON intent.admission_id=current.admission_id
+      FROM main.agent_control_provider_admission_intents intent
+      LEFT JOIN main.agent_control_provider_admission_current current
+        ON current.admission_id=intent.admission_id
       LEFT JOIN main.agent_control_provider_usage_evidence usage
         ON usage.evidence_id=current.usage_evidence_id
-      WHERE intent.admission_id IS NULL
+      WHERE current.admission_id IS NULL
         OR intent.provider_instance_id!=current.provider_instance_id
         OR intent.stage!=current.stage OR intent.handoff_id!=current.handoff_id
         OR intent.requested_at!=current.requested_at
@@ -1751,7 +1849,11 @@ const make = Effect.gen(function* () {
       const capacityProblems = yield* sql<{ readonly count: number }>`
       SELECT count(*) AS count
       FROM main.agent_control_provider_capacity_current capacity
-      WHERE capacity.last_fence_token!=COALESCE((
+      WHERE NOT EXISTS (
+          SELECT 1 FROM main.agent_control_provider_admission_intents intent
+          WHERE intent.provider_instance_id=capacity.provider_instance_id
+        )
+        OR capacity.last_fence_token!=COALESCE((
           SELECT MAX(history.provider_fence_token)
           FROM main.agent_control_provider_claim_history history
           WHERE history.provider_instance_id=capacity.provider_instance_id
@@ -1772,16 +1874,99 @@ const make = Effect.gen(function* () {
             AND admission.status IN ('admitted','entered','quarantined')
         ))
     `;
-      if (admissionProblems[0]?.count !== 0 || capacityProblems[0]?.count !== 0) {
+      const sourceProblems = yield* sql<{
+        readonly orphanCurrentCount: number;
+        readonly missingCapacityCount: number;
+        readonly claimProblemCount: number;
+        readonly authorityProblemCount: number;
+        readonly usageProblemCount: number;
+      }>`
+        SELECT
+          (SELECT count(*)
+           FROM main.agent_control_provider_admission_current current
+           WHERE NOT EXISTS (
+             SELECT 1 FROM main.agent_control_provider_admission_intents intent
+             WHERE intent.admission_id=current.admission_id
+           )) AS "orphanCurrentCount",
+          (SELECT count(*)
+           FROM (SELECT DISTINCT provider_instance_id
+                 FROM main.agent_control_provider_admission_intents) provider
+           WHERE NOT EXISTS (
+             SELECT 1 FROM main.agent_control_provider_capacity_current capacity
+             WHERE capacity.provider_instance_id=provider.provider_instance_id
+           )) AS "missingCapacityCount",
+          (SELECT count(*)
+           FROM main.agent_control_provider_claim_history claim
+           LEFT JOIN main.agent_control_provider_admission_intents intent
+             ON intent.admission_id=claim.admission_id
+           WHERE intent.admission_id IS NULL
+             OR intent.provider_instance_id!=claim.provider_instance_id
+             OR typeof(claim.claim_id)!='text'
+             OR typeof(claim.admission_id)!='text'
+             OR typeof(claim.provider_instance_id)!='text'
+             OR typeof(claim.owner_id)!='text'
+             OR typeof(claim.provider_fence_token)!='integer'
+             OR typeof(claim.claimed_at)!='text'
+             OR typeof(claim.lease_expires_at)!='text'
+             OR typeof(claim.claim_fingerprint)!='text') AS "claimProblemCount",
+          (SELECT count(*)
+           FROM main.agent_control_provider_authority_evidence authority
+           LEFT JOIN main.agent_control_provider_admission_intents intent
+             ON intent.admission_id=authority.admission_id
+           WHERE intent.admission_id IS NULL
+             OR intent.provider_instance_id!=authority.provider_instance_id) AS "authorityProblemCount",
+          (SELECT count(*)
+           FROM main.agent_control_provider_usage_evidence usage
+           LEFT JOIN main.agent_control_provider_admission_intents intent
+             ON intent.admission_id=usage.admission_id
+           WHERE intent.admission_id IS NULL
+             OR intent.provider_instance_id!=usage.provider_instance_id) AS "usageProblemCount"
+      `;
+      const sourceProblem = sourceProblems[0];
+      if (
+        admissionProblems[0]?.count !== 0 ||
+        capacityProblems[0]?.count !== 0 ||
+        sourceProblem === undefined ||
+        sourceProblem.orphanCurrentCount !== 0 ||
+        sourceProblem.missingCapacityCount !== 0 ||
+        sourceProblem.claimProblemCount !== 0 ||
+        sourceProblem.authorityProblemCount !== 0 ||
+        sourceProblem.usageProblemCount !== 0
+      ) {
         return yield* fail("startup-projection-audit", "authority-divergent");
       }
 
-      const currentIds = yield* sql<{ readonly admissionId: string }>`
+      const claims = yield* sql<ClaimRow>`
+        SELECT claim_id AS "claimId",admission_id AS "admissionId",
+          provider_instance_id AS "providerInstanceId",owner_id AS "ownerId",
+          provider_fence_token AS "providerFenceToken",claimed_at AS "claimedAt",
+          lease_expires_at AS "leaseExpiresAt",claim_fingerprint AS "claimFingerprint"
+        FROM main.agent_control_provider_claim_history
+        ORDER BY provider_instance_id,provider_fence_token
+      `;
+      const providers = new Map<string, ReadonlyArray<ClaimRow>>();
+      for (const claim of claims) {
+        const providerClaims = providers.get(claim.providerInstanceId) ?? [];
+        providers.set(claim.providerInstanceId, [...providerClaims, claim]);
+      }
+      for (const providerClaims of providers.values()) {
+        for (const [index, claim] of providerClaims.entries()) {
+          if (claim.providerFenceToken !== index + 1) {
+            return yield* fail(
+              "startup-provider-fence-audit",
+              "authority-divergent",
+              claim.admissionId,
+            );
+          }
+        }
+      }
+
+      const intentIds = yield* sql<{ readonly admissionId: string }>`
         SELECT admission_id AS "admissionId"
-        FROM main.agent_control_provider_admission_current
+        FROM main.agent_control_provider_admission_intents
         ORDER BY admission_id
       `;
-      for (const { admissionId } of currentIds) {
+      for (const { admissionId } of intentIds) {
         const [current, intent, chains] = yield* Effect.all([
           readCurrent(admissionId),
           readIntent(admissionId),
@@ -1798,6 +1983,7 @@ const make = Effect.gen(function* () {
         const quarantineChains = chains.filter((chain) => chain.authorityKind === "quarantine");
         const supersedeChains = chains.filter((chain) => chain.authorityKind === "supersede");
         const releaseChains = chains.filter((chain) => chain.authorityKind === "release");
+        const admissionClaims = claims.filter((claim) => claim.admissionId === admissionId);
         const newestMarkerSequence = chains.reduce(
           (latest, chain) => Math.max(latest, chain.markerSequence),
           0,
@@ -1833,6 +2019,47 @@ const make = Effect.gen(function* () {
               "authority-divergent",
               admissionId,
             );
+          }
+        }
+        if (admissionClaims.length !== admissionChains.length) {
+          return yield* fail("startup-claim-history-audit", "authority-divergent", admissionId);
+        }
+        for (const claim of admissionClaims) {
+          const matchingAdmissionChains = admissionChains.filter(
+            (chain) =>
+              chain.providerInstanceId === claim.providerInstanceId &&
+              chain.ownerId === claim.ownerId &&
+              chain.providerFenceToken === claim.providerFenceToken &&
+              chain.occurredAt === claim.claimedAt,
+          );
+          if (
+            claim.claimFingerprint !==
+              sha256Utf8(
+                canonicalJson([
+                  claim.admissionId,
+                  claim.ownerId,
+                  claim.providerFenceToken,
+                  claim.claimedAt,
+                  claim.leaseExpiresAt,
+                ]),
+              ) ||
+            matchingAdmissionChains.length !== 1
+          ) {
+            return yield* fail("startup-claim-history-audit", "authority-divergent", admissionId);
+          }
+        }
+        for (const chain of chains) {
+          if (chain.authorityKind === "admission") continue;
+          if (chain.authorityKind === "supersede" && chain.providerFenceToken === 0) continue;
+          if (
+            !admissionChains.some(
+              (admission) =>
+                admission.providerInstanceId === chain.providerInstanceId &&
+                admission.ownerId === chain.ownerId &&
+                admission.providerFenceToken === chain.providerFenceToken,
+            )
+          ) {
+            return yield* fail("startup-authority-fence-audit", "authority-divergent", admissionId);
           }
         }
         for (const chain of quarantineChains) {
@@ -1977,6 +2204,7 @@ const make = Effect.gen(function* () {
     admitOldest,
     validateAndEnterInTransaction,
     quarantine,
+    quarantineIfEntered,
     recordUsage,
     listWaiting,
     listEnteredWithoutRelease,

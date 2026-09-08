@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqlite from "node:sqlite";
 import { ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -453,7 +454,7 @@ const seedVerificationFinalization = (
     );
 };
 
-it.live("guards all stage effects, denies replay, and quarantines restart ambiguity", () =>
+it.live("guards all stage effects, revalidates replay, and quarantines restart ambiguity", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -565,7 +566,10 @@ it.live("guards all stage effects, denies replay, and quarantines restart ambigu
         );
         yield* guard.enter(permit, "session-start");
         const replay = yield* Effect.exit(guard.enter(permit, "session-start"));
-        assert.isTrue(Exit.isFailure(replay));
+        assert.isTrue(
+          Exit.isSuccess(replay),
+          Exit.isFailure(replay) ? Cause.pretty(replay.cause) : undefined,
+        );
         yield* guard.enter(permit, "turn-start");
         assert.deepStrictEqual(
           yield* sql.unsafe(
@@ -863,6 +867,24 @@ it.live("guards all stage effects, denies replay, and quarantines restart ambigu
         (yield* secondSql<{ readonly count: number }>`
           SELECT count(*) AS count FROM main.agent_control_provider_authority_markers
           WHERE admission_id=${permits[0]!.admissionId} AND authority_kind='release'
+        `)[0]?.count,
+        1,
+      );
+      yield* secondStore.quarantineIfEntered({
+        permit: permits[0]!,
+        observedAt: "2026-09-06T09:00:01.000Z",
+      });
+      assert.deepStrictEqual(
+        yield* secondSql<{ readonly status: string }>`
+          SELECT status FROM main.agent_control_provider_admission_current
+          WHERE admission_id=${permits[0]!.admissionId}
+        `,
+        [{ status: "released" }],
+      );
+      assert.equal(
+        (yield* secondSql<{ readonly count: number }>`
+          SELECT count(*) AS count FROM main.agent_control_provider_authority_markers
+          WHERE admission_id=${permits[0]!.admissionId} AND authority_kind='quarantine'
         `)[0]?.count,
         1,
       );
@@ -1335,6 +1357,25 @@ it.live("supersedes deadline-finalized waiting and admitted pre-entry work trans
           WHERE admission.admission_id=${admittedDecision.permit.admissionId}
         `,
         [{ status: "superseded", activeAdmissionId: null }],
+      );
+      yield* store.quarantineIfEntered({
+        permit: admittedDecision.permit,
+        observedAt: "2026-09-06T09:00:01.000Z",
+      });
+      assert.deepStrictEqual(
+        yield* sql<{ readonly status: string }>`
+          SELECT status FROM main.agent_control_provider_admission_current
+          WHERE admission_id=${admittedDecision.permit.admissionId}
+        `,
+        [{ status: "superseded" }],
+      );
+      assert.equal(
+        (yield* sql<{ readonly count: number }>`
+          SELECT count(*) AS count FROM main.agent_control_provider_authority_markers
+          WHERE admission_id=${admittedDecision.permit.admissionId}
+            AND authority_kind='quarantine'
+        `)[0]?.count,
+        0,
       );
       assert.equal(
         (yield* sql<{ readonly count: number }>`

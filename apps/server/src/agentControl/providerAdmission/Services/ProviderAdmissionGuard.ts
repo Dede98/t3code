@@ -9,7 +9,7 @@ export interface ProviderAdmissionGuardShape {
     permit: ProviderAdmissionPermit,
     boundary: "session-start" | "turn-start",
   ) => Effect.Effect<void, ProviderAdmissionError>;
-  readonly quarantineUnknown: (
+  readonly quarantineIfEntered: (
     permit: ProviderAdmissionPermit,
   ) => Effect.Effect<void, ProviderAdmissionError>;
 }

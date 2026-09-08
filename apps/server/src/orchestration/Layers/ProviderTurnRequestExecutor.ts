@@ -12,12 +12,14 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { decodeCanonicalUtf8Bytes } from "../../agentControl/initialPlanning/eventEvidence.ts";
+import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
@@ -143,6 +145,29 @@ const make = Effect.gen(function* () {
   const providerRegistry = yield* ProviderRegistry;
   const sql = yield* SqlClient.SqlClient;
   const threadModelSelections = new Map<string, ModelSelection>();
+  const failAfterAdmissionQuarantine = <E>(
+    permit: ProviderAdmissionPermit,
+    cause: Cause.Cause<E>,
+  ) =>
+    Effect.gen(function* () {
+      const quarantine = providerService.quarantineAdmissionIfEntered;
+      const quarantineExit = yield* Effect.exit(
+        Effect.uninterruptible(
+          quarantine === undefined
+            ? Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider: String(permit.providerInstanceId),
+                  method: "thread.turn.start",
+                  detail: "Durable provider admission quarantine authority is unavailable.",
+                }),
+              )
+            : quarantine(permit),
+        ),
+      );
+      return yield* Effect.failCause(
+        Exit.isFailure(quarantineExit) ? Cause.combine(cause, quarantineExit.cause) : cause,
+      );
+    });
   const serverCommandId = (tag: string) =>
     hooks.makeServerCommandId?.(tag) ??
     crypto.randomUUIDv4.pipe(
@@ -208,7 +233,7 @@ const make = Effect.gen(function* () {
     });
   });
 
-  const ensureSessionForThread: ProviderTurnRequestExecutorShape["ensureSessionForThread"] =
+  const ensureSessionForThreadRaw: ProviderTurnRequestExecutorShape["ensureSessionForThread"] =
     Effect.fn("ProviderTurnRequestExecutor.ensureSessionForThread")(
       function* (threadId, createdAt, options) {
         const thread = yield* resolveThread(threadId);
@@ -448,6 +473,19 @@ const make = Effect.gen(function* () {
       },
     );
 
+  const ensureSessionForThread: ProviderTurnRequestExecutorShape["ensureSessionForThread"] = (
+    threadId,
+    createdAt,
+    options,
+  ) =>
+    ensureSessionForThreadRaw(threadId, createdAt, options).pipe(
+      Effect.catchCause((cause) =>
+        options?.providerAdmissionPermit === undefined
+          ? Effect.failCause(cause)
+          : failAfterAdmissionQuarantine(options.providerAdmissionPermit, cause),
+      ),
+    );
+
   const encodeResumeCursorJson = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
   const decodeResumeCursorJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
   const sessionEvidenceError = (provider: string, detail: string) =>
@@ -456,7 +494,7 @@ const make = Effect.gen(function* () {
       method: "thread.turn.start",
       detail,
     });
-  const prepareTurnDelivery: ProviderTurnRequestExecutorShape["prepareTurnDelivery"] = Effect.fn(
+  const prepareTurnDeliveryRaw: ProviderTurnRequestExecutorShape["prepareTurnDelivery"] = Effect.fn(
     "ProviderTurnRequestExecutor.prepareTurnDelivery",
   )(function* (input) {
     const thread = yield* resolveThread(input.threadId);
@@ -960,6 +998,15 @@ const make = Effect.gen(function* () {
           }),
     };
   });
+
+  const prepareTurnDelivery: ProviderTurnRequestExecutorShape["prepareTurnDelivery"] = (input) =>
+    prepareTurnDeliveryRaw(input).pipe(
+      Effect.catchCause((cause) =>
+        input.providerAdmissionPermit === undefined
+          ? Effect.failCause(cause)
+          : failAfterAdmissionQuarantine(input.providerAdmissionPermit, cause),
+      ),
+    );
 
   const sendPreparedTurn: ProviderTurnRequestExecutorShape["sendPreparedTurn"] = Effect.fn(
     "ProviderTurnRequestExecutor.sendPreparedTurn",

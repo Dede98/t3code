@@ -349,18 +349,37 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               ),
             ),
           );
-  const quarantineProviderAdmission = (permit: ProviderAdmissionPermit) =>
+  const quarantineAdmissionIfEntered = (permit: ProviderAdmissionPermit) =>
     admissionGuard === undefined
-      ? Effect.void
-      : admissionGuard.quarantineUnknown(permit).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logError("provider.admission.quarantine-failed", {
-              admissionId: permit.admissionId,
-              providerInstanceId: permit.providerInstanceId,
-              cause,
-            }),
+      ? Effect.fail(
+          toValidationError(
+            "ProviderService.providerAdmissionQuarantine",
+            "Durable provider admission guard is unavailable.",
           ),
-        );
+        )
+      : admissionGuard
+          .quarantineIfEntered(permit)
+          .pipe(
+            Effect.mapError((cause) =>
+              toValidationError(
+                "ProviderService.providerAdmissionQuarantine",
+                "Durable provider admission could not be quarantined.",
+                cause,
+              ),
+            ),
+          );
+  const failAfterAdmissionQuarantine = <E>(
+    permit: ProviderAdmissionPermit,
+    cause: Cause.Cause<E>,
+  ) =>
+    Effect.gen(function* () {
+      const quarantineExit = yield* Effect.exit(
+        Effect.uninterruptible(quarantineAdmissionIfEntered(permit)),
+      );
+      return yield* Effect.failCause(
+        Exit.isFailure(quarantineExit) ? Cause.combine(cause, quarantineExit.cause) : cause,
+      );
+    });
   const recordSessionAttestation = Effect.fn("ProviderService.recordSessionAttestation")(function* (
     session: ProviderSessionWithAttestation,
   ) {
@@ -1031,7 +1050,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     rawInput: ProviderSessionStartInput,
     providerAdmissionPermit?: ProviderAdmissionPermit,
   ) {
-    let durableSessionEntryCommitted = false;
     const parsed = yield* decodeInputOrValidationError({
       operation: "ProviderService.startSession",
       schema: ProviderSessionStartInput,
@@ -1148,6 +1166,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             "Compatible Claude account switching requires persisted resume state before the target provider can start.",
         });
       }
+      let continuationSync:
+        | {
+            readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+            readonly resumeCursor: unknown;
+            readonly cwd: string | undefined;
+          }
+        | undefined;
       if (isCompatibleCrossInstanceSwitch && effectiveResumeCursor !== undefined) {
         const sourceAdapter = yield* registry.getByInstance(persistedBindingInstanceId);
         if (resolvedProvider === "claudeAgent" && sourceAdapter.syncContinuation === undefined) {
@@ -1162,27 +1187,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         // CODEX_HOME. They intentionally do not implement the Claude-only
         // local transcript import capability.
         if (sourceAdapter.syncContinuation !== undefined) {
-          yield* sourceAdapter
-            .syncContinuation({
-              threadId,
-              resumeCursor: effectiveResumeCursor,
-              ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
-            })
-            .pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapterRequestError({
-                    provider: sourceAdapter.provider,
-                    method: "thread/continuation/sync",
-                    detail: cause.message,
-                    cause,
-                  }),
-              ),
-            );
+          continuationSync = {
+            adapter: sourceAdapter,
+            resumeCursor: effectiveResumeCursor,
+            cwd: effectiveCwd,
+          };
         }
       }
       const adapter = yield* registry.getByInstance(resolvedInstanceId);
-      yield* prepareMcpSession(threadId, resolvedInstanceId);
       if (providerAdmissionPermit !== undefined) {
         const modelEvidence =
           input.modelSelection === undefined
@@ -1201,7 +1213,27 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           );
         }
         yield* enterProviderAdmission(providerAdmissionPermit, "session-start");
-        durableSessionEntryCommitted = true;
+      }
+      if (continuationSync !== undefined) {
+        yield* continuationSync.adapter.syncContinuation!({
+          threadId,
+          resumeCursor: continuationSync.resumeCursor,
+          ...(continuationSync.cwd !== undefined ? { cwd: continuationSync.cwd } : {}),
+        }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterRequestError({
+                provider: continuationSync.adapter.provider,
+                method: "thread/continuation/sync",
+                detail: cause.message,
+                cause,
+              }),
+          ),
+        );
+      }
+      yield* prepareMcpSession(threadId, resolvedInstanceId);
+      if (providerAdmissionPermit !== undefined) {
+        yield* enterProviderAdmission(providerAdmissionPermit, "session-start");
       }
       const sessionNative = yield* adapter
         .startSession({
@@ -1291,10 +1323,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
       return sessionWithInstance;
     }).pipe(
-      Effect.onError(() =>
-        durableSessionEntryCommitted && providerAdmissionPermit !== undefined
-          ? quarantineProviderAdmission(providerAdmissionPermit)
-          : Effect.void,
+      Effect.catchCause((cause) =>
+        providerAdmissionPermit === undefined
+          ? Effect.failCause(cause)
+          : failAfterAdmissionQuarantine(providerAdmissionPermit, cause),
       ),
       withMetrics({
         counter: providerSessionsTotal,
@@ -1395,67 +1427,66 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   `Initial Planning session '${input.threadId}' failed authoritative pre-invoke recheck.`,
                 );
               }
-              const preparedTurn = yield* prepareAdapterTurn(input);
-              const turnAttestation: ProviderTurnAttestation = preparedTurn.attestation;
-              const canonicalTurnEvidence = canonicalProviderModelSelectionEvidence(
-                turnAttestation.effectiveModelSelection,
-              );
-              if (
-                turnAttestation.providerInstanceId !== routed.instanceId ||
-                turnAttestation.effectiveModelSelection.instanceId !== routed.instanceId ||
-                canonicalTurnEvidence.modelSelectionJson !== turnAttestation.modelSelectionJson ||
-                canonicalTurnEvidence.modelSelectionFingerprint !==
-                  turnAttestation.modelSelectionFingerprint
-              ) {
-                return yield* toValidationError(
-                  "ProviderService.sendTurn",
-                  `Initial Planning adapter '${routed.adapter.provider}' returned invalid native turn attestation.`,
-                );
-              }
               const permit = boundary.providerAdmissionPermit;
               if (
                 String(input.threadId) !== permit.threadId ||
                 routed.instanceId !== permit.providerInstanceId ||
-                canonicalTurnEvidence.modelSelectionJson !== permit.modelSelectionJson ||
-                canonicalTurnEvidence.modelSelectionFingerprint !== permit.modelSelectionFingerprint
+                boundary.expected.modelSelectionJson !== permit.modelSelectionJson ||
+                boundary.expected.modelSelectionFingerprint !== permit.modelSelectionFingerprint
               ) {
                 return yield* toValidationError(
                   "ProviderService.sendTurn",
-                  "Durable provider admission permit does not match the prepared provider turn.",
+                  "Durable provider admission permit does not match the selected provider turn.",
                 );
               }
               return yield* Effect.uninterruptibleMask((restore) =>
                 Effect.gen(function* () {
-                  yield* restore(
-                    enterProviderAdmission(permit, "turn-start").pipe(
-                      Effect.onError(() => quarantineProviderAdmission(permit)),
-                    ),
+                  yield* restore(enterProviderAdmission(permit, "turn-start"));
+                  const preparedTurn = yield* restore(prepareAdapterTurn(input));
+                  const turnAttestation: ProviderTurnAttestation = preparedTurn.attestation;
+                  const canonicalTurnEvidence = canonicalProviderModelSelectionEvidence(
+                    turnAttestation.effectiveModelSelection,
                   );
+                  if (
+                    turnAttestation.providerInstanceId !== routed.instanceId ||
+                    turnAttestation.effectiveModelSelection.instanceId !== routed.instanceId ||
+                    canonicalTurnEvidence.modelSelectionJson !==
+                      turnAttestation.modelSelectionJson ||
+                    canonicalTurnEvidence.modelSelectionFingerprint !==
+                      turnAttestation.modelSelectionFingerprint ||
+                    canonicalTurnEvidence.modelSelectionJson !== permit.modelSelectionJson ||
+                    canonicalTurnEvidence.modelSelectionFingerprint !==
+                      permit.modelSelectionFingerprint
+                  ) {
+                    return yield* toValidationError(
+                      "ProviderService.sendTurn",
+                      `Initial Planning adapter '${routed.adapter.provider}' returned invalid native turn attestation.`,
+                    );
+                  }
                   yield* restore(boundary.beforeDeliveryCas());
                   yield* boundary.persistDeliveryAttempted(turnAttestation);
                   yield* restore(boundary.afterDeliveryCas());
+                  yield* restore(enterProviderAdmission(permit, "turn-start"));
                   return yield* restore(
-                    preparedTurn
-                      .invoke({
-                        adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
-                        nativeInvocationStarted: () =>
-                          Effect.sync(() => boundary.onNativeInvocationStarted?.()),
-                        startExternal: (operation) =>
-                          Effect.gen(function* () {
-                            const externalOperation = yield* Effect.sync(operation);
-                            boundary.onExternalOperationStarted?.();
-                            const fiber = yield* externalOperation.pipe(
-                              Effect.forkChild({
-                                startImmediately: true,
-                                uninterruptible: false,
-                              }),
-                            );
-                            return yield* Fiber.join(fiber);
-                          }),
-                      })
-                      .pipe(Effect.onError(() => quarantineProviderAdmission(permit))),
+                    preparedTurn.invoke({
+                      adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
+                      nativeInvocationStarted: () =>
+                        Effect.sync(() => boundary.onNativeInvocationStarted?.()),
+                      startExternal: (operation) =>
+                        Effect.gen(function* () {
+                          const externalOperation = yield* Effect.sync(operation);
+                          boundary.onExternalOperationStarted?.();
+                          const fiber = yield* externalOperation.pipe(
+                            Effect.forkChild({
+                              startImmediately: true,
+                              uninterruptible: false,
+                            }),
+                          );
+                          return yield* Fiber.join(fiber);
+                        }),
+                    }),
                   );
-                }),
+                }).pipe(Effect.catchCause((cause) => failAfterAdmissionQuarantine(permit, cause))),
               );
             });
       yield* directory.upsert({
@@ -1907,6 +1938,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     sendTurn: (input) => rebuildBarrier.withOperation(sendTurn(input)),
     sendTurnAtPreInvokeBoundary: (input, boundary) =>
       rebuildBarrier.withOperation(sendTurnAtPreInvokeBoundary(input, boundary)),
+    quarantineAdmissionIfEntered: (permit) =>
+      rebuildBarrier.withOperation(quarantineAdmissionIfEntered(permit)),
     getSessionAttestation,
     interruptTurn: (input) => rebuildBarrier.withOperation(interruptTurn(input)),
     respondToRequest: (input) => rebuildBarrier.withOperation(respondToRequest(input)),

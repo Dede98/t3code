@@ -57,14 +57,10 @@ const make = Effect.gen(function* () {
     },
   );
 
-  const quarantineUnknown: ProviderAdmissionGuardShape["quarantineUnknown"] = (permit) =>
-    nowIso.pipe(
-      Effect.flatMap((observedAt) =>
-        store.quarantine({ permit, reason: "external-outcome-unknown", observedAt }),
-      ),
-    );
+  const quarantineIfEntered: ProviderAdmissionGuardShape["quarantineIfEntered"] = (permit) =>
+    nowIso.pipe(Effect.flatMap((observedAt) => store.quarantineIfEntered({ permit, observedAt })));
 
-  return ProviderAdmissionGuard.of({ enter, quarantineUnknown });
+  return ProviderAdmissionGuard.of({ enter, quarantineIfEntered });
 });
 
 export const ProviderAdmissionGuardLive = Layer.effect(ProviderAdmissionGuard, make);

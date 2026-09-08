@@ -372,6 +372,7 @@ it.effect("reports a capacity pump defect through the typed runtime failure chan
         resume: () => Effect.die("unused"),
         request: () => Effect.die("unused"),
         validateAndEnterInTransaction: () => Effect.die("unused"),
+        quarantineIfEntered: () => Effect.die("unused"),
         admitOldest: () => Effect.die("injected-capacity-pump-defect"),
         quarantine: () => Effect.die("unused"),
         recordUsage: () => Effect.die("unused"),

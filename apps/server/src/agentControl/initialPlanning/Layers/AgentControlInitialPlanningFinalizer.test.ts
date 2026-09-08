@@ -190,6 +190,7 @@ import { AgentControlWorktreeController } from "../../worktree/Services/AgentCon
 import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
 import { AgentControlWorktreeEventStore } from "../../worktree/Services/AgentControlWorktreeEventStore.ts";
 import { AgentControlWorktreeStateRepository } from "../../worktree/Services/AgentControlWorktreeStateRepository.ts";
+import { ProviderAdmissionGuard } from "../../providerAdmission/Services/ProviderAdmissionGuard.ts";
 import {
   ProviderAdmissionReleaseAuthority,
   type ProviderAdmissionReleaseAuthorityShape,
@@ -4274,12 +4275,14 @@ const makeRecoverableMigration052Planning = Effect.fn("makeRecoverableMigration0
     const database = yield* makeSharedDatabase(52);
     const harness = yield* buildFinalizer(database.sqlA, database.scopeA);
     const seeded = yield* seedPlanning(database.sqlA, harness, suffix);
-    yield* appendProviderStart(database.sqlA, seeded, suffix);
+    yield* seedLegacyPlanningParents(database.sqlA, seeded, 1);
+    yield* seedLegacyPlanningTurnParents(database.sqlA, seeded);
+    const providerStart = yield* appendProviderStart(database.sqlA, seeded, suffix);
+    assert.equal(providerStart.streamVersion, 5);
     assert.equal(
       (yield* harness.finalizer.processHandoff(seeded.evidence.handoffId))._tag,
       "Started",
     );
-    yield* seedLegacyPlanningParents(database.sqlA, seeded, 1);
     yield* database.sqlA.unsafe(
       "DROP TRIGGER agent_control_initial_planning_turn_accepted_no_delete",
     ).unprepared;
@@ -7265,18 +7268,36 @@ it.effect("one invalid UTF-8 thread rolls migration 053 back for all legacy thre
 it.effect("migration 053 preserves canonical Unicode history and recovery finalizes once", () =>
   withNode(
     Effect.gen(function* () {
+      const planMarkdown = "# Grüner Plan 🚀\n\n1. Straße prüfen.";
       const { database, seeded, plan } = yield* makeRecoverableMigration052CompletedPlanning(
         "legacy-canonical-unicode",
-        "# Grüner Plan 🚀\n\n1. Straße prüfen.",
+        planMarkdown,
       );
       yield* database.sqlA.withTransaction(database.sqlA`
         UPDATE orchestration_events
         SET metadata_json = ${canonicalJson({
-          note: "Grüße aus Köln 🚀",
           providerTurnId: seeded.providerTurnId,
         })}
         WHERE event_id = ${plan.eventId}
       `);
+      const [planBefore] = yield* database.sqlA<{
+        readonly payloadStorage: string;
+        readonly payloadBytesHex: string;
+        readonly planMarkdown: string;
+      }>`
+        SELECT typeof(payload_json) AS "payloadStorage",
+          hex(CAST(payload_json AS BLOB)) AS "payloadBytesHex",
+          json_extract(payload_json, '$.proposedPlan.planMarkdown') AS "planMarkdown"
+        FROM orchestration_events
+        WHERE event_id = ${plan.eventId}
+      `;
+      if (planBefore === undefined) {
+        return yield* Effect.die(
+          new Error("expected persisted Unicode plan evidence before migration"),
+        );
+      }
+      assert.equal(planBefore.payloadStorage, "text");
+      assert.equal(planBefore.planMarkdown, planMarkdown);
       assert.deepStrictEqual(yield* database.sqlA`PRAGMA foreign_key_check`, []);
 
       assert.deepStrictEqual(
@@ -7303,6 +7324,16 @@ it.effect("migration 053 preserves canonical Unicode history and recovery finali
       assert.deepStrictEqual(yield* finalizationCounts(database.sqlB, seeded), finalized);
       assert.equal((yield* Ref.get(recovered.stagePublished)).length, 1);
       assert.equal((yield* Ref.get(recovered.leasePublished)).length, 1);
+      assert.deepStrictEqual(
+        yield* database.sqlB`
+          SELECT typeof(payload_json) AS "payloadStorage",
+            hex(CAST(payload_json AS BLOB)) AS "payloadBytesHex",
+            json_extract(payload_json, '$.proposedPlan.planMarkdown') AS "planMarkdown"
+          FROM orchestration_events
+          WHERE event_id = ${plan.eventId}
+        `,
+        [planBefore],
+      );
     }),
   ),
 );
@@ -18129,6 +18160,13 @@ it.effect(
                     providerAdapterRegistry,
                   ),
                   Layer.succeed(ProviderSessionDirectory, directory),
+                  Layer.succeed(
+                    ProviderAdmissionGuard,
+                    ProviderAdmissionGuard.of({
+                      enter: () => Effect.void,
+                      quarantineIfEntered: () => Effect.void,
+                    }),
+                  ),
                   ServerSettingsService.layerTest(),
                   AnalyticsService.layerTest,
                   Layer.succeed(
@@ -18341,7 +18379,13 @@ it.effect(
             Deferred.await(adapterSendEntered).pipe(Effect.as("adapter-entered" as const)),
             Fiber.join(handoffFiber).pipe(Effect.map((exit) => ({ exit }) as const)),
           );
-          assert.equal(handoffStart, "adapter-entered");
+          assert.equal(
+            handoffStart,
+            "adapter-entered",
+            typeof handoffStart === "object" && Exit.isFailure(handoffStart.exit)
+              ? Cause.pretty(handoffStart.exit.cause)
+              : undefined,
+          );
           assert.isUndefined(handoffFiber.pollUnsafe());
           yield* attempt.commit(
             runtimeIngestion.openProviderRuntimeEventPublishing.pipe(
@@ -19215,6 +19259,46 @@ it.effect.each([
               lastError: null,
               updatedAt: readyAt,
             };
+            const assertForeignThreadWriteRejected = Effect.fn(
+              "assertVerificationForeignThreadWriteRejected",
+            )(function* (commandId: string, payload: unknown, label: string) {
+              const before = yield* database.sqlA<Record<string, unknown>>`
+                SELECT *,
+                  typeof(payload_json) AS payload_storage_class,
+                  hex(CAST(payload_json AS BLOB)) AS payload_bytes_hex,
+                  typeof(metadata_json) AS metadata_storage_class,
+                  hex(CAST(metadata_json AS BLOB)) AS metadata_bytes_hex
+                FROM main.orchestration_events
+                WHERE command_id=${commandId}
+              `;
+              assert.lengthOf(before, 1, label);
+              const write = yield* Effect.exit(database.sqlA`
+                UPDATE main.orchestration_events
+                SET payload_json=${encodeUnknownJson(payload)}
+                WHERE command_id=${commandId}
+              `);
+              assert.isTrue(Exit.isFailure(write), label);
+              if (Exit.isFailure(write)) {
+                assert.include(
+                  Cause.pretty(write.cause),
+                  "invalid orchestration event storage",
+                  label,
+                );
+              }
+              assert.deepStrictEqual(
+                yield* database.sqlA<Record<string, unknown>>`
+                  SELECT *,
+                    typeof(payload_json) AS payload_storage_class,
+                    hex(CAST(payload_json AS BLOB)) AS payload_bytes_hex,
+                    typeof(metadata_json) AS metadata_storage_class,
+                    hex(CAST(metadata_json AS BLOB)) AS metadata_bytes_hex
+                  FROM main.orchestration_events
+                  WHERE command_id=${commandId}
+                `,
+                before,
+                label,
+              );
+            });
             const invalidPayloads = [
               {
                 name: "foreign active turn",
@@ -19268,13 +19352,6 @@ it.effect.each([
                   },
                 },
               },
-              {
-                name: "foreign controlled thread",
-                payload: {
-                  threadId: ThreadId.make("foreign-ready-thread"),
-                  session: { ...readySession, threadId: ThreadId.make("foreign-ready-thread") },
-                },
-              },
             ] as const;
             for (const invalid of invalidPayloads) {
               yield* database.sqlA`
@@ -19298,6 +19375,14 @@ it.effect.each([
                 WHERE command_id=${readyRow!.commandId}
               `;
             }
+            yield* assertForeignThreadWriteRejected(
+              readyRow!.commandId,
+              {
+                threadId: ThreadId.make("foreign-ready-thread"),
+                session: { ...readySession, threadId: ThreadId.make("foreign-ready-thread") },
+              },
+              "foreign controlled thread",
+            );
 
             yield* database.sqlA`
               UPDATE orchestration_events SET correlation_id='foreign-ready-correlation'
@@ -19404,16 +19489,6 @@ it.effect.each([
                   session: { ...stoppedSession, lastError: "unexplained stopped error" },
                 },
               },
-              {
-                name: "stopped foreign controlled thread",
-                payload: {
-                  threadId: ThreadId.make("foreign-stopped-thread"),
-                  session: {
-                    ...stoppedSession,
-                    threadId: ThreadId.make("foreign-stopped-thread"),
-                  },
-                },
-              },
             ] as const;
             for (const invalid of invalidStoppedPayloads) {
               yield* database.sqlA`
@@ -19436,6 +19511,17 @@ it.effect.each([
                 WHERE command_id=${stoppedRow!.commandId}
               `;
             }
+            yield* assertForeignThreadWriteRejected(
+              stoppedRow!.commandId,
+              {
+                threadId: ThreadId.make("foreign-stopped-thread"),
+                session: {
+                  ...stoppedSession,
+                  threadId: ThreadId.make("foreign-stopped-thread"),
+                },
+              },
+              "stopped foreign controlled thread",
+            );
             yield* database.sqlA`
               UPDATE orchestration_events SET metadata_json=${encodeUnknownJson({
                 providerRuntimeLifecycle: {

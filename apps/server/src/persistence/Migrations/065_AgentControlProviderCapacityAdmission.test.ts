@@ -276,6 +276,13 @@ it.live("commits one provider slot across two native WAL connections and preserv
       if (takeover._tag !== "Admitted") return;
       assert.equal(takeover.permit.providerFenceToken, admitted.permit.providerFenceToken + 1);
       assert.notEqual(takeover.permit.admissionMarkerId, admitted.permit.admissionMarkerId);
+      const restartContext = yield* Layer.buildWithScope(
+        Layer.fresh(ProviderAdmissionStoreLive).pipe(
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, second.sql)),
+        ),
+        second.scope,
+      );
+      assert.isDefined(Context.get(restartContext, ProviderAdmissionStore));
       const staleEntry = yield* Effect.exit(
         firstStore.validateAndEnterInTransaction({
           permit: admitted.permit,
@@ -302,6 +309,112 @@ it.live("commits one provider slot across two native WAL connections and preserv
       assert.isFalse(plan.some((row) => row.detail.startsWith("SCAN ")));
       assert.deepStrictEqual(yield* second.sql`PRAGMA main.foreign_key_check`, []);
       assert.equal((yield* second.sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("rejects deleted projection and claim authority after exact trigger restoration", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-provider-delete-audit-" });
+      const filename = path.join(directory, "delete-audit.sqlite");
+      const db = yield* openDatabase(filename);
+      yield* Effect.addFinalizer(() => Scope.close(db.scope, Exit.void));
+      yield* runMigrations({ toMigrationInclusive: 65 }).pipe(
+        Effect.provideService(SqlClient.SqlClient, db.sql),
+      );
+      const context = yield* Layer.buildWithScope(
+        Layer.fresh(ProviderAdmissionStoreLive).pipe(
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, db.sql)),
+        ),
+        db.scope,
+      );
+      const store = Context.get(context, ProviderAdmissionStore);
+      const value = request("deleted-history", "codex-deleted-history");
+      const decision = yield* store.request({
+        request: value,
+        usage: providerAdmissionUsageEvidence({
+          providerInstanceId: value.providerInstanceId,
+          status: "allowed",
+          observedAt: at,
+          source: "refresh",
+          nextRelevantAt: null,
+        }),
+        ownerId: "deleted-history-owner",
+        leaseExpiresAt: later,
+        now: at,
+      });
+      assert.equal(decision._tag, "Admitted");
+      if (decision._tag !== "Admitted") return;
+
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(db.sql`
+            DELETE FROM main.agent_control_provider_admission_current
+            WHERE admission_id=${decision.permit.admissionId}
+          `),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(db.sql`
+            DELETE FROM main.agent_control_provider_capacity_current
+            WHERE provider_instance_id=${String(value.providerInstanceId)}
+          `),
+        ),
+      );
+
+      const triggerNames = [
+        "agent_control_provider_claim_history_no_delete",
+        "agent_control_provider_admission_current_no_delete",
+        "agent_control_provider_capacity_current_no_delete",
+      ] as const;
+      const triggers = yield* db.sql<{ readonly name: string; readonly source: string }>`
+        SELECT name,sql AS source FROM main.sqlite_schema
+        WHERE name IN ${db.sql.in(triggerNames)} AND sql IS NOT NULL
+        ORDER BY name
+      `;
+      assert.equal(triggers.length, triggerNames.length);
+      for (const trigger of triggers) {
+        yield* db.sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+      }
+      yield* db.sql`
+        DELETE FROM main.agent_control_provider_claim_history
+        WHERE admission_id=${decision.permit.admissionId}
+      `;
+      yield* db.sql`
+        DELETE FROM main.agent_control_provider_admission_current
+        WHERE admission_id=${decision.permit.admissionId}
+      `;
+      yield* db.sql`
+        DELETE FROM main.agent_control_provider_capacity_current
+        WHERE provider_instance_id=${String(value.providerInstanceId)}
+      `;
+      for (const trigger of triggers) {
+        yield* db.sql.unsafe(trigger.source).unprepared;
+      }
+      const restored = yield* db.sql<{ readonly name: string; readonly source: string }>`
+        SELECT name,sql AS source FROM main.sqlite_schema
+        WHERE name IN ${db.sql.in(triggerNames)} AND sql IS NOT NULL
+        ORDER BY name
+      `;
+      assert.deepStrictEqual(restored, triggers);
+      assert.deepStrictEqual(yield* db.sql`PRAGMA main.foreign_key_check`, []);
+      assert.equal((yield* db.sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
+
+      const restartScope = yield* Scope.make("sequential");
+      const restart = yield* Effect.exit(
+        Layer.buildWithScope(
+          Layer.fresh(ProviderAdmissionStoreLive).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, db.sql)),
+          ),
+          restartScope,
+        ),
+      );
+      assert.isTrue(Exit.isFailure(restart));
+      yield* Scope.close(restartScope, Exit.void);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );
