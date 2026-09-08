@@ -29,6 +29,7 @@ import {
 import {
   ProviderAdmissionError,
   ProviderAdmissionStore,
+  type ProviderAdmissionDeadlineWakeup,
   type ProviderAdmissionStoreShape,
   type ProviderAdmissionWakeup,
 } from "../Services/ProviderAdmissionStore.ts";
@@ -57,6 +58,58 @@ WHERE provider_instance_id = ?
   AND typeof(admission_id) = 'text'
 ORDER BY requested_at, admission_id
 LIMIT 1
+`.trim();
+
+export const PROVIDER_ADMISSION_MINIMUM_WAITING_DEADLINE_SQL = `
+SELECT next_deadline_at AS deadline
+FROM main.agent_control_provider_admission_current
+INDEXED BY idx_agent_control_provider_admission_deadline
+WHERE status = 'waiting'
+  AND typeof(status) = 'text'
+  AND next_deadline_at IS NOT NULL
+  AND typeof(next_deadline_at) = 'text'
+ORDER BY next_deadline_at, provider_instance_id, admission_id
+LIMIT 1
+`.trim();
+
+export const PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_SQL = `
+SELECT lease_expires_at AS deadline
+FROM main.agent_control_provider_admission_current
+INDEXED BY idx_agent_control_provider_admission_lease_deadline
+WHERE status = 'admitted'
+  AND typeof(status) = 'text'
+  AND lease_expires_at IS NOT NULL
+  AND typeof(lease_expires_at) = 'text'
+ORDER BY lease_expires_at, provider_instance_id, admission_id
+LIMIT 1
+`.trim();
+
+export const PROVIDER_ADMISSION_DUE_WAITING_DEADLINES_SQL = `
+SELECT admission_id AS "admissionId",stage,handoff_id AS "handoffId",
+  provider_instance_id AS "providerInstanceId",next_deadline_at AS "deadlineAt",
+  'usage' AS "deadlineKind"
+FROM main.agent_control_provider_admission_current
+INDEXED BY idx_agent_control_provider_admission_deadline
+WHERE status = 'waiting'
+  AND typeof(status) = 'text'
+  AND next_deadline_at IS NOT NULL
+  AND typeof(next_deadline_at) = 'text'
+  AND next_deadline_at <= ?
+ORDER BY next_deadline_at, provider_instance_id, admission_id
+`.trim();
+
+export const PROVIDER_ADMISSION_DUE_ADMITTED_DEADLINES_SQL = `
+SELECT admission_id AS "admissionId",stage,handoff_id AS "handoffId",
+  provider_instance_id AS "providerInstanceId",lease_expires_at AS "deadlineAt",
+  'lease' AS "deadlineKind"
+FROM main.agent_control_provider_admission_current
+INDEXED BY idx_agent_control_provider_admission_lease_deadline
+WHERE status = 'admitted'
+  AND typeof(status) = 'text'
+  AND lease_expires_at IS NOT NULL
+  AND typeof(lease_expires_at) = 'text'
+  AND lease_expires_at <= ?
+ORDER BY lease_expires_at, provider_instance_id, admission_id
 `.trim();
 
 interface CurrentRow {
@@ -1296,6 +1349,26 @@ const make = Effect.gen(function* () {
     ORDER BY provider_instance_id,requested_at,admission_id
   `.pipe(Effect.mapError((cause) => fail("list-waiting", "persistence", undefined, cause)));
 
+  const listDueDeadlines: ProviderAdmissionStoreShape["listDueDeadlines"] = (now) =>
+    Effect.all([
+      sql.unsafe<ProviderAdmissionDeadlineWakeup>(PROVIDER_ADMISSION_DUE_WAITING_DEADLINES_SQL, [
+        now,
+      ]),
+      sql.unsafe<ProviderAdmissionDeadlineWakeup>(PROVIDER_ADMISSION_DUE_ADMITTED_DEADLINES_SQL, [
+        now,
+      ]),
+    ]).pipe(
+      Effect.map(([waiting, admitted]) =>
+        [...waiting, ...admitted].sort(
+          (left, right) =>
+            left.deadlineAt.localeCompare(right.deadlineAt) ||
+            left.providerInstanceId.localeCompare(right.providerInstanceId) ||
+            left.admissionId.localeCompare(right.admissionId),
+        ),
+      ),
+      Effect.mapError((cause) => fail("list-due-deadlines", "persistence", undefined, cause)),
+    );
+
   const listEnteredWithoutRelease = sql<CurrentRow & IntentRow>`
     SELECT current.admission_id AS "admissionId",current.provider_instance_id AS "providerInstanceId",
       current.stage,current.handoff_id AS "handoffId",current.status,
@@ -1333,14 +1406,16 @@ const make = Effect.gen(function* () {
     ),
   );
 
-  const minimumDeadline = sql<{ readonly deadline: string | null }>`
-    SELECT MIN(next_deadline_at) AS deadline
-    FROM main.agent_control_provider_admission_current
-    INDEXED BY idx_agent_control_provider_admission_deadline
-    WHERE status='waiting' AND next_deadline_at IS NOT NULL
-      AND typeof(status)='text' AND typeof(next_deadline_at)='text'
-  `.pipe(
-    Effect.map((rows) => rows[0]?.deadline ?? null),
+  const minimumDeadline = Effect.all([
+    sql.unsafe<{ readonly deadline: string }>(PROVIDER_ADMISSION_MINIMUM_WAITING_DEADLINE_SQL, []),
+    sql.unsafe<{ readonly deadline: string }>(PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_SQL, []),
+  ]).pipe(
+    Effect.map(([waiting, admitted]) => {
+      const deadlines = [waiting[0]?.deadline, admitted[0]?.deadline].filter(
+        (deadline): deadline is string => deadline !== undefined,
+      );
+      return deadlines.length === 0 ? null : deadlines.sort()[0]!;
+    }),
     Effect.mapError((cause) => fail("minimum-deadline", "persistence", undefined, cause)),
   );
 
@@ -2207,6 +2282,7 @@ const make = Effect.gen(function* () {
     quarantineIfEntered,
     recordUsage,
     listWaiting,
+    listDueDeadlines,
     listEnteredWithoutRelease,
     minimumDeadline,
     releaseFromFinalizationInTransaction,

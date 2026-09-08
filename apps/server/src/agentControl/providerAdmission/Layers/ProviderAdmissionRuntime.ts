@@ -131,6 +131,7 @@ const make = Effect.gen(function* () {
         providerInstanceId: String(permit.providerInstanceId),
       });
     }
+    yield* PubSub.publish(deadlineSignals, undefined);
   });
 
   const usageChanged: ProviderAdmissionRuntimeShape["usageChanged"] = Effect.fn(
@@ -138,7 +139,6 @@ const make = Effect.gen(function* () {
   )(function* (providerInstanceId, evidence) {
     yield* store.recordUsage(providerInstanceId, evidence);
     yield* advanceProvider(providerInstanceId);
-    yield* PubSub.publish(deadlineSignals, undefined);
   });
 
   const request: ProviderAdmissionRuntimeShape["request"] = Effect.fn(
@@ -162,8 +162,8 @@ const make = Effect.gen(function* () {
         leaseExpiresAt,
         now: nowText,
       }));
-    yield* PubSub.publish(deadlineSignals, undefined);
     if (decision._tag === "Admitted") {
+      yield* PubSub.publish(deadlineSignals, undefined);
       yield* wake({
         stage: input.stage,
         handoffId: input.handoffId,
@@ -213,10 +213,11 @@ const make = Effect.gen(function* () {
 
   const deadlineSubscription = yield* PubSub.subscribe(deadlineSignals);
   yield* Effect.gen(function* () {
-    let lastFiredDeadline: string | null = null;
+    const firedDeadlineKeys = new Set<string>();
     while (true) {
       const deadline = yield* store.minimumDeadline;
-      if (deadline === null || deadline === lastFiredDeadline) {
+      if (deadline === null) {
+        firedDeadlineKeys.clear();
         yield* PubSub.take(deadlineSubscription);
         continue;
       }
@@ -224,26 +225,48 @@ const make = Effect.gen(function* () {
         0,
         DateTime.toEpochMillis(DateTime.makeUnsafe(deadline)) - (yield* Clock.currentTimeMillis),
       );
-      const outcome = yield* Effect.raceFirst(
-        Effect.sleep(Duration.millis(delay)).pipe(Effect.as("deadline" as const)),
-        PubSub.take(deadlineSubscription).pipe(Effect.as("changed" as const)),
+      if (delay > 0) {
+        const outcome = yield* Effect.raceFirst(
+          Effect.sleep(Duration.millis(delay)).pipe(Effect.as("deadline" as const)),
+          PubSub.take(deadlineSubscription).pipe(Effect.as("changed" as const)),
+        );
+        if (outcome === "changed") continue;
+      }
+      const due = yield* store.listDueDeadlines(DateTime.formatIso(yield* DateTime.now));
+      const dueKeys = new Set(
+        due.map(
+          (publication) =>
+            `${publication.deadlineKind}:${publication.admissionId}:${publication.deadlineAt}`,
+        ),
       );
-      if (outcome === "changed") continue;
-      // A reset deadline is a one-shot wakeup for this runtime. If refreshing
-      // yields the same evidence, wait for a typed usage/deadline change rather
-      // than turning the expired deadline into a polling loop.
-      lastFiredDeadline = deadline;
-      const waiting = yield* store.listWaiting;
-      const providerIds = Array.from(
-        new Set(waiting.map((publication) => publication.providerInstanceId)),
-      );
+      for (const key of firedDeadlineKeys) {
+        if (!dueKeys.has(key)) firedDeadlineKeys.delete(key);
+      }
+      const unfired = due.filter((publication) => {
+        const key = `${publication.deadlineKind}:${publication.admissionId}:${publication.deadlineAt}`;
+        if (firedDeadlineKeys.has(key)) return false;
+        firedDeadlineKeys.add(key);
+        return true;
+      });
+      // Each persisted deadline identity fires once. An unchanged rejected
+      // usage reset or an owner that never resumes therefore waits for a typed
+      // authority signal, while a newly committed row at the same timestamp
+      // still receives its own deterministic wakeup.
+      if (unfired.length === 0) {
+        yield* PubSub.take(deadlineSubscription);
+        continue;
+      }
       yield* Effect.forEach(
-        providerIds,
-        (providerId) =>
-          Effect.gen(function* () {
-            const evidence = yield* inspect(ProviderInstanceId.make(providerId));
-            yield* usageChanged(providerId, evidence);
-          }),
+        unfired,
+        (publication) =>
+          publication.deadlineKind === "lease"
+            ? wake(publication)
+            : Effect.gen(function* () {
+                const evidence = yield* inspect(
+                  ProviderInstanceId.make(publication.providerInstanceId),
+                );
+                yield* usageChanged(publication.providerInstanceId, evidence);
+              }),
         { discard: true },
       );
     }

@@ -34,6 +34,12 @@ export interface ProviderAdmissionWakeup {
   readonly providerInstanceId: string;
 }
 
+export interface ProviderAdmissionDeadlineWakeup extends ProviderAdmissionWakeup {
+  readonly admissionId: string;
+  readonly deadlineAt: string;
+  readonly deadlineKind: "usage" | "lease";
+}
+
 export interface ProviderAdmissionStoreShape {
   readonly resume: (input: {
     readonly request: ProviderAdmissionRequest;
@@ -76,6 +82,9 @@ export interface ProviderAdmissionStoreShape {
     ReadonlyArray<ProviderAdmissionWakeup>,
     ProviderAdmissionError
   >;
+  readonly listDueDeadlines: (
+    now: string,
+  ) => Effect.Effect<ReadonlyArray<ProviderAdmissionDeadlineWakeup>, ProviderAdmissionError>;
   readonly listEnteredWithoutRelease: Effect.Effect<
     ReadonlyArray<ProviderAdmissionPermit>,
     ProviderAdmissionError

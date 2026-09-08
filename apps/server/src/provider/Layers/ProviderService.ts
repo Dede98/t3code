@@ -23,6 +23,7 @@ import {
   type ProviderDriverKind,
   type ProviderRuntimeEvent,
   type ProviderSession,
+  type ProviderTurnStartResult,
 } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { causeErrorTag } from "@t3tools/shared/observability";
@@ -1401,113 +1402,117 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.kind": routed.adapter.provider,
         ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
       });
-      const turn =
-        boundary === undefined
-          ? yield* routed.adapter.sendTurn(input)
-          : yield* Effect.gen(function* () {
-              const activeSessions = yield* routed.adapter.listSessions();
-              const active = activeSessions.filter(
-                (session) => session.threadId === input.threadId,
-              );
-              const sessionAttestation = sessionAttestations.get(input.threadId);
-              const prepareAdapterTurn = routed.adapter.prepareTurn;
-              if (
-                active.length !== 1 ||
-                sessionAttestation === undefined ||
-                prepareAdapterTurn === undefined ||
-                active[0]?.providerInstanceId !== routed.instanceId ||
-                active[0]?.runtimeMode !== boundary.expected.runtimeMode ||
-                active[0]?.cwd !== boundary.expected.cwd ||
-                !Equal.equals(active[0]?.resumeCursor ?? null, boundary.expected.resumeCursor) ||
-                !Equal.equals(sessionAttestation, boundary.expected) ||
-                input.modelSelection === undefined
-              ) {
-                return yield* toValidationError(
-                  "ProviderService.sendTurn",
-                  `Initial Planning session '${input.threadId}' failed authoritative pre-invoke recheck.`,
-                );
-              }
-              const permit = boundary.providerAdmissionPermit;
-              if (
-                String(input.threadId) !== permit.threadId ||
-                routed.instanceId !== permit.providerInstanceId ||
-                boundary.expected.modelSelectionJson !== permit.modelSelectionJson ||
-                boundary.expected.modelSelectionFingerprint !== permit.modelSelectionFingerprint
-              ) {
-                return yield* toValidationError(
-                  "ProviderService.sendTurn",
-                  "Durable provider admission permit does not match the selected provider turn.",
-                );
-              }
-              return yield* Effect.uninterruptibleMask((restore) =>
-                Effect.gen(function* () {
-                  yield* restore(enterProviderAdmission(permit, "turn-start"));
-                  const preparedTurn = yield* restore(prepareAdapterTurn(input));
-                  const turnAttestation: ProviderTurnAttestation = preparedTurn.attestation;
-                  const canonicalTurnEvidence = canonicalProviderModelSelectionEvidence(
-                    turnAttestation.effectiveModelSelection,
-                  );
-                  if (
-                    turnAttestation.providerInstanceId !== routed.instanceId ||
-                    turnAttestation.effectiveModelSelection.instanceId !== routed.instanceId ||
-                    canonicalTurnEvidence.modelSelectionJson !==
-                      turnAttestation.modelSelectionJson ||
-                    canonicalTurnEvidence.modelSelectionFingerprint !==
-                      turnAttestation.modelSelectionFingerprint ||
-                    canonicalTurnEvidence.modelSelectionJson !== permit.modelSelectionJson ||
-                    canonicalTurnEvidence.modelSelectionFingerprint !==
-                      permit.modelSelectionFingerprint
-                  ) {
-                    return yield* toValidationError(
-                      "ProviderService.sendTurn",
-                      `Initial Planning adapter '${routed.adapter.provider}' returned invalid native turn attestation.`,
-                    );
-                  }
-                  yield* restore(boundary.beforeDeliveryCas());
-                  yield* boundary.persistDeliveryAttempted(turnAttestation);
-                  yield* restore(boundary.afterDeliveryCas());
-                  yield* restore(enterProviderAdmission(permit, "turn-start"));
-                  return yield* restore(
-                    preparedTurn.invoke({
-                      adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
-                      nativeInvocationStarted: () =>
-                        Effect.sync(() => boundary.onNativeInvocationStarted?.()),
-                      startExternal: (operation) =>
-                        Effect.gen(function* () {
-                          const externalOperation = yield* Effect.sync(operation);
-                          boundary.onExternalOperationStarted?.();
-                          const fiber = yield* externalOperation.pipe(
-                            Effect.forkChild({
-                              startImmediately: true,
-                              uninterruptible: false,
-                            }),
-                          );
-                          return yield* Fiber.join(fiber);
-                        }),
-                    }),
-                  );
-                }).pipe(Effect.catchCause((cause) => failAfterAdmissionQuarantine(permit, cause))),
-              );
-            });
-      yield* directory.upsert({
-        threadId: input.threadId,
-        provider: routed.adapter.provider,
-        providerInstanceId: routed.instanceId,
-        status: "running",
-        ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
-        runtimePayload: {
-          ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
-          activeTurnId: turn.turnId,
-          lastRuntimeEvent: "provider.sendTurn",
-          lastRuntimeEventAt: yield* nowIso,
-        },
+      const persistTurn = Effect.fn("ProviderService.persistSentTurn")(function* (
+        turn: ProviderTurnStartResult,
+      ) {
+        yield* directory.upsert({
+          threadId: input.threadId,
+          provider: routed.adapter.provider,
+          providerInstanceId: routed.instanceId,
+          status: "running",
+          ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
+          runtimePayload: {
+            ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+            activeTurnId: turn.turnId,
+            lastRuntimeEvent: "provider.sendTurn",
+            lastRuntimeEventAt: yield* nowIso,
+          },
+        });
+        yield* analytics.record("provider.turn.sent", {
+          provider: routed.adapter.provider,
+          model: input.modelSelection?.model,
+          interactionMode: input.interactionMode,
+          attachmentCount: input.attachments.length,
+          hasInput: typeof input.input === "string" && input.input.trim().length > 0,
+        });
       });
-      yield* analytics.record("provider.turn.sent", {
-        provider: routed.adapter.provider,
-        model: input.modelSelection?.model,
-        interactionMode: input.interactionMode,
-        attachmentCount: input.attachments.length,
-        hasInput: typeof input.input === "string" && input.input.trim().length > 0,
+      if (boundary === undefined) {
+        const turn = yield* routed.adapter.sendTurn(input);
+        yield* persistTurn(turn);
+        return turn;
+      }
+      const turn = yield* Effect.gen(function* () {
+        const activeSessions = yield* routed.adapter.listSessions();
+        const active = activeSessions.filter((session) => session.threadId === input.threadId);
+        const sessionAttestation = sessionAttestations.get(input.threadId);
+        const prepareAdapterTurn = routed.adapter.prepareTurn;
+        if (
+          active.length !== 1 ||
+          sessionAttestation === undefined ||
+          prepareAdapterTurn === undefined ||
+          active[0]?.providerInstanceId !== routed.instanceId ||
+          active[0]?.runtimeMode !== boundary.expected.runtimeMode ||
+          active[0]?.cwd !== boundary.expected.cwd ||
+          !Equal.equals(active[0]?.resumeCursor ?? null, boundary.expected.resumeCursor) ||
+          !Equal.equals(sessionAttestation, boundary.expected) ||
+          input.modelSelection === undefined
+        ) {
+          return yield* toValidationError(
+            "ProviderService.sendTurn",
+            `Initial Planning session '${input.threadId}' failed authoritative pre-invoke recheck.`,
+          );
+        }
+        const permit = boundary.providerAdmissionPermit;
+        if (
+          String(input.threadId) !== permit.threadId ||
+          routed.instanceId !== permit.providerInstanceId ||
+          boundary.expected.modelSelectionJson !== permit.modelSelectionJson ||
+          boundary.expected.modelSelectionFingerprint !== permit.modelSelectionFingerprint
+        ) {
+          return yield* toValidationError(
+            "ProviderService.sendTurn",
+            "Durable provider admission permit does not match the selected provider turn.",
+          );
+        }
+        return yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            yield* restore(enterProviderAdmission(permit, "turn-start"));
+            const preparedTurn = yield* restore(prepareAdapterTurn(input));
+            const turnAttestation: ProviderTurnAttestation = preparedTurn.attestation;
+            const canonicalTurnEvidence = canonicalProviderModelSelectionEvidence(
+              turnAttestation.effectiveModelSelection,
+            );
+            if (
+              turnAttestation.providerInstanceId !== routed.instanceId ||
+              turnAttestation.effectiveModelSelection.instanceId !== routed.instanceId ||
+              canonicalTurnEvidence.modelSelectionJson !== turnAttestation.modelSelectionJson ||
+              canonicalTurnEvidence.modelSelectionFingerprint !==
+                turnAttestation.modelSelectionFingerprint ||
+              canonicalTurnEvidence.modelSelectionJson !== permit.modelSelectionJson ||
+              canonicalTurnEvidence.modelSelectionFingerprint !== permit.modelSelectionFingerprint
+            ) {
+              return yield* toValidationError(
+                "ProviderService.sendTurn",
+                `Initial Planning adapter '${routed.adapter.provider}' returned invalid native turn attestation.`,
+              );
+            }
+            yield* restore(boundary.beforeDeliveryCas());
+            yield* boundary.persistDeliveryAttempted(turnAttestation);
+            yield* restore(boundary.afterDeliveryCas());
+            yield* restore(enterProviderAdmission(permit, "turn-start"));
+            const turn = yield* restore(
+              preparedTurn.invoke({
+                adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
+                nativeInvocationStarted: () =>
+                  Effect.sync(() => boundary.onNativeInvocationStarted?.()),
+                startExternal: (operation) =>
+                  Effect.gen(function* () {
+                    const externalOperation = yield* Effect.sync(operation);
+                    boundary.onExternalOperationStarted?.();
+                    const fiber = yield* externalOperation.pipe(
+                      Effect.forkChild({
+                        startImmediately: true,
+                        uninterruptible: false,
+                      }),
+                    );
+                    return yield* Fiber.join(fiber);
+                  }),
+              }),
+            );
+            yield* restore(persistTurn(turn));
+            return turn;
+          }).pipe(Effect.catchCause((cause) => failAfterAdmissionQuarantine(permit, cause))),
+        );
       });
       return turn;
     }).pipe(

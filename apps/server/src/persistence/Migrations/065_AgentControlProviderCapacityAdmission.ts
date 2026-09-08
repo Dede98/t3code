@@ -16,6 +16,7 @@ export const PROVIDER_ADMISSION_SCHEMA_OBJECTS = [
   "agent_control_provider_capacity_current",
   "idx_agent_control_provider_admission_queue",
   "idx_agent_control_provider_admission_deadline",
+  "idx_agent_control_provider_admission_lease_deadline",
   "idx_agent_control_provider_authority_admission",
   "agent_control_provider_admission_intents_no_update",
   "agent_control_provider_admission_intents_no_delete",
@@ -202,6 +203,7 @@ const createIndexes = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`CREATE INDEX main.idx_agent_control_provider_admission_queue ON agent_control_provider_admission_current(provider_instance_id,status,usage_eligible,requested_at,admission_id)`;
   yield* sql`CREATE INDEX main.idx_agent_control_provider_admission_deadline ON agent_control_provider_admission_current(status,next_deadline_at,provider_instance_id,admission_id)`;
+  yield* sql`CREATE INDEX main.idx_agent_control_provider_admission_lease_deadline ON agent_control_provider_admission_current(status,lease_expires_at,provider_instance_id,admission_id)`;
   yield* sql`CREATE INDEX main.idx_agent_control_provider_authority_admission ON agent_control_provider_authority_markers(admission_id,authority_kind,committed_at)`;
 });
 
@@ -566,6 +568,8 @@ export const EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS: Readonly<Record<strin
     "940b432bee33fe4c6ef7e29d6a3aa9bd3359455b20a5347e5735786614a7c086",
   idx_agent_control_provider_admission_deadline:
     "a3a37248a42803b1e9d25da366d61e00ffcf1769de93ce5bb76d977c0ac197fb",
+  idx_agent_control_provider_admission_lease_deadline:
+    "651ee3c9d163ed597c2b38ec1d9529b582c731421fa6c1f0f4c7149aaa9e07ae",
   idx_agent_control_provider_admission_queue:
     "00b31f8aaf190823a28af7f9fb50cf94e2ae6b26ee29aef952c663d099ad635c",
   idx_agent_control_provider_authority_admission:

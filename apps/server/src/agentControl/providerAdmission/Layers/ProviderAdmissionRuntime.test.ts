@@ -12,6 +12,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
@@ -34,7 +35,13 @@ import {
   ProviderAdmissionStore,
 } from "../Services/ProviderAdmissionStore.ts";
 import { ProviderAdmissionRuntimeLive } from "./ProviderAdmissionRuntime.ts";
-import { ProviderAdmissionStoreLive } from "./ProviderAdmissionStore.ts";
+import {
+  PROVIDER_ADMISSION_DUE_ADMITTED_DEADLINES_SQL,
+  PROVIDER_ADMISSION_DUE_WAITING_DEADLINES_SQL,
+  PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_SQL,
+  PROVIDER_ADMISSION_MINIMUM_WAITING_DEADLINE_SQL,
+  ProviderAdmissionStoreLive,
+} from "./ProviderAdmissionStore.ts";
 import { providerAdmissionUsageEvidence } from "../model.ts";
 
 type Observation =
@@ -252,7 +259,7 @@ it.effect("binds all usage outcomes and wakes rejected admission from one global
         `;
       assert.equal(rejectedAfterWake[0]?.status, "admitted");
       assert.match(rejectedAfterWake[0]?.markerId ?? "", /^provider-admission:/u);
-      assert.equal(yield* store.minimumDeadline, null);
+      assert.equal(yield* store.minimumDeadline, "1970-01-01T00:02:00.000Z");
       assert.deepStrictEqual(yield* sql`PRAGMA main.foreign_key_check`, []);
       assert.equal((yield* sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
     }),
@@ -364,6 +371,208 @@ it.effect(
     ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.effect(
+  "wakes an expired admitted lease across fresh native WAL runtimes and takes over monotonically",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-admission-lease-deadline-",
+        });
+        const filename = path.join(directory, "lease-deadline.sqlite");
+        const openSql = Effect.gen(function* () {
+          const scope = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const context = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
+          const sql = Context.get(context, SqlClient.SqlClient);
+          yield* sql`PRAGMA journal_mode=WAL`;
+          return { scope, sql } as const;
+        });
+        const firstSql = yield* openSql;
+        const secondSql = yield* openSql;
+        yield* runMigrations({ toMigrationInclusive: 65 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, firstSql.sql),
+        );
+
+        const providerInstanceId = ProviderInstanceId.make("lease-deadline-shared");
+        const parallelProviderInstanceId = ProviderInstanceId.make("lease-deadline-parallel");
+        const restartProviderInstanceId = ProviderInstanceId.make("lease-deadline-restart");
+        const originalRequest = request(
+          "lease-deadline-shared",
+          providerInstanceId,
+          "implementation",
+        );
+        const restartRequest = request(
+          "lease-deadline-restart",
+          restartProviderInstanceId,
+          "verification",
+        );
+        const usageEvents = yield* PubSub.unbounded<never>();
+        const usageLayer = Layer.succeed(ProviderUsage, {
+          inspectForAdmission: (instanceId) =>
+            Effect.succeed({
+              _tag: "Observed" as const,
+              snapshot: snapshot(instanceId, "allowed"),
+            }),
+          getSnapshot: Effect.succeed([]),
+          refresh: () => Effect.succeed({ refreshedAt: epoch, usage: [], failures: [] }),
+          subscribeEvents: PubSub.subscribe(usageEvents),
+        });
+        const captureLeaseWakeup = yield* Ref.make(false);
+        const captureRestartWakeup = yield* Ref.make(false);
+        const leaseWakeup = yield* Deferred.make<void>();
+        const restartWakeup = yield* Deferred.make<void>();
+        const wakeups = yield* Ref.make<Array<string>>([]);
+        const wake = (handoffId: string) =>
+          Effect.gen(function* () {
+            yield* Ref.update(wakeups, (current) => [...current, handoffId]);
+            if (handoffId === originalRequest.handoffId && (yield* Ref.get(captureLeaseWakeup))) {
+              yield* Deferred.succeed(leaseWakeup, undefined);
+            }
+            if (handoffId === restartRequest.handoffId && (yield* Ref.get(captureRestartWakeup))) {
+              yield* Deferred.succeed(restartWakeup, undefined);
+            }
+          });
+        const wakeupLayers = Layer.mergeAll(
+          Layer.succeed(AgentControlInitialPlanningWakeup, { wake, stream: Stream.never }),
+          Layer.succeed(AgentControlImplementationTurnWakeup, { wake, stream: Stream.never }),
+          Layer.succeed(AgentControlVerificationTurnWakeup, {
+            wake,
+            stream: Stream.never,
+            subscribe: Effect.succeed(Stream.never),
+          }),
+        );
+        const buildRuntime = (sql: SqlClient.SqlClient) =>
+          Effect.gen(function* () {
+            const scope = yield* Scope.make("sequential");
+            yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+            const storeLayer = Layer.fresh(ProviderAdmissionStoreLive).pipe(
+              Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+            );
+            const runtimeLayer = Layer.fresh(ProviderAdmissionRuntimeLive).pipe(
+              Layer.provideMerge(storeLayer),
+              Layer.provideMerge(usageLayer),
+              Layer.provide(wakeupLayers),
+            );
+            const context = yield* Layer.buildWithScope(runtimeLayer, scope);
+            return {
+              runtime: Context.get(context, ProviderAdmissionRuntime),
+              store: Context.get(context, ProviderAdmissionStore),
+              scope,
+            } as const;
+          });
+
+        const first = yield* buildRuntime(firstSql.sql);
+        const firstDecision = yield* first.runtime.request(originalRequest);
+        assert.equal(firstDecision._tag, "Admitted");
+        if (firstDecision._tag !== "Admitted") return;
+        assert.equal(firstDecision.permit.providerFenceToken, 1);
+        yield* Scope.close(first.scope, Exit.void);
+
+        const second = yield* buildRuntime(secondSql.sql);
+        const beforeExpiry = yield* second.runtime.request(originalRequest);
+        assert.deepStrictEqual(beforeExpiry, {
+          _tag: "Waiting",
+          admissionId: firstDecision.permit.admissionId,
+          retryAt: firstDecision.permit.admissionLeaseExpiresAt,
+        });
+        yield* Ref.set(captureLeaseWakeup, true);
+        yield* TestClock.adjust("119999 millis");
+        assert.isTrue(Option.isNone(yield* Deferred.poll(leaseWakeup)));
+        assert.equal((yield* second.runtime.request(originalRequest))._tag, "Waiting");
+
+        const parallel = yield* second.runtime.request(
+          request("lease-deadline-parallel", parallelProviderInstanceId, "initial-planning"),
+        );
+        assert.equal(parallel._tag, "Admitted");
+        yield* TestClock.adjust("1 millis");
+        yield* Deferred.await(leaseWakeup);
+        const takeover = yield* second.runtime.request(originalRequest);
+        assert.equal(takeover._tag, "Admitted");
+        if (takeover._tag !== "Admitted") return;
+        assert.equal(
+          takeover.permit.providerFenceToken,
+          firstDecision.permit.providerFenceToken + 1,
+        );
+        assert.notEqual(takeover.permit.admissionMarkerId, firstDecision.permit.admissionMarkerId);
+        assert.deepStrictEqual(
+          yield* secondSql.sql<{ readonly count: number }>`
+            SELECT count(*) AS count
+            FROM main.agent_control_provider_claim_history
+            WHERE admission_id=${takeover.permit.admissionId}
+          `,
+          [{ count: 2 }],
+        );
+        assert.deepStrictEqual(
+          yield* secondSql.sql<{ readonly count: number }>`
+            SELECT count(*) AS count
+            FROM main.agent_control_provider_authority_markers
+            WHERE admission_id=${takeover.permit.admissionId} AND authority_kind='admission'
+          `,
+          [{ count: 2 }],
+        );
+
+        const restartFirst = yield* second.runtime.request(restartRequest);
+        assert.equal(restartFirst._tag, "Admitted");
+        if (restartFirst._tag !== "Admitted") return;
+        yield* Scope.close(second.scope, Exit.void);
+        yield* TestClock.adjust("2 minutes");
+        yield* Ref.set(captureRestartWakeup, true);
+        const restarted = yield* buildRuntime(firstSql.sql);
+        yield* Deferred.await(restartWakeup);
+        const restartTakeover = yield* restarted.runtime.request(restartRequest);
+        assert.equal(restartTakeover._tag, "Admitted");
+        if (restartTakeover._tag !== "Admitted") return;
+        assert.equal(
+          restartTakeover.permit.providerFenceToken,
+          restartFirst.permit.providerFenceToken + 1,
+        );
+
+        assert.deepStrictEqual(
+          yield* secondSql.sql<{ readonly name: string }>`
+            PRAGMA main.index_info('idx_agent_control_provider_admission_lease_deadline')
+          `.pipe(Effect.map((rows) => rows.map((row) => row.name))),
+          ["status", "lease_expires_at", "provider_instance_id", "admission_id"],
+        );
+        for (const [statement, parameters, index] of [
+          [
+            PROVIDER_ADMISSION_MINIMUM_WAITING_DEADLINE_SQL,
+            [],
+            "idx_agent_control_provider_admission_deadline",
+          ],
+          [
+            PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_SQL,
+            [],
+            "idx_agent_control_provider_admission_lease_deadline",
+          ],
+          [
+            PROVIDER_ADMISSION_DUE_WAITING_DEADLINES_SQL,
+            ["2100-01-01T00:00:00.000Z"],
+            "idx_agent_control_provider_admission_deadline",
+          ],
+          [
+            PROVIDER_ADMISSION_DUE_ADMITTED_DEADLINES_SQL,
+            ["2100-01-01T00:00:00.000Z"],
+            "idx_agent_control_provider_admission_lease_deadline",
+          ],
+        ] as const) {
+          const plan = yield* secondSql.sql.unsafe<{ readonly detail: string }>(
+            `EXPLAIN QUERY PLAN ${statement}`,
+            [...parameters],
+          );
+          assert.isTrue(plan.some((row) => row.detail.includes(index)));
+          assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
+          assert.isFalse(plan.some((row) => row.detail.startsWith("SCAN ")));
+        }
+        assert.deepStrictEqual(yield* secondSql.sql`PRAGMA main.foreign_key_check`, []);
+        assert.equal((yield* secondSql.sql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
+        yield* Scope.close(restarted.scope, Exit.void);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect("reports a capacity pump defect through the typed runtime failure channel", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -377,6 +586,7 @@ it.effect("reports a capacity pump defect through the typed runtime failure chan
         quarantine: () => Effect.die("unused"),
         recordUsage: () => Effect.die("unused"),
         listWaiting: Effect.succeed([]),
+        listDueDeadlines: () => Effect.succeed([]),
         listEnteredWithoutRelease: Effect.succeed([]),
         minimumDeadline: Effect.succeed(null),
         releaseFromFinalizationInTransaction: () => Effect.die("unused"),
