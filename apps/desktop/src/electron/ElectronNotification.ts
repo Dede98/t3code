@@ -14,7 +14,7 @@ export interface ElectronNotificationShowInput {
   readonly onFailed: (error: string) => void;
 }
 
-export class ElectronNotificationShowError extends Schema.TaggedErrorClass<ElectronNotificationShowError>()(
+export class ElectronNotificationShowError extends Schema.TaggedError<ElectronNotificationShowError>()(
   "ElectronNotificationShowError",
   {
     key: Schema.String,

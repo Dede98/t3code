@@ -123,7 +123,7 @@ export const ProviderThreadContinuationSyncErrorCode = Schema.Literals([
 export type ProviderThreadContinuationSyncErrorCode =
   typeof ProviderThreadContinuationSyncErrorCode.Type;
 
-export class ProviderThreadContinuationSyncError extends Schema.TaggedErrorClass<ProviderThreadContinuationSyncError>()(
+export class ProviderThreadContinuationSyncError extends Schema.TaggedError<ProviderThreadContinuationSyncError>()(
   "ProviderThreadContinuationSyncError",
   {
     code: ProviderThreadContinuationSyncErrorCode,
@@ -160,7 +160,7 @@ export const ProviderUploadFeedbackResult = Schema.Struct({
 });
 export type ProviderUploadFeedbackResult = typeof ProviderUploadFeedbackResult.Type;
 
-export class ProviderUploadFeedbackError extends Schema.TaggedErrorClass<ProviderUploadFeedbackError>()(
+export class ProviderUploadFeedbackError extends Schema.TaggedError<ProviderUploadFeedbackError>()(
   "ProviderUploadFeedbackError",
   {
     threadId: ThreadId,

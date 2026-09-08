@@ -66,7 +66,7 @@ export interface ProviderThreadSnapshot {
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
 
-export class ProviderContinuationSyncCapabilityError extends Schema.TaggedErrorClass<ProviderContinuationSyncCapabilityError>()(
+export class ProviderContinuationSyncCapabilityError extends Schema.TaggedError<ProviderContinuationSyncCapabilityError>()(
   "ProviderContinuationSyncCapabilityError",
   {
     code: Schema.Literals(["transcript-not-found", "sync-failed"]),
