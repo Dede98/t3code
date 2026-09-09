@@ -88,7 +88,7 @@ const seedStageAndDelivery = (
       ) VALUES (
         ${value.stageRunId},${value.projectId},${value.taskId},${value.attemptId},
         ${`role-${value.stage}`},
-        ${value.stage === "initial-planning" ? "planning" : value.stage},1,1,'running',1,1,
+        ${value.stage === "initial-planning" ? "planning" : value.stage},1,1,'prepared',1,1,
         ${sourceFingerprint},'{}',${at},${at},1,1
       )
     `;
@@ -454,7 +454,7 @@ const seedVerificationFinalization = (
     );
 };
 
-it.live("guards all stage effects, revalidates replay, and quarantines restart ambiguity", () =>
+const guardScenario = (matchingNativeTerminal: boolean) => () =>
   Effect.scoped(
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -589,6 +589,57 @@ it.live("guards all stage effects, revalidates replay, and quarantines restart a
         );
       }
 
+      // Exercise the second guard check after the consumer commits its delivery CAS.
+      // Only fixture setup bypasses delivery transitions; all admission guards remain active.
+      for (const trigger of deliveryTriggers) {
+        yield* sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+      }
+      for (const permit of permits) {
+        const table =
+          permit.stage === "initial-planning"
+            ? "agent_control_initial_planning_deliveries"
+            : permit.stage === "implementation"
+              ? "agent_control_implementation_deliveries"
+              : "agent_control_verification_deliveries";
+        yield* Effect.sync(() =>
+          fixtureDatabase
+            .prepare(`
+          UPDATE main.${table} SET state='delivery-attempted', revision=revision+1,
+            attempt_count=1, provider_session_created_at=?, provider_resume_cursor_json='{}'
+          WHERE provider_delivery_id=?
+        `)
+            .run(at, permit.providerDeliveryId),
+        );
+      }
+      for (const trigger of deliveryTriggers) {
+        yield* sql.unsafe(trigger.source).unprepared;
+      }
+      for (const permit of permits) {
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(guard.enter(permit, "session-start"))));
+        yield* guard.enter(permit, "turn-start");
+      }
+      for (const trigger of deliveryTriggers) {
+        yield* sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+      }
+      for (const permit of permits) {
+        const table =
+          permit.stage === "initial-planning"
+            ? "agent_control_initial_planning_deliveries"
+            : permit.stage === "implementation"
+              ? "agent_control_implementation_deliveries"
+              : "agent_control_verification_deliveries";
+        yield* Effect.sync(() =>
+          fixtureDatabase
+            .prepare(`
+          UPDATE main.${table} SET state='claimed' WHERE provider_delivery_id=?
+        `)
+            .run(permit.providerDeliveryId),
+        );
+      }
+      for (const trigger of deliveryTriggers) {
+        yield* sql.unsafe(trigger.source).unprepared;
+      }
+
       const wrongProvider = yield* Effect.exit(
         guard.enter(
           { ...permits[0]!, providerInstanceId: ProviderInstanceId.make("foreign-provider") },
@@ -685,10 +736,10 @@ it.live("guards all stage effects, revalidates replay, and quarantines restart a
       const terminalEventId = `terminal-event-${releasePermit.admissionId}`;
       const terminalCommandId = `terminal-command-${releasePermit.admissionId}`;
       const terminalMetadata = canonicalJson({
-        providerRuntimeMessage: {
-          eventType: "turn.completed",
+        providerRuntimeLifecycle: {
+          runtimeEventType: "turn.completed",
+          providerState: "failed",
           providerInstanceId: releasePermit.providerInstanceId,
-          providerItemId: null,
           providerTurnId: `provider-turn-${releasePermit.admissionId}`,
           runtimeEventId: `runtime-terminal-${releasePermit.admissionId}`,
         },
@@ -726,8 +777,10 @@ it.live("guards all stage effects, revalidates replay, and quarantines restart a
           eventType: "turn.completed",
           providerInstanceId: verificationPermit.providerInstanceId,
           providerItemId: null,
-          providerTurnId: `provider-turn-${verificationPermit.admissionId}`,
-          runtimeEventId: `foreign-runtime-event-${verificationPermit.admissionId}`,
+          providerTurnId: matchingNativeTerminal
+            ? `provider-turn-${verificationPermit.admissionId}`
+            : `foreign-provider-turn-${verificationPermit.admissionId}`,
+          runtimeEventId: `native-runtime-event-${verificationPermit.admissionId}`,
         },
       });
       const verificationTerminalPayload = canonicalJson({
@@ -760,14 +813,16 @@ it.live("guards all stage effects, revalidates replay, and quarantines restart a
           fixtureDatabase,
           verificationPermit,
           finalizedAt,
-          verificationTerminalEventId,
+          matchingNativeTerminal
+            ? `native-runtime-event-${verificationPermit.admissionId}`
+            : verificationTerminalEventId,
         ),
       );
       for (const trigger of finalizationTriggers) {
         yield* secondSql.unsafe(trigger.source).unprepared;
       }
 
-      const foreignRuntimeEvent = yield* Effect.exit(
+      const verificationRelease = yield* Effect.exit(
         secondSql.withTransaction(
           secondStore.releaseFromFinalizationInTransaction({
             stage: "verification",
@@ -776,20 +831,20 @@ it.live("guards all stage effects, revalidates replay, and quarantines restart a
           }),
         ),
       );
-      assert.isTrue(Exit.isFailure(foreignRuntimeEvent));
+      assert.equal(Exit.isSuccess(verificationRelease), matchingNativeTerminal);
       assert.deepStrictEqual(
         yield* secondSql<{ readonly status: string }>`
           SELECT status FROM main.agent_control_provider_admission_current
           WHERE admission_id=${verificationPermit.admissionId}
         `,
-        [{ status: "quarantined" }],
+        [{ status: matchingNativeTerminal ? "released" : "quarantined" }],
       );
       assert.equal(
         (yield* secondSql<{ readonly count: number }>`
           SELECT count(*) AS count FROM main.agent_control_provider_authority_markers
           WHERE admission_id=${verificationPermit.admissionId} AND authority_kind='release'
         `)[0]?.count,
-        0,
+        matchingNativeTerminal ? 1 : 0,
       );
 
       const wrongTerminal = yield* Effect.exit(
@@ -984,7 +1039,15 @@ it.live("guards all stage effects, revalidates replay, and quarantines restart a
       assert.deepStrictEqual(yield* secondSql`PRAGMA main.foreign_key_check`, []);
       assert.equal((yield* secondSql`PRAGMA main.integrity_check`)[0]?.integrity_check, "ok");
     }),
-  ).pipe(Effect.provide(NodeServices.layer)),
+  ).pipe(Effect.provide(NodeServices.layer));
+
+it.live(
+  "guards all stage effects, revalidates replay, and quarantines restart ambiguity",
+  guardScenario(false),
+);
+it.live(
+  "releases verification capacity using distinct native and orchestration event IDs",
+  guardScenario(true),
 );
 
 it.live(

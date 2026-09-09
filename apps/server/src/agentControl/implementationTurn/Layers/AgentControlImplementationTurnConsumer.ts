@@ -172,6 +172,10 @@ const make = Effect.gen(function* () {
       definitelyRejected = false,
     ) {
       const at = yield* DateTime.now;
+      yield* Effect.logWarning("Implementation provider delivery failed", {
+        handoffId: claim.evidence.handoffId,
+        cause,
+      });
       const code = safeErrorCode(cause);
       if (code === "session-incompatible" && !definitelyRejected) {
         yield* store.markAmbiguous({
@@ -212,12 +216,7 @@ const make = Effect.gen(function* () {
         Equal.equals(thread.value.modelSelection, claim.evidence.modelSelection) &&
         thread.value.worktreePath === claim.evidence.worktreePath
       ) {
-        const observed = yield* store.observeProviderStarted({
-          threadId: claim.evidence.threadId,
-          providerTurnId: String(active.activeTurnId),
-          acceptedAt: active.updatedAt,
-        });
-        if (Option.isSome(observed)) yield* wakeup.wake(claim.evidence.handoffId);
+        // Keep waiting for the provider start event; session.updatedAt is not its timestamp.
         return;
       }
       if (
@@ -392,15 +391,7 @@ const make = Effect.gen(function* () {
     ) {
       return yield* Effect.die(new Error("Implementation delivery evidence diverged."));
     }
-    yield* store.markProviderStarted({
-      handoffId: persisted.evidence.handoffId,
-      ownerId,
-      claimGeneration: persisted.delivery.claimGeneration,
-      expectedRevision: persisted.delivery.revision,
-      providerTurnId: String(deliveryExit.value.result.turnId),
-      acceptedAt: yield* nowIso,
-    });
-    yield* wakeup.wake(persisted.evidence.handoffId);
+    // Wait for turn.started to record the provider timestamp used by orchestration.
   });
 
   const processHandoff = Effect.fn("AgentControlImplementationTurnConsumer.processHandoff")(

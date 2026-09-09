@@ -2379,6 +2379,18 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
             return yield* Effect.die(new Error("provider response lost after acceptance"));
           }
           if (prepared.entryState !== undefined) prepared.entryState.adapterReturned = true;
+          yield* consumer
+            .processRuntimeEvent({
+              type: "turn.started",
+              eventId: EventId.make(`implementation-start-${prepared.input.threadId}`),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: prepared.input.modelSelection.instanceId,
+              threadId: prepared.input.threadId,
+              turnId: TurnId.make("implementation-provider-turn"),
+              createdAt: DateTime.formatIso(yield* DateTime.now),
+              payload: {},
+            })
+            .pipe(Effect.orDie);
           return {
             certainty: "accepted" as const,
             result: {
@@ -2415,9 +2427,8 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
       ),
       input.scope,
     );
-    return {
-      consumer: Context.get(context, AgentControlImplementationTurnConsumer),
-    } satisfies ImplementationConsumerHarness;
+    const consumer = Context.get(context, AgentControlImplementationTurnConsumer);
+    return { consumer } satisfies ImplementationConsumerHarness;
   },
 );
 
@@ -3063,6 +3074,18 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
               return yield* Effect.failCause(input.responseLossCause);
             }
             if (prepared.entryState !== undefined) prepared.entryState.adapterReturned = true;
+            yield* consumer
+              .processRuntimeEvent({
+                type: "turn.started",
+                eventId: EventId.make(`verification-start-${prepared.input.threadId}`),
+                provider: ProviderDriverKind.make("codex"),
+                providerInstanceId: prepared.input.modelSelection.instanceId,
+                threadId: prepared.input.threadId,
+                turnId: input.providerTurnId ?? TurnId.make("verification-provider-turn"),
+                createdAt: DateTime.formatIso(yield* DateTime.now),
+                payload: {},
+              })
+              .pipe(Effect.orDie);
             return {
               certainty: "accepted" as const,
               result: {
@@ -3099,10 +3122,11 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
       ),
       input.scope,
     );
-    return Context.get(
+    const consumer: AgentControlVerificationTurnConsumerShape = Context.get(
       context,
       AgentControlVerificationTurnConsumer,
-    ) satisfies AgentControlVerificationTurnConsumerShape;
+    );
+    return consumer satisfies AgentControlVerificationTurnConsumerShape;
   },
 );
 
@@ -8191,7 +8215,7 @@ it.effect(
                   FROM agent_control_initial_planning_finalization_markers
                   WHERE handoff_id=${handoffId}
                 `.pipe(Effect.orDie))[0]?.count,
-                  0,
+                  1,
                 );
                 yield* Ref.update(releaseCalls, (count) => count + 1);
                 return "provider-release-initial";
@@ -24791,7 +24815,7 @@ it.effect.each<{
                       FROM agent_control_implementation_stage_finalization_markers
                       WHERE handoff_id=${handoffId}
                     `.pipe(Effect.orDie))[0]?.count,
-                    0,
+                    1,
                   );
                   yield* Ref.update(releaseCalls, (count) => count + 1);
                   yield* Ref.set(releasedHandoff, handoffId);

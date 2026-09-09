@@ -301,17 +301,22 @@ function stalePendingRequestDetail(
   return `Stale pending ${requestKind} request: ${requestId}. Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue.`;
 }
 
-export const isVerificationOwnedTurnRequest = Effect.fn(
-  "ProviderCommandReactor.isVerificationOwnedTurnRequest",
+export const isImplementationOrVerificationOwnedTurnRequest = Effect.fn(
+  "ProviderCommandReactor.isImplementationOrVerificationOwnedTurnRequest",
 )(function* (sql: SqlClient.SqlClient, commandId: CommandId) {
   const rows = yield* sql<{ readonly count: number }>`
-    SELECT count(*) AS count FROM main.agent_control_verification_handoff_accepted
-    WHERE turn_request_command_id = ${commandId}
+    SELECT count(*) AS count FROM (
+      SELECT turn_request_command_id FROM main.agent_control_implementation_handoff_accepted
+      WHERE turn_request_command_id = ${commandId}
+      UNION ALL
+      SELECT turn_request_command_id FROM main.agent_control_verification_handoff_accepted
+      WHERE turn_request_command_id = ${commandId}
+    )
   `;
   const count = rows[0]?.count;
   if (count !== 0 && count !== 1) {
     return yield* Effect.die(
-      new Error(`Verification turn ownership is non-unique for '${commandId}'.`),
+      new Error(`Automated turn ownership is non-unique for '${commandId}'.`),
     );
   }
   return count === 1;
@@ -1266,7 +1271,7 @@ const make = Effect.gen(function* () {
       if (handoffOwned) {
         return;
       }
-      if (yield* isVerificationOwnedTurnRequest(sql, commandId)) {
+      if (yield* isImplementationOrVerificationOwnedTurnRequest(sql, commandId)) {
         return;
       }
     }

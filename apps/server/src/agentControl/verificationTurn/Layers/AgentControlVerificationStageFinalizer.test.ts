@@ -1010,7 +1010,7 @@ it.live.each([
             Effect.gen(function* () {
               assert.equal(stage, "verification");
               assert.equal(handoffId, claim.evidence.handoffId);
-              assert.equal(markerCountFromFreshConnection(), 0);
+              assert.equal(markerCountFromFreshConnection(), 1);
               yield* Ref.update(releaseCalls, (count) => count + 1);
               return "provider-release-verification";
             }),
@@ -1046,7 +1046,7 @@ it.live.each([
     ).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.live("rolls the finalization boundary back when provider release rejects", () =>
+it.live("preserves committed finalization for recovery when provider release rejects", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -1070,22 +1070,13 @@ it.live("rolls the finalization boundary back when provider release rejects", ()
         signalCommitted: () => Ref.update(releaseSignals, (count) => count + 1),
         recover: Effect.void,
       });
-      const stateBefore = yield* runtime.sql<{
-        readonly lease: string;
-        readonly stage: string;
-      }>`
-        SELECT stage.status AS stage,lease.status AS lease
-        FROM main.agent_control_stage_run_states stage
-        JOIN main.agent_control_stage_run_lease_states lease
-          ON lease.stage_run_id=stage.stage_run_id
-      `;
       assert.isTrue(
         Exit.isFailure(
           yield* Effect.exit(runtime.finalizer.processHandoff(claim.evidence.handoffId)),
         ),
       );
       assert.deepStrictEqual(yield* counts(runtime.sql), [
-        { events: 0, evidence: 0, receipts: 0, markers: 0 },
+        { events: 2, evidence: 1, receipts: 1, markers: 1 },
       ]);
       assert.deepStrictEqual(
         yield* runtime.sql<{
@@ -1097,7 +1088,7 @@ it.live("rolls the finalization boundary back when provider release rejects", ()
           JOIN main.agent_control_stage_run_lease_states lease
             ON lease.stage_run_id=stage.stage_run_id
         `,
-        stateBefore,
+        [{ stage: "failed", lease: "released" }],
       );
       assert.equal(yield* Ref.get(runtime.stagePublications), 0);
       assert.equal(yield* Ref.get(runtime.leasePublications), 0);

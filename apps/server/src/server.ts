@@ -779,6 +779,7 @@ const AgentControlVerificationEvaluatorLayerLive = AgentControlVerificationEvalu
 
 const AgentControlVerificationStageFinalizerLayerLive =
   AgentControlVerificationStageFinalizerLive.pipe(
+    Layer.provide(ProviderAdmissionReleaseAuthorityLayerLive),
     Layer.provideMerge(VerificationHandoffStoreLayerLive),
     Layer.provideMerge(AgentControlVerificationEvaluatorLayerLive),
     Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
@@ -838,6 +839,7 @@ const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
       AgentControlArmedSchedulerLayerLive,
     ),
   ),
+  Layer.provideMerge(RuntimeCoreDependenciesBaseLive),
 );
 
 const RuntimeCoreDependenciesLive = Layer.mergeAll(

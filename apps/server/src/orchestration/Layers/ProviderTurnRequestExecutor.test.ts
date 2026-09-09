@@ -183,6 +183,49 @@ const makeProvider = (input: {
     streamEvents: Stream.empty,
   });
 
+it.effect("binds a session using its observation time after a slow provider start", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const scope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+      const sqlContext = yield* Layer.buildWithScope(
+        SqlitePersistenceMemory.pipe(Layer.provideMerge(NodeServices.layer)),
+        scope,
+      );
+      const observedAt = "2026-09-06T10:00:02.000Z";
+      const delayedSession = { ...session, updatedAt: observedAt };
+      const providerService = makeProvider({
+        startSession: () => Effect.succeed(delayedSession),
+        listSessions: () => Effect.succeed([]),
+        quarantineAdmissionIfEntered: () => Effect.die("Unexpected quarantine"),
+      });
+      let bound = false;
+      const context = yield* buildExecutor(
+        scope,
+        Context.get(sqlContext, SqlClient.SqlClient),
+        providerService,
+        (command) =>
+          Effect.sync(() => {
+            assert.equal(command.type, "thread.session.set");
+            if (command.type === "thread.session.set") {
+              assert.equal(command.createdAt, observedAt);
+              assert.equal(command.session.updatedAt, command.createdAt);
+              assert.notEqual(command.createdAt, createdAt);
+              bound = true;
+            }
+            return { sequence: 1 };
+          }),
+      );
+      yield* Context.get(context, ProviderTurnRequestExecutor).ensureSessionForThread(
+        threadId,
+        createdAt,
+        { modelSelection },
+      );
+      assert.isTrue(bound);
+    }),
+  ),
+);
+
 it.effect(
   "quarantines a committed session entry when thread binding fails and keeps both causes",
   () =>

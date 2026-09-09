@@ -54,7 +54,7 @@ import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQu
 import {
   providerErrorLabelFromInstanceHint,
   ProviderCommandReactorLive,
-  isVerificationOwnedTurnRequest,
+  isImplementationOrVerificationOwnedTurnRequest,
 } from "./ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
@@ -109,10 +109,13 @@ const deriveServerPathsSync = (baseDir: string, devUrl: URL | undefined) =>
 effectIt.layer(NodeSqliteClient.layerMemory())(
   "Verification ProviderCommandReactor ownership",
   (it) => {
-    it.effect("uses only one unique main-schema Verification ownership row", () =>
+    it.effect("recognizes Implementation and Verification ownership only in the main schema", () =>
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         const commandId = CommandId.make("verification-owned-command");
+        yield* sql`CREATE VIEW agent_control_implementation_handoff_accepted AS
+          SELECT CAST(NULL AS TEXT) AS turn_request_command_id WHERE 0`;
+
         yield* sql`
           CREATE VIEW agent_control_verification_handoff_accepted AS
           SELECT CAST(NULL AS TEXT) AS turn_request_command_id WHERE 0
@@ -126,14 +129,14 @@ effectIt.layer(NodeSqliteClient.layerMemory())(
           INSERT INTO temp.agent_control_verification_handoff_accepted(turn_request_command_id)
           VALUES (${commandId})
         `;
-        assert.isFalse(yield* isVerificationOwnedTurnRequest(sql, commandId));
+        assert.isFalse(yield* isImplementationOrVerificationOwnedTurnRequest(sql, commandId));
 
         yield* sql`DROP VIEW main.agent_control_verification_handoff_accepted`;
         yield* sql.unsafe(`
           CREATE VIEW agent_control_verification_handoff_accepted AS
           SELECT 'verification-owned-command' AS turn_request_command_id
         `).unprepared;
-        assert.isTrue(yield* isVerificationOwnedTurnRequest(sql, commandId));
+        assert.isTrue(yield* isImplementationOrVerificationOwnedTurnRequest(sql, commandId));
 
         yield* sql`DROP VIEW main.agent_control_verification_handoff_accepted`;
         yield* sql.unsafe(`
@@ -142,8 +145,17 @@ effectIt.layer(NodeSqliteClient.layerMemory())(
           UNION ALL SELECT 'verification-owned-command'
         `).unprepared;
         assert.isTrue(
-          Exit.isFailure(yield* Effect.exit(isVerificationOwnedTurnRequest(sql, commandId))),
+          Exit.isFailure(
+            yield* Effect.exit(isImplementationOrVerificationOwnedTurnRequest(sql, commandId)),
+          ),
         );
+        yield* sql`DROP VIEW main.agent_control_verification_handoff_accepted`;
+        yield* sql`CREATE VIEW agent_control_verification_handoff_accepted AS
+          SELECT CAST(NULL AS TEXT) AS turn_request_command_id WHERE 0`;
+        yield* sql`DROP VIEW main.agent_control_implementation_handoff_accepted`;
+        yield* sql`CREATE VIEW agent_control_implementation_handoff_accepted AS
+          SELECT 'verification-owned-command' AS turn_request_command_id`;
+        assert.isTrue(yield* isImplementationOrVerificationOwnedTurnRequest(sql, commandId));
       }),
     );
   },

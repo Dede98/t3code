@@ -3066,6 +3066,107 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("admits turn options that are configured at turn start rather than session start", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-durable-turn-options");
+      const sessionModel = createModelSelection(codexInstanceId, "gpt-5.4");
+      const turnModel = createModelSelection(codexInstanceId, "gpt-5.4", [
+        { id: "reasoningEffort", value: "low" },
+      ]);
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("durable-turn-options"),
+        modelSelection: sessionModel,
+        runtimeMode: "approval-required",
+      });
+      const session = yield* provider.getSessionAttestation!(threadId);
+      assert.isDefined(session);
+      if (session === undefined) return;
+      const turnEvidence = canonicalProviderModelSelectionEvidence(turnModel);
+      const permit = {
+        ...makeTestProviderAdmissionPermit(session),
+        modelSelectionJson: turnEvidence.modelSelectionJson,
+        modelSelectionFingerprint: turnEvidence.modelSelectionFingerprint,
+      };
+      let marked = false;
+      const result = yield* provider.sendTurnAtPreInvokeBoundary!(
+        {
+          threadId,
+          input: "plan",
+          attachments: [],
+          modelSelection: turnModel,
+          interactionMode: "plan",
+        },
+        {
+          expected: session,
+          providerAdmissionPermit: permit,
+          beforeDeliveryCas: () => Effect.void,
+          persistDeliveryAttempted: (actual) =>
+            Effect.sync(() => {
+              assert.deepStrictEqual(actual, attestProviderNativeTurnConfiguration(turnModel));
+              marked = true;
+            }),
+          afterDeliveryCas: () => Effect.void,
+        },
+      );
+      assert.isTrue(marked);
+      assert.equal(result.turnId, `turn-${threadId}`);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
+  it.effect("delivers bounded controller evidence while preserving the public input limit", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-controller-prompt-budget");
+      const modelSelection = createModelSelection(codexInstanceId, "gpt-5.4");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("controller-prompt-budget"),
+        modelSelection,
+        runtimeMode: "approval-required",
+      });
+      const session = yield* provider.getSessionAttestation!(threadId);
+      assert.isDefined(session);
+      if (session === undefined) return;
+      const input = "evidence ".repeat(32_000);
+      const request = { threadId, input, modelSelection };
+      const callsBefore = routing.codex.sendTurn.mock.calls.length;
+      const publicFailure = yield* provider.sendTurn(request).pipe(Effect.flip);
+      assert.instanceOf(publicFailure, ProviderValidationError);
+      assert.equal(routing.codex.sendTurn.mock.calls.length, callsBefore);
+      let marked = false;
+      const boundary = {
+        expected: session,
+        providerAdmissionPermit: makeTestProviderAdmissionPermit(session),
+        beforeDeliveryCas: () => Effect.void,
+        persistDeliveryAttempted: () =>
+          Effect.sync(() => {
+            marked = true;
+          }),
+        afterDeliveryCas: () => Effect.void,
+      };
+      yield* provider.sendTurnAtPreInvokeBoundary!(request, boundary);
+      assert.isTrue(marked);
+      assert.equal(routing.codex.sendTurn.mock.calls.at(-1)?.[0].input, input.trim());
+      const callsAfter = routing.codex.sendTurn.mock.calls.length;
+      marked = false;
+      const oversized = yield* provider.sendTurnAtPreInvokeBoundary!(
+        { ...request, input: "é".repeat(524_289) },
+        boundary,
+      ).pipe(Effect.flip);
+      assert.instanceOf(oversized, ProviderValidationError);
+      assert.isFalse(marked);
+      assert.equal(routing.codex.sendTurn.mock.calls.length, callsAfter);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
   it.effect("places the Initial Planning marker at the actual adapter invoke boundary", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

@@ -288,6 +288,22 @@ const enforceAgentControlAuthority = Effect.fn("enforceAgentControlAuthority")(f
   }
 
   if (authority === "client" && thread.agentControl.controlState === "controlled") {
+    // A controlled turn can request human approval. Answering that exact
+    // pending request does not transfer thread control or authorize later work.
+    if (
+      command.type === "thread.approval.respond" &&
+      (command.decision === "accept" ||
+        command.decision === "decline" ||
+        command.decision === "cancel")
+    ) {
+      const pending = openRequests(thread).get(command.requestId);
+      if (
+        pending?.kind === "approval.requested" &&
+        pending.turnId !== null &&
+        pending.turnId === thread.session?.activeTurnId
+      )
+        return;
+    }
     return yield* controlInvariant(
       command.type,
       `Thread '${threadId}' is controlled by Agent Control; client mutation '${command.type}' is forbidden.`,

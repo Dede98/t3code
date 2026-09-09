@@ -1670,25 +1670,6 @@ const make = Effect.gen(function* () {
             ${resultEvidenceId}, ${evidence.handoffId}, ${delivery.terminalAt}
           )
         `;
-          const releasedProviderInstanceId =
-            providerAdmissionRelease === undefined
-              ? null
-              : yield* providerAdmissionRelease
-                  .releaseInTransaction({
-                    stage: "initial-planning",
-                    handoffId: evidence.handoffId,
-                    finalizedAt: delivery.terminalAt!,
-                  })
-                  .pipe(
-                    Effect.mapError((cause) =>
-                      finalizerError(
-                        evidence.handoffId,
-                        "provider-admission-release",
-                        "persistence",
-                        cause,
-                      ),
-                    ),
-                  );
           yield* hooks.beforeTransactionComplete({
             ...observation,
             stageRevision: currentStage.revision,
@@ -1696,7 +1677,11 @@ const make = Effect.gen(function* () {
           });
           return {
             _tag: "Finalized" as const,
-            releasedProviderInstanceId,
+            releaseInput: {
+              stage: "initial-planning" as const,
+              handoffId: evidence.handoffId,
+              finalizedAt: delivery.terminalAt!,
+            },
             observation,
             publication: {
               handoffId: evidence.handoffId,
@@ -1742,9 +1727,17 @@ const make = Effect.gen(function* () {
       return { _tag: "Started" as const, event: transaction.event };
     }
     yield* hooks.afterNativeCommit(transaction.observation);
-    yield* providerAdmissionRelease === undefined
-      ? Effect.void
-      : providerAdmissionRelease.signalCommitted(transaction.releasedProviderInstanceId);
+    if (providerAdmissionRelease !== undefined) {
+      // Finalization markers close their transaction. Release capacity from committed evidence.
+      const released = yield* sql
+        .withTransaction(providerAdmissionRelease.releaseInTransaction(transaction.releaseInput))
+        .pipe(
+          Effect.mapError((cause) =>
+            finalizerError(evidence.handoffId, "provider-admission-release", "persistence", cause),
+          ),
+        );
+      yield* providerAdmissionRelease.signalCommitted(released);
+    }
     yield* Effect.uninterruptible(
       Effect.gen(function* () {
         yield* stageEngine.publishCommitted(transaction.publication.stageEvents);

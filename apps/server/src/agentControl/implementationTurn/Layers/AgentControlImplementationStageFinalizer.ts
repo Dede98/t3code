@@ -981,24 +981,9 @@ const make = Effect.gen(function* () {
       )
     `.pipe(Effect.mapError((cause) => failure(handoffId, "insert-marker", "persistence", cause)));
 
-    const releasedProviderInstanceId =
-      providerAdmissionRelease === undefined
-        ? null
-        : yield* providerAdmissionRelease
-            .releaseInTransaction({
-              stage: "implementation",
-              handoffId,
-              finalizedAt,
-            })
-            .pipe(
-              Effect.mapError((cause) =>
-                failure(handoffId, "provider-admission-release", "persistence", cause),
-              ),
-            );
-
     return {
       _tag: "Finalized",
-      releasedProviderInstanceId,
+      releaseInput: { stage: "implementation" as const, handoffId, finalizedAt },
       publication: {
         handoffId,
         resultEvidenceId,
@@ -1097,9 +1082,16 @@ const make = Effect.gen(function* () {
       if (transaction._tag === "Replayed") return transaction;
       if (transaction._tag !== "Finalized") return transaction;
       yield* hooks.afterOuterCommit(handoffId);
-      yield* providerAdmissionRelease === undefined
-        ? Effect.void
-        : providerAdmissionRelease.signalCommitted(transaction.releasedProviderInstanceId);
+      if (providerAdmissionRelease !== undefined) {
+        const released = yield* sql
+          .withTransaction(providerAdmissionRelease.releaseInTransaction(transaction.releaseInput))
+          .pipe(
+            Effect.mapError((cause) =>
+              failure(handoffId, "provider-admission-release", "persistence", cause),
+            ),
+          );
+        yield* providerAdmissionRelease.signalCommitted(released);
+      }
       yield* Effect.uninterruptible(
         Effect.gen(function* () {
           yield* stageEngine.publishCommitted([transaction.publication.stageEvent]);

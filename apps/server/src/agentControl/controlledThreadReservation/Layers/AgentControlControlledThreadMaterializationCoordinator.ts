@@ -685,7 +685,7 @@ const make = Effect.gen(function* () {
     AgentControlControlledThreadMaterializationCoordinatorError
   > {
     const rows = yield* loadEvidence(input).pipe(
-      Effect.mapError(() => error("internal-persistence-error", input)),
+      Effect.mapError((cause) => error("internal-persistence-error", input, cause)),
     );
     if (rows.length === 0) {
       const partial = yield* sql<{ readonly count: number }>`
@@ -708,7 +708,7 @@ const make = Effect.gen(function* () {
               OR controlled_thread_reservation_id =
                 ${input.controlledThreadReservationId})
         ) AS count
-      `.pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+      `.pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
       if ((partial[0]?.count ?? 0) !== 0) {
         return yield* error("historical-evidence-corrupt", input);
       }
@@ -864,7 +864,7 @@ const make = Effect.gen(function* () {
         AND controlled_thread_reservation_id =
           ${input.controlledThreadReservationId}
         AND thread_id = ${state.threadId}
-    `.pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    `.pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
     const legacy = legacyRows[0]?.count === 1;
     if (
       (legacy && Option.isSome(handoff)) ||
@@ -994,7 +994,7 @@ const make = Effect.gen(function* () {
     const materializationFingerprint = yield* fingerprintAgentControlThreadMaterializationCommand(
       crypto,
       command,
-    ).pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    ).pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
     const resolvedCoordinatorFingerprint = deriveAgentControlControlledThreadCoordinatorFingerprint(
       input,
       materializationFingerprint,
@@ -1046,7 +1046,7 @@ const make = Effect.gen(function* () {
       command: beginCommand,
       eventId: EventId.make(
         yield* crypto.randomUUIDv4.pipe(
-          Effect.mapError(() => error("internal-persistence-error", input)),
+          Effect.mapError((cause) => error("internal-persistence-error", input, cause)),
         ),
       ),
       occurredAt: at,
@@ -1058,7 +1058,7 @@ const make = Effect.gen(function* () {
         expectedStreamVersion: 1,
         events: beginDecision,
       })
-      .pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+      .pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
     const materializingEvent = materializingEvents[0];
     if (
       materializingEvents.length !== 1 ||
@@ -1068,7 +1068,7 @@ const make = Effect.gen(function* () {
     }
     yield* reservationProjection
       .projectEventInTransaction(materializingEvent)
-      .pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+      .pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
     const materializingState = yield* projectAgentControlControlledThreadReservationEvent(
       current.reservation,
       materializingEvent,
@@ -1081,7 +1081,7 @@ const make = Effect.gen(function* () {
       return yield* error("internal-persistence-error", input);
     }
     const orchestrationResult = yield* materializeInTransaction(command).pipe(
-      Effect.mapError(() => error("internal-persistence-error", input)),
+      Effect.mapError((cause) => error("internal-persistence-error", input, cause)),
     );
     if (orchestrationResult.committedEvents.length !== 2) {
       return yield* error("historical-evidence-corrupt", input);
@@ -1105,7 +1105,7 @@ const make = Effect.gen(function* () {
       command: bindCommand,
       eventId: EventId.make(
         yield* crypto.randomUUIDv4.pipe(
-          Effect.mapError(() => error("internal-persistence-error", input)),
+          Effect.mapError((cause) => error("internal-persistence-error", input, cause)),
         ),
       ),
       occurredAt: at,
@@ -1127,11 +1127,11 @@ const make = Effect.gen(function* () {
     }
     yield* reservationProjection
       .projectEventInTransaction(boundEvent)
-      .pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+      .pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
     yield* hooks.afterBoundProjection(observation(input, current.reservation.threadId));
 
     const modelSelectionJson = yield* encodeModelSelectionJson(command.modelSelection).pipe(
-      Effect.mapError(() => error("internal-persistence-error", input)),
+      Effect.mapError((cause) => error("internal-persistence-error", input, cause)),
     );
     const bindingJson = encodeAgentControlThreadBindingStorage(command.binding);
     yield* sql`
@@ -1170,7 +1170,7 @@ const make = Effect.gen(function* () {
         ${orchestrationResult.lastSequence}, ${at}, ${at}, ${at}, ${at},
         ${input.commandId}
       )
-    `.pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    `.pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
     yield* sql`
       INSERT INTO agent_control_controlled_thread_materialization_receipts (
         coordinator_command_id, request_fingerprint,
@@ -1185,7 +1185,7 @@ const make = Effect.gen(function* () {
         ${command.threadId}, ${command.commandId}, ${materializationFingerprint},
         ${orchestrationResult.lastSequence}, 'accepted', ${at}, ${input.commandId}
       )
-    `.pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    `.pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
     yield* hooks.afterCoordinatorEvidence(observation(input, command.threadId));
     yield* hooks.beforeAcceptedMarker(observation(input, command.threadId));
 
@@ -1377,7 +1377,7 @@ const make = Effect.gen(function* () {
         ${command.commandId}, ${materializationFingerprint},
         ${orchestrationResult.lastSequence}, ${at}
       )
-    `.pipe(Effect.mapError(() => error("internal-persistence-error", input)));
+    `.pipe(Effect.mapError((cause) => error("internal-persistence-error", input, cause)));
     return {
       result: {
         commandId: input.commandId,
@@ -1608,12 +1608,10 @@ const make = Effect.gen(function* () {
           {
             beforeInspection: replayAccepted(input).pipe(
               Effect.map(
-                Option.map(
-                  (replayed): CoordinatorGuardedOutcome => ({
-                    _tag: "Replayed",
-                    replayed,
-                  }),
-                ),
+                Option.map((replayed): CoordinatorGuardedOutcome => ({
+                  _tag: "Replayed",
+                  replayed,
+                })),
               ),
             ),
           },
@@ -1637,7 +1635,7 @@ const make = Effect.gen(function* () {
       return guarded.committed.result;
     }).pipe(
       Effect.mapError((cause) =>
-        isCoordinatorError(cause) ? cause : error("internal-persistence-error", input),
+        isCoordinatorError(cause) ? cause : error("internal-persistence-error", input, cause),
       ),
     );
 

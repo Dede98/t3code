@@ -396,7 +396,7 @@ const make = Effect.gen(function* () {
                 lastError: session.lastError ?? null,
                 updatedAt: session.updatedAt,
               },
-              createdAt,
+              createdAt: session.updatedAt,
             });
           });
         const existingSessionThreadId =

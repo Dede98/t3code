@@ -3716,6 +3716,12 @@ const make = Effect.gen(function* () {
           stageRun,
           lease: leaseState,
           readyReuseAuthority,
+          reuseStage:
+            stageHistory.find(
+              (candidate) =>
+                candidate.stageRunId === leaseState.stageRunId &&
+                candidate.attemptId === leaseState.attemptId,
+            ) ?? null,
         };
       });
     return yield* (
@@ -3774,6 +3780,7 @@ const make = Effect.gen(function* () {
       JSON.stringify(canonical.stageRun),
       JSON.stringify(canonical.lease),
       JSON.stringify(canonical.readyReuseAuthority),
+      JSON.stringify(canonical.reuseStage),
     ]);
 
   const ensureCanonicalBinding = Effect.fn("AgentControlWorktreeController.ensureCanonicalBinding")(
@@ -4202,6 +4209,14 @@ const make = Effect.gen(function* () {
     | { readonly _tag: "attention"; readonly code: AgentControlWorktreeAttentionCode },
     AgentControlWorktreeRpcError
   > {
+    // Verification consumes the implementation's edits and commits. Ownership,
+    // source history and the current lease still have to pass the same guards.
+    const inspectingImplementation =
+      requireOwnership &&
+      canonical.readyReuseAuthority !== null &&
+      canonical.reuseStage?.stageKind === "verification" &&
+      canonical.reuseStage.status === "prepared" &&
+      canonical.lease.status === "reserved";
     const pathIdentity = yield* validateExistingAgentControlWorktreePath({
       target: state.internalWorktreePath,
       repositoryWorkspace: state.repositoryWorkspace,
@@ -4286,7 +4301,7 @@ const make = Effect.gen(function* () {
       );
     }
     const branchSha = branchResult.exitCode === 0 ? branchResult.stdout.trim() : null;
-    if (branchSha !== null && branchSha !== state.baseCommitSha) {
+    if (!inspectingImplementation && branchSha !== null && branchSha !== state.baseCommitSha) {
       return { _tag: "attention", code: "branch-commit-mismatch" };
     }
     const pathMatches = parsed.filter(
@@ -4335,7 +4350,7 @@ const make = Effect.gen(function* () {
       targetEntry.locked ||
       targetEntry.prunable ||
       targetEntry.branch !== state.branchName ||
-      targetEntry.head !== state.baseCommitSha
+      (!inspectingImplementation && targetEntry.head !== state.baseCommitSha)
     ) {
       return {
         _tag: "attention",
@@ -4400,8 +4415,34 @@ const make = Effect.gen(function* () {
     if (branch.exitCode !== 0 || branch.stdout.trim() !== state.branchName) {
       return { _tag: "attention", code: "worktree-branch-mismatch" };
     }
-    if (head.stdout.trim() !== state.baseCommitSha) {
+    if (
+      head.exitCode !== 0 ||
+      head.stdout.trim() !== targetEntry.head ||
+      head.stdout.trim() !== branchSha ||
+      (!inspectingImplementation && head.stdout.trim() !== state.baseCommitSha)
+    ) {
       return { _tag: "attention", code: "worktree-head-mismatch" };
+    }
+    if (inspectingImplementation && head.stdout.trim() !== state.baseCommitSha) {
+      const ancestry = yield* gitRun(
+        "AgentControlWorktree.inspect.implementationAncestry",
+        state.internalWorktreePath,
+        ["merge-base", "--is-ancestor", state.baseCommitSha, head.stdout.trim()],
+        true,
+      ).pipe(
+        Effect.mapError(() =>
+          error(
+            "repository-unavailable",
+            "materialize",
+            state.projectId,
+            state.taskId,
+            state.reservationId,
+          ),
+        ),
+      );
+      if (ancestry.exitCode !== 0) {
+        return { _tag: "attention", code: "worktree-head-mismatch" };
+      }
     }
     const commonCandidate = path.isAbsolute(common.stdout.trim())
       ? common.stdout.trim()
@@ -4444,7 +4485,10 @@ const make = Effect.gen(function* () {
           state.reservationId,
         ),
     });
-    if (statusRecords.length !== 0) {
+    if (
+      statusRecords.some((record) => record.type === "unmerged") ||
+      (!inspectingImplementation && statusRecords.length !== 0)
+    ) {
       return { _tag: "attention", code: "worktree-dirty" };
     }
     for (const gitPath of [

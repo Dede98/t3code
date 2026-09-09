@@ -254,17 +254,8 @@ const make = Effect.gen(function* () {
         Equal.equals(thread.value.modelSelection, claim.evidence.modelSelection) &&
         thread.value.worktreePath === claim.evidence.worktreePath
       ) {
-        return yield* store
-          .observeProviderStarted({
-            threadId: claim.evidence.threadId,
-            providerTurnId: String(active.activeTurnId),
-            acceptedAt: active.updatedAt,
-          })
-          .pipe(
-            Effect.tap((observed) =>
-              Option.isSome(observed) ? wakeup.wake(claim.evidence.handoffId) : Effect.void,
-            ),
-          );
+        // Session.updatedAt can describe the response or a later activity, not turn.started.
+        return Option.none<AgentControlInitialPlanningDelivery>();
       }
       if (
         claim.delivery.claimExpiresAt !== null &&
@@ -332,10 +323,17 @@ const make = Effect.gen(function* () {
     claim: AgentControlInitialPlanningClaim,
     cause: Cause.Cause<unknown>,
   ) =>
-    hooks.beforeRetryClassification?.({
+    Effect.logWarning("Initial Planning provider delivery failed", {
       handoffId: claim.evidence.handoffId,
       cause,
-    }) ?? Effect.void;
+    }).pipe(
+      Effect.andThen(
+        hooks.beforeRetryClassification?.({
+          handoffId: claim.evidence.handoffId,
+          cause,
+        }) ?? Effect.void,
+      ),
+    );
 
   const schedulePreDeliveryFailure = Effect.fn(
     "AgentControlInitialPlanningConsumer.schedulePreDeliveryFailure",
@@ -436,7 +434,6 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    let attemptedDelivery: AgentControlInitialPlanningDelivery | undefined;
     const boundaryExit = yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const exit = yield* restore(
@@ -469,11 +466,6 @@ const make = Effect.gen(function* () {
                     providerInstanceId: String(attestation.providerInstanceId),
                     turnModelSelectionJson: attestation.modelSelectionJson,
                     turnModelSelectionFingerprint: attestation.modelSelectionFingerprint,
-                  }),
-                ),
-                Effect.tap((delivery) =>
-                  Effect.sync(() => {
-                    attemptedDelivery = delivery;
                   }),
                 ),
                 Effect.asVoid,
@@ -525,40 +517,15 @@ const make = Effect.gen(function* () {
       }
       return;
     }
-    const attempted =
-      attemptedDelivery === undefined
-        ? yield* load(owned.evidence.handoffId)
-        : { ...owned, delivery: attemptedDelivery };
-    const reconcileDeliveryRace = Effect.fn(
-      "AgentControlInitialPlanningConsumer.reconcileDeliveryRace",
-    )(function* (providerTurnId?: string) {
-      const persisted = yield* load(attempted.evidence.handoffId);
-      if (
-        persisted.delivery.state === "provider-started" &&
-        (providerTurnId === undefined || persisted.delivery.providerTurnId === providerTurnId)
-      ) {
-        return persisted.delivery;
-      }
-      if (providerTurnId === undefined && persisted.delivery.state === "delivery-attempted") {
-        return yield* markAmbiguousAndSettle(persisted, yield* nowIso);
-      }
+    // The turn response has no provider timestamp. Only turn.started can supply
+    // the same start identity and time that orchestration persists for finalization.
+    const persisted = yield* load(owned.evidence.handoffId);
+    if (
+      persisted.delivery.state !== "delivery-attempted" &&
+      persisted.delivery.providerTurnId !== String(boundaryExit.value.result.turnId)
+    ) {
       return yield* Effect.die(new Error("Initial Planning provider delivery evidence diverged."));
-    });
-    const acceptedAt = yield* nowIso;
-    yield* store
-      .markProviderStarted({
-        handoffId: attempted.evidence.handoffId,
-        ownerId,
-        claimGeneration: attempted.delivery.claimGeneration,
-        expectedRevision: attempted.delivery.revision,
-        providerTurnId: String(boundaryExit.value.result.turnId),
-        acceptedAt,
-      })
-      .pipe(
-        Effect.catch(() => reconcileDeliveryRace(String(boundaryExit.value.result.turnId))),
-        Effect.tap(() => wakeup.wake(attempted.evidence.handoffId)),
-        Effect.asVoid,
-      );
+    }
   });
 
   const processHandoff = Effect.fn("AgentControlInitialPlanningConsumer.processHandoff")(function* (

@@ -1743,23 +1743,9 @@ const make = Effect.gen(function* () {
         error(handoffId, "insert-finalization-marker", "persistence", cause),
       ),
     );
-    const releasedProviderInstanceId =
-      providerAdmissionRelease === undefined
-        ? null
-        : yield* providerAdmissionRelease
-            .releaseInTransaction({
-              stage: "verification",
-              handoffId,
-              finalizedAt,
-            })
-            .pipe(
-              Effect.mapError((cause) =>
-                error(handoffId, "provider-admission-release", "persistence", cause),
-              ),
-            );
     return {
       _tag: "Finalized",
-      releasedProviderInstanceId,
+      releaseInput: { stage: "verification" as const, handoffId, finalizedAt },
       publication: {
         handoffId,
         finalizationEvidenceId,
@@ -1809,9 +1795,16 @@ const make = Effect.gen(function* () {
     const transaction = transactionExit.value;
     if (transaction._tag !== "Finalized") return transaction;
     yield* hooks.afterCommit(handoffId);
-    yield* providerAdmissionRelease === undefined
-      ? Effect.void
-      : providerAdmissionRelease.signalCommitted(transaction.releasedProviderInstanceId);
+    if (providerAdmissionRelease !== undefined) {
+      const released = yield* sql
+        .withTransaction(providerAdmissionRelease.releaseInTransaction(transaction.releaseInput))
+        .pipe(
+          Effect.mapError((cause) =>
+            error(handoffId, "provider-admission-release", "persistence", cause),
+          ),
+        );
+      yield* providerAdmissionRelease.signalCommitted(released);
+    }
     yield* Effect.uninterruptible(
       Effect.gen(function* () {
         yield* stageEngine.publishCommitted([transaction.publication.stageEvent]);

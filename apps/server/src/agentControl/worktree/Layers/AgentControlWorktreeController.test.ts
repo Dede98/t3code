@@ -33,6 +33,7 @@ import {
   type AgentControlStageRunState,
   type AgentControlTaskState,
   type OrchestrationEvent,
+  type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
@@ -49,6 +50,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -3442,6 +3444,8 @@ activationLayer("Controlled thread activation facade", (it) => {
         });
         const unsupportedProviderCall = () =>
           Effect.die(new Error("unexpected provider call")) as never;
+        const runtimeEvents = yield* Queue.unbounded<ProviderRuntimeEvent>();
+        const startObserved = yield* Queue.unbounded<string>();
         const providerService = ProviderService.of({
           compactThread: () => Effect.die("Unexpected compactThread"),
           assertConversationRollbackSupported: () => Effect.void,
@@ -3456,7 +3460,7 @@ activationLayer("Controlled thread activation facade", (it) => {
           getCapabilities: unsupportedProviderCall,
           getInstanceInfo: unsupportedProviderCall,
           rollbackConversation: unsupportedProviderCall,
-          streamEvents: Stream.never,
+          streamEvents: Stream.fromQueue(runtimeEvents),
         } satisfies ProviderServiceShape);
         const admittedProviderRuntime = ProviderAdmissionRuntime.of({
           awaitFailure: Effect.never,
@@ -3488,7 +3492,13 @@ activationLayer("Controlled thread activation facade", (it) => {
             Layer.fresh(AgentControlInitialPlanningConsumerLive),
             consumerScope,
           ).pipe(
-            Effect.provideService(AgentControlInitialPlanningHandoffStore, store),
+            Effect.provideService(AgentControlInitialPlanningHandoffStore, {
+              ...store,
+              observeProviderStarted: (input) =>
+                store
+                  .observeProviderStarted(input)
+                  .pipe(Effect.tap(() => Queue.offer(startObserved, String(input.threadId)))),
+            }),
             Effect.provideService(OrchestrationEngineService, engine),
             Effect.provideService(ProjectionSnapshotQuery, snapshotQuery),
             Effect.provideService(ProjectionTurnRepository, projectionTurns),
@@ -3576,6 +3586,28 @@ activationLayer("Controlled thread activation facade", (it) => {
         yield* Deferred.succeed(releaseExecute, undefined);
         yield* consumerA.consumer.drain;
         yield* consumerB.consumer.drain;
+        const awaitingStart = Option.getOrThrow(yield* store.loadAcceptedByHandoffId(handoffId));
+        assert.equal(awaitingStart.delivery.state, "delivery-attempted");
+        assert.isNull(awaitingStart.delivery.providerAcceptedAt);
+        const providerStartedAt = DateTime.formatIso(
+          DateTime.add(yield* DateTime.now, { seconds: 1 }),
+        );
+        yield* Queue.offer(runtimeEvents, {
+          type: "turn.started",
+          eventId: EventId.make("initial-planning-start-after-response"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: awaitingStart.evidence.providerInstanceId,
+          threadId: awaitingStart.evidence.threadId,
+          turnId: TurnId.make("provider-turn-initial-planning"),
+          createdAt: providerStartedAt,
+          payload: {},
+        });
+        assert.equal(yield* Queue.take(startObserved), awaitingStart.evidence.threadId);
+        assert.equal(
+          Option.getOrThrow(yield* store.loadAcceptedByHandoffId(handoffId)).delivery
+            .providerAcceptedAt,
+          providerStartedAt,
+        );
         assert.equal(ensureCallsWhileWaiting, 1);
         assert.equal(executeCallsWhileWaiting, 1);
         assert.deepStrictEqual(
@@ -3794,6 +3826,20 @@ activationLayer("Controlled thread activation facade", (it) => {
         const callsBeforeClaimRestart = yield* Ref.get(executeCalls);
         const beforeClaimRestart = yield* buildConsumer();
         yield* beforeClaimRestart.consumer.drain;
+        const restartedClaim = Option.getOrThrow(
+          yield* store.loadAcceptedByHandoffId(beforeClaimHandoff),
+        );
+        yield* Queue.offer(runtimeEvents, {
+          type: "turn.started",
+          eventId: EventId.make("initial-planning-start-after-claim-restart"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: restartedClaim.evidence.providerInstanceId,
+          threadId: restartedClaim.evidence.threadId,
+          turnId: TurnId.make("provider-turn-initial-planning"),
+          createdAt: DateTime.formatIso(yield* DateTime.now),
+          payload: {},
+        });
+        assert.equal(yield* Queue.take(startObserved), restartedClaim.evidence.threadId);
         yield* Scope.close(beforeClaimRestart.consumerScope, Exit.void);
         assert.equal(yield* Ref.get(executeCalls), callsBeforeClaimRestart + 1);
         assert.deepStrictEqual(
@@ -3910,6 +3956,20 @@ activationLayer("Controlled thread activation facade", (it) => {
         `)[0]!.handoffId;
         const deadlineStart = yield* buildConsumer();
         yield* deadlineStart.consumer.drain;
+        const deadlineClaim = Option.getOrThrow(
+          yield* store.loadAcceptedByHandoffId(deadlineHandoff),
+        );
+        yield* Queue.offer(runtimeEvents, {
+          type: "turn.started",
+          eventId: EventId.make("initial-planning-start-deadline"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: deadlineClaim.evidence.providerInstanceId,
+          threadId: deadlineClaim.evidence.threadId,
+          turnId: TurnId.make("provider-turn-initial-planning"),
+          createdAt: DateTime.formatIso(yield* DateTime.now),
+          payload: {},
+        });
+        assert.equal(yield* Queue.take(startObserved), deadlineClaim.evidence.threadId);
         yield* Scope.close(deadlineStart.consumerScope, Exit.void);
         assert.deepStrictEqual(
           yield* sql`

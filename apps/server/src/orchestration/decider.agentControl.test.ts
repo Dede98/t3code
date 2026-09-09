@@ -324,6 +324,79 @@ it.layer(NodeServices.layer)("Agent Control decider rules", (it) => {
     );
   }
 
+  for (const decision of [
+    "accept",
+    "decline",
+    "cancel",
+    "acceptForSession",
+    "acceptAlways",
+  ] as const) {
+    it.effect(`limits controlled approval ${decision} to the current pending request`, () =>
+      Effect.gen(function* () {
+        for (const state of ["pending", "resolved", "foreign-turn"] as const) {
+          const model = readModel("controlled");
+          const controlled = model.threads[0]!;
+          const turnId = TurnId.make("approval-turn");
+          const requestId = ApprovalRequestId.make("approval-pending");
+          const requested = {
+            id: EventId.make("approval-requested"),
+            kind: "approval.requested",
+            tone: "approval" as const,
+            summary: "Approval requested",
+            payload: { requestId },
+            turnId: state === "foreign-turn" ? TurnId.make("other-turn") : turnId,
+            createdAt: NOW,
+          };
+          const result = yield* Effect.result(
+            decideOrchestrationCommand({
+              authority: "client",
+              command: {
+                type: "thread.approval.respond",
+                commandId: CommandId.make(`approval-${decision}-${state}`),
+                threadId: THREAD_ID,
+                requestId,
+                decision,
+                createdAt: NOW,
+              },
+              readModel: {
+                ...model,
+                threads: [
+                  {
+                    ...controlled,
+                    session: {
+                      threadId: THREAD_ID,
+                      status: "running",
+                      providerName: "codex",
+                      providerInstanceId: ProviderInstanceId.make("codex"),
+                      runtimeMode: "approval-required",
+                      activeTurnId: turnId,
+                      lastError: null,
+                      updatedAt: NOW,
+                    },
+                    activities:
+                      state === "resolved"
+                        ? [
+                            requested,
+                            {
+                              ...requested,
+                              id: EventId.make("approval-resolved"),
+                              kind: "approval.resolved",
+                            },
+                          ]
+                        : [requested],
+                  },
+                ],
+              },
+            }),
+          );
+          const allowed =
+            state === "pending" && decision !== "acceptForSession" && decision !== "acceptAlways";
+          expect(result._tag).toBe(allowed ? "Success" : "Failure");
+        }
+      }),
+    );
+  }
+
   it.effect("rejects indirect controlled-thread deletion through project.delete", () =>
     Effect.gen(function* () {
       const error = yield* Effect.flip(

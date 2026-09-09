@@ -208,6 +208,7 @@ interface FinalizationRow {
   readonly fenceToken: number;
   readonly providerDeliveryId: string;
   readonly providerInstanceId: string;
+  readonly providerTurnId: string | null;
   readonly terminalRuntimeEventId: string | null;
   readonly terminalOrchestrationEventId: string;
   readonly terminalEventType: string;
@@ -1039,6 +1040,7 @@ const make = Effect.gen(function* () {
     if (!exact) {
       return yield* fail("pre-effect-validate", "authority-divergent", input.permit.admissionId);
     }
+    // A stage becomes running only after the provider accepts its first turn.
     const stageRows = yield* sql<{ readonly count: number }>`
       SELECT count(*) AS count
       FROM main.agent_control_stage_run_states stage
@@ -1050,7 +1052,7 @@ const make = Effect.gen(function* () {
         AND stage.task_id=${input.permit.taskId} AND typeof(stage.task_id)='text'
         AND stage.attempt_id=${input.permit.attemptId} AND typeof(stage.attempt_id)='text'
         AND stage.stage_kind=${input.permit.stage === "initial-planning" ? "planning" : input.permit.stage}
-        AND typeof(stage.stage_kind)='text' AND stage.status IN ('running','waiting')
+        AND typeof(stage.stage_kind)='text' AND stage.status IN ('prepared','running','waiting')
         AND typeof(stage.status)='text'
         AND lease.project_id=stage.project_id AND lease.task_id=stage.task_id
         AND lease.stage_run_id=stage.stage_run_id AND lease.attempt_id=stage.attempt_id
@@ -1062,6 +1064,7 @@ const make = Effect.gen(function* () {
     if (stageRows[0]?.count !== 1) {
       return yield* fail("pre-effect-stage", "stale-owner", input.permit.admissionId);
     }
+    // The final pre-invoke check follows the durable delivery-attempted CAS.
     const deliveryRows =
       input.permit.stage === "initial-planning"
         ? yield* sql<{ readonly count: number }>`
@@ -1072,7 +1075,8 @@ const make = Effect.gen(function* () {
               AND thread_id=${input.permit.threadId} AND typeof(thread_id)='text'
               AND provider_instance_id=${String(input.permit.providerInstanceId)}
               AND typeof(provider_instance_id)='text'
-              AND state='claimed' AND typeof(state)='text'
+              AND (state='claimed' OR (${input.boundary === "turn-start" ? 1 : 0} AND state='delivery-attempted'))
+              AND typeof(state)='text'
           `
         : input.permit.stage === "implementation"
           ? yield* sql<{ readonly count: number }>`
@@ -1087,7 +1091,8 @@ const make = Effect.gen(function* () {
                 AND fence_token=${input.permit.stageFenceToken} AND typeof(fence_token)='integer'
                 AND provider_instance_id=${String(input.permit.providerInstanceId)}
                 AND model_selection_fingerprint=${input.permit.modelSelectionFingerprint}
-                AND state='claimed' AND typeof(state)='text'
+                AND (state='claimed' OR (${input.boundary === "turn-start" ? 1 : 0} AND state='delivery-attempted'))
+              AND typeof(state)='text'
             `
           : yield* sql<{ readonly count: number }>`
               SELECT count(*) AS count FROM main.agent_control_verification_deliveries
@@ -1101,7 +1106,8 @@ const make = Effect.gen(function* () {
                 AND fence_token=${input.permit.stageFenceToken} AND typeof(fence_token)='integer'
                 AND provider_instance_id=${String(input.permit.providerInstanceId)}
                 AND model_selection_fingerprint=${input.permit.modelSelectionFingerprint}
-                AND state='claimed' AND typeof(state)='text'
+                AND (state='claimed' OR (${input.boundary === "turn-start" ? 1 : 0} AND state='delivery-attempted'))
+              AND typeof(state)='text'
             `;
     if (deliveryRows[0]?.count !== 1) {
       return yield* fail("pre-effect-delivery", "authority-divergent", input.permit.admissionId);
@@ -1478,6 +1484,7 @@ const make = Effect.gen(function* () {
               evidence.lease_holder_id AS "leaseHolderId",evidence.fence_token AS "fenceToken",
               evidence.provider_delivery_id AS "providerDeliveryId",
               evidence.provider_instance_id AS "providerInstanceId",
+              evidence.provider_turn_id AS "providerTurnId",
               NULL AS "terminalRuntimeEventId",
               terminal.event_id AS "terminalOrchestrationEventId",
               terminal.event_type AS "terminalEventType",
@@ -1521,6 +1528,7 @@ const make = Effect.gen(function* () {
                 evidence.lease_holder_id AS "leaseHolderId",evidence.fence_token AS "fenceToken",
                 evidence.provider_delivery_id AS "providerDeliveryId",
                 evidence.provider_instance_id AS "providerInstanceId",
+              evidence.provider_turn_id AS "providerTurnId",
                 NULL AS "terminalRuntimeEventId",
                 terminal.event_id AS "terminalOrchestrationEventId",
                 terminal.event_type AS "terminalEventType",
@@ -1565,6 +1573,7 @@ const make = Effect.gen(function* () {
                 evidence.lease_holder_id AS "leaseHolderId",evidence.fence_token AS "fenceToken",
                 evidence.provider_delivery_id AS "providerDeliveryId",
                 evidence.provider_instance_id AS "providerInstanceId",
+              evidence.provider_turn_id AS "providerTurnId",
                 evidence.terminal_runtime_event_id AS "terminalRuntimeEventId",
                 terminal.event_id AS "terminalOrchestrationEventId",
                 terminal.event_type AS "terminalEventType",
@@ -1590,7 +1599,16 @@ const make = Effect.gen(function* () {
                 AND marker.finalization_fingerprint=evidence.finalization_fingerprint
                 AND marker.handoff_id=evidence.handoff_id AND marker.committed_at=receipt.accepted_at
               JOIN main.orchestration_events terminal
-                ON terminal.event_id=evidence.terminal_runtime_event_id
+                ON terminal.stream_id = (
+                  SELECT intent.thread_id FROM main.agent_control_provider_admission_intents intent
+                  WHERE intent.handoff_id=evidence.handoff_id AND intent.stage='verification'
+                ) AND (
+                  terminal.event_id=evidence.terminal_runtime_event_id
+                  OR json_extract(terminal.metadata_json, '$.providerRuntimeLifecycle.runtimeEventId')
+                    =evidence.terminal_runtime_event_id
+                  OR json_extract(terminal.metadata_json, '$.providerRuntimeMessage.runtimeEventId')
+                    =evidence.terminal_runtime_event_id
+                )
               WHERE evidence.handoff_id=${handoffId}
                 AND typeof(evidence.handoff_id)='text' AND typeof(evidence.project_id)='text'
                 AND typeof(evidence.task_id)='text' AND typeof(evidence.stage_run_id)='text'
@@ -1602,6 +1620,8 @@ const make = Effect.gen(function* () {
                 AND typeof(marker.marker_id)='text' AND typeof(marker.marker_fingerprint)='text'
                 AND typeof(evidence.finalized_at)='text' AND typeof(terminal.event_id)='text'
                 AND typeof(terminal.event_type)='text' AND typeof(terminal.stream_version)='integer'
+              ORDER BY terminal.stream_version
+              LIMIT 1
             `;
     if (rows.length !== 1) return undefined;
     return rows[0]!;
@@ -1674,13 +1694,22 @@ const make = Effect.gen(function* () {
       catch: (cause) =>
         fail("release-runtime-metadata", "authority-divergent", current.admissionId, cause),
     });
-    const correlation = metadata.value.providerRuntimeMessage;
+    const lifecycle = metadata.value.providerRuntimeLifecycle;
+    const correlation =
+      metadata.value.providerRuntimeMessage ??
+      (lifecycle === undefined
+        ? undefined
+        : {
+            ...lifecycle,
+            eventType: lifecycle.runtimeEventType,
+          });
     if (
       (correlation === undefined && finalization.terminalRuntimeEventId !== null) ||
       (correlation !== undefined &&
         (correlation.providerInstanceId !== current.providerInstanceId ||
-          correlation.runtimeEventId !==
-            (finalization.terminalRuntimeEventId ?? correlation.runtimeEventId)))
+          correlation.providerTurnId !== finalization.providerTurnId ||
+          (finalization.terminalRuntimeEventId !== null &&
+            finalization.terminalRuntimeEventId !== correlation.runtimeEventId)))
     ) {
       return yield* fail("release-runtime-binding", "authority-divergent", current.admissionId);
     }

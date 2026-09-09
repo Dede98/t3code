@@ -140,6 +140,9 @@ const make = Effect.gen(function* () {
             "AgentControlControlledThreadMaterializationCoordinator.materializeInitialForRunOnce",
           )(runId, materializeInput)
     ).pipe(
+      Effect.tapError((failure) =>
+        Effect.logError("Controlled thread materialization failed", failure),
+      ),
       Effect.mapError((failure) =>
         rpcError(coordinatorCode(failure.reason), input, controlledThreadReservationId),
       ),

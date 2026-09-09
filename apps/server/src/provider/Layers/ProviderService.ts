@@ -27,6 +27,7 @@ import {
   ProviderStopSessionInput,
   ProviderUploadFeedbackInput,
   ThreadId,
+  TrimmedNonEmptyString,
   TurnId,
   type ProviderInstanceId,
   type ProviderDriverKind,
@@ -77,6 +78,7 @@ import { withAgentControlRunOnceProjectFence } from "../../agentControl/runOnce/
 import { withProviderAdmissionEffectFence } from "../../agentControl/providerAdmission/context.ts";
 import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
 import { ProviderAdmissionGuard } from "../../agentControl/providerAdmission/Services/ProviderAdmissionGuard.ts";
+import { AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES } from "../../agentControl/verificationTurn/prompt.ts";
 import { ProjectId } from "@t3tools/contracts";
 import {
   type ProviderAdapterError,
@@ -414,6 +416,19 @@ type ProviderSessionWithInstance = ProviderSessionWithAttestation & {
 const ProviderRollbackConversationInput = Schema.Struct({
   threadId: ThreadId,
   numTurns: NonNegativeInt,
+});
+
+// Controller prompts include persisted evidence and have their own byte budget.
+// This schema is used only behind the durable admission and delivery boundary.
+const AgentControlSendTurnInput = Schema.Struct({
+  ...ProviderSendTurnInput.fields,
+  input: Schema.optional(
+    TrimmedNonEmptyString.check(
+      Schema.makeFilter(
+        (value) => Buffer.byteLength(value, "utf8") <= AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES,
+      ),
+    ),
+  ),
 });
 
 function toValidationError(
@@ -2194,7 +2209,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     if (inputTextWithCitations !== parsed.input) {
       yield* decodeInputOrValidationError({
         operation: "ProviderService.sendTurn",
-        schema: ProviderSendTurnInput.fields.input,
+        schema:
+          boundary === undefined
+            ? ProviderSendTurnInput.fields.input
+            : AgentControlSendTurnInput.fields.input,
         payload: inputTextWithCitations,
       });
     }
@@ -2415,11 +2433,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           );
         }
         const permit = boundary.providerAdmissionPermit;
+        // Options such as reasoning effort are applied by turn/start, not thread/start.
+        const requestedTurnEvidence = canonicalProviderModelSelectionEvidence(input.modelSelection);
         if (
           String(input.threadId) !== permit.threadId ||
           routed.instanceId !== permit.providerInstanceId ||
-          boundary.expected.modelSelectionJson !== permit.modelSelectionJson ||
-          boundary.expected.modelSelectionFingerprint !== permit.modelSelectionFingerprint
+          requestedTurnEvidence.modelSelectionJson !== permit.modelSelectionJson ||
+          requestedTurnEvidence.modelSelectionFingerprint !== permit.modelSelectionFingerprint
         ) {
           return yield* toValidationError(
             "ProviderService.sendTurn",
@@ -2507,7 +2527,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   > = (rawInput, boundary) =>
     decodeInputOrValidationError({
       operation: "ProviderService.sendTurn",
-      schema: ProviderSendTurnInput,
+      schema: AgentControlSendTurnInput,
       payload: rawInput,
     }).pipe(
       Effect.flatMap((input) =>
