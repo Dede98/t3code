@@ -360,6 +360,7 @@ export function canCommandNativeTelemetrySidecar(
   return hasHandle && (status === "healthy" || status === "degraded");
 }
 
+/** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.fn("resourceTelemetry.nativeTelemetryClient.make")(function* () {
   const binary = yield* ResourceMonitorBinary.ResourceMonitorBinary;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -507,10 +508,9 @@ export const make = Effect.fn("resourceTelemetry.nativeTelemetryClient.make")(fu
           Effect.flatMap(
             Option.match({
               onNone: () => Effect.void,
-              onSome: (deferred) => Deferred.succeed(deferred, event.processes),
+              onSome: (deferred) => Deferred.succeed(deferred, event.processes).pipe(Effect.asVoid),
             }),
           ),
-          Effect.asVoid,
         );
       case "historyChunk":
         return Effect.gen(function* () {

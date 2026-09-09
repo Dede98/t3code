@@ -92,7 +92,7 @@ function selectProviderInstancesForSettleCheck(
   return instances.filter((instance) => instanceIds.has(instance.instanceId));
 }
 
-export const areProviderSessionsSettled = Effect.fn(
+const areProviderSessionsSettled = Effect.fn(
   "ProviderInstanceRegistryHydration.areProviderSessionsSettled",
 )(function* (
   registry: Pick<ProviderInstanceRegistryShape, "listInstances">,
