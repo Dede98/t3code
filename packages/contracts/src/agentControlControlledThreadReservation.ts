@@ -9,7 +9,6 @@
  */
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
-import * as Option from "effect/Option";
 
 import {
   AgentControlAttemptId,
@@ -161,7 +160,7 @@ const exactPrepareInitialTransportObject = Schema.makeFilter<unknown>(
       input === null ||
       (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)
     ) {
-      return new SchemaIssue.InvalidValue(Option.some(input), {
+      return new SchemaIssue.InvalidValue({
         message: "prepareInitial payload must be a plain object",
       });
     }
@@ -176,7 +175,7 @@ const exactPrepareInitialTransportObject = Schema.makeFilter<unknown>(
           ),
       )
     ) {
-      return new SchemaIssue.InvalidValue(Option.some(input), {
+      return new SchemaIssue.InvalidValue({
         message: "prepareInitial payload contains unknown fields",
       });
     }
@@ -380,7 +379,7 @@ export type AgentControlControlledThreadReservationRejectedCommandCode =
   typeof AgentControlControlledThreadReservationRejectedCommandCode.Type;
 
 /** Closed wire error: no paths, fingerprints, holder IDs, fences, or causes. */
-export class AgentControlControlledThreadReservationRpcError extends Schema.TaggedErrorClass<AgentControlControlledThreadReservationRpcError>()(
+export class AgentControlControlledThreadReservationRpcError extends Schema.TaggedError<AgentControlControlledThreadReservationRpcError>()(
   "AgentControlControlledThreadReservationRpcError",
   {
     code: AgentControlControlledThreadReservationRejectedCommandCode,

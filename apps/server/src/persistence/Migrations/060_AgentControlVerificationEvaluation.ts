@@ -177,7 +177,7 @@ const orchestrationEventJsonStorage = (row = "NEW") => `
   ) = 1
 `;
 
-const orchestrationEventStorage = (
+export const orchestrationEventStorage = (
   row = "NEW",
   minimumStreamVersion = 1,
   includeJsonEncoding = true,
@@ -193,6 +193,8 @@ const orchestrationEventStorage = (
   AND ${row}.event_type IN (
     'project.created', 'project.meta-updated', 'project.deleted',
     'thread.created', 'thread.deleted', 'thread.archived', 'thread.unarchived',
+    'thread.settled', 'thread.unsettled', 'thread.snoozed', 'thread.unsnoozed',
+    'thread.pinned', 'thread.unpinned', 'thread.pin-reordered',
     'thread.meta-updated', 'thread.runtime-mode-set', 'thread.interaction-mode-set',
     'thread.message-sent', 'thread.verification-result-fragment-captured',
     'thread.turn-start-requested', 'thread.turn-interrupt-requested',

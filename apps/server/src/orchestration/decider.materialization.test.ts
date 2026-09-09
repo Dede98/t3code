@@ -396,6 +396,8 @@ it.layer(NodeServices.layer)("controlled thread materialization decider", (it) =
                 proposedPlans: [],
                 activities: [],
                 checkpoints: [],
+                settledOverride: null,
+                settledAt: null,
                 session: null,
               },
             ],

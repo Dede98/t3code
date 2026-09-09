@@ -10,8 +10,8 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 import Migration052 from "./052_AgentControlInitialPlanningStageFinalization.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
-const encodeJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
-const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeJsonObject = (value: string) => decodeJson(value) as Record<string, unknown>;
 const at = "2026-08-02T08:00:00.000Z";
 const metadata = '{"schemaVersion":1}';

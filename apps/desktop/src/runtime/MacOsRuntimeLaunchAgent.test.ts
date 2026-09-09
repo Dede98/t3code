@@ -29,7 +29,7 @@ const decodeInstallation = Schema.decodeUnknownSync(RuntimeDaemonLauncherInstall
 const encodeLock = Schema.encodeSync(Schema.fromJsonString(RuntimeDaemonLock));
 const encodeDiscovery = Schema.encodeSync(Schema.fromJsonString(RuntimeDaemonDiscovery));
 const encodeRecovery = Schema.encodeSync(Schema.fromJsonString(RuntimeDaemonRecoveryState));
-const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 interface HarnessControl {
   loaded: boolean;

@@ -16,7 +16,7 @@ import { loadOrchestrationEventStreamPage } from "../../orchestration/orchestrat
 
 export type AgentControlImplementationOutcome = "succeeded" | "failed" | "cancelled";
 
-export class AgentControlImplementationOrchestrationEvidenceError extends Schema.TaggedErrorClass<AgentControlImplementationOrchestrationEvidenceError>()(
+export class AgentControlImplementationOrchestrationEvidenceError extends Schema.TaggedError<AgentControlImplementationOrchestrationEvidenceError>()(
   "AgentControlImplementationOrchestrationEvidenceError",
   {
     operation: Schema.String,

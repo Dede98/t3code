@@ -120,7 +120,7 @@ const modelSelection: ModelSelection = {
 };
 const policyRoles = ["planner", "implementer", "verifier"] as const;
 const encodeModelSelectionJson = Schema.encodeUnknownSync(Schema.fromJsonString(ModelSelection));
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const git = (cwd: string, args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
@@ -173,6 +173,9 @@ const makeProvider = Effect.fn("makeArmedProductionProvider")(function* () {
   const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   let turnOrdinal = 0;
   const service = ProviderService.of({
+    compactThread: () => Effect.die("Unexpected compactThread"),
+    assertConversationRollbackSupported: () => Effect.void,
+    uploadFeedback: () => Effect.die("Unexpected uploadFeedback"),
     startSession: (threadId, input) =>
       Effect.gen(function* () {
         const createdAt = DateTime.formatIso(yield* DateTime.now);

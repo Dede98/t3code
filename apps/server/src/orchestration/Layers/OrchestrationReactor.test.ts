@@ -18,27 +18,46 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { it as effectIt } from "@effect/vitest";
-import { describe, expect } from "vite-plus/test";
-
+import { describe, expect, it } from "vite-plus/test";
 import { CheckpointReactor } from "../Services/CheckpointReactor.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
 import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeIngestion.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import { OrchestrationReactor } from "../Services/OrchestrationReactor.ts";
-import { makeOrchestrationReactor } from "./OrchestrationReactor.ts";
+import { makeOrchestrationReactor as makeOrchestrationReactorBase } from "./OrchestrationReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import { AgentControlInitialPlanningConsumer } from "../../agentControl/initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlImplementationTurnConsumer } from "../../agentControl/implementationTurn/Services/AgentControlImplementationTurnConsumer.ts";
-import { AgentControlVerificationTurnConsumer } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
-import type { AgentControlVerificationTurnConsumerActivation } from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
-import type {
-  ProviderRuntimeEventPublication,
-  ProviderRuntimeEventSourceActivation,
+import {
+  AgentControlVerificationTurnConsumer,
+  type AgentControlVerificationTurnConsumerActivation,
+} from "../../agentControl/verificationTurn/Services/AgentControlVerificationTurnConsumer.ts";
+import {
+  type ProviderRuntimeEventPublication,
+  type ProviderRuntimeEventSourceActivation,
 } from "../../provider/Services/ProviderService.ts";
 import {
   makeReactorStartupActivation,
   makeReactorStartupAttempt,
 } from "../../reactorStartupActivation.ts";
+import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as ThreadSettlementReactor from "../ThreadSettlementReactor.ts";
+import * as ThreadPullRequestReactor from "../ThreadPullRequestReactor.ts";
+
+const makeOrchestrationReactor = makeOrchestrationReactorBase.pipe(
+  Effect.provide(
+    Layer.mergeAll(
+      Layer.succeed(ThreadPullRequestReactor.ThreadPullRequestReactor, {
+        start: () => Effect.void,
+        drain: Effect.void,
+      }),
+      Layer.succeed(ThreadSettlementReactor.ThreadSettlementReactor, {
+        start: () => Effect.void,
+        drain: Effect.void,
+      }),
+    ),
+  ),
+);
 
 const makeNoopProviderSourceActivation: Effect.Effect<ProviderRuntimeEventSourceActivation> =
   Effect.gen(function* () {
@@ -133,7 +152,10 @@ const makeLifecycleTestLayer = (input?: {
           drain: Effect.void,
         }),
         Layer.succeed(CheckpointReactor, { start: () => Effect.void, drain: Effect.void }),
-        Layer.succeed(ThreadDeletionReactor, { start: () => Effect.void, drain: Effect.void }),
+        Layer.succeed(ThreadDeletionReactor, {
+          start: () => Effect.void,
+          drainThrough: () => Effect.void,
+        }),
         Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
           publishThread: () => Effect.void,
           start: () => Effect.void,
@@ -223,7 +245,7 @@ describe("OrchestrationReactor", () => {
             started.push("thread-deletion-reactor");
             return Effect.void;
           },
-          drain: Effect.void,
+          drainThrough: () => Effect.void,
         }),
       ),
       Layer.provideMerge(
@@ -348,7 +370,7 @@ describe("OrchestrationReactor", () => {
                 }),
                 Layer.succeed(ThreadDeletionReactor, {
                   start: () => Effect.void,
-                  drain: Effect.void,
+                  drainThrough: () => Effect.void,
                 }),
                 Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
                   publishThread: () => Effect.void,
@@ -452,7 +474,7 @@ describe("OrchestrationReactor", () => {
                 }),
                 Layer.succeed(ThreadDeletionReactor, {
                   start: () => Effect.void,
-                  drain: Effect.void,
+                  drainThrough: () => Effect.void,
                 }),
                 Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
                   publishThread: () => Effect.void,
@@ -578,7 +600,7 @@ describe("OrchestrationReactor", () => {
                 }),
                 Layer.succeed(ThreadDeletionReactor, {
                   start: () => Effect.void,
-                  drain: Effect.void,
+                  drainThrough: () => Effect.void,
                 }),
                 Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
                   publishThread: () => Effect.void,
@@ -1229,4 +1251,105 @@ describe("OrchestrationReactor", () => {
       }),
     ),
   );
+
+  it("starts every orchestration reactor", async () => {
+    const started: string[] = [];
+
+    const runtime = ManagedRuntime.make(
+      Layer.effect(OrchestrationReactor, makeOrchestrationReactorBase).pipe(
+        Layer.provide(
+          Layer.mock(AgentControlVerificationTurnConsumer)({
+            subscribeProviderEvents: Effect.succeed(undefined as never),
+            prepare: () =>
+              Effect.succeed(
+                withNoopVerificationDrain({ commit: Effect.void, drain: Effect.void }),
+              ),
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(ProviderRuntimeIngestionService, {
+            subscribeProviderEvents: Effect.succeed(undefined as never),
+            openProviderRuntimeEventPublishing: Effect.void,
+            startProviderRuntimeEventSources: makeNoopProviderSourceActivation,
+            start: () => {
+              started.push("provider-runtime-ingestion");
+              return Effect.succeed(noopRuntimeActivation);
+            },
+            drain: Effect.void,
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(ProviderCommandReactor, {
+            start: () => {
+              started.push("provider-command-reactor");
+              return Effect.void;
+            },
+            drain: Effect.void,
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(CheckpointReactor, {
+            start: () => {
+              started.push("checkpoint-reactor");
+              return Effect.void;
+            },
+            drain: Effect.void,
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(ThreadDeletionReactor, {
+            start: () => {
+              started.push("thread-deletion-reactor");
+              return Effect.void;
+            },
+            drainThrough: () => Effect.void,
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(ThreadPullRequestReactor.ThreadPullRequestReactor, {
+            start: () => {
+              started.push("thread-pull-request-reactor");
+              return Effect.void;
+            },
+            drain: Effect.void,
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(ThreadSettlementReactor.ThreadSettlementReactor, {
+            start: () => {
+              started.push("thread-settlement-reactor");
+              return Effect.void;
+            },
+            drain: Effect.void,
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
+            publishThread: () => Effect.void,
+            start: () => {
+              started.push("agent-awareness-relay");
+              return Effect.void;
+            },
+          }),
+        ),
+      ),
+    );
+
+    const reactor = await runtime!.runPromise(Effect.service(OrchestrationReactor));
+    const scope = await Effect.runPromise(Scope.make("sequential"));
+    await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
+
+    expect(started).toEqual([
+      "provider-runtime-ingestion",
+      "provider-command-reactor",
+      "checkpoint-reactor",
+      "thread-deletion-reactor",
+      "thread-pull-request-reactor",
+      "thread-settlement-reactor",
+      "agent-awareness-relay",
+    ]);
+
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    await runtime.dispose();
+  });
 });

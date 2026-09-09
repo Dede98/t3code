@@ -60,7 +60,7 @@ import {
   type Migration064FaultPoint,
 } from "./064_AgentControlArmedSingleFlight.ts";
 
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const at = "2026-09-02T08:00:00.000Z";
 const projectId = ProjectId.make("migration-064-populated-project");

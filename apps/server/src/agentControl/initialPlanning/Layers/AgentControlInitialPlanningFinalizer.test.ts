@@ -1,3 +1,6 @@
+import * as CheckpointStore from "../../../checkpointing/CheckpointStore.ts";
+import * as ThreadPlanProgress from "../../../orchestration/ThreadPlanProgress.ts";
+import * as ThreadBackgroundLiveness from "../../../orchestration/ThreadBackgroundLiveness.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeCrypto from "node:crypto";
 import * as NodeSqlite from "node:sqlite";
@@ -79,14 +82,14 @@ import { AgentControlProjectionStateRepositoryLive } from "../../../persistence/
 import { AgentControlProjectionStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
-import { OrchestrationEngineLive } from "../../../orchestration/Layers/OrchestrationEngine.ts";
+import { OrchestrationEngineLive as OrchestrationEngineLiveBase } from "../../../orchestration/Layers/OrchestrationEngine.ts";
 import {
-  ProviderRuntimeIngestionLive,
+  ProviderRuntimeIngestionLive as ProviderRuntimeIngestionLiveBase,
   verificationResultCaptureCacheKey,
 } from "../../../orchestration/Layers/ProviderRuntimeIngestion.ts";
 import { ProviderTurnRequestExecutorLive } from "../../../orchestration/Layers/ProviderTurnRequestExecutor.ts";
 import { OrchestrationProjectionPipelineLive } from "../../../orchestration/Layers/ProjectionPipeline.ts";
-import { OrchestrationProjectionSnapshotQueryLive } from "../../../orchestration/Layers/ProjectionSnapshotQuery.ts";
+import { OrchestrationProjectionSnapshotQueryLive as OrchestrationProjectionSnapshotQueryLiveBase } from "../../../orchestration/Layers/ProjectionSnapshotQuery.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProviderRuntimeIngestionService } from "../../../orchestration/Services/ProviderRuntimeIngestion.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -379,6 +382,22 @@ import { AgentControlInitialPlanningHandoffStore } from "../Services/AgentContro
 import { AgentControlInitialPlanningFinalizerLive } from "./AgentControlInitialPlanningFinalizer.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "./AgentControlInitialPlanningHandoffStore.ts";
 
+const ProviderRuntimeIngestionLive = ProviderRuntimeIngestionLiveBase.pipe(
+  Layer.provide(ThreadBackgroundLiveness.layer),
+  Layer.provide(ThreadPlanProgress.layer),
+  Layer.provide(
+    Layer.mock(CheckpointStore.CheckpointStore)({ isGitRepository: () => Effect.succeed(false) }),
+  ),
+);
+
+const OrchestrationProjectionSnapshotQueryLive = OrchestrationProjectionSnapshotQueryLiveBase.pipe(
+  Layer.provide(Layer.merge(ThreadBackgroundLiveness.layer, ThreadPlanProgress.layer)),
+);
+
+const OrchestrationEngineLive = OrchestrationEngineLiveBase.pipe(
+  Layer.provide(Layer.merge(ThreadBackgroundLiveness.layer, ThreadPlanProgress.layer)),
+);
+
 const createdAt = "2026-08-02T08:00:00.000Z";
 const providerAcceptedAt = "2026-08-02T08:01:00.000Z";
 const terminalAt = "2026-08-02T08:02:00.000Z";
@@ -397,8 +416,8 @@ const isFinalizerError = Schema.is(AgentControlInitialPlanningFinalizerError);
 const isImplementationFinalizerError = Schema.is(AgentControlImplementationStageFinalizerError);
 const isVerificationAdmissionError = Schema.is(AgentControlVerificationAdmissionError);
 const isVerificationStoreError = Schema.is(AgentControlVerificationStoreError);
-const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const fixtureFingerprint = (value: string) =>
   NodeCrypto.createHash("sha256").update(value).digest("hex");
 const openNativeDatabase = (filename: string) => {
@@ -2258,6 +2277,9 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
   }) {
     const store = input.store ?? input.coordinator.handoffStore;
     const provider = ProviderService.of({
+      compactThread: () => Effect.die("Unexpected compactThread"),
+      assertConversationRollbackSupported: () => Effect.void,
+      uploadFeedback: () => Effect.die("Unexpected uploadFeedback"),
       startSession: () => Effect.die("unused"),
       sendTurn: () => Effect.die("unused"),
       interruptTurn: () => Effect.die("unused"),
@@ -2917,6 +2939,9 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
     const provider =
       input.providerService ??
       ProviderService.of({
+        compactThread: () => Effect.die("Unexpected compactThread"),
+        assertConversationRollbackSupported: () => Effect.void,
+        uploadFeedback: () => Effect.die("Unexpected uploadFeedback"),
         startSession: () => Effect.die("unused"),
         sendTurn: () => Effect.die("unused"),
         interruptTurn: () => Effect.die("unused"),
@@ -3101,6 +3126,9 @@ const buildVerificationRuntimeIngestion = Effect.fn("buildVerificationRuntimeIng
     const publications = yield* PubSub.unbounded<ProviderRuntimeEventPublication>();
     const unsupported = () => Effect.die("unused") as never;
     const provider = ProviderService.of({
+      compactThread: () => Effect.die("Unexpected compactThread"),
+      assertConversationRollbackSupported: () => Effect.void,
+      uploadFeedback: () => Effect.die("Unexpected uploadFeedback"),
       startSession: unsupported,
       sendTurn: unsupported,
       interruptTurn: unsupported,
@@ -11694,7 +11722,7 @@ it.effect.each([
             providerInstanceId: providerStarted.evidence.providerInstanceId,
             runtimeMode: providerStarted.evidence.runtimeMode,
           });
-          assert.isFalse((yield* runtimeA.getSettings).enableAssistantStreaming);
+          assert.isFalse((yield* runtimeA.getSettings).enableLegacyTokenStreaming);
           yield* runtimeA.publish({
             type: "turn.started",
             eventId: EventId.make(`v2-restart-start-${providerName}`),
@@ -12233,7 +12261,7 @@ it.effect.each([
             providerInstanceId: providerStarted.evidence.providerInstanceId,
             runtimeMode: providerStarted.evidence.runtimeMode,
           });
-          assert.isFalse((yield* runtimeB.getSettings).enableAssistantStreaming);
+          assert.isFalse((yield* runtimeB.getSettings).enableLegacyTokenStreaming);
           const completionEvent = {
             type: "item.completed",
             eventId: EventId.make(`v2-restart-completion-${providerName}`),
@@ -18175,6 +18203,9 @@ it.effect(
                   ),
                 ),
               ),
+              Layer.provide(
+                ServerConfig.layerTest(process.cwd(), { prefix: "t3-verification-provider-test-" }),
+              ),
               Layer.provideMerge(NodeServices.layer),
             ),
             resourcesScope,
@@ -18196,6 +18227,7 @@ it.effect(
           });
 
           const providerRegistry = ProviderRegistry.of({
+            refreshWorkspaceSnapshot: () => Effect.succeed([]),
             getProviders: Effect.succeed([]),
             refresh: () => Effect.succeed([]),
             refreshInstance: () => Effect.succeed([]),

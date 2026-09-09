@@ -4,7 +4,7 @@ import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import { AdoptPolicy } from "alchemy/AdoptPolicy";
 import { AlchemyContext, AlchemyContextLive } from "alchemy/AlchemyContext";
 import * as Apply from "alchemy/Apply";
-import { provideFreshArtifactStore } from "alchemy/Artifacts";
+import { ArtifactStore, createArtifactStore, provideFreshArtifactStore } from "alchemy/Artifacts";
 import { AuthProviders } from "alchemy/Auth/AuthProvider";
 import { CredentialsStoreLive } from "alchemy/Auth/Credentials";
 import { ProfileLive } from "alchemy/Auth/Profile";
@@ -53,20 +53,17 @@ export const RelayDeployResult = Schema.Literals([
 ]);
 export type RelayDeployResult = typeof RelayDeployResult.Type;
 
-export class RelayDeployError extends Schema.TaggedErrorClass<RelayDeployError>()(
-  "RelayDeployError",
-  {
-    source: Schema.Literals(["alchemy_state", "alchemy_apply"]),
-    stage: Schema.String,
-    missingFields: Schema.Array(RelayDeployOutputField),
-  },
-) {
+export class RelayDeployError extends Schema.TaggedError<RelayDeployError>()("RelayDeployError", {
+  source: Schema.Literals(["alchemy_state", "alchemy_apply"]),
+  stage: Schema.String,
+  missingFields: Schema.Array(RelayDeployOutputField),
+}) {
   override get message(): string {
     return `Relay deploy output from '${this.source}' for stage '${this.stage}' is missing required public config fields: ${this.missingFields.join(", ")}`;
   }
 }
 
-export class RelayDeployPublicConfigUnavailableError extends Schema.TaggedErrorClass<RelayDeployPublicConfigUnavailableError>()(
+export class RelayDeployPublicConfigUnavailableError extends Schema.TaggedError<RelayDeployPublicConfigUnavailableError>()(
   "RelayDeployPublicConfigUnavailableError",
   {
     result: RelayDeployResult,
@@ -260,6 +257,7 @@ const writeGithubEnvFile = Effect.fn("relay.deploy.writeGithubEnvFile")(function
 
 const deployBaseServices = Layer.mergeAll(
   Layer.succeed(AuthProviders, {}),
+  Layer.succeed(ArtifactStore, createArtifactStore()),
   Layer.provideMerge(AlchemyContextLive, PlatformServices),
   Layer.provide(ProfileLive, PlatformServices),
   Layer.provide(CredentialsStoreLive, PlatformServices),

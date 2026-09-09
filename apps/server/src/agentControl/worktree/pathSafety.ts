@@ -11,7 +11,7 @@ import * as Schema from "effect/Schema";
 import { ServerConfig } from "../../config.ts";
 import { deriveAgentControlWorktreePathKeys } from "./identity.ts";
 
-export class AgentControlWorktreePathSafetyError extends Schema.TaggedErrorClass<AgentControlWorktreePathSafetyError>()(
+export class AgentControlWorktreePathSafetyError extends Schema.TaggedError<AgentControlWorktreePathSafetyError>()(
   "AgentControlWorktreePathSafetyError",
   {
     reason: Schema.Literals([

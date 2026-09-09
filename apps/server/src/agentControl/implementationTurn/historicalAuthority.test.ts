@@ -57,7 +57,7 @@ const repository = {
 };
 const baseCommitSha = "b".repeat(40);
 const targetGenerationId = "c".repeat(64);
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const runtimeLayer = AgentControlRuntimeLayerLive.pipe(
   Layer.provideMerge(SqlitePersistenceMemory),

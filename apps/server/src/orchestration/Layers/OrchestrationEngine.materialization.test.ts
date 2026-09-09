@@ -1,3 +1,5 @@
+import * as ThreadPlanProgress from "../ThreadPlanProgress.ts";
+import * as ThreadBackgroundLiveness from "../ThreadBackgroundLiveness.ts";
 import {
   AgentControlAttemptId,
   AgentControlRoleId,
@@ -53,9 +55,17 @@ import {
   type AgentControlThreadMaterializationTransactionHooksShape,
   type AgentControlThreadMaterializationTransactionObservation,
 } from "../Services/AgentControlThreadMaterializationTransactionHooks.ts";
-import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
+import { OrchestrationEngineLive as OrchestrationEngineLiveBase } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
-import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
+import { OrchestrationProjectionSnapshotQueryLive as OrchestrationProjectionSnapshotQueryLiveBase } from "./ProjectionSnapshotQuery.ts";
+
+const OrchestrationProjectionSnapshotQueryLive = OrchestrationProjectionSnapshotQueryLiveBase.pipe(
+  Layer.provide(Layer.merge(ThreadBackgroundLiveness.layer, ThreadPlanProgress.layer)),
+);
+
+const OrchestrationEngineLive = OrchestrationEngineLiveBase.pipe(
+  Layer.provide(Layer.merge(ThreadBackgroundLiveness.layer, ThreadPlanProgress.layer)),
+);
 
 const NOW = "2026-07-27T11:00:00.000Z";
 const timeout = "10 seconds";

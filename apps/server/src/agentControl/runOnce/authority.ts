@@ -28,7 +28,7 @@ import {
 import { AgentControlRunOnceError, type RunOnceStepBindings } from "./model.ts";
 
 const isRunOnceError = Schema.is(AgentControlRunOnceError);
-const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
 export interface RunOnceStateBinding {
   readonly projectId: ProjectId;

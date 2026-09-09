@@ -1,110 +1,70 @@
-import {
-  ProviderDriverKind,
-  ProviderInstanceId,
-  type ProviderUsageSnapshot,
-} from "@t3tools/contracts";
+import type { ServerProviderUsageLimits, ServerProviderUsageWindow } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import { getProviderUsageAttention, selectPrimaryUsageWindow } from "./providerUsageAvailability";
 
-import {
-  getProviderUsageAttention,
-  getProviderUsageUnavailableReason,
-} from "./providerUsageAvailability";
+const now = Date.parse("2026-09-07T10:00:00Z");
+const session: ServerProviderUsageWindow = {
+  id: "five_hour",
+  kind: "session",
+  label: "Session",
+  usedPercent: 20,
+};
+const weekly: ServerProviderUsageWindow = {
+  id: "seven_day",
+  kind: "weekly",
+  label: "Weekly",
+  usedPercent: 50,
+};
+const limits = (windows: readonly ServerProviderUsageWindow[]): ServerProviderUsageLimits => ({
+  checkedAt: new Date(now).toISOString(),
+  windows,
+});
 
-function usage(
-  driver: "claudeAgent" | "codex",
-  windows: ProviderUsageSnapshot["windows"],
-  status: ProviderUsageSnapshot["status"] = "rejected",
-): ProviderUsageSnapshot {
-  return {
-    providerInstanceId: ProviderInstanceId.make(driver),
-    driver: ProviderDriverKind.make(driver),
-    observedAt: "2026-07-14T10:00:00.000Z",
-    source: "refresh",
-    status,
-    windows,
-  };
-}
-
-describe("getProviderUsageUnavailableReason", () => {
-  it("marks a provider unavailable when a general window is exhausted", () => {
-    const reason = getProviderUsageUnavailableReason(
-      usage("claudeAgent", [
-        {
-          id: "five_hour",
-          label: "5 hours",
-          usedPercent: 100,
-          resetsAt: "2026-07-14T12:00:00.000Z",
-        },
-      ]),
-    );
-
-    expect(reason).toContain("5 hours usage limit reached");
+describe("composer limits", () => {
+  it("prefers session headroom and falls back to weekly or monthly plans", () => {
+    expect(selectPrimaryUsageWindow(limits([weekly, session]), now)).toEqual(session);
+    expect(selectPrimaryUsageWindow(limits([weekly]), now)).toEqual(weekly);
+    const monthly = { ...weekly, kind: "monthly" as const, id: "primary", label: "Monthly" };
+    expect(selectPrimaryUsageWindow(limits([monthly]), now)).toEqual(monthly);
   });
-
-  it("does not block all of Claude for an exhausted model-scoped limit", () => {
-    expect(
-      getProviderUsageUnavailableReason(
-        usage("claudeAgent", [
-          {
-            id: "seven_day_overage_included",
-            label: "Fable 5",
-            usedPercent: 100,
-            resetsAt: null,
-          },
-        ]),
-      ),
-    ).toBeNull();
-  });
-
-  it("uses an explicit rejected status when no window reports 100 percent", () => {
-    expect(
-      getProviderUsageUnavailableReason(
-        usage("codex", [{ id: "secondary", label: "Weekly", usedPercent: 99, resetsAt: null }]),
-      ),
-    ).toBe("Usage limit reached.");
-  });
-
-  it("keeps allowed providers selectable", () => {
-    expect(
-      getProviderUsageUnavailableReason(
-        usage(
-          "codex",
-          [{ id: "secondary", label: "Weekly", usedPercent: 42, resetsAt: null }],
-          "allowed",
-        ),
-      ),
-    ).toBeNull();
-  });
-
-  it("warns for the highest window above 90 percent without disabling the provider", () => {
-    const snapshot = usage(
-      "claudeAgent",
-      [
-        { id: "five_hour", label: "5 hours", usedPercent: 0, resetsAt: null },
-        { id: "seven_day", label: "Weekly", usedPercent: 99, resetsAt: null },
-      ],
-      "warning",
-    );
-
-    expect(getProviderUsageUnavailableReason(snapshot)).toBeNull();
-    expect(getProviderUsageAttention(snapshot)).toMatchObject({
+  it("surfaces the most constrained window above ninety percent", () => {
+    const critical = { ...weekly, usedPercent: 99 };
+    expect(selectPrimaryUsageWindow(limits([session, critical]), now)).toEqual(critical);
+    expect(getProviderUsageAttention(limits([session, critical]), now)).toMatchObject({
       severity: "warning",
-      label: "Weekly 99%",
+      label: "Weekly 1% left",
     });
   });
-
-  it("warns for a scoped limit without disabling all Claude models", () => {
-    const attention = getProviderUsageAttention(
-      usage("claudeAgent", [
-        {
-          id: "seven_day_overage_included",
-          label: "Fable 5",
-          usedPercent: 100,
-          resetsAt: null,
-        },
-      ]),
-    );
-
-    expect(attention).toMatchObject({ severity: "warning", label: "Fable 5 100%" });
+  it("warns without asserting rejection for an exhausted general or scoped quota", () => {
+    for (const window of [session, { ...weekly, id: "weekly_scoped_fable_5", label: "Fable 5" }]) {
+      expect(
+        getProviderUsageAttention(limits([{ ...window, usedPercent: 100 }]), now),
+      ).toMatchObject({ severity: "warning", label: `${window.label} 0% left` });
+    }
+  });
+  it("drops expired warnings and accepts replenished windows after refresh or reset", () => {
+    const exhausted = { ...weekly, usedPercent: 100, resetsAt: new Date(now + 1000).toISOString() };
+    expect(getProviderUsageAttention(limits([exhausted]), now)).not.toBeNull();
+    expect(getProviderUsageAttention(limits([exhausted]), now + 1000)).toBeNull();
+    expect(getProviderUsageAttention(limits([{ ...exhausted, usedPercent: 0 }]), now)).toBeNull();
+    expect(
+      selectPrimaryUsageWindow(
+        limits([{ ...exhausted, resetsAt: new Date(now).toISOString() }, session]),
+        now,
+      ),
+    ).toEqual(session);
+  });
+  it("keeps unavailable or absent quota out of the meter and picker warnings", () => {
+    for (const unavailable of [
+      undefined,
+      { reason: "unsupported" as const },
+      { reason: "probeFailed" as const },
+    ]) {
+      const value = unavailable
+        ? { ...limits([{ ...session, usedPercent: 100 }]), unavailable }
+        : undefined;
+      expect(selectPrimaryUsageWindow(value, now)).toBeNull();
+      expect(getProviderUsageAttention(value, now)).toBeNull();
+    }
   });
 });

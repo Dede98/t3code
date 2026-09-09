@@ -282,7 +282,7 @@ const decodeReservationState = Schema.decodeUnknownEffect(
 );
 const isWorktreeRejectedCommandCode = Schema.is(AgentControlWorktreeRejectedCommandCode);
 const isWorktreeAttentionCode = Schema.is(AgentControlWorktreeAttentionCode);
-class AgentControlGitObservationIncomplete extends Schema.TaggedErrorClass<AgentControlGitObservationIncomplete>()(
+class AgentControlGitObservationIncomplete extends Schema.TaggedError<AgentControlGitObservationIncomplete>()(
   "AgentControlGitObservationIncomplete",
   {},
 ) {}
@@ -2646,9 +2646,8 @@ const make = Effect.gen(function* () {
 
   const typedFailuresAsDefects = (cause: Cause.Cause<unknown>): Cause.Cause<never> =>
     Cause.fromReasons(
-      cause.reasons.map(
-        (reason): Cause.Reason<never> =>
-          Cause.isFailReason(reason) ? Cause.makeDieReason(reason.error) : reason,
+      cause.reasons.map((reason): Cause.Reason<never> =>
+        Cause.isFailReason(reason) ? Cause.makeDieReason(reason.error) : reason,
       ),
     );
 

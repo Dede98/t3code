@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sync Upstream Fork"
+  short_description: "Merge upstream safely while preserving fork behavior"
+  default_prompt: "Use $sync-upstream-fork to fetch and merge upstream/main into this fork while preserving and verifying fork functionality."

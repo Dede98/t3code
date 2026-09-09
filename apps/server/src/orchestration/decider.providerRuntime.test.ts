@@ -53,6 +53,8 @@ const readModel: OrchestrationReadModel = {
       proposedPlans: [],
       activities: [],
       checkpoints: [],
+      settledOverride: null,
+      settledAt: null,
       session: null,
     },
   ],

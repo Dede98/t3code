@@ -3,7 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
-export class AgentControlVerificationEvaluationError extends Schema.TaggedErrorClass<AgentControlVerificationEvaluationError>()(
+export class AgentControlVerificationEvaluationError extends Schema.TaggedError<AgentControlVerificationEvaluationError>()(
   "AgentControlVerificationEvaluationError",
   {
     handoffId: Schema.optional(Schema.String),

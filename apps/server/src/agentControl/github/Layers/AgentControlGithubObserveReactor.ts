@@ -188,7 +188,7 @@ type StartDecision =
     }
   | { readonly _tag: "done" };
 
-class AgentControlGithubObserveRecoveryError extends Schema.TaggedErrorClass<AgentControlGithubObserveRecoveryError>()(
+class AgentControlGithubObserveRecoveryError extends Schema.TaggedError<AgentControlGithubObserveRecoveryError>()(
   "AgentControlGithubObserveRecoveryError",
   {
     projectId: Schema.NullOr(Schema.String),

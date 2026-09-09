@@ -42,7 +42,7 @@ export const ClearAgentControlProjectPolicyInput = Schema.Struct({
 });
 export type ClearAgentControlProjectPolicyInput = typeof ClearAgentControlProjectPolicyInput.Type;
 
-export class AgentControlProjectPolicyValidationError extends Schema.TaggedErrorClass<AgentControlProjectPolicyValidationError>()(
+export class AgentControlProjectPolicyValidationError extends Schema.TaggedError<AgentControlProjectPolicyValidationError>()(
   "AgentControlProjectPolicyValidationError",
   {
     projectId: Schema.String,
@@ -56,7 +56,7 @@ export class AgentControlProjectPolicyValidationError extends Schema.TaggedError
   }
 }
 
-export class AgentControlProjectPolicyConflictError extends Schema.TaggedErrorClass<AgentControlProjectPolicyConflictError>()(
+export class AgentControlProjectPolicyConflictError extends Schema.TaggedError<AgentControlProjectPolicyConflictError>()(
   "AgentControlProjectPolicyConflictError",
   {
     projectId: ProjectId,
@@ -70,7 +70,7 @@ export class AgentControlProjectPolicyConflictError extends Schema.TaggedErrorCl
   }
 }
 
-export class AgentControlProjectPolicyProjectUnavailableError extends Schema.TaggedErrorClass<AgentControlProjectPolicyProjectUnavailableError>()(
+export class AgentControlProjectPolicyProjectUnavailableError extends Schema.TaggedError<AgentControlProjectPolicyProjectUnavailableError>()(
   "AgentControlProjectPolicyProjectUnavailableError",
   {
     projectId: ProjectId,
@@ -86,7 +86,7 @@ export class AgentControlProjectPolicyProjectUnavailableError extends Schema.Tag
  * A persisted row exists but cannot be trusted as an Agent Control policy.
  * Consumers must not fall back to a less restrictive policy after this error.
  */
-export class AgentControlProjectPolicyCorruptError extends Schema.TaggedErrorClass<AgentControlProjectPolicyCorruptError>()(
+export class AgentControlProjectPolicyCorruptError extends Schema.TaggedError<AgentControlProjectPolicyCorruptError>()(
   "AgentControlProjectPolicyCorruptError",
   {
     projectId: ProjectId,

@@ -79,7 +79,7 @@ const decodeProfileConfig = Schema.decodeUnknownEffect(RuntimeProfileConfig);
 const decodeCurrentPointerJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(RuntimeCurrentPointer),
 );
-const encodeUnknownJson = Schema.encodeEffect(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 function isNotFound(error: PlatformError.PlatformError): boolean {
   return error.reason._tag === "NotFound";

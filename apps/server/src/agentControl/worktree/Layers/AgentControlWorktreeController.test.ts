@@ -1,3 +1,4 @@
+import { ProviderAuthService } from "../../../provider/Services/ProviderAuthService.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
@@ -516,8 +517,8 @@ const decodeInitialPlanningModelSelectionJson = Schema.decodeUnknownEffect(
 const decodeReservationState = Schema.decodeUnknownSync(
   Schema.fromJsonString(AgentControlWorktreeReservationState),
 );
-const decodeUnknownJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeOrchestrationEvent = Schema.decodeUnknownSync(OrchestrationEventSchema);
 const canonicalJsonForIdentity = (value: unknown): string => {
   const canonicalize = (input: unknown): unknown => {
@@ -3442,6 +3443,9 @@ activationLayer("Controlled thread activation facade", (it) => {
         const unsupportedProviderCall = () =>
           Effect.die(new Error("unexpected provider call")) as never;
         const providerService = ProviderService.of({
+          compactThread: () => Effect.die("Unexpected compactThread"),
+          assertConversationRollbackSupported: () => Effect.void,
+          uploadFeedback: () => Effect.die("Unexpected uploadFeedback"),
           startSession: unsupportedProviderCall,
           sendTurn: unsupportedProviderCall,
           interruptTurn: () => Ref.update(interruptCalls, (count) => count + 1),
@@ -6600,8 +6604,24 @@ activationLayer("Controlled thread activation facade", (it) => {
           } as const;
           const adapter = yield* (
             adapterProvider === grokProvider
-              ? makeGrokAdapter(grokSettings, adapterOptions)
-              : makeCursorAdapter(cursorSettings, adapterOptions)
+              ? makeGrokAdapter(grokSettings, adapterOptions).pipe(
+                  Effect.map(
+                    (
+                      adapter,
+                    ): import("../../../provider/Services/ProviderAdapter.ts").ProviderAdapterShape<
+                      import("../../../provider/Errors.ts").ProviderAdapterError
+                    > => adapter,
+                  ),
+                )
+              : makeCursorAdapter(cursorSettings, adapterOptions).pipe(
+                  Effect.map(
+                    (
+                      adapter,
+                    ): import("../../../provider/Services/ProviderAdapter.ts").ProviderAdapterShape<
+                      import("../../../provider/Errors.ts").ProviderAdapterError
+                    > => adapter,
+                  ),
+                )
           ).pipe(
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
             Effect.provideService(Scope.Scope, adapterScope),
@@ -7091,6 +7111,12 @@ activationLayer("Controlled thread activation facade", (it) => {
           const reactorScope = yield* Scope.make("sequential");
           yield* Effect.addFinalizer(() => Scope.close(reactorScope, Exit.void));
           const reactorLayer = ProviderCommandReactorCore.pipe(
+            Layer.provide(makeProviderRegistryLayer()),
+            Layer.provide(
+              Layer.mock(ProviderAuthService)({
+                tryHandlePromptCommand: () => Effect.succeed(false),
+              }),
+            ),
             Layer.provideMerge(
               Layer.succeed(OrchestrationEngineService, source.orchestrationEngine),
             ),
@@ -7108,6 +7134,7 @@ activationLayer("Controlled thread activation facade", (it) => {
             Layer.provideMerge(
               Layer.succeed(VcsStatusBroadcaster, {
                 getStatus: () => Effect.die("unexpected Reactor VCS read"),
+                refreshPullRequestStatus: () => Effect.die("Unexpected PR refresh"),
                 refreshLocalStatus: () => Effect.die("unexpected Reactor VCS refresh"),
                 refreshStatus: () => Effect.die("unexpected Reactor VCS refresh"),
                 streamStatus: () => Stream.die("unexpected Reactor VCS stream"),

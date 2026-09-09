@@ -35,7 +35,7 @@ const TARGET_ARCHITECTURE = "arm64" as const;
 const decodeManifest = Schema.decodeUnknownSync(RuntimeArtifactManifest);
 const encodeManifest = Schema.encodeSync(Schema.fromJsonString(RuntimeArtifactManifest));
 const encodeLock = Schema.encodeSync(Schema.fromJsonString(RuntimeDaemonLock));
-const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 interface Harness {
   readonly fs: FileSystem.FileSystem;

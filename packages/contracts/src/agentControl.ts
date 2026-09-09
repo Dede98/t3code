@@ -278,7 +278,7 @@ export const AgentControlPolicyStateResult = Schema.Struct({
 });
 export type AgentControlPolicyStateResult = typeof AgentControlPolicyStateResult.Type;
 
-export class AgentControlPolicyValidationError extends Schema.TaggedErrorClass<AgentControlPolicyValidationError>()(
+export class AgentControlPolicyValidationError extends Schema.TaggedError<AgentControlPolicyValidationError>()(
   "AgentControlPolicyValidationError",
   {
     code: Schema.Literal("validation"),
@@ -292,7 +292,7 @@ export class AgentControlPolicyValidationError extends Schema.TaggedErrorClass<A
   },
 ) {}
 
-export class AgentControlPolicyRevisionConflictError extends Schema.TaggedErrorClass<AgentControlPolicyRevisionConflictError>()(
+export class AgentControlPolicyRevisionConflictError extends Schema.TaggedError<AgentControlPolicyRevisionConflictError>()(
   "AgentControlPolicyRevisionConflictError",
   {
     code: Schema.Literal("revision-conflict"),
@@ -302,7 +302,7 @@ export class AgentControlPolicyRevisionConflictError extends Schema.TaggedErrorC
   },
 ) {}
 
-export class AgentControlPolicyProjectMissingError extends Schema.TaggedErrorClass<AgentControlPolicyProjectMissingError>()(
+export class AgentControlPolicyProjectMissingError extends Schema.TaggedError<AgentControlPolicyProjectMissingError>()(
   "AgentControlPolicyProjectMissingError",
   {
     code: Schema.Literal("project-missing"),
@@ -310,7 +310,7 @@ export class AgentControlPolicyProjectMissingError extends Schema.TaggedErrorCla
   },
 ) {}
 
-export class AgentControlPolicyProjectDeletedError extends Schema.TaggedErrorClass<AgentControlPolicyProjectDeletedError>()(
+export class AgentControlPolicyProjectDeletedError extends Schema.TaggedError<AgentControlPolicyProjectDeletedError>()(
   "AgentControlPolicyProjectDeletedError",
   {
     code: Schema.Literal("project-deleted"),
@@ -318,7 +318,7 @@ export class AgentControlPolicyProjectDeletedError extends Schema.TaggedErrorCla
   },
 ) {}
 
-export class AgentControlPolicyCorruptError extends Schema.TaggedErrorClass<AgentControlPolicyCorruptError>()(
+export class AgentControlPolicyCorruptError extends Schema.TaggedError<AgentControlPolicyCorruptError>()(
   "AgentControlPolicyCorruptError",
   {
     code: Schema.Literal("policy-corrupt"),
@@ -326,7 +326,7 @@ export class AgentControlPolicyCorruptError extends Schema.TaggedErrorClass<Agen
   },
 ) {}
 
-export class AgentControlPolicyPersistenceError extends Schema.TaggedErrorClass<AgentControlPolicyPersistenceError>()(
+export class AgentControlPolicyPersistenceError extends Schema.TaggedError<AgentControlPolicyPersistenceError>()(
   "AgentControlPolicyPersistenceError",
   {
     code: Schema.Literal("internal-persistence-error"),

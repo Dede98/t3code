@@ -50,7 +50,7 @@ export interface RuntimeLaunchctlResult {
   readonly exitCode: number;
 }
 
-export class RuntimeLaunchctlRunnerError extends Schema.TaggedErrorClass<RuntimeLaunchctlRunnerError>()(
+export class RuntimeLaunchctlRunnerError extends Schema.TaggedError<RuntimeLaunchctlRunnerError>()(
   "RuntimeLaunchctlRunnerError",
   {},
 ) {}

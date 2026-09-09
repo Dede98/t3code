@@ -203,7 +203,7 @@ export const AgentControlRejectedCommandErrorCode = Schema.Literals([
 ]);
 export type AgentControlRejectedCommandErrorCode = typeof AgentControlRejectedCommandErrorCode.Type;
 
-export class AgentControlRuntimeValidationError extends Schema.TaggedErrorClass<AgentControlRuntimeValidationError>()(
+export class AgentControlRuntimeValidationError extends Schema.TaggedError<AgentControlRuntimeValidationError>()(
   "AgentControlRuntimeValidationError",
   {
     code: Schema.Literal("validation"),
@@ -211,7 +211,7 @@ export class AgentControlRuntimeValidationError extends Schema.TaggedErrorClass<
   },
 ) {}
 
-export class AgentControlProjectMissingError extends Schema.TaggedErrorClass<AgentControlProjectMissingError>()(
+export class AgentControlProjectMissingError extends Schema.TaggedError<AgentControlProjectMissingError>()(
   "AgentControlProjectMissingError",
   {
     code: Schema.Literal("project-missing"),
@@ -219,7 +219,7 @@ export class AgentControlProjectMissingError extends Schema.TaggedErrorClass<Age
   },
 ) {}
 
-export class AgentControlProjectDeletedError extends Schema.TaggedErrorClass<AgentControlProjectDeletedError>()(
+export class AgentControlProjectDeletedError extends Schema.TaggedError<AgentControlProjectDeletedError>()(
   "AgentControlProjectDeletedError",
   {
     code: Schema.Literal("project-deleted"),
@@ -227,7 +227,7 @@ export class AgentControlProjectDeletedError extends Schema.TaggedErrorClass<Age
   },
 ) {}
 
-export class AgentControlProjectRevisionConflictError extends Schema.TaggedErrorClass<AgentControlProjectRevisionConflictError>()(
+export class AgentControlProjectRevisionConflictError extends Schema.TaggedError<AgentControlProjectRevisionConflictError>()(
   "AgentControlProjectRevisionConflictError",
   {
     code: Schema.Literal("revision-conflict"),
@@ -237,7 +237,7 @@ export class AgentControlProjectRevisionConflictError extends Schema.TaggedError
   },
 ) {}
 
-export class AgentControlTransitionNotAllowedError extends Schema.TaggedErrorClass<AgentControlTransitionNotAllowedError>()(
+export class AgentControlTransitionNotAllowedError extends Schema.TaggedError<AgentControlTransitionNotAllowedError>()(
   "AgentControlTransitionNotAllowedError",
   {
     code: Schema.Literal("transition-not-allowed"),
@@ -247,7 +247,7 @@ export class AgentControlTransitionNotAllowedError extends Schema.TaggedErrorCla
   },
 ) {}
 
-export class AgentControlModeNotAvailableError extends Schema.TaggedErrorClass<AgentControlModeNotAvailableError>()(
+export class AgentControlModeNotAvailableError extends Schema.TaggedError<AgentControlModeNotAvailableError>()(
   "AgentControlModeNotAvailableError",
   {
     code: Schema.Literal("mode-not-available"),
@@ -256,7 +256,7 @@ export class AgentControlModeNotAvailableError extends Schema.TaggedErrorClass<A
   },
 ) {}
 
-export class AgentControlCommandPreviouslyRejectedError extends Schema.TaggedErrorClass<AgentControlCommandPreviouslyRejectedError>()(
+export class AgentControlCommandPreviouslyRejectedError extends Schema.TaggedError<AgentControlCommandPreviouslyRejectedError>()(
   "AgentControlCommandPreviouslyRejectedError",
   {
     code: Schema.Literal("command-previously-rejected"),
@@ -265,7 +265,7 @@ export class AgentControlCommandPreviouslyRejectedError extends Schema.TaggedErr
   },
 ) {}
 
-export class AgentControlCommandIdentityMismatchError extends Schema.TaggedErrorClass<AgentControlCommandIdentityMismatchError>()(
+export class AgentControlCommandIdentityMismatchError extends Schema.TaggedError<AgentControlCommandIdentityMismatchError>()(
   "AgentControlCommandIdentityMismatchError",
   {
     code: Schema.Literal("command-identity-mismatch"),
@@ -273,7 +273,7 @@ export class AgentControlCommandIdentityMismatchError extends Schema.TaggedError
   },
 ) {}
 
-export class AgentControlEventDecodeFailedError extends Schema.TaggedErrorClass<AgentControlEventDecodeFailedError>()(
+export class AgentControlEventDecodeFailedError extends Schema.TaggedError<AgentControlEventDecodeFailedError>()(
   "AgentControlEventDecodeFailedError",
   {
     code: Schema.Literal("event-decode-failed"),
@@ -281,7 +281,7 @@ export class AgentControlEventDecodeFailedError extends Schema.TaggedErrorClass<
   },
 ) {}
 
-export class AgentControlProjectionCorruptError extends Schema.TaggedErrorClass<AgentControlProjectionCorruptError>()(
+export class AgentControlProjectionCorruptError extends Schema.TaggedError<AgentControlProjectionCorruptError>()(
   "AgentControlProjectionCorruptError",
   {
     code: Schema.Literal("projection-corrupt"),
@@ -289,7 +289,7 @@ export class AgentControlProjectionCorruptError extends Schema.TaggedErrorClass<
   },
 ) {}
 
-export class AgentControlInternalPersistenceError extends Schema.TaggedErrorClass<AgentControlInternalPersistenceError>()(
+export class AgentControlInternalPersistenceError extends Schema.TaggedError<AgentControlInternalPersistenceError>()(
   "AgentControlInternalPersistenceError",
   {
     code: Schema.Literal("internal-persistence-error"),

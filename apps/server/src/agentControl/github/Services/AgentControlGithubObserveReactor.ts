@@ -8,7 +8,7 @@ import type * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
-export class AgentControlGithubObserveStartupError extends Schema.TaggedErrorClass<AgentControlGithubObserveStartupError>()(
+export class AgentControlGithubObserveStartupError extends Schema.TaggedError<AgentControlGithubObserveStartupError>()(
   "AgentControlGithubObserveStartupError",
   {
     reason: Schema.Literals([

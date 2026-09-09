@@ -10,7 +10,7 @@ import {
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-export class AgentControlPersistenceSqlError extends Schema.TaggedErrorClass<AgentControlPersistenceSqlError>()(
+export class AgentControlPersistenceSqlError extends Schema.TaggedError<AgentControlPersistenceSqlError>()(
   "AgentControlPersistenceSqlError",
   {
     operation: Schema.String,
@@ -18,7 +18,7 @@ export class AgentControlPersistenceSqlError extends Schema.TaggedErrorClass<Age
   },
 ) {}
 
-export class AgentControlPersistenceDecodeError extends Schema.TaggedErrorClass<AgentControlPersistenceDecodeError>()(
+export class AgentControlPersistenceDecodeError extends Schema.TaggedError<AgentControlPersistenceDecodeError>()(
   "AgentControlPersistenceDecodeError",
   {
     operation: Schema.String,
@@ -26,7 +26,7 @@ export class AgentControlPersistenceDecodeError extends Schema.TaggedErrorClass<
   },
 ) {}
 
-export class AgentControlStreamVersionConflictError extends Schema.TaggedErrorClass<AgentControlStreamVersionConflictError>()(
+export class AgentControlStreamVersionConflictError extends Schema.TaggedError<AgentControlStreamVersionConflictError>()(
   "AgentControlStreamVersionConflictError",
   {
     projectId: ProjectId,
@@ -35,7 +35,7 @@ export class AgentControlStreamVersionConflictError extends Schema.TaggedErrorCl
   },
 ) {}
 
-export class AgentControlTaskStreamVersionConflictError extends Schema.TaggedErrorClass<AgentControlTaskStreamVersionConflictError>()(
+export class AgentControlTaskStreamVersionConflictError extends Schema.TaggedError<AgentControlTaskStreamVersionConflictError>()(
   "AgentControlTaskStreamVersionConflictError",
   {
     taskId: AgentControlTaskId,
@@ -44,7 +44,7 @@ export class AgentControlTaskStreamVersionConflictError extends Schema.TaggedErr
   },
 ) {}
 
-export class AgentControlStageRunStreamVersionConflictError extends Schema.TaggedErrorClass<AgentControlStageRunStreamVersionConflictError>()(
+export class AgentControlStageRunStreamVersionConflictError extends Schema.TaggedError<AgentControlStageRunStreamVersionConflictError>()(
   "AgentControlStageRunStreamVersionConflictError",
   {
     stageRunId: AgentControlStageRunId,
@@ -53,7 +53,7 @@ export class AgentControlStageRunStreamVersionConflictError extends Schema.Tagge
   },
 ) {}
 
-export class AgentControlStageRunLeaseStreamVersionConflictError extends Schema.TaggedErrorClass<AgentControlStageRunLeaseStreamVersionConflictError>()(
+export class AgentControlStageRunLeaseStreamVersionConflictError extends Schema.TaggedError<AgentControlStageRunLeaseStreamVersionConflictError>()(
   "AgentControlStageRunLeaseStreamVersionConflictError",
   {
     leaseId: AgentControlStageRunLeaseId,
@@ -62,7 +62,7 @@ export class AgentControlStageRunLeaseStreamVersionConflictError extends Schema.
   },
 ) {}
 
-export class AgentControlWorktreeStreamVersionConflictError extends Schema.TaggedErrorClass<AgentControlWorktreeStreamVersionConflictError>()(
+export class AgentControlWorktreeStreamVersionConflictError extends Schema.TaggedError<AgentControlWorktreeStreamVersionConflictError>()(
   "AgentControlWorktreeStreamVersionConflictError",
   {
     reservationId: AgentControlWorktreeReservationId,
@@ -71,7 +71,7 @@ export class AgentControlWorktreeStreamVersionConflictError extends Schema.Tagge
   },
 ) {}
 
-export class AgentControlControlledThreadReservationStreamVersionConflictError extends Schema.TaggedErrorClass<AgentControlControlledThreadReservationStreamVersionConflictError>()(
+export class AgentControlControlledThreadReservationStreamVersionConflictError extends Schema.TaggedError<AgentControlControlledThreadReservationStreamVersionConflictError>()(
   "AgentControlControlledThreadReservationStreamVersionConflictError",
   {
     controlledThreadReservationId: AgentControlControlledThreadReservationId,
@@ -80,7 +80,7 @@ export class AgentControlControlledThreadReservationStreamVersionConflictError e
   },
 ) {}
 
-export class AgentControlGithubSchedulerConflictError extends Schema.TaggedErrorClass<AgentControlGithubSchedulerConflictError>()(
+export class AgentControlGithubSchedulerConflictError extends Schema.TaggedError<AgentControlGithubSchedulerConflictError>()(
   "AgentControlGithubSchedulerConflictError",
   {
     projectId: ProjectId,
@@ -89,7 +89,7 @@ export class AgentControlGithubSchedulerConflictError extends Schema.TaggedError
   },
 ) {}
 
-export class AgentControlTaskReconcileConflictError extends Schema.TaggedErrorClass<AgentControlTaskReconcileConflictError>()(
+export class AgentControlTaskReconcileConflictError extends Schema.TaggedError<AgentControlTaskReconcileConflictError>()(
   "AgentControlTaskReconcileConflictError",
   {
     projectId: ProjectId,
@@ -98,7 +98,7 @@ export class AgentControlTaskReconcileConflictError extends Schema.TaggedErrorCl
   },
 ) {}
 
-export class AgentControlProjectUnavailableError extends Schema.TaggedErrorClass<AgentControlProjectUnavailableError>()(
+export class AgentControlProjectUnavailableError extends Schema.TaggedError<AgentControlProjectUnavailableError>()(
   "AgentControlProjectUnavailableError",
   {
     projectId: ProjectId,
@@ -106,7 +106,7 @@ export class AgentControlProjectUnavailableError extends Schema.TaggedErrorClass
   },
 ) {}
 
-export class AgentControlReceiptConflictError extends Schema.TaggedErrorClass<AgentControlReceiptConflictError>()(
+export class AgentControlReceiptConflictError extends Schema.TaggedError<AgentControlReceiptConflictError>()(
   "AgentControlReceiptConflictError",
   {
     commandId: CommandId,

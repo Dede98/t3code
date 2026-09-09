@@ -31,7 +31,7 @@ export const AgentControlControlledThreadMaterializationCoordinatorReason = Sche
 export type AgentControlControlledThreadMaterializationCoordinatorReason =
   typeof AgentControlControlledThreadMaterializationCoordinatorReason.Type;
 
-export class AgentControlControlledThreadMaterializationCoordinatorError extends Schema.TaggedErrorClass<AgentControlControlledThreadMaterializationCoordinatorError>()(
+export class AgentControlControlledThreadMaterializationCoordinatorError extends Schema.TaggedError<AgentControlControlledThreadMaterializationCoordinatorError>()(
   "AgentControlControlledThreadMaterializationCoordinatorError",
   {
     reason: AgentControlControlledThreadMaterializationCoordinatorReason,

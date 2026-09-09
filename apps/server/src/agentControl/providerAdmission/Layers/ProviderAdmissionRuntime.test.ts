@@ -166,6 +166,7 @@ it.effect("binds all usage outcomes and wakes rejected admission from one global
           ),
         );
       const usageLayer = Layer.succeed(ProviderUsage, {
+        stream: Stream.empty,
         inspectForAdmission: (providerInstanceId) =>
           Ref.get(observations).pipe(Effect.map((current) => current.get(providerInstanceId)!)),
         getSnapshot: Effect.succeed([]),
@@ -326,6 +327,7 @@ it.effect(
         const inspectCalls = yield* Ref.make(0);
         const usageEvents = yield* PubSub.unbounded<never>();
         const usageLayer = Layer.succeed(ProviderUsage, {
+          stream: Stream.empty,
           inspectForAdmission: () =>
             Ref.updateAndGet(inspectCalls, (count) => count + 1).pipe(
               Effect.as({
@@ -451,6 +453,7 @@ it.effect(
         );
         const usageEvents = yield* PubSub.unbounded<never>();
         const usageLayer = Layer.succeed(ProviderUsage, {
+          stream: Stream.empty,
           inspectForAdmission: (instanceId) =>
             Effect.succeed({
               _tag: "Observed" as const,
@@ -760,6 +763,7 @@ it.effect("reports a capacity pump defect through the typed runtime failure chan
         catchUpFinalized: Effect.succeed([]),
       });
       const usageLayer = Layer.succeed(ProviderUsage, {
+        stream: Stream.empty,
         inspectForAdmission: () => Effect.die("unused"),
         getSnapshot: Effect.succeed([]),
         refresh: () => Effect.succeed({ refreshedAt: epoch, usage: [], failures: [] }),

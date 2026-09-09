@@ -3,7 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
-export class AgentControlImplementationStageStarterError extends Schema.TaggedErrorClass<AgentControlImplementationStageStarterError>()(
+export class AgentControlImplementationStageStarterError extends Schema.TaggedError<AgentControlImplementationStageStarterError>()(
   "AgentControlImplementationStageStarterError",
   {
     handoffId: Schema.String,

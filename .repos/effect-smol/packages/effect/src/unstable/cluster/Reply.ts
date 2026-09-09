@@ -1,24 +1,12 @@
 /**
- * The `Reply` module models responses produced by clustered RPC execution. A
- * reply belongs to a request and is either a terminal {@link WithExit}, which
- * carries the final RPC `Exit`, or a streaming {@link Chunk}, which carries a
- * non-empty batch of success values for RPCs that stream results.
+ * Defines reply values produced by clustered RPC execution.
  *
- * **Common tasks**
- *
- * - Represent runtime replies with {@link Reply}, {@link WithExit}, and {@link Chunk}
- * - Encode and decode transport payloads with {@link Encoded} and {@link Reply}
- * - Persist replies together with schema context via {@link ReplyWithContext}
- * - Serialize the latest received reply when resuming or de-duplicating requests with {@link serializeLastReceived}
- *
- * **Streaming and acknowledgement notes**
- *
- * - Chunk replies are sequenced and can be replayed until acknowledged by the
- *   receiver.
- * - A `WithExit` reply is terminal and completes the request, while chunks only
- *   represent intermediate streamed success values.
- * - `Chunk.emptyFrom` is used as an acknowledgement marker for an empty streamed
- *   reply; it is not a general-purpose success payload.
+ * Every reply belongs to a request and is either a final `WithExit`, which
+ * carries the final RPC `Exit`, or a streaming `Chunk`, which carries a
+ * non-empty batch of success values. This module includes runtime and encoded
+ * reply shapes, guards, per-RPC schema builders, `ReplyWithContext` for
+ * carrying encoding services, and serialization helpers for storage or
+ * transport.
  *
  * @since 4.0.0
  */
@@ -30,13 +18,15 @@ import * as Exit from "../../Exit.ts"
 import * as Option from "../../Option.ts"
 import { hasProperty } from "../../Predicate.ts"
 import * as Schema from "../../Schema.ts"
-import * as Issue from "../../SchemaIssue.ts"
-import * as Parser from "../../SchemaParser.ts"
-import * as Transformation from "../../SchemaTransformation.ts"
+import * as SchemaIssue from "../../SchemaIssue.ts"
+import * as SchemaParser from "../../SchemaParser.ts"
+import * as SchemaTransformation from "../../SchemaTransformation.ts"
 import * as Rpc from "../rpc/Rpc.ts"
 import type * as RpcMessage from "../rpc/RpcMessage.ts"
 import type * as RpcSchema from "../rpc/RpcSchema.ts"
+import type * as RpcSerialization from "../rpc/RpcSerialization.ts"
 import { MalformedMessage } from "./ClusterError.ts"
+import * as Envelope from "./Envelope.ts"
 import type { OutgoingRequest } from "./Message.ts"
 import { Snowflake, SnowflakeFromBigInt } from "./Snowflake.ts"
 
@@ -78,7 +68,7 @@ export type Encoded = WithExitEncoded | ChunkEncoded
  * @category schemas
  * @since 4.0.0
  */
-export const Encoded: Schema.Codec<Encoded> = Schema.Any as any
+export const Encoded: Schema.Codec<Encoded> = Envelope.OpaqueHole as any
 
 /**
  * Represents a cluster reply paired with the RPC definition and service context required to
@@ -111,7 +101,7 @@ export class ReplyWithContext<R extends Rpc.Any> extends Data.TaggedClass("Reply
       reply: new WithExit({
         requestId: options.requestId,
         id: options.id,
-        exit: Exit.die(Schema.encodeSync(Schema.Defect)(options.defect))
+        exit: Exit.die(Schema.encodeSync(Schema.Defect())(options.defect))
       }),
       context: Context.empty() as any,
       rpc: neverRpc
@@ -173,7 +163,9 @@ export interface ChunkEncoded {
   readonly values: NonEmptyReadonlyArray<unknown>
 }
 
-const schemaCache = new WeakMap<Rpc.Any, Schema.Top>()
+// Keyed by codec first: the storage path and the transport path can compile
+// different codecs for the same RPC.
+const schemaCaches = new WeakMap<RpcSerialization.CodecFor, WeakMap<Rpc.Any, Schema.Top>>()
 
 /**
  * Represents a streaming RPC reply chunk for a request, carrying a non-empty
@@ -221,7 +213,7 @@ export class Chunk<R extends Rpc.Any> extends Data.TaggedClass("Chunk")<{
    *
    * @since 4.0.0
    */
-  static readonly transform: Transformation.Transformation<any, any> = Transformation.transform({
+  static readonly transform: SchemaTransformation.Transformation<any, any> = SchemaTransformation.transform({
     decode: (a: any) => new Chunk(a),
     encode: (a) => a as any
   })
@@ -246,7 +238,7 @@ export class Chunk<R extends Rpc.Any> extends Data.TaggedClass("Chunk")<{
    *
    * @since 4.0.0
    */
-  static schemaFrom<Success extends Schema.Top>(
+  static schemaFrom<Success extends Schema.Constraint>(
     success: Success
   ): Schema.declareConstructor<Chunk<Rpc.Any>, Chunk<Rpc.Any>, readonly [Success]> {
     // TODO: extract to a helper function
@@ -254,10 +246,10 @@ export class Chunk<R extends Rpc.Any> extends Data.TaggedClass("Chunk")<{
       [success],
       ([success]) => (input, ast, options) => {
         if (!isReply(input) || input._tag !== "Chunk") {
-          return Effect.fail(new Issue.InvalidType(ast, Option.some(input)))
+          return Effect.fail(new SchemaIssue.InvalidType(ast, input, options))
         }
-        return Effect.mapBothEager(Parser.decodeEffect(Schema.NonEmptyArray(success))(input.values, options), {
-          onFailure: (issue) => new Issue.Composite(ast, Option.some(input), [new Issue.Pointer(["values"], issue)]),
+        return Effect.mapBothEager(SchemaParser.decodeEffect(Schema.NonEmptyArray(success))(input.values, options), {
+          onFailure: (issue) => SchemaIssue.makeCompositeAtKey(ast, "values", issue, input, options),
           onSuccess: (values) => new Chunk({ ...input, values } as any)
         })
       },
@@ -269,10 +261,10 @@ export class Chunk<R extends Rpc.Any> extends Data.TaggedClass("Chunk")<{
               _tag: Schema.Literal("Chunk"),
               requestId: SnowflakeFromBigInt,
               id: SnowflakeFromBigInt,
-              sequence: Schema.Number,
+              sequence: Schema.Int,
               values: Schema.NonEmptyArray(success)
             }),
-            Transformation.transform({
+            SchemaTransformation.transform({
               decode: (encoded) => new Chunk(encoded),
               encode: (result) => ({ ...result })
             })
@@ -347,7 +339,11 @@ export class WithExit<R extends Rpc.Any> extends Data.TaggedClass("WithExit")<{
    *
    * @since 4.0.0
    */
-  static schemaFrom<Success extends Schema.Top, Error extends Schema.Top, Defect extends Schema.Top>(
+  static schemaFrom<
+    Success extends Schema.Constraint,
+    Error extends Schema.Constraint,
+    Defect extends Schema.Constraint
+  >(
     exitSchema: Schema.Exit<Success, Error, Defect>
   ): Schema.declareConstructor<
     WithExit<Rpc.Any>,
@@ -359,10 +355,10 @@ export class WithExit<R extends Rpc.Any> extends Data.TaggedClass("WithExit")<{
       [exitSchema],
       ([exit]) => (input, ast, options) => {
         if (!isReply(input) || input._tag !== "WithExit") {
-          return Effect.fail(new Issue.InvalidType(ast, Option.some(input)))
+          return Effect.fail(new SchemaIssue.InvalidType(ast, input, options))
         }
-        return Effect.mapBothEager(Parser.decodeEffect(exit)(input.exit, options), {
-          onFailure: (issue) => new Issue.Composite(ast, Option.some(input), [new Issue.Pointer(["exit"], issue)]),
+        return Effect.mapBothEager(SchemaParser.decodeEffect(exit)(input.exit, options), {
+          onFailure: (issue) => SchemaIssue.makeCompositeAtKey(ast, "exit", issue, input, options),
           onSuccess: (exit) => new WithExit({ ...input, exit: exit as any })
         })
       },
@@ -376,7 +372,7 @@ export class WithExit<R extends Rpc.Any> extends Data.TaggedClass("WithExit")<{
               id: SnowflakeFromBigInt,
               exit
             }),
-            Transformation.transform({
+            SchemaTransformation.transform({
               decode: (encoded) => new WithExit(encoded as any),
               encode: (result) => ({ ...result })
             })
@@ -406,17 +402,24 @@ export class WithExit<R extends Rpc.Any> extends Data.TaggedClass("WithExit")<{
  * @since 4.0.0
  */
 export const Reply = <R extends Rpc.Any>(
-  rpc: R
+  rpc: R,
+  codecFor: RpcSerialization.CodecFor
 ): Schema.Codec<
   WithExit<R> | Chunk<R>,
   Encoded,
   Rpc.ServicesServer<R>,
   Rpc.ServicesClient<R>
 > => {
-  if (schemaCache.has(rpc)) {
-    return schemaCache.get(rpc) as any
+  let schemaCache = schemaCaches.get(codecFor)
+  if (schemaCache === undefined) {
+    schemaCache = new WeakMap()
+    schemaCaches.set(codecFor, schemaCache)
   }
-  const schema = Schema.toCodecJson(Schema.Union([WithExit.schema(rpc), Chunk.schema(rpc)]))
+  const cached = schemaCache.get(rpc)
+  if (cached !== undefined) {
+    return cached as any
+  }
+  const schema = codecFor(Schema.Union([WithExit.schema(rpc), Chunk.schema(rpc)]))
   schemaCache.set(rpc, schema)
   return schema as any
 }
@@ -430,9 +433,10 @@ export const Reply = <R extends Rpc.Any>(
  * @since 4.0.0
  */
 export const serialize = <R extends Rpc.Any>(
-  self: ReplyWithContext<R>
+  self: ReplyWithContext<R>,
+  codecFor: RpcSerialization.CodecFor
 ): Effect.Effect<Encoded, MalformedMessage> => {
-  const schema = Reply(self.rpc)
+  const schema = Reply(self.rpc, codecFor)
   return MalformedMessage.refail(
     Effect.provideContext(
       Schema.encodeEffect(schema)(self.reply),
@@ -440,6 +444,31 @@ export const serialize = <R extends Rpc.Any>(
     )
   )
 }
+
+/**
+ * Serializes a `ReplyWithContext`, falling back to a serializable defect reply
+ * when the original reply cannot be encoded.
+ *
+ * @category serialization
+ * @since 4.0.0
+ */
+export const serializeOrDefect = <R extends Rpc.Any>(
+  self: ReplyWithContext<R>,
+  codecFor: RpcSerialization.CodecFor
+): Effect.Effect<Encoded> =>
+  Effect.catchTag(
+    serialize(self, codecFor),
+    "MalformedMessage",
+    (error) =>
+      Effect.orDie(serialize(
+        ReplyWithContext.fromDefect({
+          id: self.reply.id,
+          requestId: self.reply.requestId,
+          defect: error
+        }),
+        codecFor
+      ))
+  )
 
 /**
  * Serializes an outgoing request's last received reply when one exists, returning
@@ -450,13 +479,14 @@ export const serialize = <R extends Rpc.Any>(
  * @since 4.0.0
  */
 export const serializeLastReceived = <R extends Rpc.Any>(
-  self: OutgoingRequest<R>
+  self: OutgoingRequest<R>,
+  codecFor: RpcSerialization.CodecFor
 ): Effect.Effect<Option.Option<Encoded>, MalformedMessage> => {
   const lastReceivedReply = self.lastReceivedReply
   if (lastReceivedReply._tag === "None") {
     return Effect.succeedNone
   }
-  const schema = Reply(self.rpc)
+  const schema = Reply(self.rpc, codecFor)
   return MalformedMessage.refail(
     Effect.provideContext(Schema.encodeEffect(schema)(lastReceivedReply.value), self.context)
   ).pipe(

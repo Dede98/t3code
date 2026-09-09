@@ -97,10 +97,10 @@ export class RuntimeArtifactInstaller extends Context.Service<
   }
 >()("@t3tools/desktop/runtime/RuntimeArtifactInstaller") {}
 
-const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeManifest = Schema.decodeUnknownEffect(RuntimeArtifactManifest);
 const decodeCurrentPointer = Schema.decodeUnknownEffect(RuntimeCurrentPointer);
-const encodeUnknownJson = Schema.encodeEffect(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 function isNotFound(error: PlatformError.PlatformError): boolean {
   return error.reason._tag === "NotFound";

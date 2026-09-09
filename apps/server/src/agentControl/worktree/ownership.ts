@@ -58,7 +58,7 @@ const encodeMarker = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlWorktreeOwnershipMarker),
 );
 
-export class AgentControlWorktreeOwnershipObservationError extends Schema.TaggedErrorClass<AgentControlWorktreeOwnershipObservationError>()(
+export class AgentControlWorktreeOwnershipObservationError extends Schema.TaggedError<AgentControlWorktreeOwnershipObservationError>()(
   "AgentControlWorktreeOwnershipObservationError",
   {
     reason: Schema.Literals(["missing", "io", "incomplete", "unsafe-type", "corrupt"]),

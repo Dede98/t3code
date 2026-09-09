@@ -371,6 +371,8 @@ const makeHarness = (options?: {
         subscribeDomainEvents: subscribe("github-intake", githubEvents),
       }),
       Effect.provideService(OrchestrationEngineService, {
+        readThreadEvents: () => Stream.empty,
+        getThreadReplayStats: () => Effect.die("Unexpected getThreadReplayStats"),
         readEvents: () => Stream.empty,
         dispatch: () => Effect.die("unused"),
         dispatchClient: () => Effect.die("unused"),

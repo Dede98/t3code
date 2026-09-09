@@ -103,6 +103,7 @@ const snapshots = ProjectionSnapshotQuery.of({
 } as unknown as ProjectionSnapshotQuery["Service"]);
 
 const providerRegistry = ProviderRegistry.of({
+  refreshWorkspaceSnapshot: () => Effect.succeed([]),
   getProviders: Effect.succeed([]),
   refresh: () => Effect.succeed([]),
   refreshInstance: () => Effect.succeed([]),
@@ -128,11 +129,14 @@ const buildExecutor = (
           Layer.succeed(
             OrchestrationEngineService,
             OrchestrationEngineService.of({
+              readThreadEvents: () => Stream.empty,
+              getThreadReplayStats: () => Effect.die("Unexpected getThreadReplayStats"),
               dispatch,
               readEvents: () => Stream.empty,
               dispatchClient: () => Effect.die("unused"),
               dispatchAgentControl: () => Effect.die("unused"),
               streamDomainEvents: Stream.empty,
+              subscribeDomainEvents: Effect.succeed(Stream.empty),
               latestSequence: Effect.succeed(0),
             }),
           ),
@@ -151,6 +155,9 @@ const makeProvider = (input: {
   >;
 }): ProviderService["Service"] =>
   ProviderService.of({
+    compactThread: () => Effect.die("Unexpected compactThread"),
+    assertConversationRollbackSupported: () => Effect.void,
+    uploadFeedback: () => Effect.die("Unexpected uploadFeedback"),
     startSession: input.startSession,
     sendTurn: () => Effect.die("unused"),
     interruptTurn: () => Effect.die("unused"),

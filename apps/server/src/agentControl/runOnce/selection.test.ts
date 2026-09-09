@@ -12,7 +12,7 @@ import {
   selectAgentControlRunOnceCandidate,
 } from "./selection.ts";
 
-const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const layer = it.layer(NodeSqliteClient.layerMemory());
 

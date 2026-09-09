@@ -5,7 +5,7 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
-export class AgentControlImplementationStageFinalizerError extends Schema.TaggedErrorClass<AgentControlImplementationStageFinalizerError>()(
+export class AgentControlImplementationStageFinalizerError extends Schema.TaggedError<AgentControlImplementationStageFinalizerError>()(
   "AgentControlImplementationStageFinalizerError",
   {
     handoffId: Schema.String,

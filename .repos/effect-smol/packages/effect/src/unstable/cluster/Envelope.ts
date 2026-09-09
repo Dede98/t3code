@@ -1,26 +1,11 @@
 /**
- * The `Envelope` module defines the transport messages exchanged by Effect
- * cluster entities while processing RPC requests. Envelopes wrap decoded
- * request payloads with routing metadata, trace context, and request ids, and
- * also model delivery-control messages such as streamed-reply acknowledgements
- * and request interrupts.
+ * Defines the transport envelopes exchanged by cluster entities.
  *
- * **Common use cases**
- *
- * - Construct a runtime request envelope with {@link makeRequest}
- * - Decode or encode envelopes crossing a network or durable queue with {@link PartialJson}
- * - Batch encoded envelopes with {@link PartialArray}
- * - Detect envelope values at runtime with {@link isEnvelope}
- * - Build storage keys for keyed request payloads with {@link primaryKey}
- *
- * **Serialization and delivery notes**
- *
- * Request envelopes are decoded in two phases: the envelope metadata is parsed
- * first, while the RPC payload remains `unknown` until the receiving side knows
- * the target RPC schema. Snowflake identifiers are encoded as strings for JSON
- * transport, and acknowledgement / interrupt envelopes carry the original
- * request id so delivery protocols can correlate control messages with the
- * in-flight request.
+ * Request envelopes wrap decoded RPC payloads with the target entity address,
+ * RPC tag, request id, headers, and optional tracing context. The module also
+ * includes acknowledgement envelopes for streamed reply chunks, interrupt
+ * envelopes for in-flight requests, JSON codecs for partially decoded
+ * envelopes, guards, request constructors, and storage primary-key helpers.
  *
  * @since 4.0.0
  */
@@ -28,7 +13,7 @@ import * as Predicate from "../../Predicate.ts"
 import * as PrimaryKey from "../../PrimaryKey.ts"
 import type { ReadonlyRecord } from "../../Record.ts"
 import * as Schema from "../../Schema.ts"
-import * as Transformation from "../../SchemaTransformation.ts"
+import * as SchemaTransformation from "../../SchemaTransformation.ts"
 import * as Headers from "../http/Headers.ts"
 import type * as Rpc from "../rpc/Rpc.ts"
 import { EntityAddress } from "./EntityAddress.ts"
@@ -41,6 +26,35 @@ import { type Snowflake, SnowflakeFromBigInt } from "./Snowflake.ts"
  * @since 4.0.0
  */
 export const TypeId = "~effect/cluster/Envelope"
+
+/**
+ * Schema for a value that has already been encoded by the transport's hole
+ * codec.
+ *
+ * **Details**
+ *
+ * Cluster payloads are encoded twice: the entity payload is encoded with the
+ * entity RPC schema, and the result is carried opaquely inside the runner
+ * envelope. This schema names that hole so the outer runner encode leaves it
+ * alone. It is the identity under `Schema.toCodecJson`, so JSON, NDJSON, and
+ * MessagePack transports stay wire-compatible. A binary codec compiles it as a
+ * bytes leaf.
+ *
+ * @category schemas
+ * @since 4.0.0
+ */
+export const OpaqueHole: Schema.declare<any> = Schema.declare(
+  (_: unknown): _ is any => true,
+  {
+    expected: "an already-encoded value",
+    toCodecJson: () => undefined,
+    toCodec: () =>
+      Schema.link<any>()(
+        Schema.Uint8Array,
+        SchemaTransformation.passthrough()
+      )
+  }
+)
 
 /**
  * Union of cluster envelopes exchanged for an RPC request.
@@ -118,7 +132,7 @@ export class PartialRequest extends Schema.Opaque<PartialRequest>()(Schema.Struc
   requestId: SnowflakeFromBigInt,
   address: EntityAddress,
   tag: Schema.String,
-  payload: Schema.Any,
+  payload: OpaqueHole,
   headers: Headers.HeadersSchema,
   traceId: Schema.optional(Schema.String),
   spanId: Schema.optional(Schema.String),
@@ -335,7 +349,7 @@ export declare namespace Request {
  *
  * The check is based on the envelope type identifier.
  *
- * @category refinements
+ * @category guards
  * @since 4.0.0
  */
 export const isEnvelope = (u: unknown): u is Envelope<any> => Predicate.hasProperty(u, TypeId)
@@ -406,10 +420,10 @@ export const Request = Schema.declare(
  * @category serialization
  * @since 4.0.0
  */
-export const RequestTransform: Transformation.Transformation<
+export const RequestTransform: SchemaTransformation.Transformation<
   Request.Any,
   any
-> = Transformation.transform({
+> = SchemaTransformation.transform({
   decode: (u: any) => makeRequest(u),
   encode: (u) => u as any
 })
@@ -418,7 +432,7 @@ export const RequestTransform: Transformation.Transformation<
  * Returns the storage primary key for a request envelope whose payload has a
  * primary key, or `null` when the envelope is not a keyed request.
  *
- * @category primary key
+ * @category getters
  * @since 4.0.0
  */
 export const primaryKey = <R extends Rpc.Any>(envelope: Envelope<R>): string | null => {
@@ -436,7 +450,7 @@ export const primaryKey = <R extends Rpc.Any>(envelope: Envelope<R>): string | n
  * Builds a storage primary-key string from an entity address, RPC tag, and
  * payload primary-key ID.
  *
- * @category primary key
+ * @category constructors
  * @since 4.0.0
  */
 export const primaryKeyByAddress = (options: {
@@ -444,5 +458,6 @@ export const primaryKeyByAddress = (options: {
   readonly tag: string
   readonly id: string
 }): string =>
-  // hash the entity address to save space?
+  // storage drivers with fixed-width key columns (e.g. SqlMessageStorage)
+  // hash this composed key at their own boundary
   `${options.address.entityType}/${options.address.entityId}/${options.tag}/${options.id}`

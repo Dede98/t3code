@@ -10,7 +10,7 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
-export class AgentControlTaskIntakeStartupError extends Schema.TaggedErrorClass<AgentControlTaskIntakeStartupError>()(
+export class AgentControlTaskIntakeStartupError extends Schema.TaggedError<AgentControlTaskIntakeStartupError>()(
   "AgentControlTaskIntakeStartupError",
   {
     reason: Schema.Literals([

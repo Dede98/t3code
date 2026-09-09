@@ -11,7 +11,7 @@ import type {
 } from "../model.ts";
 import type { AgentControlImplementationHandoffAuthority } from "../handoffValidation.ts";
 
-export class AgentControlImplementationStoreError extends Schema.TaggedErrorClass<AgentControlImplementationStoreError>()(
+export class AgentControlImplementationStoreError extends Schema.TaggedError<AgentControlImplementationStoreError>()(
   "AgentControlImplementationStoreError",
   {
     operation: Schema.String,

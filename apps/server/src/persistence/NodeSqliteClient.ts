@@ -2236,7 +2236,7 @@ export interface SqliteMemoryClientConfig extends Omit<
   };
 }
 
-export class UnsupportedNodeSqliteVersionError extends Schema.TaggedErrorClass<UnsupportedNodeSqliteVersionError>()(
+export class UnsupportedNodeSqliteVersionError extends Schema.TaggedError<UnsupportedNodeSqliteVersionError>()(
   "UnsupportedNodeSqliteVersionError",
   {
     nodeVersion: Schema.String,
@@ -2248,7 +2248,7 @@ export class UnsupportedNodeSqliteVersionError extends Schema.TaggedErrorClass<U
   }
 }
 
-export class UnsupportedNodeSqliteOperationError extends Schema.TaggedErrorClass<UnsupportedNodeSqliteOperationError>()(
+export class UnsupportedNodeSqliteOperationError extends Schema.TaggedError<UnsupportedNodeSqliteOperationError>()(
   "UnsupportedNodeSqliteOperationError",
   {},
 ) {
@@ -3099,9 +3099,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         }),
       );
 
-    const runValues = (sql: string, params: ReadonlyArray<unknown>) =>
+    const runValues = (sql: string, params: ReadonlyArray<unknown>, unprepared = false) =>
       Effect.acquireUseRelease(
-        prepareCached(sql),
+        unprepared ? prepareUncached(sql) : prepareCached(sql),
         (statement) =>
           runStatement(statement, params, (statement, params) => {
             if (hasRows(statement)) {
@@ -3136,6 +3136,9 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       },
       executeRaw(sql, params) {
         return run(sql, params, true);
+      },
+      executeValuesUnprepared(sql, params) {
+        return runValues(sql, params, true);
       },
       executeValues(sql, params) {
         return runValues(sql, params);

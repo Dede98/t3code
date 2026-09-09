@@ -9,7 +9,7 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
-export class AgentControlVerificationTurnCoordinatorError extends Schema.TaggedErrorClass<AgentControlVerificationTurnCoordinatorError>()(
+export class AgentControlVerificationTurnCoordinatorError extends Schema.TaggedError<AgentControlVerificationTurnCoordinatorError>()(
   "AgentControlVerificationTurnCoordinatorError",
   {
     operation: Schema.String,

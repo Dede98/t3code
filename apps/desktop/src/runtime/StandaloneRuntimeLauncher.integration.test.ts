@@ -39,7 +39,7 @@ const decodeRecoveryJson = Schema.decodeUnknownSync(
   Schema.fromJsonString(RuntimeDaemonRecoveryState),
 );
 const encodeRecovery = Schema.encodeSync(Schema.fromJsonString(RuntimeDaemonRecoveryState));
-const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const FakeSpawnRecordSchema = Schema.Struct({
   pid: Schema.Int,
   at: Schema.Number,
@@ -133,7 +133,7 @@ interface IntegrationHarness {
   readonly materialized: StandaloneRuntimeLauncher.MaterializedRuntimeLauncher;
 }
 
-class IntegrationTestError extends Schema.TaggedErrorClass<IntegrationTestError>()(
+class IntegrationTestError extends Schema.TaggedError<IntegrationTestError>()(
   "IntegrationTestError",
   {},
 ) {}

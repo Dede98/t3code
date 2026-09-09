@@ -44,7 +44,7 @@ const repository = {
 } as const;
 const now = "2026-07-23T10:00:00.000Z";
 const encodeTaskState = Schema.encodeUnknownEffect(Schema.fromJsonString(AgentControlTaskState));
-const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const sourcePrecondition = (
   projectId: ProjectId,
   expectedIssueCount: number,

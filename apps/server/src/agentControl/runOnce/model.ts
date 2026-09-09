@@ -1,7 +1,7 @@
 import { AgentControlRunOnceId, AgentControlRunOnceStep, ProjectId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-export class AgentControlRunOnceError extends Schema.TaggedErrorClass<AgentControlRunOnceError>()(
+export class AgentControlRunOnceError extends Schema.TaggedError<AgentControlRunOnceError>()(
   "AgentControlRunOnceError",
   {
     projectId: ProjectId,

@@ -29,7 +29,7 @@ import {
   type VerificationTerminalSource,
 } from "./terminalObservation.ts";
 
-export class AgentControlVerificationOrchestrationHistoryError extends Schema.TaggedErrorClass<AgentControlVerificationOrchestrationHistoryError>()(
+export class AgentControlVerificationOrchestrationHistoryError extends Schema.TaggedError<AgentControlVerificationOrchestrationHistoryError>()(
   "AgentControlVerificationOrchestrationHistoryError",
   {
     operation: Schema.String,

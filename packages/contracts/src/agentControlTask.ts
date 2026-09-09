@@ -619,7 +619,7 @@ export const AgentControlTaskRejectedCommandCode = Schema.Literals(
 export type AgentControlTaskRejectedCommandCode = typeof AgentControlTaskRejectedCommandCode.Type;
 
 /** Closed wire error: it cannot carry source content, commands, paths, or exceptions. */
-export class AgentControlTaskRpcError extends Schema.TaggedErrorClass<AgentControlTaskRpcError>()(
+export class AgentControlTaskRpcError extends Schema.TaggedError<AgentControlTaskRpcError>()(
   "AgentControlTaskRpcError",
   {
     code: AgentControlTaskRejectedCommandCode,

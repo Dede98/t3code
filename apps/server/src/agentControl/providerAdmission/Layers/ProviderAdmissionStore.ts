@@ -1970,10 +1970,15 @@ const make = Effect.gen(function* () {
       const capacityProblems = yield* sql<{ readonly count: number }>`
       SELECT count(*) AS count
       FROM main.agent_control_provider_capacity_current capacity
-      WHERE NOT EXISTS (
+      WHERE (NOT EXISTS (
           SELECT 1 FROM main.agent_control_provider_admission_intents intent
           WHERE intent.provider_instance_id=capacity.provider_instance_id
-        )
+        ) AND NOT (
+          capacity.last_fence_token=0 AND capacity.revision=1
+          AND capacity.active_admission_id IS NULL AND capacity.active_state IS NULL
+          AND capacity.active_owner_id IS NULL AND capacity.active_lease_expires_at IS NULL
+          AND capacity.active_fence_token IS NULL AND capacity.active_marker_fingerprint IS NULL
+        ))
         OR capacity.last_fence_token!=COALESCE((
           SELECT MAX(history.provider_fence_token)
           FROM main.agent_control_provider_claim_history history

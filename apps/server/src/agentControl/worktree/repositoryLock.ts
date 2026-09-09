@@ -8,7 +8,7 @@ import * as DateTime from "effect/DateTime";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
-export class AgentControlRepositoryLockError extends Schema.TaggedErrorClass<AgentControlRepositoryLockError>()(
+export class AgentControlRepositoryLockError extends Schema.TaggedError<AgentControlRepositoryLockError>()(
   "AgentControlRepositoryLockError",
   { reason: Schema.Literals(["busy", "io", "ownership-lost"]) },
 ) {}

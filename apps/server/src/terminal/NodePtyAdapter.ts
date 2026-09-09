@@ -9,7 +9,7 @@ import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/ho
 
 import * as PtyAdapter from "./PtyAdapter.ts";
 
-export class NodePtyModuleLoadError extends Schema.TaggedErrorClass<NodePtyModuleLoadError>()(
+export class NodePtyModuleLoadError extends Schema.TaggedError<NodePtyModuleLoadError>()(
   "NodePtyModuleLoadError",
   {
     platform: Schema.String,
@@ -69,9 +69,11 @@ const ensureNodePtySpawnHelperExecutable = Effect.fn(function* () {
 
 class NodePtyProcess implements PtyAdapter.PtyProcess {
   private readonly process: import("node-pty").IPty;
+  private readonly platform: NodeJS.Platform;
 
-  constructor(process: import("node-pty").IPty) {
+  constructor(process: import("node-pty").IPty, platform: NodeJS.Platform) {
     this.process = process;
+    this.platform = platform;
   }
 
   get pid(): number {
@@ -87,7 +89,8 @@ class NodePtyProcess implements PtyAdapter.PtyProcess {
   }
 
   kill(signal?: string): void {
-    this.process.kill(signal);
+    // node-pty terminates the Windows process tree without a POSIX signal.
+    this.process.kill(this.platform === "win32" ? undefined : signal);
   }
 
   onData(callback: (data: string) => void): () => void {
@@ -141,14 +144,21 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* (
   return PtyAdapter.PtyAdapter.of({
     spawn: Effect.fn("NodePtyAdapter.spawn")(function* (input) {
       yield* ensureNodePtySpawnHelperExecutableCached;
+      // node-pty only writes `name` into the child's TERM on the Unix path;
+      // the ConPTY path leaves the environment untouched, so Windows children
+      // inherit a missing or 16-color TERM unless it is set here.
+      const env =
+        platform === "win32" && input.env["TERM"] === undefined
+          ? { ...input.env, TERM: "xterm-256color" }
+          : input.env;
       const ptyProcess = yield* Effect.try({
         try: () =>
           nodePty.spawn(input.shell, input.args ?? [], {
             cwd: input.cwd,
             cols: input.cols,
             rows: input.rows,
-            env: input.env,
-            name: platform === "win32" ? "xterm-color" : "xterm-256color",
+            env,
+            name: "xterm-256color",
           }),
         catch: (cause) =>
           new PtyAdapter.PtySpawnError({
@@ -157,7 +167,7 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* (
             cause,
           }),
       });
-      return new NodePtyProcess(ptyProcess);
+      return new NodePtyProcess(ptyProcess, platform);
     }),
   });
 });

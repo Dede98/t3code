@@ -4,7 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
-export class AgentControlVerificationStageFinalizerError extends Schema.TaggedErrorClass<AgentControlVerificationStageFinalizerError>()(
+export class AgentControlVerificationStageFinalizerError extends Schema.TaggedError<AgentControlVerificationStageFinalizerError>()(
   "AgentControlVerificationStageFinalizerError",
   {
     handoffId: Schema.String,

@@ -1,15 +1,15 @@
 /**
- * MigrationsLive - Migration runner with inline loader
+ * Migration runner with an inline loader.
  *
  * Uses Migrator.make with fromRecord to define migrations inline.
  * All migrations are statically imported - no dynamic file system loading.
  *
- * Migrations run automatically when the MigrationLayer is provided,
- * ensuring the database schema is always up-to-date before the application starts.
+ * `runMigrations` is called by the SQLite persistence layer at startup, so the
+ * schema is always up to date before the application starts.
  */
 
 import * as Migrator from "effect/unstable/sql/Migrator";
-import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as Effect from "effect/Effect";
 
 // Import all migrations statically
@@ -46,38 +46,23 @@ import Migration0030 from "./Migrations/030_ProjectionThreadShellArchiveIndexes.
 import Migration0031 from "./Migrations/031_AuthAuthorizationScopes.ts";
 import Migration0032 from "./Migrations/032_AuthPairingProofKeyThumbprint.ts";
 import Migration0033 from "./Migrations/033_ClaudeSessionStore.ts";
-import Migration0034 from "./Migrations/034_OrchestrationCommandAuthority.ts";
-import Migration0035 from "./Migrations/035_AgentControlThreadBinding.ts";
-import Migration0036 from "./Migrations/036_AgentControlProjectPolicies.ts";
-import Migration0037 from "./Migrations/037_DetachAgentControlProjectPolicies.ts";
-import Migration0038 from "./Migrations/038_AgentControlCqrsFoundation.ts";
-import Migration0039 from "./Migrations/039_AgentControlGithubObserveFoundation.ts";
-import Migration0040 from "./Migrations/040_AgentControlGithubObserveReactor.ts";
-import Migration0041 from "./Migrations/041_AgentControlGithubObserveRecoveryCas.ts";
-import Migration0042 from "./Migrations/042_AgentControlTaskIntakeCqrs.ts";
-import Migration0043 from "./Migrations/043_AgentControlTaskIntakeHardening.ts";
-import Migration0044 from "./Migrations/044_AgentControlStageRunCqrs.ts";
-import Migration0045 from "./Migrations/045_AgentControlStageRunLeaseFoundation.ts";
-import Migration0046 from "./Migrations/046_AgentControlWorktreeReservationFoundation.ts";
-import Migration0047 from "./Migrations/047_AgentControlControlledThreadReservationFoundation.ts";
-import Migration0048 from "./Migrations/048_AgentControlControlledThreadMaterializationBoundary.ts";
-import Migration0049 from "./Migrations/049_AgentControlControlledThreadMaterializationCoordinator.ts";
-import Migration0050 from "./Migrations/050_AgentControlControlledThreadPrepareFinalization.ts";
-import Migration0051 from "./Migrations/051_AgentControlInitialPlanningHandoff.ts";
-import Migration0052 from "./Migrations/052_AgentControlInitialPlanningStageFinalization.ts";
-import Migration0053 from "./Migrations/053_AgentControlInitialPlanningStageFinalizationHardening.ts";
-import Migration0054 from "./Migrations/054_AgentControlImplementationAdmission.ts";
-import Migration0055 from "./Migrations/055_AgentControlImplementationTurnStart.ts";
-import Migration0056 from "./Migrations/056_AgentControlImplementationStageFinalization.ts";
-import Migration0057 from "./Migrations/057_AgentControlVerificationAdmission.ts";
-import Migration0058 from "./Migrations/058_AgentControlVerificationTurnStart.ts";
-import Migration0059 from "./Migrations/059_AgentControlVerificationTurnTerminalObservation.ts";
-import Migration0060 from "./Migrations/060_AgentControlVerificationEvaluation.ts";
-import Migration0061 from "./Migrations/061_AgentControlVerificationStageFinalization.ts";
-import Migration0062 from "./Migrations/062_AgentControlTaskVerificationFinalization.ts";
-import Migration0063 from "./Migrations/063_AgentControlRunOnceActivation.ts";
-import Migration0064 from "./Migrations/064_AgentControlArmedSingleFlight.ts";
-import Migration0065 from "./Migrations/065_AgentControlProviderCapacityAdmission.ts";
+import Migration0034 from "./Migrations/034_ProjectionThreadsSettled.ts";
+import Migration0035 from "./Migrations/035_ProjectionThreadsSnoozed.ts";
+import Migration0036 from "./Migrations/036_ProjectionThreadTitleRegeneration.ts";
+import Migration0037 from "./Migrations/037_ProjectionThreadsPinned.ts";
+import Migration0038 from "./Migrations/038_ProjectionTurnsKeysetIndex.ts";
+import Migration0039 from "./Migrations/039_ProjectionThreadsPinOrderKey.ts";
+import Migration0040 from "./Migrations/040_ProjectionProjectsDefaultThreadEnvMode.ts";
+import Migration0041 from "./Migrations/041_ProjectionProjectFaviconPath.ts";
+import Migration0042 from "./Migrations/042_AuthSessionClientConnection.ts";
+import Migration0043 from "./Migrations/043_ProjectionThreadLinkedPullRequest.ts";
+import Migration0044 from "./Migrations/044_ProjectionThreadsUnsettledAt.ts";
+import Migration0045 from "./Migrations/045_ClearAutomaticProjectModelDefaults.ts";
+import Migration0046 from "./Migrations/046_ProjectionProjectsAutoPull.ts";
+import Migration0047 from "./Migrations/047_RepairAutomaticSettlementTimestamps.ts";
+import Migration0048 from "./Migrations/048_ProjectionProjectIcon.ts";
+import Migration0049 from "./Migrations/049_ProjectionThreadBranchPullRequest.ts";
+import Migration0050 from "./Migrations/050_ProjectionThreadsActiveOrderKey.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -89,7 +74,78 @@ import Migration0065 from "./Migrations/065_AgentControlProviderCapacityAdmissio
  * Uses Migrator.fromRecord which parses the key format and
  * returns migrations sorted by ID.
  */
-export const migrationEntries = [
+import AgentMigration0034 from "./Migrations/034_OrchestrationCommandAuthority.ts";
+import AgentMigration0035 from "./Migrations/035_AgentControlThreadBinding.ts";
+import AgentMigration0036 from "./Migrations/036_AgentControlProjectPolicies.ts";
+import AgentMigration0037 from "./Migrations/037_DetachAgentControlProjectPolicies.ts";
+import AgentMigration0038 from "./Migrations/038_AgentControlCqrsFoundation.ts";
+import AgentMigration0039 from "./Migrations/039_AgentControlGithubObserveFoundation.ts";
+import AgentMigration0040 from "./Migrations/040_AgentControlGithubObserveReactor.ts";
+import AgentMigration0041 from "./Migrations/041_AgentControlGithubObserveRecoveryCas.ts";
+import AgentMigration0042 from "./Migrations/042_AgentControlTaskIntakeCqrs.ts";
+import AgentMigration0043 from "./Migrations/043_AgentControlTaskIntakeHardening.ts";
+import AgentMigration0044 from "./Migrations/044_AgentControlStageRunCqrs.ts";
+import AgentMigration0045 from "./Migrations/045_AgentControlStageRunLeaseFoundation.ts";
+import AgentMigration0046 from "./Migrations/046_AgentControlWorktreeReservationFoundation.ts";
+import AgentMigration0047 from "./Migrations/047_AgentControlControlledThreadReservationFoundation.ts";
+import AgentMigration0048 from "./Migrations/048_AgentControlControlledThreadMaterializationBoundary.ts";
+import AgentMigration0049 from "./Migrations/049_AgentControlControlledThreadMaterializationCoordinator.ts";
+import AgentMigration0050 from "./Migrations/050_AgentControlControlledThreadPrepareFinalization.ts";
+import AgentMigration0051 from "./Migrations/051_AgentControlInitialPlanningHandoff.ts";
+import AgentMigration0052 from "./Migrations/052_AgentControlInitialPlanningStageFinalization.ts";
+import AgentMigration0053 from "./Migrations/053_AgentControlInitialPlanningStageFinalizationHardening.ts";
+import AgentMigration0054 from "./Migrations/054_AgentControlImplementationAdmission.ts";
+import AgentMigration0055 from "./Migrations/055_AgentControlImplementationTurnStart.ts";
+import AgentMigration0056 from "./Migrations/056_AgentControlImplementationStageFinalization.ts";
+import AgentMigration0057 from "./Migrations/057_AgentControlVerificationAdmission.ts";
+import AgentMigration0058 from "./Migrations/058_AgentControlVerificationTurnStart.ts";
+import AgentMigration0059 from "./Migrations/059_AgentControlVerificationTurnTerminalObservation.ts";
+import AgentMigration0060 from "./Migrations/060_AgentControlVerificationEvaluation.ts";
+import AgentMigration0061 from "./Migrations/061_AgentControlVerificationStageFinalization.ts";
+import AgentMigration0062 from "./Migrations/062_AgentControlTaskVerificationFinalization.ts";
+import AgentMigration0063 from "./Migrations/063_AgentControlRunOnceActivation.ts";
+import AgentMigration0064 from "./Migrations/064_AgentControlArmedSingleFlight.ts";
+import AgentMigration0065 from "./Migrations/065_AgentControlProviderCapacityAdmission.ts";
+
+import AgentMigration0066 from "./Migrations/066_AgentControlMainLifecycleEvents.ts";
+
+const agentMigrationEntries = [
+  [34, "OrchestrationCommandAuthority", AgentMigration0034],
+  [35, "AgentControlThreadBinding", AgentMigration0035],
+  [36, "AgentControlProjectPolicies", AgentMigration0036],
+  [37, "DetachAgentControlProjectPolicies", AgentMigration0037],
+  [38, "AgentControlCqrsFoundation", AgentMigration0038],
+  [39, "AgentControlGithubObserveFoundation", AgentMigration0039],
+  [40, "AgentControlGithubObserveReactor", AgentMigration0040],
+  [41, "AgentControlGithubObserveRecoveryCas", AgentMigration0041],
+  [42, "AgentControlTaskIntakeCqrs", AgentMigration0042],
+  [43, "AgentControlTaskIntakeHardening", AgentMigration0043],
+  [44, "AgentControlStageRunCqrs", AgentMigration0044],
+  [45, "AgentControlStageRunLeaseFoundation", AgentMigration0045],
+  [46, "AgentControlWorktreeReservationFoundation", AgentMigration0046],
+  [47, "AgentControlControlledThreadReservationFoundation", AgentMigration0047],
+  [48, "AgentControlControlledThreadMaterializationBoundary", AgentMigration0048],
+  [49, "AgentControlControlledThreadMaterializationCoordinator", AgentMigration0049],
+  [50, "AgentControlControlledThreadPrepareFinalization", AgentMigration0050],
+  [51, "AgentControlInitialPlanningHandoff", AgentMigration0051],
+  [52, "AgentControlInitialPlanningStageFinalization", AgentMigration0052],
+  [53, "AgentControlInitialPlanningStageFinalizationHardening", AgentMigration0053],
+  [54, "AgentControlImplementationAdmission", AgentMigration0054],
+  [55, "AgentControlImplementationTurnStart", AgentMigration0055],
+  [56, "AgentControlImplementationStageFinalization", AgentMigration0056],
+  [57, "AgentControlVerificationAdmission", AgentMigration0057],
+  [58, "AgentControlVerificationTurnStart", AgentMigration0058],
+  [59, "AgentControlVerificationTurnTerminalObservation", AgentMigration0059],
+  [60, "AgentControlVerificationEvaluation", AgentMigration0060],
+  [61, "AgentControlVerificationStageFinalization", AgentMigration0061],
+  [62, "AgentControlTaskVerificationFinalization", AgentMigration0062],
+  [63, "AgentControlRunOnceActivation", AgentMigration0063],
+  [64, "AgentControlArmedSingleFlight", AgentMigration0064],
+  [65, "AgentControlProviderCapacityAdmission", AgentMigration0065],
+  [66, "AgentControlMainLifecycleEvents", AgentMigration0066],
+] as const;
+
+const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
   [2, "OrchestrationCommandReceipts", Migration0002],
   [3, "CheckpointDiffBlobs", Migration0003],
@@ -123,44 +179,40 @@ export const migrationEntries = [
   [31, "AuthAuthorizationScopes", Migration0031],
   [32, "AuthPairingProofKeyThumbprint", Migration0032],
   [33, "ClaudeSessionStore", Migration0033],
-  [34, "OrchestrationCommandAuthority", Migration0034],
-  [35, "AgentControlThreadBinding", Migration0035],
-  [36, "AgentControlProjectPolicies", Migration0036],
-  [37, "DetachAgentControlProjectPolicies", Migration0037],
-  [38, "AgentControlCqrsFoundation", Migration0038],
-  [39, "AgentControlGithubObserveFoundation", Migration0039],
-  [40, "AgentControlGithubObserveReactor", Migration0040],
-  [41, "AgentControlGithubObserveRecoveryCas", Migration0041],
-  [42, "AgentControlTaskIntakeCqrs", Migration0042],
-  [43, "AgentControlTaskIntakeHardening", Migration0043],
-  [44, "AgentControlStageRunCqrs", Migration0044],
-  [45, "AgentControlStageRunLeaseFoundation", Migration0045],
-  [46, "AgentControlWorktreeReservationFoundation", Migration0046],
-  [47, "AgentControlControlledThreadReservationFoundation", Migration0047],
-  [48, "AgentControlControlledThreadMaterializationBoundary", Migration0048],
-  [49, "AgentControlControlledThreadMaterializationCoordinator", Migration0049],
-  [50, "AgentControlControlledThreadPrepareFinalization", Migration0050],
-  [51, "AgentControlInitialPlanningHandoff", Migration0051],
-  [52, "AgentControlInitialPlanningStageFinalization", Migration0052],
-  [53, "AgentControlInitialPlanningStageFinalizationHardening", Migration0053],
-  [54, "AgentControlImplementationAdmission", Migration0054],
-  [55, "AgentControlImplementationTurnStart", Migration0055],
-  [56, "AgentControlImplementationStageFinalization", Migration0056],
-  [57, "AgentControlVerificationAdmission", Migration0057],
-  [58, "AgentControlVerificationTurnStart", Migration0058],
-  [59, "AgentControlVerificationTurnTerminalObservation", Migration0059],
-  [60, "AgentControlVerificationEvaluation", Migration0060],
-  [61, "AgentControlVerificationStageFinalization", Migration0061],
-  [62, "AgentControlTaskVerificationFinalization", Migration0062],
-  [63, "AgentControlRunOnceActivation", Migration0063],
-  [64, "AgentControlArmedSingleFlight", Migration0064],
-  [65, "AgentControlProviderCapacityAdmission", Migration0065],
+  [34, "ProjectionThreadsSettled", Migration0034],
+  [35, "ProjectionThreadsSnoozed", Migration0035],
+  [36, "ProjectionThreadTitleRegeneration", Migration0036],
+  [37, "ProjectionThreadsPinned", Migration0037],
+  [38, "ProjectionTurnsKeysetIndex", Migration0038],
+  [39, "ProjectionThreadsPinOrderKey", Migration0039],
+  [40, "ProjectionProjectsDefaultThreadEnvMode", Migration0040],
+  [41, "ProjectionProjectFaviconPath", Migration0041],
+  [42, "AuthSessionClientConnection", Migration0042],
+  [43, "ProjectionThreadLinkedPullRequest", Migration0043],
+  [44, "ProjectionThreadsUnsettledAt", Migration0044],
+  [45, "ClearAutomaticProjectModelDefaults", Migration0045],
+  [46, "ProjectionProjectsAutoPull", Migration0046],
+  [47, "RepairAutomaticSettlementTimestamps", Migration0047],
+  [48, "ProjectionProjectIcon", Migration0048],
+  [49, "ProjectionThreadBranchPullRequest", Migration0049],
+  [50, "ProjectionThreadsActiveOrderKey", Migration0050],
 ] as const;
+
+export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
 
 export const makeMigrationLoader = (throughId?: number) =>
   Migrator.fromRecord(
     Object.fromEntries(
       migrationEntries
+        .filter(([id]) => throughId === undefined || id <= throughId)
+        .map(([id, name, migration]) => [`${id}_${name}`, migration]),
+    ),
+  );
+
+export const makeAgentControlMigrationLoader = (throughId?: number) =>
+  Migrator.fromRecord(
+    Object.fromEntries(
+      agentMigrationEntries
         .filter(([id]) => throughId === undefined || id <= throughId)
         .map(([id, name, migration]) => [`${id}_${name}`, migration]),
     ),
@@ -189,29 +241,38 @@ export interface RunMigrationsOptions {
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
 }: RunMigrationsOptions = {}) {
-  const executedMigrations = yield* run({ loader: makeMigrationLoader(toMigrationInclusive) });
+  const sql = yield* SqlClient.SqlClient;
+  // The two branches allocated IDs independently. Keep the released main
+  // history intact and track Agent Control migrations in a separate journal.
+  // Move only exact known legacy entries, preserving their original timestamps.
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`CREATE TABLE IF NOT EXISTS main.effect_sql_migrations (
+      migration_id integer PRIMARY KEY NOT NULL,
+      created_at datetime NOT NULL DEFAULT current_timestamp,
+      name VARCHAR(255) NOT NULL
+    )`;
+      yield* sql`CREATE TABLE IF NOT EXISTS main.effect_sql_agent_control_migrations (
+      migration_id integer PRIMARY KEY NOT NULL,
+      created_at datetime NOT NULL DEFAULT current_timestamp,
+      name VARCHAR(255) NOT NULL
+    )`;
+      for (const [id, name] of agentMigrationEntries) {
+        yield* sql`INSERT OR IGNORE INTO main.effect_sql_agent_control_migrations
+        SELECT * FROM main.effect_sql_migrations WHERE migration_id = ${id} AND name = ${name}`;
+        yield* sql`DELETE FROM main.effect_sql_migrations WHERE migration_id = ${id} AND name = ${name}`;
+      }
+    }),
+  );
+  const coreMigrations = yield* run({ loader: makeMigrationLoader(toMigrationInclusive) });
+  const agentMigrations = yield* run({
+    table: "effect_sql_agent_control_migrations",
+    loader: makeAgentControlMigrationLoader(toMigrationInclusive),
+  });
+  const executedMigrations = [...coreMigrations, ...agentMigrations];
   const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
   yield* migrations.length === 0
     ? Effect.logDebug("Database schema is current")
     : Effect.log("Migrations ran successfully").pipe(Effect.annotateLogs({ migrations }));
   return executedMigrations;
 });
-
-/**
- * Layer that runs migrations when the layer is built.
- *
- * Use this to ensure migrations run before your application starts.
- * Migrations are run automatically - no separate script is needed.
- *
- * @example
- * ```typescript
- * import { MigrationsLive } from "@acme/db/Migrations"
- * import * as SqliteClient from "@acme/db/SqliteClient"
- *
- * // Migrations run automatically when SqliteClient is provided
- * const AppLayer = MigrationsLive.pipe(
- *   Layer.provideMerge(SqliteClient.layer({ filename: "database.sqlite" }))
- * )
- * ```
- */
-export const MigrationsLive = Layer.effectDiscard(runMigrations());

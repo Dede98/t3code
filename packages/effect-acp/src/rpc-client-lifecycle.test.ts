@@ -1,3 +1,4 @@
+import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
 import { assert, describe, it } from "@effect/vitest";
 import {
   Cause,
@@ -66,6 +67,7 @@ const makeProtocolHarness = Effect.fn("makeProtocolHarness")(function* (sendRequ
       Queue.offer(outbound, message).pipe(
         Effect.andThen(message._tag === "Request" ? sendRequest(message) : Effect.void),
       ),
+    codecFor: RpcSerialization.ndJsonRpc().codecFor,
     supportsAck: false,
     supportsTransferables: false,
   });
@@ -83,7 +85,7 @@ const makeProtocolHarness = Effect.fn("makeProtocolHarness")(function* (sendRequ
   return { outbound, protocol, respond } satisfies ProtocolHarness;
 });
 
-const requestIds = (...ids: ReadonlyArray<bigint>) => {
+const requestIds = (...ids: ReadonlyArray<number>) => {
   let index = 0;
   return () => RequestId(ids[index++]!);
 };
@@ -91,7 +93,7 @@ const requestIds = (...ids: ReadonlyArray<bigint>) => {
 const makeClient = <Rpcs extends Rpc.Any>(
   group: RpcGroup.RpcGroup<Rpcs>,
   harness: ProtocolHarness,
-  ids: ReadonlyArray<bigint>,
+  ids: ReadonlyArray<number>,
 ) =>
   RpcClient.make(group, {
     disableTracing: true,
@@ -109,7 +111,7 @@ const sendError = (label: string) =>
     reason: new RpcClientDefect({ message: label, cause: label }),
   });
 
-const successResponse = (requestId: string, value: unknown): FromServerEncoded => ({
+const successResponse = (requestId: string | number, value: unknown): FromServerEncoded => ({
   _tag: "Exit",
   requestId,
   exit: { _tag: "Success", value },
@@ -160,7 +162,7 @@ const makeObservedStruct = (value: unknown) => {
 
 const runUnarySendFailure = Effect.fn("runUnarySendFailure")(function* (
   cause: Cause.Cause<RpcClientError>,
-  requestId: bigint,
+  requestId: number,
 ) {
   let transportCause: Cause.Cause<RpcClientError> | undefined;
   const harness = yield* makeProtocolHarness(() =>
@@ -187,7 +189,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
   it.effect("ignores a valid late success response after send failure", () =>
     Effect.gen(function* () {
       const cause = Cause.fail(sendError("late-success"));
-      const { harness, request } = yield* runUnarySendFailure(cause, 101n);
+      const { harness, request } = yield* runUnarySendFailure(cause, 101);
       const observed = makeObservedStruct("late");
 
       yield* harness.respond(successResponse(request.id, observed.encoded));
@@ -199,7 +201,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
   it.effect("ignores a valid late error response after send failure", () =>
     Effect.gen(function* () {
       const cause = Cause.fail(sendError("late-error"));
-      const { harness, request } = yield* runUnarySendFailure(cause, 102n);
+      const { harness, request } = yield* runUnarySendFailure(cause, 102);
       let reads = 0;
       const reason: { readonly _tag: "Fail"; readonly error: unknown } = Object.defineProperty(
         { _tag: "Fail" as const },
@@ -228,14 +230,14 @@ describe("Effect RPC request lifecycle cleanup", () => {
       const defect = new Error("send-defect");
       const cause = Cause.die(defect) as Cause.Cause<RpcClientError>;
 
-      yield* runUnarySendFailure(cause, 103n);
+      yield* runUnarySendFailure(cause, 103);
     }),
   );
 
   it.effect("preserves the identical send interrupt Cause and FiberId", () =>
     Effect.gen(function* () {
       const cause = Cause.interrupt(73_001) as Cause.Cause<RpcClientError>;
-      const { exit } = yield* runUnarySendFailure(cause, 104n);
+      const { exit } = yield* runUnarySendFailure(cause, 104);
 
       assert.isTrue(Exit.isFailure(exit));
       if (Exit.isFailure(exit)) {
@@ -263,7 +265,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
         Cause.makeInterruptReason(73_002).annotate(annotation) as Cause.Reason<RpcClientError>,
       ];
       const cause = Cause.fromReasons(reasons);
-      const { exit } = yield* runUnarySendFailure(cause, 105n);
+      const { exit } = yield* runUnarySendFailure(cause, 105);
 
       assert.isTrue(Exit.isFailure(exit));
       if (Exit.isFailure(exit)) {
@@ -281,7 +283,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
   it.effect("does not decode a schema-invalid late terminal response", () =>
     Effect.gen(function* () {
       const cause = Cause.fail(sendError("late-invalid"));
-      const { harness, request } = yield* runUnarySendFailure(cause, 106n);
+      const { harness, request } = yield* runUnarySendFailure(cause, 106);
       const observed = makeObservedStruct(42);
 
       yield* harness.respond(successResponse(request.id, observed.encoded));
@@ -305,7 +307,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
             )
           : Effect.void;
       });
-      const client = yield* makeClient(TestRpcs, harness, [107n, 107n]);
+      const client = yield* makeClient(TestRpcs, harness, [107, 107]);
       const first = yield* client
         .Unary({ label: "first" })
         .pipe(Effect.forkChild({ startImmediately: true }));
@@ -338,7 +340,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
           Effect.andThen(Effect.failCause(cause)),
         ),
       );
-      const client = yield* makeClient(TestRpcs, harness, [108n]);
+      const client = yield* makeClient(TestRpcs, harness, [108]);
       const fiber = yield* client
         .Unary({ label: "send-wins" })
         .pipe(Effect.forkChild({ startImmediately: true }));
@@ -359,7 +361,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
       const outerScope = yield* Scope.Scope;
       const { fiber, request } = yield* Effect.scoped(
         Effect.gen(function* () {
-          const client = yield* makeClient(TestRpcs, harness, [109n]);
+          const client = yield* makeClient(TestRpcs, harness, [109]);
           const fiber = yield* client
             .Unary({ label: "no-response" })
             .pipe(Effect.forkIn(outerScope, { startImmediately: true }));
@@ -372,7 +374,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
       if (Exit.isFailure(exit)) {
         assert.isTrue(Cause.hasInterrupts(exit.cause));
       }
-      assert.strictEqual(request.id, "109");
+      assert.strictEqual(request.id, 109);
     }),
   );
 
@@ -380,9 +382,9 @@ describe("Effect RPC request lifecycle cleanup", () => {
     Effect.gen(function* () {
       const firstCause = Cause.fail(sendError("first-request"));
       const harness = yield* makeProtocolHarness((request) =>
-        request.id === "110" ? Effect.failCause(firstCause) : Effect.void,
+        request.id === 110 ? Effect.failCause(firstCause) : Effect.void,
       );
-      const client = yield* makeClient(TestRpcs, harness, [110n, 111n]);
+      const client = yield* makeClient(TestRpcs, harness, [110, 111]);
       const first = yield* client
         .Unary({ label: "first" })
         .pipe(Effect.forkChild({ startImmediately: true }));
@@ -402,7 +404,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
   it.effect("claims outer entries on ClientProtocolError", () =>
     Effect.gen(function* () {
       const harness = yield* makeProtocolHarness(() => Effect.never);
-      const client = yield* makeClient(TestRpcs, harness, [112n]);
+      const client = yield* makeClient(TestRpcs, harness, [112]);
       const fiber = yield* client
         .Unary({ label: "protocol-error" })
         .pipe(Effect.forkChild({ startImmediately: true }));
@@ -429,7 +431,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
   it.effect("preserves stream chunk order through the terminal exit", () =>
     Effect.gen(function* () {
       const harness = yield* makeProtocolHarness(() => Effect.void);
-      const client = (yield* makeClient(TestRpcs, harness, [113n])) as TestClient;
+      const client = (yield* makeClient(TestRpcs, harness, [113])) as TestClient;
       const fiber = yield* client
         .Numbers({ label: "chunks" })
         .pipe(Stream.runCollect, Effect.forkChild({ startImmediately: true }));
@@ -455,7 +457,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
     Effect.gen(function* () {
       const cause = Cause.fail(sendError("stream-send-failure"));
       const harness = yield* makeProtocolHarness(() => Effect.failCause(cause));
-      const client = (yield* makeClient(TestRpcs, harness, [114n])) as TestClient;
+      const client = (yield* makeClient(TestRpcs, harness, [114])) as TestClient;
       const fiber = yield* client
         .Numbers({ label: "stream-failure" })
         .pipe(Stream.runCollect, Effect.forkChild({ startImmediately: true }));
@@ -507,7 +509,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
       const ControlledRpcs = RpcGroup.make(ControlledRpc);
       const harness = yield* makeProtocolHarness(() => Effect.never);
       const clientScope = yield* Scope.make();
-      const client = yield* makeClient(ControlledRpcs, harness, [115n]).pipe(
+      const client = yield* makeClient(ControlledRpcs, harness, [115]).pipe(
         Effect.provideService(Scope.Scope, clientScope),
       );
       const requestFiber = yield* client
@@ -551,7 +553,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
         const hooks = RpcClient.RequestHooks.of({
           onRequestClaimReady: (info) =>
             Effect.gen(function* () {
-              assert.strictEqual(info.id, RequestId(116n));
+              assert.strictEqual(info.id, RequestId(116));
               assert.strictEqual(info.tag, "Unary");
               assert.isFalse(info.stream);
               if (info.claim === "response") {
@@ -567,7 +569,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
             }),
           onRequestClaimResult: (info) =>
             Effect.gen(function* () {
-              assert.strictEqual(info.id, RequestId(116n));
+              assert.strictEqual(info.id, RequestId(116));
               assert.strictEqual(info.tag, "Unary");
               assert.isFalse(info.stream);
               if (info.claim === "response") {
@@ -596,7 +598,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
             }),
         });
         const harness = yield* makeProtocolHarness(() => Effect.void);
-        const client = yield* makeClient(TestRpcs, harness, [116n, 116n]).pipe(
+        const client = yield* makeClient(TestRpcs, harness, [116, 116]).pipe(
           Effect.provideService(RpcClient.RequestHooks, hooks),
         );
         const first = yield* client
@@ -684,7 +686,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
         const hooks = RpcClient.RequestHooks.of({
           onRequestClaimReady: (info) =>
             Effect.gen(function* () {
-              assert.strictEqual(info.id, RequestId(117n));
+              assert.strictEqual(info.id, RequestId(117));
               assert.strictEqual(info.tag, "Numbers");
               assert.isTrue(info.stream);
               if (info.claim === "response") {
@@ -700,7 +702,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
             }),
           onRequestClaimResult: (info) =>
             Effect.gen(function* () {
-              assert.strictEqual(info.id, RequestId(117n));
+              assert.strictEqual(info.id, RequestId(117));
               assert.strictEqual(info.tag, "Numbers");
               assert.isTrue(info.stream);
               if (info.claim === "response") {
@@ -726,7 +728,7 @@ describe("Effect RPC request lifecycle cleanup", () => {
             }),
         });
         const harness = yield* makeProtocolHarness(() => Effect.void);
-        const client = (yield* makeClient(TestRpcs, harness, [117n, 117n]).pipe(
+        const client = (yield* makeClient(TestRpcs, harness, [117, 117]).pipe(
           Effect.provideService(RpcClient.RequestHooks, hooks),
         )) as TestClient;
         const oldScope = yield* Scope.make();

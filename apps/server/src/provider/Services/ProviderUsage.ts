@@ -1,13 +1,14 @@
+import type * as PubSub from "effect/PubSub";
+import type * as Scope from "effect/Scope";
 import type {
   ProviderInstanceId,
-  ProviderUsageRefreshResult,
   ProviderUsageSnapshot,
+  ProviderUsageRefreshResult,
   ProviderUsageStreamEvent,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
-import type * as PubSub from "effect/PubSub";
-import type * as Scope from "effect/Scope";
+import type * as Stream from "effect/Stream";
 
 export interface ProviderUsageShape {
   readonly inspectForAdmission?: (
@@ -17,6 +18,7 @@ export interface ProviderUsageShape {
     | { readonly _tag: "Observed"; readonly snapshot: ProviderUsageSnapshot }
     | { readonly _tag: "SupportedUnusable"; readonly observedAt: string }
   >;
+  readonly stream: Stream.Stream<ProviderUsageStreamEvent>;
   readonly getSnapshot: Effect.Effect<ReadonlyArray<ProviderUsageSnapshot>>;
   readonly refresh: (
     providerInstanceIds?: ReadonlyArray<ProviderInstanceId>,

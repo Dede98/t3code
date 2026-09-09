@@ -38,7 +38,7 @@ import {
   ORCHESTRATION_EVENT_ROUTE_INVALID,
 } from "../../orchestration/orchestrationEventStorage.ts";
 
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 // Production fixture reconstructed from the ProviderRuntimeIngestion correlation
 // object and EventMetadataFromJsonString encoder at 6ae31d3cc881380c706b7320cb8d652feaa5fcea.

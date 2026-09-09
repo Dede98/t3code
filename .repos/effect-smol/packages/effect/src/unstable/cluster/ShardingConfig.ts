@@ -1,39 +1,12 @@
 /**
- * The `ShardingConfig` module describes how an Effect Cluster runner joins and
- * participates in sharding. It combines the runner network identity, shard group
- * membership, shard-count and weight settings, storage-lock timing, entity
- * mailbox and lifecycle limits, and polling intervals used by the local runner.
+ * Configures how an Effect Cluster runner participates in sharding.
  *
- * **Mental model**
- *
- * - {@link ShardingConfig} is provided as a service so cluster components read
- *   one consistent set of sharding settings.
- * - {@link defaults} is the local-development baseline; {@link layer} overlays
- *   explicit values, and {@link layerFromEnv} loads constant-case environment
- *   variables before applying optional overrides.
- * - `runnerAddress` is the externally reachable address advertised to other
- *   runners; `runnerListenAddress` can differ when the process binds a
- *   different interface.
- * - `availableShardGroups`, `assignedShardGroups`, `shardsPerGroup`, and
- *   `runnerShardWeight` decide which shards a runner may own and how assignment
- *   is balanced.
- *
- * **Common tasks**
- *
- * - Provide default local configuration with {@link layerDefaults}.
- * - Override selected fields in code with {@link layer}.
- * - Load deployment configuration from the environment with
- *   {@link configFromEnv} or {@link layerFromEnv}.
- * - Normalize configured shard groups with {@link shardGroupConfig}.
- *
- * **Gotchas**
- *
- * - Keep cluster-wide values such as `availableShardGroups` and
- *   `shardsPerGroup` consistent for runners sharing the same storage backend.
- * - Use stable, reachable `runnerAddress` values; client-only nodes should use
- *   `Option.none()` for `runnerAddress`.
- * - Tune lock expiration, refresh intervals, and termination timeouts together
- *   so normal shutdown does not look like runner failure.
+ * `ShardingConfig` describes the runner address, shard group membership, shard
+ * counts and weights, lock timing, entity mailbox and lifecycle limits, polling
+ * intervals, health checks, and local serialization simulation. This module
+ * includes the service, default values, programmatic and environment-based
+ * layers, a `Config` description for loading values, and helpers for normalizing
+ * assigned shard groups.
  *
  * @since 4.0.0
  */
@@ -50,7 +23,7 @@ import { RunnerAddress } from "./RunnerAddress.ts"
 /**
  * Represents the configuration for the `Sharding` service on a given runner.
  *
- * @category models
+ * @category services
  * @since 4.0.0
  */
 export class ShardingConfig extends Context.Service<ShardingConfig, {
@@ -97,7 +70,11 @@ export class ShardingConfig extends Context.Service<ShardingConfig, {
    */
   readonly shardsPerGroup: number
   /**
-   * Shard lock refresh interval.
+   * The maximum interval between shard lock refreshes.
+   *
+   * The runner may shorten this interval to one third of
+   * `shardLockExpiration` to preserve enough time to stop entities safely if
+   * lock storage becomes unavailable.
    */
   readonly shardLockRefreshInterval: Duration.Input
   /**
@@ -118,6 +95,28 @@ export class ShardingConfig extends Context.Service<ShardingConfig, {
    * The default capacity of the mailbox for entities.
    */
   readonly entityMailboxCapacity: number | "unbounded"
+  /**
+   * The maximum number of entities that can be resident on this runner at the
+   * same time.
+   *
+   * When the limit is reached, no new entities are spawned: the storage read
+   * loop stops admitting messages for new entity addresses (they stay in
+   * storage until a slot frees up), and volatile sends to new addresses fail
+   * with `MailboxFull`.
+   *
+   * `"unbounded"` can only be set programmatically; the environment
+   * configuration only accepts integers.
+   *
+   * Defaults to `10_000`.
+   */
+  readonly maxResidentEntities: number | "unbounded"
+  /**
+   * The maximum number of unprocessed messages read from storage in a single
+   * poll.
+   *
+   * Defaults to `1024`.
+   */
+  readonly unprocessedMessageBatchSize: number
   /**
    * The maximum duration of inactivity (i.e. without receiving a message)
    * after which an entity will be interrupted.
@@ -186,6 +185,8 @@ export const defaults: ShardingConfig["Service"] = {
   shardLockExpiration: Duration.seconds(35),
   shardLockDisableAdvisory: false,
   entityMailboxCapacity: 4096,
+  maxResidentEntities: 10_000,
+  unprocessedMessageBatchSize: 1024,
   entityMaxIdleTime: Duration.minutes(1),
   entityRegistrationTimeout: Duration.minutes(1),
   entityTerminationTimeout: Duration.seconds(15),
@@ -203,10 +204,10 @@ export const defaults: ShardingConfig["Service"] = {
  *
  * **When to use**
  *
- * Use when wiring a cluster runner with explicit `ShardingConfig` values,
- * especially in tests, local development, or code paths where configuration
- * should be provided programmatically instead of loaded from environment
- * variables.
+ * Use when you need to wire a cluster runner with explicit `ShardingConfig`
+ * values, especially in tests, local development, or code paths where
+ * configuration should be provided programmatically instead of loaded from
+ * environment variables.
  *
  * **Details**
  *
@@ -233,7 +234,7 @@ export const layer = (options?: Partial<ShardingConfig["Service"]>): Layer.Layer
 /**
  * Layer that provides the default `ShardingConfig` values.
  *
- * @category defaults
+ * @category layers
  * @since 4.0.0
  */
 export const layerDefaults: Layer.Layer<ShardingConfig> = layer()
@@ -268,11 +269,11 @@ export const config: Config.Config<ShardingConfig["Service"]> = Config.all({
     Config.withDefault(defaults.runnerShardWeight)
     // Config.withDescription("A number that determines how many shards this runner will be assigned relative to other runners.")
   ),
-  availableShardGroups: Config.schema(Schema.Array(Schema.String), "availableShardGroups").pipe(
+  availableShardGroups: Config.schema(Config.Array(Schema.String), "availableShardGroups").pipe(
     Config.withDefault(["default"])
     // Config.withDescription("The shard groups available across all runners.")
   ),
-  assignedShardGroups: Config.schema(Schema.Array(Schema.String), "shardGroups").pipe(
+  assignedShardGroups: Config.schema(Config.Array(Schema.String), "shardGroups").pipe(
     Config.withDefault(["default"])
     // Config.withDescription("The shard groups that are assigned to this runner.")
   ),
@@ -299,6 +300,20 @@ export const config: Config.Config<ShardingConfig["Service"]> = Config.all({
   entityMailboxCapacity: Config.int("entityMailboxCapacity").pipe(
     Config.withDefault(defaults.entityMailboxCapacity)
     // Config.withDescription("The default capacity of the mailbox for entities.")
+  ),
+  maxResidentEntities: Config.schema(
+    Schema.Int.check(Schema.isGreaterThan(0)),
+    "maxResidentEntities"
+  ).pipe(
+    Config.withDefault(defaults.maxResidentEntities)
+    // Config.withDescription("The maximum number of entities that can be resident on this runner at the same time.")
+  ),
+  unprocessedMessageBatchSize: Config.schema(
+    Schema.Int.check(Schema.isGreaterThan(0)),
+    "unprocessedMessageBatchSize"
+  ).pipe(
+    Config.withDefault(defaults.unprocessedMessageBatchSize)
+    // Config.withDescription("The maximum number of unprocessed messages read from storage in a single poll.")
   ),
   entityMaxIdleTime: Config.duration("entityMaxIdleTime").pipe(
     Config.withDefault(defaults.entityMaxIdleTime)
@@ -376,7 +391,7 @@ export const layerFromEnv = (options?: Partial<ShardingConfig["Service"]> | unde
  * Normalizes the provided `ShardingConfig` to calculate the `available` and
  * `assigned` shard groups.
  *
- * @category Shard groups
+ * @category converting
  * @since 4.0.0
  */
 export const shardGroupConfig = (config: ShardingConfig["Service"]): {

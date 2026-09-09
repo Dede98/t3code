@@ -13,7 +13,7 @@ import type * as Scope from "effect/Scope";
 
 import type { ReactorStartupActivation } from "../../reactorStartupActivation.ts";
 
-export class OrchestrationReactorStartupError extends Schema.TaggedErrorClass<OrchestrationReactorStartupError>()(
+export class OrchestrationReactorStartupError extends Schema.TaggedError<OrchestrationReactorStartupError>()(
   "OrchestrationReactorStartupError",
   {
     reason: Schema.Literals([

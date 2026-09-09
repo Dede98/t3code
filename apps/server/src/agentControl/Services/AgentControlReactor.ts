@@ -12,7 +12,7 @@ import type { AgentControlRunOnceError } from "../runOnce/model.ts";
 import type { AgentControlArmedError } from "../armed/model.ts";
 import type { ProviderAdmissionError } from "../providerAdmission/Services/ProviderAdmissionStore.ts";
 
-export class AgentControlReactorStartupError extends Schema.TaggedErrorClass<AgentControlReactorStartupError>()(
+export class AgentControlReactorStartupError extends Schema.TaggedError<AgentControlReactorStartupError>()(
   "AgentControlReactorStartupError",
   {
     reason: Schema.Literals(["already-started-different-scope", "lifecycle-closed"]),

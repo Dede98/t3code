@@ -18,8 +18,8 @@ import { ClaudeSessionStoreLive } from "./ClaudeSessionStore.ts";
 const SESSION_ID = "00000000-0000-4000-8000-000000000099";
 const PROJECT_KEY = "tmp-project";
 const ASSISTANT_UUID = "assistant-checkpoint";
-const encodeUnknownJsonString = Schema.encodeSync(Schema.UnknownFromJsonString);
-const decodeUnknownJsonString = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeUnknownJsonString = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const testLayer = it.layer(
   Layer.mergeAll(

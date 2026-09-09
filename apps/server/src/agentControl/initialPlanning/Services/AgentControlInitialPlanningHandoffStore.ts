@@ -15,7 +15,7 @@ import type {
   AgentControlInitialPlanningHandoffEvidence,
 } from "../model.ts";
 
-export class AgentControlInitialPlanningStoreError extends Schema.TaggedErrorClass<AgentControlInitialPlanningStoreError>()(
+export class AgentControlInitialPlanningStoreError extends Schema.TaggedError<AgentControlInitialPlanningStoreError>()(
   "AgentControlInitialPlanningStoreError",
   {
     operation: Schema.String,

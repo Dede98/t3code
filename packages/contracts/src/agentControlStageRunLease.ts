@@ -666,7 +666,7 @@ export type AgentControlStageRunLeaseReceiptableRejectionCode =
   typeof AgentControlStageRunLeaseReceiptableRejectionCode.Type;
 
 /** Closed wire error: no holder, process, path, source content, or SQL cause. */
-export class AgentControlStageRunLeaseRpcError extends Schema.TaggedErrorClass<AgentControlStageRunLeaseRpcError>()(
+export class AgentControlStageRunLeaseRpcError extends Schema.TaggedError<AgentControlStageRunLeaseRpcError>()(
   "AgentControlStageRunLeaseRpcError",
   {
     code: AgentControlStageRunLeaseRejectedCommandCode,

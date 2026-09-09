@@ -319,7 +319,7 @@ export const AgentControlGithubRpcErrorCode = Schema.Literals(AGENT_CONTROL_GITH
 export type AgentControlGithubRpcErrorCode = typeof AgentControlGithubRpcErrorCode.Type;
 
 /** Wire-safe by construction: no cwd, argv, stderr, exception, token, or issue content. */
-export class AgentControlGithubRpcError extends Schema.TaggedErrorClass<AgentControlGithubRpcError>()(
+export class AgentControlGithubRpcError extends Schema.TaggedError<AgentControlGithubRpcError>()(
   "AgentControlGithubRpcError",
   {
     code: AgentControlGithubRpcErrorCode,

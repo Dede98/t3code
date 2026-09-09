@@ -1,7 +1,7 @@
 import { IsoDateTime, ProjectId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-export class AgentControlArmedError extends Schema.TaggedErrorClass<AgentControlArmedError>()(
+export class AgentControlArmedError extends Schema.TaggedError<AgentControlArmedError>()(
   "AgentControlArmedError",
   {
     projectId: ProjectId,

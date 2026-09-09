@@ -20,7 +20,7 @@ export const GithubIssueTrackerClientErrorCode = Schema.Literals([
 ]);
 export type GithubIssueTrackerClientErrorCode = typeof GithubIssueTrackerClientErrorCode.Type;
 
-export class GithubIssueTrackerClientError extends Schema.TaggedErrorClass<GithubIssueTrackerClientError>()(
+export class GithubIssueTrackerClientError extends Schema.TaggedError<GithubIssueTrackerClientError>()(
   "GithubIssueTrackerClientError",
   {
     code: GithubIssueTrackerClientErrorCode,

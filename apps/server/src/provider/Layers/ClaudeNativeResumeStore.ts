@@ -19,8 +19,8 @@ const MAIN_TRANSCRIPT_STATE_TYPES = ["last-prompt", "mode"] as const;
 const MAIN_TRANSCRIPT_STATE_TYPE_SET = new Set<string>(MAIN_TRANSCRIPT_STATE_TYPES);
 const DEFAULT_READINESS_TIMEOUT_MS = 5_000;
 const READINESS_POLL_INTERVAL_MS = 50;
-const encodeUnknownJsonString = Schema.encodeSync(Schema.UnknownFromJsonString);
-const decodeUnknownJsonString = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeUnknownJsonString = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const isClaudeSessionStoreError = Schema.is(ClaudeSessionStoreError);
 
 export interface ClaudeNativeResumeStoreOptions {

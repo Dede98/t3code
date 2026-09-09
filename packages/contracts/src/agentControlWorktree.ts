@@ -438,7 +438,7 @@ export const AgentControlWorktreeRejectedCommandCode = Schema.Literals(
 export type AgentControlWorktreeRejectedCommandCode =
   typeof AgentControlWorktreeRejectedCommandCode.Type;
 
-export class AgentControlWorktreeRpcError extends Schema.TaggedErrorClass<AgentControlWorktreeRpcError>()(
+export class AgentControlWorktreeRpcError extends Schema.TaggedError<AgentControlWorktreeRpcError>()(
   "AgentControlWorktreeRpcError",
   {
     code: AgentControlWorktreeRejectedCommandCode,

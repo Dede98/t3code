@@ -441,17 +441,17 @@ export const RuntimeDaemonStatus = Schema.Struct({
 });
 export type RuntimeDaemonStatus = typeof RuntimeDaemonStatus.Type;
 
-export class RuntimeInvalidProfileIdError extends Schema.TaggedErrorClass<RuntimeInvalidProfileIdError>()(
+export class RuntimeInvalidProfileIdError extends Schema.TaggedError<RuntimeInvalidProfileIdError>()(
   "RuntimeInvalidProfileIdError",
   { code: Schema.Literal("invalid-profile-id") },
 ) {}
 
-export class RuntimeInvalidProfileConfigError extends Schema.TaggedErrorClass<RuntimeInvalidProfileConfigError>()(
+export class RuntimeInvalidProfileConfigError extends Schema.TaggedError<RuntimeInvalidProfileConfigError>()(
   "RuntimeInvalidProfileConfigError",
   { code: Schema.Literal("invalid-profile-config") },
 ) {}
 
-export class RuntimeProfileConfigConflictError extends Schema.TaggedErrorClass<RuntimeProfileConfigConflictError>()(
+export class RuntimeProfileConfigConflictError extends Schema.TaggedError<RuntimeProfileConfigConflictError>()(
   "RuntimeProfileConfigConflictError",
   {
     code: Schema.Literal("profile-config-conflict"),
@@ -462,7 +462,7 @@ export class RuntimeProfileConfigConflictError extends Schema.TaggedErrorClass<R
   },
 ) {}
 
-export class RuntimeProfileNotFoundError extends Schema.TaggedErrorClass<RuntimeProfileNotFoundError>()(
+export class RuntimeProfileNotFoundError extends Schema.TaggedError<RuntimeProfileNotFoundError>()(
   "RuntimeProfileNotFoundError",
   {
     code: Schema.Literal("profile-not-found"),
@@ -470,7 +470,7 @@ export class RuntimeProfileNotFoundError extends Schema.TaggedErrorClass<Runtime
   },
 ) {}
 
-export class RuntimeProfileCorruptError extends Schema.TaggedErrorClass<RuntimeProfileCorruptError>()(
+export class RuntimeProfileCorruptError extends Schema.TaggedError<RuntimeProfileCorruptError>()(
   "RuntimeProfileCorruptError",
   {
     code: Schema.Literal("profile-corrupt"),
@@ -478,7 +478,7 @@ export class RuntimeProfileCorruptError extends Schema.TaggedErrorClass<RuntimeP
   },
 ) {}
 
-export class RuntimeProfilePathEscapeError extends Schema.TaggedErrorClass<RuntimeProfilePathEscapeError>()(
+export class RuntimeProfilePathEscapeError extends Schema.TaggedError<RuntimeProfilePathEscapeError>()(
   "RuntimeProfilePathEscapeError",
   {
     code: Schema.Literal("profile-path-escape"),
@@ -486,12 +486,12 @@ export class RuntimeProfilePathEscapeError extends Schema.TaggedErrorClass<Runti
   },
 ) {}
 
-export class RuntimeArtifactManifestInvalidError extends Schema.TaggedErrorClass<RuntimeArtifactManifestInvalidError>()(
+export class RuntimeArtifactManifestInvalidError extends Schema.TaggedError<RuntimeArtifactManifestInvalidError>()(
   "RuntimeArtifactManifestInvalidError",
   { code: Schema.Literal("artifact-manifest-invalid") },
 ) {}
 
-export class RuntimeArtifactFileMissingError extends Schema.TaggedErrorClass<RuntimeArtifactFileMissingError>()(
+export class RuntimeArtifactFileMissingError extends Schema.TaggedError<RuntimeArtifactFileMissingError>()(
   "RuntimeArtifactFileMissingError",
   {
     code: Schema.Literal("artifact-file-missing"),
@@ -499,7 +499,7 @@ export class RuntimeArtifactFileMissingError extends Schema.TaggedErrorClass<Run
   },
 ) {}
 
-export class RuntimeArtifactSizeMismatchError extends Schema.TaggedErrorClass<RuntimeArtifactSizeMismatchError>()(
+export class RuntimeArtifactSizeMismatchError extends Schema.TaggedError<RuntimeArtifactSizeMismatchError>()(
   "RuntimeArtifactSizeMismatchError",
   {
     code: Schema.Literal("artifact-size-mismatch"),
@@ -507,7 +507,7 @@ export class RuntimeArtifactSizeMismatchError extends Schema.TaggedErrorClass<Ru
   },
 ) {}
 
-export class RuntimeArtifactDigestMismatchError extends Schema.TaggedErrorClass<RuntimeArtifactDigestMismatchError>()(
+export class RuntimeArtifactDigestMismatchError extends Schema.TaggedError<RuntimeArtifactDigestMismatchError>()(
   "RuntimeArtifactDigestMismatchError",
   {
     code: Schema.Literal("artifact-digest-mismatch"),
@@ -515,7 +515,7 @@ export class RuntimeArtifactDigestMismatchError extends Schema.TaggedErrorClass<
   },
 ) {}
 
-export class RuntimeArtifactPlatformMismatchError extends Schema.TaggedErrorClass<RuntimeArtifactPlatformMismatchError>()(
+export class RuntimeArtifactPlatformMismatchError extends Schema.TaggedError<RuntimeArtifactPlatformMismatchError>()(
   "RuntimeArtifactPlatformMismatchError",
   {
     code: Schema.Literal("artifact-platform-mismatch"),
@@ -526,12 +526,12 @@ export class RuntimeArtifactPlatformMismatchError extends Schema.TaggedErrorClas
   },
 ) {}
 
-export class RuntimeArtifactPathEscapeError extends Schema.TaggedErrorClass<RuntimeArtifactPathEscapeError>()(
+export class RuntimeArtifactPathEscapeError extends Schema.TaggedError<RuntimeArtifactPathEscapeError>()(
   "RuntimeArtifactPathEscapeError",
   { code: Schema.Literal("artifact-path-escape") },
 ) {}
 
-export class RuntimeArtifactInstallConflictError extends Schema.TaggedErrorClass<RuntimeArtifactInstallConflictError>()(
+export class RuntimeArtifactInstallConflictError extends Schema.TaggedError<RuntimeArtifactInstallConflictError>()(
   "RuntimeArtifactInstallConflictError",
   {
     code: Schema.Literal("artifact-install-conflict"),
@@ -540,7 +540,7 @@ export class RuntimeArtifactInstallConflictError extends Schema.TaggedErrorClass
   },
 ) {}
 
-export class RuntimeArtifactNotInstalledError extends Schema.TaggedErrorClass<RuntimeArtifactNotInstalledError>()(
+export class RuntimeArtifactNotInstalledError extends Schema.TaggedError<RuntimeArtifactNotInstalledError>()(
   "RuntimeArtifactNotInstalledError",
   {
     code: Schema.Literal("artifact-not-installed"),
@@ -549,7 +549,7 @@ export class RuntimeArtifactNotInstalledError extends Schema.TaggedErrorClass<Ru
   },
 ) {}
 
-export class RuntimeCurrentPointerCorruptError extends Schema.TaggedErrorClass<RuntimeCurrentPointerCorruptError>()(
+export class RuntimeCurrentPointerCorruptError extends Schema.TaggedError<RuntimeCurrentPointerCorruptError>()(
   "RuntimeCurrentPointerCorruptError",
   {
     code: Schema.Literal("current-pointer-corrupt"),
@@ -557,7 +557,7 @@ export class RuntimeCurrentPointerCorruptError extends Schema.TaggedErrorClass<R
   },
 ) {}
 
-export class RuntimeCurrentPointerMissingError extends Schema.TaggedErrorClass<RuntimeCurrentPointerMissingError>()(
+export class RuntimeCurrentPointerMissingError extends Schema.TaggedError<RuntimeCurrentPointerMissingError>()(
   "RuntimeCurrentPointerMissingError",
   {
     code: Schema.Literal("current-pointer-missing"),
@@ -565,7 +565,7 @@ export class RuntimeCurrentPointerMissingError extends Schema.TaggedErrorClass<R
   },
 ) {}
 
-export class RuntimeArtifactFileTypeInvalidError extends Schema.TaggedErrorClass<RuntimeArtifactFileTypeInvalidError>()(
+export class RuntimeArtifactFileTypeInvalidError extends Schema.TaggedError<RuntimeArtifactFileTypeInvalidError>()(
   "RuntimeArtifactFileTypeInvalidError",
   {
     code: Schema.Literal("artifact-file-type-invalid"),
@@ -574,7 +574,7 @@ export class RuntimeArtifactFileTypeInvalidError extends Schema.TaggedErrorClass
   },
 ) {}
 
-export class RuntimeNodeNotExecutableError extends Schema.TaggedErrorClass<RuntimeNodeNotExecutableError>()(
+export class RuntimeNodeNotExecutableError extends Schema.TaggedError<RuntimeNodeNotExecutableError>()(
   "RuntimeNodeNotExecutableError",
   {
     code: Schema.Literal("node-not-executable"),
@@ -582,7 +582,7 @@ export class RuntimeNodeNotExecutableError extends Schema.TaggedErrorClass<Runti
   },
 ) {}
 
-export class RuntimeProfileDirectoryInvalidError extends Schema.TaggedErrorClass<RuntimeProfileDirectoryInvalidError>()(
+export class RuntimeProfileDirectoryInvalidError extends Schema.TaggedError<RuntimeProfileDirectoryInvalidError>()(
   "RuntimeProfileDirectoryInvalidError",
   {
     code: Schema.Literal("profile-directory-invalid"),
@@ -591,12 +591,12 @@ export class RuntimeProfileDirectoryInvalidError extends Schema.TaggedErrorClass
   },
 ) {}
 
-export class RuntimeHostUnsupportedError extends Schema.TaggedErrorClass<RuntimeHostUnsupportedError>()(
+export class RuntimeHostUnsupportedError extends Schema.TaggedError<RuntimeHostUnsupportedError>()(
   "RuntimeHostUnsupportedError",
   { code: Schema.Literal("host-unsupported") },
 ) {}
 
-export class RuntimeDaemonLifecycleError extends Schema.TaggedErrorClass<RuntimeDaemonLifecycleError>()(
+export class RuntimeDaemonLifecycleError extends Schema.TaggedError<RuntimeDaemonLifecycleError>()(
   "RuntimeDaemonLifecycleError",
   {
     code: Schema.Literals([
@@ -629,7 +629,7 @@ export class RuntimeDaemonLifecycleError extends Schema.TaggedErrorClass<Runtime
   },
 ) {}
 
-export class RuntimeFilesystemError extends Schema.TaggedErrorClass<RuntimeFilesystemError>()(
+export class RuntimeFilesystemError extends Schema.TaggedError<RuntimeFilesystemError>()(
   "RuntimeFilesystemError",
   {
     code: Schema.Literal("filesystem-error"),

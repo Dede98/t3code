@@ -1,5 +1,6 @@
 import type {
   AgentControlThreadMaterializeCommand,
+  OrchestrationClientOrigin,
   OrchestrationEvent,
   OrchestrationReadModel,
   ProjectId,
@@ -54,6 +55,8 @@ import { NodeSqliteTransactionHooks } from "../../persistence/Services/NodeSqlit
 import {
   OrchestrationCommandAuthorityMismatchError,
   OrchestrationCommandIdentityConflictError,
+  isOrchestrationCommandRejection,
+  OrchestrationCommandIdConflictError,
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
   type OrchestrationDispatchError,
@@ -112,6 +115,7 @@ import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { OrchestrationEnginePublicationHooks } from "../Services/OrchestrationEnginePublicationHooks.ts";
 import { VerificationResultRuntimeEventAuthorityHooks } from "../Services/VerificationResultRuntimeEventAuthorityHooks.ts";
+import { ThreadBackgroundLivenessService } from "../ThreadBackgroundLiveness.ts";
 import {
   OrchestrationEngineService,
   type AgentControlImplementationTurnDispatchEvidence,
@@ -123,6 +127,7 @@ import {
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
+const isOrchestrationCommandIdConflictError = Schema.is(OrchestrationCommandIdConflictError);
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
 const isOrchestrationCommandIdentityConflictError = Schema.is(
   OrchestrationCommandIdentityConflictError,
@@ -218,7 +223,42 @@ const isAgentControlThreadMaterializeCommand = (
 ): command is AgentControlThreadMaterializeCommand =>
   command.type === "thread.agent-control.materialize";
 
+const historicalReceiptCommands = new Set<OrchestrationCommand["type"]>([
+  "thread.settle",
+  "thread.auto-settle",
+  "thread.unsettle",
+  "thread.snooze",
+  "thread.unsnooze",
+  "thread.pin",
+  "thread.unpin",
+  "thread.pin.reorder",
+  "thread.active.reorder",
+  "thread.title.regeneration.complete",
+  "thread.pull-request.sync",
+  "thread.user-input.dismiss",
+  "thread.history.import",
+  "thread.meta.update",
+  "thread.turn.start",
+  "thread.user-input.respond",
+  "thread.session.set",
+  "thread.activity.append",
+]);
+
 const acceptedReceiptEventTypes = {
+  "thread.settle": ["thread.settled"],
+  "thread.auto-settle": ["thread.settled"],
+  "thread.unsettle": ["thread.unsettled"],
+  "thread.snooze": ["thread.snoozed"],
+  "thread.unsnooze": ["thread.unsnoozed"],
+  "thread.pin": ["thread.pinned"],
+  "thread.unpin": ["thread.unpinned"],
+  "thread.pin.reorder": ["thread.pin-reordered"],
+  "thread.active.reorder": ["thread.meta-updated"],
+  "thread.title.regeneration.complete": ["thread.meta-updated"],
+  "thread.pull-request.sync": ["thread.meta-updated"],
+  "thread.user-input.dismiss": ["thread.activity-appended"],
+  "thread.history.import": ["thread.message-sent"],
+
   "project.create": ["project.created"],
   "project.meta.update": ["project.meta-updated"],
   "thread.create": ["thread.created"],
@@ -315,6 +355,7 @@ interface CommandEnvelope {
   initialPlanning?: AgentControlInitialPlanningTurnDispatchEvidence;
   implementation?: AgentControlImplementationTurnDispatchEvidence;
   verification?: AgentControlVerificationTurnDispatchEvidence;
+  origin?: OrchestrationClientOrigin | undefined;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   cancelled: Deferred.Deferred<void>;
   startedAtMs: number;
@@ -349,6 +390,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const materializationTransactionHooks = yield* AgentControlThreadMaterializationTransactionHooks;
   const materializationConvergencePolicy =
     yield* AgentControlThreadMaterializationConvergencePolicy;
+  const threadBackgroundLiveness = yield* ThreadBackgroundLivenessService;
   const crypto = yield* Crypto.Crypto;
   const publicationHooks = yield* OrchestrationEnginePublicationHooks;
   const verificationResultRuntimeEventAuthorityHooks =
@@ -590,7 +632,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         event.correlationId === command.commandId &&
         stored?.actorKind === expectedActorKind &&
         Equal.equals(event.payload, expected.payload) &&
-        Equal.equals(event.metadata, expected.metadata ?? {})
+        Equal.equals(
+          Object.fromEntries(Object.entries(event.metadata).filter(([key]) => key !== "origin")),
+          expected.metadata ?? {},
+        )
       );
     };
     const receiptMatchesLast = (last: OrchestrationEvent | undefined): boolean => {
@@ -691,6 +736,75 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return;
     }
 
+    // New lifecycle commands can emit state-dependent companion events. Re-decide
+    // against durable pre-command history instead of assuming a fixed event count.
+    if (historicalReceiptCommands.has(command.type) && "threadId" in command) {
+      const firstPage = yield* loadOrchestrationEventsByCommandIdPage(sql, {
+        commandId: command.commandId,
+        sequenceExclusive: 0,
+        operationPrefix: "accepted-receipt-replay",
+      }).pipe(Effect.mapError(orchestrationRawToPersistenceError));
+      const first = firstPage.rows[0];
+      if (first === undefined) return yield* identityConflict();
+      const prior = yield* loadThreadReadModelBeforeSequence(
+        command.threadId,
+        first.event.sequence,
+      );
+      const userInputActivity =
+        "requestId" in command
+          ? prior.threads[0]?.activities.findLast(
+              (activity) =>
+                typeof activity.payload === "object" &&
+                activity.payload !== null &&
+                "requestId" in activity.payload &&
+                activity.payload.requestId === command.requestId,
+            )
+          : undefined;
+      const clock = yield* Clock.Clock;
+      const millis = Date.parse(first.event.occurredAt);
+      const decision = yield* decideOrchestrationCommand({
+        authority: "system",
+        command,
+        readModel: prior,
+        ...(userInputActivity === undefined ? {} : { userInputActivity }),
+      }).pipe(
+        Effect.provideService(Crypto.Crypto, crypto),
+        Effect.provideService(Clock.Clock, {
+          currentTimeNanosUnsafe: () => BigInt(millis) * 1_000_000n,
+          currentTimeNanos: Effect.succeed(BigInt(millis) * 1_000_000n),
+          monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+          monotonicTimeNanos: clock.monotonicTimeNanos,
+          sleep: (duration) => clock.sleep(duration),
+          currentTimeMillis: Effect.succeed(millis),
+          currentTimeMillisUnsafe: () => millis,
+        }),
+        Effect.mapError(() => identityConflict()),
+      );
+      const expected = Array.isArray(decision) ? decision : [decision];
+      const stored = yield* loadOrchestrationCommandEvents(
+        command,
+        "accepted-receipt-replay",
+        expected.length,
+      );
+      if (stored.length !== expected.length || !receiptMatchesLast(stored.at(-1)?.event)) {
+        return yield* identityConflict();
+      }
+      for (const [index, event] of expected.entries()) {
+        const causationIndex = expected.findIndex(
+          (candidate) => candidate.eventId === event.causationEventId,
+        );
+        if (
+          !commonMatches(stored[index], {
+            ...event,
+            causationEventId:
+              causationIndex < 0 ? event.causationEventId : stored[causationIndex]!.event.eventId,
+          })
+        )
+          return yield* identityConflict();
+      }
+      return receipt.resultSequence;
+    }
+
     const commandEvents = yield* loadOrchestrationCommandEvents(
       command,
       "accepted-receipt-replay",
@@ -716,7 +830,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             projectId: command.projectId,
             title: command.title,
             workspaceRoot: command.workspaceRoot,
-            defaultModelSelection: command.defaultModelSelection ?? null,
+            defaultModelSelection: null,
+            faviconPath: null,
+            projectIcon: null,
             scripts: [],
             createdAt: command.createdAt,
             updatedAt: command.createdAt,
@@ -739,6 +855,12 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               ? {}
               : { defaultModelSelection: command.defaultModelSelection }),
             ...(command.scripts === undefined ? {} : { scripts: command.scripts }),
+            ...(command.defaultThreadEnvMode === undefined
+              ? {}
+              : { defaultThreadEnvMode: command.defaultThreadEnvMode }),
+            ...(command.autoPull === undefined ? {} : { autoPull: command.autoPull }),
+            ...(command.faviconPath === undefined ? {} : { faviconPath: command.faviconPath }),
+            ...(command.projectIcon === undefined ? {} : { projectIcon: command.projectIcon }),
             updatedAt: occurredAt,
           },
         });
@@ -1119,6 +1241,21 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         break;
       case "thread.agent-control.materialize":
         matches = false;
+        break;
+      case "thread.settle":
+      case "thread.auto-settle":
+      case "thread.unsettle":
+      case "thread.snooze":
+      case "thread.unsnooze":
+      case "thread.pin":
+      case "thread.unpin":
+      case "thread.pin.reorder":
+      case "thread.active.reorder":
+      case "thread.title.regeneration.complete":
+      case "thread.pull-request.sync":
+      case "thread.user-input.dismiss":
+      case "thread.history.import":
+        matches = false; // Handled by historical decision validation above.
         break;
       default:
         command satisfies never;
@@ -3511,6 +3648,21 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               attemptedAuthority: envelope.authority,
             });
           }
+          // A receipt only proves this exact command was handled. Replaying it
+          // for a command aimed at another aggregate would report success for
+          // work that never happened.
+          if (
+            existingReceipt.value.aggregateKind !== aggregateRef.aggregateKind ||
+            existingReceipt.value.aggregateId !== aggregateRef.aggregateId
+          ) {
+            return yield* new OrchestrationCommandIdConflictError({
+              commandId: envelope.command.commandId,
+              receiptAggregateKind: existingReceipt.value.aggregateKind,
+              receiptAggregateId: existingReceipt.value.aggregateId,
+              commandAggregateKind: aggregateRef.aggregateKind,
+              commandAggregateId: aggregateRef.aggregateId,
+            });
+          }
           if (existingReceipt.value.status === "accepted") {
             yield* validateGenericAcceptedReceiptReplay(envelope.command, existingReceipt.value);
             if (envelope.command.type === "thread.verification-result.capture") {
@@ -3555,6 +3707,54 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
+        if (
+          envelope.command.type === "thread.auto-settle" &&
+          (yield* eventStore.hasEventAfter({
+            aggregateKind: "thread",
+            aggregateId: envelope.command.threadId,
+            sequenceExclusive: envelope.command.snapshotSequence,
+          }))
+        ) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: envelope.command.type,
+            detail: `thread ${envelope.command.threadId} changed before automatic settlement`,
+          });
+        }
+
+        // The decider compares the lookup inputs. Only recreation needs an
+        // event check, since it can reset a thread to the same field values.
+        if (
+          envelope.command.type === "thread.pull-request.sync" &&
+          (yield* eventStore.hasEventAfter({
+            aggregateKind: "thread",
+            aggregateId: envelope.command.threadId,
+            sequenceExclusive: envelope.command.snapshotSequence,
+            type: "thread.created",
+          }))
+        ) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: envelope.command.type,
+            detail: `thread ${envelope.command.threadId} was recreated before pull request discovery`,
+          });
+        }
+
+        if (
+          envelope.command.type === "thread.auto-settle" &&
+          threadBackgroundLiveness.getThreadBackgroundLiveness(envelope.command.threadId) !== null
+        ) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: envelope.command.type,
+            detail: `thread ${envelope.command.threadId} has live background work`,
+          });
+        }
+
+        // Command snapshots omit activities at startup and cap them while running.
+        // Read this request's durable state before deciding how to send the answer.
+        const userInputActivity =
+          envelope.command.type === "thread.user-input.respond" ||
+          envelope.command.type === "thread.user-input.dismiss"
+            ? yield* projectionSnapshotQuery.getUserInputActivity(envelope.command)
+            : Option.none();
         const decisionReadModel =
           envelope.implementation === undefined && envelope.verification === undefined
             ? commandReadModel
@@ -3563,11 +3763,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           command: envelope.command,
           readModel: decisionReadModel,
           authority: envelope.authority,
+          ...(Option.isSome(userInputActivity)
+            ? { userInputActivity: userInputActivity.value }
+            : {}),
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
           Effect.provideService(OrchestrationEnginePublicationHooks, publicationHooks),
           Effect.mapError((cause) =>
-            isOrchestrationCommandInvariantError(cause)
+            isOrchestrationCommandRejection(cause)
               ? cause
               : new OrchestrationCommandInvariantError({
                   commandType: envelope.command.type,
@@ -3581,7 +3784,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         const implementation = envelope.implementation;
         const verification = envelope.verification;
         const durableAgentControlTurn = initialPlanning ?? implementation ?? verification;
-        const eventBases =
+        const durableEventBases =
           durableAgentControlTurn === undefined
             ? decidedEventBases
             : decidedEventBases.map((event, index) =>
@@ -3619,10 +3822,18 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                     ),
                   ),
               };
+        const eventBases =
+          envelope.origin === undefined
+            ? durableEventBases
+            : durableEventBases.map((event) => ({
+                ...event,
+                metadata: { ...event.metadata, origin: envelope.origin },
+              }));
         const committedCommand = yield* sql
           .withTransaction(
             Effect.gen(function* () {
               const committedEvents: OrchestrationEvent[] = [];
+              const attachmentCleanups: Effect.Effect<void>[] = [];
               let nextCommandReadModel = decisionReadModel;
 
               if (envelope.command.type === "thread.verification-result.capture") {
@@ -3726,7 +3937,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                     ),
                   );
                 nextCommandReadModel = yield* projectEvent(nextCommandReadModel, savedEvent);
-                yield* projectionPipeline.projectEvent(savedEvent);
+                const cleanup = yield* projectionPipeline.projectEventDeferred(savedEvent);
+                attachmentCleanups.push(cleanup);
                 committedEvents.push(savedEvent);
               }
 
@@ -3976,6 +4188,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               }
               const transactionResult = {
                 committedEvents,
+                attachmentCleanups,
                 lastSequence: lastSavedEvent.sequence,
                 nextCommandReadModel,
               } as const;
@@ -4036,6 +4249,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                   }
                   return {
                     committedEvents: [],
+                    attachmentCleanups: [],
                     lastSequence: committedWinner,
                     nextCommandReadModel: decisionReadModel,
                   } as const;
@@ -4044,6 +4258,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           );
 
         commandReadModel = committedCommand.nextCommandReadModel;
+        for (const cleanup of committedCommand.attachmentCleanups) {
+          yield* cleanup;
+        }
         for (const [index, event] of committedCommand.committedEvents.entries()) {
           yield* publishDomainEvent(event);
           if (index === 0) {
@@ -4124,7 +4341,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             envelope.initialPlanning === undefined &&
             envelope.implementation === undefined &&
             envelope.verification === undefined &&
-            !isOrchestrationCommandPreviouslyRejectedError(error)
+            !isOrchestrationCommandPreviouslyRejectedError(error) &&
+            !isOrchestrationCommandIdConflictError(error)
           ) {
             yield* reconcileReadModelAfterDispatchFailure.pipe(
               Effect.catch(() =>
@@ -4140,7 +4358,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             );
 
             if (
-              isOrchestrationCommandInvariantError(error) &&
+              isOrchestrationCommandRejection(error) &&
               !isAgentControlReservedThreadCreate(envelope.command) &&
               !isAgentControlThreadMaterializeCommand(envelope.command)
             ) {
@@ -4177,9 +4395,23 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
+  const readThreadEvents: OrchestrationEngineShape["readThreadEvents"] = ({ threadId, ...range }) =>
+    eventStore.readAggregateRange({ ...range, aggregateKind: "thread", aggregateId: threadId });
+
+  const getThreadReplayStats: OrchestrationEngineShape["getThreadReplayStats"] = ({
+    threadId,
+    ...range
+  }) =>
+    eventStore.getAggregateReplayStats({
+      ...range,
+      aggregateKind: "thread",
+      aggregateId: threadId,
+    });
+
   const dispatchWithAuthority = (
     authority: OrchestrationCommandAuthority,
     command: OrchestrationCommand,
+    origin?: OrchestrationClientOrigin,
     durableTurn?:
       | {
           readonly kind: "initial-planning";
@@ -4205,6 +4437,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           : {}),
         ...(durableTurn?.kind === "implementation" ? { implementation: durableTurn.evidence } : {}),
         ...(durableTurn?.kind === "verification" ? { verification: durableTurn.evidence } : {}),
+        origin,
         result,
         cancelled,
         startedAtMs: yield* Clock.currentTimeMillis,
@@ -4221,16 +4454,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       );
     });
 
-  const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
-    dispatchWithAuthority("system", command);
-  const dispatchClient: OrchestrationEngineShape["dispatchClient"] = (command) =>
-    dispatchWithAuthority("client", command);
+  const dispatch: OrchestrationEngineShape["dispatch"] = (command, options) =>
+    dispatchWithAuthority("system", command, options?.origin);
+  const dispatchClient: OrchestrationEngineShape["dispatchClient"] = (command, options) =>
+    dispatchWithAuthority("client", command, options?.origin);
   const dispatchAgentControl: OrchestrationEngineShape["dispatchAgentControl"] = (command) =>
     dispatchWithAuthority("agent-control", command);
   const dispatchAgentControlInitialPlanningTurn: NonNullable<
     OrchestrationEngineShape["dispatchAgentControlInitialPlanningTurn"]
   > = (command, evidence) =>
-    dispatchWithAuthority("agent-control", command, {
+    dispatchWithAuthority("agent-control", command, undefined, {
       kind: "initial-planning",
       evidence,
     }).pipe(
@@ -4244,7 +4477,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const dispatchAgentControlImplementationTurn: NonNullable<
     OrchestrationEngineShape["dispatchAgentControlImplementationTurn"]
   > = (command, evidence) =>
-    dispatchWithAuthority("agent-control", command, {
+    dispatchWithAuthority("agent-control", command, undefined, {
       kind: "implementation",
       evidence,
     }).pipe(
@@ -4258,7 +4491,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const dispatchAgentControlVerificationTurn: NonNullable<
     OrchestrationEngineShape["dispatchAgentControlVerificationTurn"]
   > = (command, evidence) =>
-    dispatchWithAuthority("agent-control", command, {
+    dispatchWithAuthority("agent-control", command, undefined, {
       kind: "verification",
       evidence,
     }).pipe(
@@ -4272,6 +4505,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
   return {
     readEvents,
+    readThreadEvents,
+    getThreadReplayStats,
     dispatch,
     dispatchClient,
     dispatchAgentControl,

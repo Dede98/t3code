@@ -10,7 +10,7 @@ import type {
   ProviderAdmissionUsageEvidence,
 } from "../model.ts";
 
-export class ProviderAdmissionError extends Schema.TaggedErrorClass<ProviderAdmissionError>()(
+export class ProviderAdmissionError extends Schema.TaggedError<ProviderAdmissionError>()(
   "ProviderAdmissionError",
   {
     operation: Schema.String,

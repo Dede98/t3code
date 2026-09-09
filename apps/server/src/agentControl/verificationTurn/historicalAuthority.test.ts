@@ -27,7 +27,7 @@ const at = "2026-09-02T12:30:00.000Z";
 const taskId = AgentControlTaskId.make("verification-history-task");
 const projectId = ProjectId.make("verification-history-project");
 const metadata = { schemaVersion: 1 } as const;
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const taskPayload = {
   taskId,
   source: {

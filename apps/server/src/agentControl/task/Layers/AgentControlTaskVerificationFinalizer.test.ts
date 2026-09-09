@@ -2682,6 +2682,8 @@ it.effect(
         const aheadCallerClock: Clock.Clock = {
           currentTimeMillisUnsafe: () => aheadCallerTime,
           currentTimeMillis: Effect.succeed(aheadCallerTime),
+          monotonicTimeNanosUnsafe: () => 0n,
+          monotonicTimeNanos: Effect.succeed(0n),
           currentTimeNanosUnsafe: () => BigInt(aheadCallerTime) * 1_000_000n,
           currentTimeNanos: Effect.succeed(BigInt(aheadCallerTime) * 1_000_000n),
           sleep: (duration) => authoritativeClock.sleep(duration),

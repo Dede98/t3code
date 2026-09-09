@@ -27,7 +27,7 @@ export const AgentControlTaskConsumerGuardReason = Schema.Literals([
 ]);
 export type AgentControlTaskConsumerGuardReason = typeof AgentControlTaskConsumerGuardReason.Type;
 
-export class AgentControlTaskConsumerGuardError extends Schema.TaggedErrorClass<AgentControlTaskConsumerGuardError>()(
+export class AgentControlTaskConsumerGuardError extends Schema.TaggedError<AgentControlTaskConsumerGuardError>()(
   "AgentControlTaskConsumerGuardError",
   {
     projectId: ProjectId,

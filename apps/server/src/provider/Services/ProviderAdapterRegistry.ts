@@ -14,7 +14,6 @@ import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as PubSub from "effect/PubSub";
 import type * as Scope from "effect/Scope";
-import type * as Stream from "effect/Stream";
 
 import type { ProviderAdapterError, ProviderUnsupportedError } from "../Errors.ts";
 import type { ProviderAdapterShape } from "./ProviderAdapter.ts";
@@ -53,25 +52,6 @@ export interface ProviderAdapterRegistryShape {
    * callers of this method want something they can pass to `getByInstance`.
    */
   readonly listInstances: () => Effect.Effect<ReadonlyArray<ProviderInstanceId>>;
-
-  /**
-   * Legacy: list provider kinds whose default instance is currently
-   * registered.
-   *
-   * @deprecated Prefer `listInstances`. Retained for migration-era call
-   * sites that iterate providers to build UI/metrics.
-   */
-  readonly listProviders: () => Effect.Effect<ReadonlyArray<ProviderDriverKind>>;
-
-  /**
-   * Change notification stream mirroring `ProviderInstanceRegistry.streamChanges`.
-   * Emits one `void` tick whenever the set of live instances changes
-   * (instance added, removed, or rebuilt after a settings edit). Consumers
-   * that fan out `adapter.streamEvents` per instance — e.g. `ProviderService`'s
-   * runtime event bus — re-pull `listInstances` on each tick and fork new
-   * subscriptions for instances they haven't seen yet.
-   */
-  readonly streamChanges: Stream.Stream<void>;
 
   /**
    * Acquire a change subscription synchronously in the caller's current fiber.

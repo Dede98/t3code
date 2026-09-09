@@ -37,7 +37,7 @@ export const VerificationResultDecodeErrorCode = Schema.Literals([
 ]);
 export type VerificationResultDecodeErrorCode = typeof VerificationResultDecodeErrorCode.Type;
 
-export class VerificationResultDecodeError extends Schema.TaggedErrorClass<VerificationResultDecodeError>()(
+export class VerificationResultDecodeError extends Schema.TaggedError<VerificationResultDecodeError>()(
   "VerificationResultDecodeError",
   {
     code: VerificationResultDecodeErrorCode,

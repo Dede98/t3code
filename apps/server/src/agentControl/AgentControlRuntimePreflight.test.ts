@@ -122,7 +122,8 @@ function providerInstance(input: {
     displayName: undefined,
     enabled: input.enabled ?? true,
     snapshot: {
-      maintenanceCapabilities: {} as ProviderInstance["snapshot"]["maintenanceCapabilities"],
+      resolveMaintenance: () => Effect.die("Unexpected maintenance resolution"),
+      applyUsageLimits: () => Effect.void,
       getSnapshot: Effect.succeed(snapshot),
       refresh,
       streamChanges: Stream.empty,

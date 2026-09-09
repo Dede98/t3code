@@ -70,7 +70,7 @@ const settings = (pollIntervalSeconds = 15): AgentControlGithubTrackerSettings =
   pollIntervalSeconds,
 });
 const encodeIntakeState = Schema.encodeSync(Schema.fromJsonString(AgentControlGithubIntakeState));
-const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const persistGithubEvent = Effect.fn("test.persistGithubEvent")(function* (
   event: AgentControlGithubEvent,
@@ -593,6 +593,8 @@ const makeHarness = (options?: {
       subscribeDomainEvents: subscribe("project-controller", projectEvents),
     });
     const orchestration = OrchestrationEngineService.of({
+      readThreadEvents: () => Stream.empty,
+      getThreadReplayStats: () => Effect.die("Unexpected getThreadReplayStats"),
       readEvents: () => Stream.empty,
       dispatch: () => Effect.succeed({ sequence: 0 }),
       dispatchClient: () => Effect.succeed({ sequence: 0 }),

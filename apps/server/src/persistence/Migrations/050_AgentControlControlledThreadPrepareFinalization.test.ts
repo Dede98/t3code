@@ -11,7 +11,7 @@ import Migration050 from "./050_AgentControlControlledThreadPrepareFinalization.
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 const rollbackLayer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
-const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const finalizationOwnerId = "00000000-0000-0000-0000-000000000050";
 
 const insertFinalizationStateFromEvidence = (

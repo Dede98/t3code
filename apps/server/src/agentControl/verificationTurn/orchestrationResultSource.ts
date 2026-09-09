@@ -31,7 +31,7 @@ import {
   verificationResultOutputEvidenceDigest,
 } from "./runtimeEvidence.ts";
 
-export class VerificationResultHistoryError extends Schema.TaggedErrorClass<VerificationResultHistoryError>()(
+export class VerificationResultHistoryError extends Schema.TaggedError<VerificationResultHistoryError>()(
   "VerificationResultHistoryError",
   {
     operation: Schema.String,

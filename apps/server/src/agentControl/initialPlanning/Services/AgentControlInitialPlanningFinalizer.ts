@@ -5,7 +5,7 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
-export class AgentControlInitialPlanningFinalizerError extends Schema.TaggedErrorClass<AgentControlInitialPlanningFinalizerError>()(
+export class AgentControlInitialPlanningFinalizerError extends Schema.TaggedError<AgentControlInitialPlanningFinalizerError>()(
   "AgentControlInitialPlanningFinalizerError",
   {
     operation: Schema.String,

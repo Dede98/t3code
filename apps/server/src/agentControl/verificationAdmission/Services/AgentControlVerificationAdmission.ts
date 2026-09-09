@@ -10,7 +10,7 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
-export class AgentControlVerificationAdmissionError extends Schema.TaggedErrorClass<AgentControlVerificationAdmissionError>()(
+export class AgentControlVerificationAdmissionError extends Schema.TaggedError<AgentControlVerificationAdmissionError>()(
   "AgentControlVerificationAdmissionError",
   {
     implementationResultEvidenceId: Schema.String,

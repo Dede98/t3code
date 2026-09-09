@@ -22,7 +22,7 @@ export type AgentControlGitStatusRecord =
   | { readonly type: "untracked"; readonly path: string }
   | { readonly type: "ignored"; readonly path: string };
 
-export class AgentControlGitStateParseError extends Schema.TaggedErrorClass<AgentControlGitStateParseError>()(
+export class AgentControlGitStateParseError extends Schema.TaggedError<AgentControlGitStateParseError>()(
   "AgentControlGitStateParseError",
   { reason: Schema.String },
 ) {}

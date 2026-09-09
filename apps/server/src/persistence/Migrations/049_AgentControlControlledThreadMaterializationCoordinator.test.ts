@@ -12,8 +12,8 @@ const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 const rollbackLayer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 const legacyValidationLayer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 const at = "2026-07-27T10:00:00.000Z";
-const encodeJson = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
-const encodeJsonSync = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeJson = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+const encodeJsonSync = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const seedPreparedReservation = Effect.fn("seedPreparedReservationBeforeMigration049")(function* (
   suffix = "",

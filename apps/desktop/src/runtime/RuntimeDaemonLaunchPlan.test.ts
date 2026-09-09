@@ -40,7 +40,7 @@ const CREATED_AT = "2026-07-22T00:00:00.000Z" as const;
 const decodeManifest = Schema.decodeUnknownSync(RuntimeArtifactManifest);
 const encodeManifest = Schema.encodeSync(Schema.fromJsonString(RuntimeArtifactManifest));
 const encodeLaunchPlan = Schema.encodeSync(Schema.fromJsonString(RuntimeDaemonLaunchPlanSchema));
-const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 interface RuntimeHarness {
   readonly fs: FileSystem.FileSystem;

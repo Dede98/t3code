@@ -39,7 +39,7 @@ export const AgentControlVerificationHistoricalAuthorityReason = Schema.Literals
 export type AgentControlVerificationHistoricalAuthorityReason =
   typeof AgentControlVerificationHistoricalAuthorityReason.Type;
 
-export class AgentControlVerificationHistoricalAuthorityError extends Schema.TaggedErrorClass<AgentControlVerificationHistoricalAuthorityError>()(
+export class AgentControlVerificationHistoricalAuthorityError extends Schema.TaggedError<AgentControlVerificationHistoricalAuthorityError>()(
   "AgentControlVerificationHistoricalAuthorityError",
   {
     operation: Schema.String,

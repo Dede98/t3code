@@ -14,7 +14,8 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { RPC_REQUIRED_SCOPE } from "./ws.ts";
+import { RPC_REQUIRED_SCOPES } from "./auth/RpcAuthorization.ts";
+const RPC_REQUIRED_SCOPE = new Map<string, unknown>(Object.entries(RPC_REQUIRED_SCOPES));
 
 describe("Agent Control RPC registration", () => {
   it("keeps both worktree query RPCs read-only in the scope matrix", () => {

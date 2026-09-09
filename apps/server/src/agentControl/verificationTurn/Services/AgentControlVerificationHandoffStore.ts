@@ -13,7 +13,7 @@ import type {
 import type { AgentControlVerificationHandoffAuthority } from "../handoffValidation.ts";
 import type { VerificationTerminalObservation } from "../terminalObservation.ts";
 
-export class AgentControlVerificationStoreError extends Schema.TaggedErrorClass<AgentControlVerificationStoreError>()(
+export class AgentControlVerificationStoreError extends Schema.TaggedError<AgentControlVerificationStoreError>()(
   "AgentControlVerificationStoreError",
   {
     operation: Schema.String,

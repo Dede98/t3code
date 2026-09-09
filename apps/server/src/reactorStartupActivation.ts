@@ -8,7 +8,7 @@ import * as Semaphore from "effect/Semaphore";
 
 export type ReactorStartupCloseDisposition = "retryable" | "terminal";
 
-export class ReactorStartupAttemptError extends Schema.TaggedErrorClass<ReactorStartupAttemptError>()(
+export class ReactorStartupAttemptError extends Schema.TaggedError<ReactorStartupAttemptError>()(
   "ReactorStartupAttemptError",
   {
     reason: Schema.Literals(["attempt-closing", "attempt-closed"]),

@@ -769,7 +769,7 @@ export type AgentControlStageRunRejectedCommandCode =
   typeof AgentControlStageRunRejectedCommandCode.Type;
 
 /** Closed wire error: it cannot carry source content, paths, commands, or causes. */
-export class AgentControlStageRunRpcError extends Schema.TaggedErrorClass<AgentControlStageRunRpcError>()(
+export class AgentControlStageRunRpcError extends Schema.TaggedError<AgentControlStageRunRpcError>()(
   "AgentControlStageRunRpcError",
   {
     code: AgentControlStageRunRejectedCommandCode,

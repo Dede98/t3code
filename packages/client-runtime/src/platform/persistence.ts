@@ -14,7 +14,7 @@ import * as Schema from "effect/Schema";
 import type { ConnectionRegistration } from "../connection/catalog.ts";
 import type { ConnectionTarget } from "../connection/model.ts";
 
-export class ConnectionPersistenceError extends Schema.TaggedErrorClass<ConnectionPersistenceError>()(
+export class ConnectionPersistenceError extends Schema.TaggedError<ConnectionPersistenceError>()(
   "ConnectionPersistenceError",
   {
     operation: Schema.Literals([
@@ -30,6 +30,8 @@ export class ConnectionPersistenceError extends Schema.TaggedErrorClass<Connecti
       "save-server-config",
       "load-vcs-refs",
       "save-vcs-refs",
+      "remove-vcs-refs",
+      "clear-vcs-refs",
       "clear-environment",
     ]),
     message: Schema.String,
@@ -101,6 +103,18 @@ export class EnvironmentCacheStore extends Context.Service<
       environmentId: EnvironmentId,
       cwd: string,
       refs: VcsListRefsResult,
+    ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly removeVcsRefs: (
+      environmentId: EnvironmentId,
+      cwd: string,
+    ) => Effect.Effect<void, ConnectionPersistenceError>;
+    /**
+     * Removes every persisted branch-list snapshot for an environment. Git ref
+     * mutations are repository-wide, and linked worktrees may have cached the
+     * same refs under different working-directory keys.
+     */
+    readonly clearVcsRefs: (
+      environmentId: EnvironmentId,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
     readonly clear: (
       environmentId: EnvironmentId,

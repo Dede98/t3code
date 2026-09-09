@@ -73,6 +73,8 @@ function readModel(controlState?: AgentControlThreadControlState): Orchestration
         proposedPlans: [],
         activities: [],
         checkpoints: [],
+        settledOverride: null,
+        settledAt: null,
         session: null,
       },
     ],

@@ -21,7 +21,7 @@ import {
   SQLITE_ORCHESTRATION_EVENT_PROJECT_MEMBERSHIP_ROUTE_FUNCTION,
 } from "../persistence/SqliteFunctions.ts";
 
-export class OrchestrationEventRawHistoryError extends Schema.TaggedErrorClass<OrchestrationEventRawHistoryError>()(
+export class OrchestrationEventRawHistoryError extends Schema.TaggedError<OrchestrationEventRawHistoryError>()(
   "OrchestrationEventRawHistoryError",
   {
     operation: Schema.String,

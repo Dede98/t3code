@@ -30,7 +30,7 @@ export interface VerificationTerminalObservation {
   readonly observationDigest: string;
 }
 
-export class VerificationTerminalMappingError extends Schema.TaggedErrorClass<VerificationTerminalMappingError>()(
+export class VerificationTerminalMappingError extends Schema.TaggedError<VerificationTerminalMappingError>()(
   "VerificationTerminalMappingError",
   {
     reason: Schema.Literals([

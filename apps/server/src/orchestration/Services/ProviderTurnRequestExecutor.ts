@@ -50,7 +50,7 @@ export type ProviderTurnAcceptanceCertainty =
   | "acceptance-unknown"
   | "accepted";
 
-export class ProviderTurnDeliveryError extends Schema.TaggedErrorClass<ProviderTurnDeliveryError>()(
+export class ProviderTurnDeliveryError extends Schema.TaggedError<ProviderTurnDeliveryError>()(
   "ProviderTurnDeliveryError",
   {
     certainty: Schema.Literals([

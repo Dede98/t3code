@@ -10,7 +10,7 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
-export class AgentControlImplementationAdmissionError extends Schema.TaggedErrorClass<AgentControlImplementationAdmissionError>()(
+export class AgentControlImplementationAdmissionError extends Schema.TaggedError<AgentControlImplementationAdmissionError>()(
   "AgentControlImplementationAdmissionError",
   {
     operation: Schema.String,

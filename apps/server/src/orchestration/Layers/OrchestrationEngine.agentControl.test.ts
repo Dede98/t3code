@@ -1,3 +1,5 @@
+import * as ThreadPlanProgress from "../ThreadPlanProgress.ts";
+import * as ThreadBackgroundLiveness from "../ThreadBackgroundLiveness.ts";
 import {
   AgentControlAttemptId,
   AgentControlControlledThreadReservationId,
@@ -36,9 +38,9 @@ import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
-import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
+import { OrchestrationEngineLive as OrchestrationEngineLiveBase } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
-import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
+import { OrchestrationProjectionSnapshotQueryLive as OrchestrationProjectionSnapshotQueryLiveBase } from "./ProjectionSnapshotQuery.ts";
 import {
   deriveAgentControlControlledThreadReservationId,
   deriveAgentControlReservedThreadId,
@@ -49,6 +51,14 @@ import {
 } from "../../agentControl/stageRun/identity.ts";
 import { deriveAgentControlStageRunLeaseId } from "../../agentControl/stageRunLease/identity.ts";
 import { fingerprintAgentControlThreadMaterializationCommand } from "../agentControlThreadMaterializationIntent.ts";
+
+const OrchestrationProjectionSnapshotQueryLive = OrchestrationProjectionSnapshotQueryLiveBase.pipe(
+  Layer.provide(Layer.merge(ThreadBackgroundLiveness.layer, ThreadPlanProgress.layer)),
+);
+
+const OrchestrationEngineLive = OrchestrationEngineLiveBase.pipe(
+  Layer.provide(Layer.merge(ThreadBackgroundLiveness.layer, ThreadPlanProgress.layer)),
+);
 
 const NOW = "2026-07-21T12:00:00.000Z";
 const PROJECT_ID = ProjectId.make("project-agent-control-engine");

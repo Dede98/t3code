@@ -1,30 +1,15 @@
 /**
- * The `EntityResource` module provides helpers for acquiring resources inside a
- * cluster entity and keeping them available across entity restarts. It is useful
- * for long-lived resources tied to an entity address, such as external
- * processes, network clients, Kubernetes Pods, or other handles that should not
- * be torn down during routine shard movement.
+ * Keeps resources available across cluster entity restarts.
  *
- * **Common tasks**
- *
- * - Create a reusable entity-scoped resource with {@link make}
- * - Keep an entity alive while the resource is acquired
- * - Explicitly release the resource with `EntityResource.close`
- * - Attach cleanup work to the resource close scope with {@link CloseScope}
- * - Create and manage a Kubernetes Pod resource with {@link makeK8sPod}
- *
- * **Lifecycle gotchas**
- *
- * - Resources are retained by an `RcRef` and are only fully released after
- *   `idleTimeToLive` expires or `close` is called
- * - The default idle time to live is infinite, so resources remain alive until
- *   explicitly closed
- * - `CloseScope` is separate from the caller scope and is not closed by entity
- *   restarts, shard movement, or node shutdown finalization
+ * `EntityResource` is useful for long-lived resources tied to an entity
+ * address, such as external processes, network clients, Kubernetes Pods, or
+ * other handles that should survive routine shard movement. This module
+ * includes the resource wrapper, a close scope that survives normal entity
+ * restarts, a generic resource constructor, and a Kubernetes Pod resource
+ * helper built on `K8sHttpClient`.
  *
  * @since 4.0.0
  */
-import type * as v1 from "kubernetes-types/core/v1.d.ts"
 import * as Context from "../../Context.ts"
 import * as Duration from "../../Duration.ts"
 import * as Effect from "../../Effect.ts"
@@ -33,6 +18,7 @@ import * as RcRef from "../../RcRef.ts"
 import * as Scope from "../../Scope.ts"
 import * as Entity from "./Entity.ts"
 import * as K8sHttpClient from "./K8sHttpClient.ts"
+import type { Pod as K8sPod } from "./K8sTypes.ts"
 import type { Sharding } from "./Sharding.ts"
 
 /**
@@ -71,11 +57,16 @@ export interface EntityResource<out A, out E = never> {
 /**
  * Context service for a Scope that is only closed when the resource is explicitly closed.
  *
+ * **When to use**
+ *
+ * Use when a cluster entity resource needs a scope that survives restarts and
+ * closes only through the resource lifecycle.
+ *
  * **Gotchas**
  *
  * It is not closed during restarts, due to shard movement or node shutdowns.
  *
- * @category resource management
+ * @category services
  * @since 4.0.0
  */
 export class CloseScope extends Context.Service<
@@ -85,6 +76,11 @@ export class CloseScope extends Context.Service<
 
 /**
  * Creates an `EntityResource` that can be acquired inside a cluster entity.
+ *
+ * **When to use**
+ *
+ * Use when a cluster entity should lazily share an acquired resource across
+ * messages and release it only on idle timeout or explicit close.
  *
  * **Details**
  *
@@ -160,11 +156,11 @@ export const make: <A, E, R>(options: {
  * The pod is created and waited on through `K8sHttpClient`, and is kept alive
  * until the resource is closed or its idle time to live expires.
  *
- * @category Kubernetes
+ * @category constructors
  * @since 4.0.0
  */
 export const makeK8sPod: (
-  spec: v1.Pod,
+  spec: K8sPod,
   options?: {
     readonly idleTimeToLive?: Duration.Input | undefined
   } | undefined
@@ -172,7 +168,7 @@ export const makeK8sPod: (
   EntityResource<K8sHttpClient.PodStatus>,
   never,
   Scope.Scope | Sharding | Entity.CurrentAddress | K8sHttpClient.K8sHttpClient
-> = Effect.fnUntraced(function*(spec: v1.Pod, options?: {
+> = Effect.fnUntraced(function*(spec: K8sPod, options?: {
   readonly idleTimeToLive?: Duration.Input | undefined
 }) {
   const createPod = yield* K8sHttpClient.makeCreatePod

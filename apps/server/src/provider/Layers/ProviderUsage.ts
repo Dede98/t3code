@@ -1,214 +1,126 @@
+import * as PubSub from "effect/PubSub";
 import type {
-  ProviderInstanceId,
-  ProviderUsageRefreshFailure,
   ProviderUsageSnapshot,
   ProviderUsageStreamEvent,
+  ServerProvider,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
-import * as PubSub from "effect/PubSub";
-import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 
-import { projectProviderUsageEvent } from "../providerUsageProjection.ts";
-import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
-import { ProviderRegistryRebuildBarrier } from "../Services/ProviderRegistryRebuildBarrier.ts";
-import * as ProviderService from "../Services/ProviderService.ts";
-import * as ProviderUsage from "../Services/ProviderUsage.ts";
+import { ProviderRegistry } from "../Services/ProviderRegistry.ts";
+import { ProviderUsage } from "../Services/ProviderUsage.ts";
 
-export { projectProviderUsageEvent } from "../providerUsageProjection.ts";
-
-const CLAUDE_ACTIVE_USAGE_REFRESH_INTERVAL = Duration.seconds(60);
-
-interface MakeProviderUsageOptions {
-  readonly activeUsageRefreshInterval?: Duration.Input;
+/** Wire compatibility for older fork clients; the registry owns all usage state. */
+export function legacyProviderUsage(providers: readonly ServerProvider[]): ProviderUsageSnapshot[] {
+  return providers.flatMap((provider) => {
+    const limits = provider.usageLimits;
+    if (!provider.enabled || !limits || limits.unavailable || limits.windows.length === 0)
+      return [];
+    const highest = Math.max(...limits.windows.map((window) => window.usedPercent));
+    return [
+      {
+        providerInstanceId: provider.instanceId,
+        driver: provider.driver,
+        observedAt: limits.checkedAt,
+        source: "refresh" as const,
+        // Quota exhaustion does not prove a turn will be rejected (for example, paid overage).
+        status: highest >= 90 ? ("warning" as const) : ("allowed" as const),
+        windows: limits.windows.map((window) => ({
+          id: window.id,
+          label: window.label,
+          usedPercent: window.usedPercent,
+          resetsAt: window.resetsAt ?? null,
+          ...(window.windowDurationMins && window.windowDurationMins > 0
+            ? { durationMinutes: window.windowDurationMins }
+            : {}),
+        })),
+      },
+    ];
+  });
 }
 
-export const makeProviderUsage = Effect.fn("makeProviderUsage")(function* (
-  options: MakeProviderUsageOptions = {},
-) {
-  const providerService = yield* ProviderService.ProviderService;
-  const adapterRegistry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
-  const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
-  const snapshots = yield* Ref.make(new Map<ProviderInstanceId, ProviderUsageSnapshot>());
+export const makeProviderUsage = Effect.fn("makeProviderUsage")(function* () {
+  const registry = yield* ProviderRegistry;
   const events = yield* PubSub.unbounded<ProviderUsageStreamEvent>();
-  const activeClaudeTurns = yield* Ref.make(new Map<ProviderInstanceId, ReadonlySet<string>>());
-  const activeRefreshLoops = yield* Ref.make(new Set<ProviderInstanceId>());
-  const activeUsageRefreshInterval =
-    options.activeUsageRefreshInterval ?? CLAUDE_ACTIVE_USAGE_REFRESH_INTERVAL;
-
-  const publish = (usage: ProviderUsageSnapshot) =>
-    Effect.all([
-      Ref.update(snapshots, (state) => new Map(state).set(usage.providerInstanceId, usage)),
-      PubSub.publish(events, { version: 1 as const, type: "updated" as const, usage }),
-    ]).pipe(Effect.asVoid);
-
-  const readProviderUsageUnlocked = Effect.fn("ProviderUsage.readProviderUsage")(function* (
-    providerInstanceId: ProviderInstanceId,
-  ) {
-    const adapter = yield* adapterRegistry.getByInstance(providerInstanceId);
-    if (!adapter.readUsage) return Option.none<ProviderUsageSnapshot>();
-    const usage = yield* adapter.readUsage();
-    yield* publish(usage);
-    return Option.some(usage);
-  });
-  const readProviderUsage = (providerInstanceId: ProviderInstanceId) =>
-    rebuildBarrier.withOperation(readProviderUsageUnlocked(providerInstanceId));
-
-  const refreshAutomatically = Effect.fn("ProviderUsage.refreshAutomatically")(
-    function* (providerInstanceId: ProviderInstanceId) {
-      yield* readProviderUsage(providerInstanceId);
-    },
-    Effect.catch((cause) =>
-      Effect.logWarning("Automatic provider usage refresh failed.").pipe(
-        Effect.annotateLogs({
-          cause,
-        }),
-      ),
-    ),
-  );
-
-  const hasActiveClaudeTurn = (providerInstanceId: ProviderInstanceId) =>
-    Ref.get(activeClaudeTurns).pipe(
-      Effect.map((turnsByInstance) => (turnsByInstance.get(providerInstanceId)?.size ?? 0) > 0),
-    );
-
-  const runActiveRefreshLoop = Effect.fn("ProviderUsage.runActiveRefreshLoop")(function* (
-    providerInstanceId: ProviderInstanceId,
-  ) {
-    while (true) {
-      yield* Effect.sleep(activeUsageRefreshInterval);
-      if (!(yield* hasActiveClaudeTurn(providerInstanceId))) return;
-      yield* refreshAutomatically(providerInstanceId);
-    }
-  });
-
-  const startActiveRefreshLoop = Effect.fn("ProviderUsage.startActiveRefreshLoop")(function* (
-    providerInstanceId: ProviderInstanceId,
-  ) {
-    const shouldStart = yield* Ref.modify(activeRefreshLoops, (running) => {
-      if (running.has(providerInstanceId)) return [false, running] as const;
-      const next = new Set(running);
-      next.add(providerInstanceId);
-      return [true, next] as const;
-    });
-    if (!shouldStart) return;
-
-    yield* runActiveRefreshLoop(providerInstanceId).pipe(
-      Effect.ensuring(
-        Ref.update(activeRefreshLoops, (running) => {
-          const next = new Set(running);
-          next.delete(providerInstanceId);
-          return next;
-        }),
-      ),
-      Effect.forkScoped,
-    );
-  });
-
-  const trackClaudeTurn = Effect.fn("ProviderUsage.trackClaudeTurn")(function* (
-    event: Parameters<typeof projectProviderUsageEvent>[0],
-  ) {
-    const providerInstanceId = event.providerInstanceId;
-    if (event.provider !== "claudeAgent" || providerInstanceId === undefined) return;
-
-    if (event.type === "turn.started") {
-      yield* Ref.update(activeClaudeTurns, (turnsByInstance) => {
-        const next = new Map(turnsByInstance);
-        const activeTurns = new Set(next.get(providerInstanceId) ?? []);
-        activeTurns.add(event.threadId);
-        next.set(providerInstanceId, activeTurns);
-        return next;
-      });
-      yield* startActiveRefreshLoop(providerInstanceId);
-      return;
-    }
-
-    if (event.type !== "turn.completed") return;
-    yield* Ref.update(activeClaudeTurns, (turnsByInstance) => {
-      const next = new Map(turnsByInstance);
-      const activeTurns = new Set(next.get(providerInstanceId) ?? []);
-      activeTurns.delete(event.threadId);
-      if (activeTurns.size === 0) next.delete(providerInstanceId);
-      else next.set(providerInstanceId, activeTurns);
-      return next;
-    });
-    yield* refreshAutomatically(providerInstanceId).pipe(Effect.forkScoped);
-  });
-
-  yield* providerService.streamEvents.pipe(
-    Stream.runForEach((event) =>
-      Effect.gen(function* () {
-        if (event.providerInstanceId === undefined) return;
-        const current = yield* Ref.get(snapshots);
-        const usage = projectProviderUsageEvent(event, current.get(event.providerInstanceId));
-        if (usage !== null) yield* publish(usage);
-        yield* trackClaudeTurn(event);
+  yield* registry.streamChanges.pipe(
+    Stream.runForEach((providers) =>
+      PubSub.publish(events, {
+        version: 1,
+        type: "snapshot",
+        usage: legacyProviderUsage(providers),
       }),
     ),
     Effect.forkScoped,
   );
-
-  return ProviderUsage.ProviderUsage.of({
+  return ProviderUsage.of({
+    getSnapshot: registry.getProviders.pipe(Effect.map(legacyProviderUsage)),
+    subscribeEvents: PubSub.subscribe(events),
     inspectForAdmission: (providerInstanceId) =>
       Effect.gen(function* () {
         const observedAt = DateTime.formatIso(yield* DateTime.now);
-        const adapter = yield* Effect.result(adapterRegistry.getByInstance(providerInstanceId));
-        if (adapter._tag === "Failure") {
+        const providers = yield* registry.refreshInstance(providerInstanceId);
+        const provider = providers.find((provider) => provider.instanceId === providerInstanceId);
+        if (provider === undefined || !provider.enabled)
           return { _tag: "SupportedUnusable" as const, observedAt };
-        }
-        if (adapter.success.readUsage === undefined) {
+        if (provider.usageLimits?.unavailable?.reason === "unsupported")
           return { _tag: "Unsupported" as const, observedAt };
-        }
-        const usage = yield* Effect.result(readProviderUsage(providerInstanceId));
-        if (
-          usage._tag === "Failure" ||
-          Option.isNone(usage.success) ||
-          usage.success.value.providerInstanceId !== providerInstanceId
-        ) {
-          return { _tag: "SupportedUnusable" as const, observedAt };
-        }
-        return { _tag: "Observed" as const, snapshot: usage.success.value };
+        const snapshot = legacyProviderUsage([provider])[0];
+        if (snapshot !== undefined) return { _tag: "Observed" as const, snapshot };
+        return { _tag: "SupportedUnusable" as const, observedAt };
       }),
-    getSnapshot: Ref.get(snapshots).pipe(Effect.map((state) => Array.from(state.values()))),
+    stream: Stream.unwrap(
+      Effect.gen(function* () {
+        // Subscribe before reading. A queued notification rereads current state rather
+        // than replaying a snapshot that may already predate the initial read.
+        const updates = yield* Queue.sliding<void>(1);
+        yield* Stream.runForEach(registry.streamChanges, () =>
+          Queue.offer(updates, undefined),
+        ).pipe(Effect.forkScoped({ startImmediately: true }));
+        return Stream.concat(Stream.make(undefined), Stream.fromQueue(updates)).pipe(
+          Stream.mapEffect(() => registry.getProviders),
+          Stream.map(legacyProviderUsage),
+          Stream.changesWith((a, b) => Equal.equals(a, b)),
+          Stream.map((usage) => ({ version: 1 as const, type: "snapshot" as const, usage })),
+        );
+      }),
+    ),
     refresh: (requestedIds) =>
       Effect.gen(function* () {
-        const providerInstanceIds = requestedIds ?? (yield* adapterRegistry.listInstances());
-        const results = yield* Effect.forEach(
-          providerInstanceIds,
-          (providerInstanceId) =>
-            Effect.gen(function* () {
-              const usage = yield* readProviderUsage(providerInstanceId);
-              if (Option.isNone(usage)) {
-                return {
-                  providerInstanceId,
-                  message: "Usage refresh is not supported.",
-                } satisfies ProviderUsageRefreshFailure;
-              }
-              return usage.value;
-            }).pipe(
-              Effect.catch((cause) =>
-                Effect.succeed({
-                  providerInstanceId,
-                  message: cause instanceof Error ? cause.message : "Usage refresh failed.",
-                } satisfies ProviderUsageRefreshFailure),
-              ),
-            ),
-          { concurrency: 3 },
-        );
-        const usage = results.filter(
-          (result): result is ProviderUsageSnapshot => "windows" in result,
-        );
-        const failures = results.filter(
-          (result): result is ProviderUsageRefreshFailure => "message" in result,
-        );
+        if (requestedIds === undefined) {
+          yield* registry.refresh();
+        } else {
+          yield* Effect.forEach([...new Set(requestedIds)], (id) => registry.refreshInstance(id), {
+            concurrency: 3,
+          });
+        }
+        const providers = yield* registry.getProviders;
+        const selected =
+          requestedIds === undefined
+            ? providers
+            : providers.filter((provider) => requestedIds.includes(provider.instanceId));
+        const usage = legacyProviderUsage(selected);
+        const ids = requestedIds ?? selected.map((provider) => provider.instanceId);
+        const failures = [...new Set(ids)].flatMap((providerInstanceId) => {
+          if (usage.some((snapshot) => snapshot.providerInstanceId === providerInstanceId))
+            return [];
+          const provider = selected.find(
+            (candidate) => candidate.instanceId === providerInstanceId,
+          );
+          return [
+            {
+              providerInstanceId,
+              message:
+                provider?.usageLimits?.unavailable?.message ?? "Usage limits are unavailable.",
+            },
+          ];
+        });
         return { refreshedAt: DateTime.formatIso(yield* DateTime.now), usage, failures };
       }),
-    subscribeEvents: PubSub.subscribe(events),
   });
 });
 
-export const ProviderUsageLive = Layer.effect(ProviderUsage.ProviderUsage, makeProviderUsage());
+export const ProviderUsageLive = Layer.effect(ProviderUsage, makeProviderUsage());

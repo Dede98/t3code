@@ -486,8 +486,8 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const encodeResumeCursorJson = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
-  const decodeResumeCursorJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+  const encodeResumeCursorJson = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+  const decodeResumeCursorJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
   const sessionEvidenceError = (provider: string, detail: string) =>
     new ProviderAdapterRequestError({
       provider,

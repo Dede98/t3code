@@ -33,7 +33,7 @@ export interface ClaudeSessionStoreShape extends SessionStore {
   readonly replaceSession: (snapshot: ClaudeSessionSnapshot) => Promise<void>;
 }
 
-export class ClaudeSessionStoreError extends Schema.TaggedErrorClass<ClaudeSessionStoreError>()(
+export class ClaudeSessionStoreError extends Schema.TaggedError<ClaudeSessionStoreError>()(
   "ClaudeSessionStoreError",
   {
     operation: Schema.String,
