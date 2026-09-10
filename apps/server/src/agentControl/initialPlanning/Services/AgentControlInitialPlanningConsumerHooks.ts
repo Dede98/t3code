@@ -3,6 +3,7 @@ import type * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 
 export interface AgentControlInitialPlanningConsumerHooksShape {
+  readonly afterNativeTerminalRecorded?: (handoffId: string) => Effect.Effect<void>;
   readonly beforeClaim: (handoffId: string) => Effect.Effect<void>;
   readonly afterClaim: (handoffId: string) => Effect.Effect<void>;
   readonly afterTurnDispatchBeforeAcceptanceRead?: (handoffId: string) => Effect.Effect<void>;

@@ -55,6 +55,7 @@ import {
   deriveAgentControlControlledThreadReservationId,
   deriveAgentControlReservedThreadId,
 } from "../../controlledThreadReservation/identity.ts";
+import { projectAgentControlControlledThreadReservationEvent } from "../../controlledThreadReservation/projector.ts";
 import { AgentControlControlledThreadReservationEngine } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationEngine.ts";
 import { AgentControlControlledThreadReservationEventStore } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationEventStore.ts";
 import { AgentControlControlledThreadReservationProjection } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationProjection.ts";
@@ -640,7 +641,37 @@ const make = Effect.gen(function* () {
     const preparedStageState = stage.value.statesByVersion[0];
     const reservedLeaseState =
       lease.value.statesByVersion[row.implementationLeaseEventStreamVersion - 1];
-    const reservationState = reservation.value;
+    // The projection may already be bound. Validate the admission against its
+    // prepared event after the complete stream and current projection were checked.
+    const reservationPrefix = yield* reservationEvents
+      .readStream(row.implementationControlledThreadReservationId, 0, 1)
+      .pipe(
+        Effect.mapError((cause) =>
+          admissionError(
+            handoffId,
+            "replay-reservation-prefix",
+            "reservation-history-corrupt",
+            cause,
+          ),
+        ),
+      );
+    const preparedReservationEvent = reservationPrefix[0];
+    if (preparedReservationEvent?.eventId !== row.implementationReservationEventId) {
+      return yield* admissionError(handoffId, "replay-reservation-prefix", "receipt-mismatch");
+    }
+    const reservationState = yield* projectAgentControlControlledThreadReservationEvent(
+      null,
+      preparedReservationEvent,
+    ).pipe(
+      Effect.mapError((cause) =>
+        admissionError(
+          handoffId,
+          "replay-reservation-prefix",
+          "reservation-history-corrupt",
+          cause,
+        ),
+      ),
+    );
     if (
       preparedStageState === undefined ||
       preparedStageState.status !== "prepared" ||
@@ -910,13 +941,8 @@ const make = Effect.gen(function* () {
                     );
                   }
                   const runtimeHolderId = yield* leaseEngine.runtimeHolderId;
-                  if (runtimeHolderId !== planning.leaseHolderId) {
-                    return yield* admissionError(
-                      planning.handoffId,
-                      "runtime-holder",
-                      "identity-mismatch",
-                    );
-                  }
+                  // The historical holder released this lease. The validated
+                  // release and next fence authorize the current runtime's reserve.
                   const implementationStageRunId = yield* deriveAgentControlStageRunId({
                     projectId: planning.projectId,
                     taskId: planning.taskId,

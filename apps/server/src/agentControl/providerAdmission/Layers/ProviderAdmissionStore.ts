@@ -1,4 +1,12 @@
 import { ProviderInstanceId } from "@t3tools/contracts";
+import { PROVIDER_PRE_INVOKE_DDL_FINGERPRINTS } from "../../../persistence/Migrations/068_AgentControlProviderPreInvokeRecovery.ts";
+import {
+  decodePreInvokeRecovery,
+  ProviderAdmissionPreInvokeRecovery,
+  preInvokeDeliveryPredicate,
+  providerAdmissionDeliveryTables,
+  PROVIDER_PRE_INVOKE_DEADLINES_SQL,
+} from "../preInvokeRecovery.ts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -33,6 +41,8 @@ import {
   type ProviderAdmissionStoreShape,
   type ProviderAdmissionWakeup,
 } from "../Services/ProviderAdmissionStore.ts";
+
+const decodeRecoverySnapshot = Schema.decodeUnknownEffect(ProviderAdmissionPreInvokeRecovery);
 
 const utf8 = (value: string): Uint8Array => new TextEncoder().encode(value);
 const isProviderAdmissionError = Schema.is(ProviderAdmissionError);
@@ -630,6 +640,44 @@ const make = Effect.gen(function* () {
     };
   };
 
+  const preInvokeRecovery = Effect.fn("ProviderAdmissionStore.preInvokeRecovery")(function* (
+    current: CurrentRow,
+    now: string,
+  ) {
+    if (current.status !== "entered" && current.status !== "quarantined") return undefined;
+    if (
+      current.ownerId === null ||
+      current.providerFenceToken === null ||
+      current.leaseExpiresAt === null ||
+      current.leaseExpiresAt > now
+    )
+      return undefined;
+    const tables = providerAdmissionDeliveryTables.find(([stage]) => stage === current.stage)!;
+    const rows = yield* sql.unsafe<{
+      readonly deliveryRevision: number;
+      readonly claimOwnerId: string;
+      readonly claimGeneration: number;
+      readonly claimExpiresAt: string;
+    }>(
+      `SELECT delivery.revision AS "deliveryRevision", delivery.claim_owner_id AS "claimOwnerId", delivery.claim_generation AS "claimGeneration",
+          delivery.claim_expires_at AS "claimExpiresAt"
+        FROM main.${tables[1]} delivery
+        JOIN main.agent_control_provider_admission_intents intent ON intent.admission_id=?
+          AND delivery.provider_delivery_id=intent.provider_delivery_id
+        WHERE (${preInvokeDeliveryPredicate("intent", "?")})`,
+      [current.admissionId, now, now, now],
+    );
+    if (rows.length !== 1) return undefined;
+    return yield* decodeRecoverySnapshot({
+      previousOwnerId: current.ownerId,
+      previousFenceToken: current.providerFenceToken,
+      previousLeaseExpiresAt: current.leaseExpiresAt,
+      ...rows[0],
+      deliveryState: "claimed",
+      deliveryAttestationAbsent: true,
+    });
+  });
+
   const requestInternal = Effect.fn("ProviderAdmissionStore.requestInternal")(function* (
     input: ProviderAdmissionAttemptInput,
   ) {
@@ -733,9 +781,10 @@ const make = Effect.gen(function* () {
               return { _tag: "Admitted", permit } satisfies ProviderAdmissionDecision;
             }
           }
+          const recovery = yield* preInvokeRecovery(current, input.now);
           if (
-            current.status === "entered" ||
-            current.status === "quarantined" ||
+            (current.status === "entered" && recovery === undefined) ||
+            (current.status === "quarantined" && recovery === undefined) ||
             current.status === "released" ||
             current.status === "superseded"
           ) {
@@ -752,13 +801,13 @@ const make = Effect.gen(function* () {
               retryAt: current.nextDeadlineAt,
             } satisfies ProviderAdmissionDecision;
           }
-          const takeoverAdmitted = current.status === "admitted";
+          const takeoverAdmitted = current.status === "admitted" || recovery !== undefined;
           let fence: number;
           if (capacity.activeAdmissionId !== null) {
             if (
               capacity.activeAdmissionId !== admissionId ||
-              capacity.activeState === "entered" ||
-              capacity.activeState === "quarantined" ||
+              (capacity.activeState === "entered" && recovery === undefined) ||
+              (capacity.activeState === "quarantined" && recovery === undefined) ||
               (capacity.activeState === "admitted" && !takeoverAdmitted) ||
               capacity.activeLeaseExpiresAt === null ||
               capacity.activeLeaseExpiresAt > input.now
@@ -822,6 +871,7 @@ const make = Effect.gen(function* () {
               handoffId: input.request.handoffId,
               providerDeliveryId: input.request.providerDeliveryId,
               usageEvidenceFingerprint: current.usageEvidenceFingerprint,
+              ...(recovery === undefined ? {} : { preInvokeRecovery: recovery }),
             },
           });
           yield* sql`
@@ -840,6 +890,34 @@ const make = Effect.gen(function* () {
             updated_at=${input.now}
           WHERE provider_instance_id=${String(input.request.providerInstanceId)}
         `;
+          if (recovery !== undefined) {
+            const table = providerAdmissionDeliveryTables.find(
+              ([stage]) => stage === current.stage,
+            )![1];
+            // Fence the delivery claim in the same transaction as capacity. A
+            // late old CAS must fail before it can leave attempted delivery state.
+            const invalidated = yield* sql.unsafe(
+              `
+              UPDATE main.${table} SET state='retry-wait',revision=revision+1,
+                claim_owner_id=NULL,claim_expires_at=NULL,next_attempt_at=?,
+                last_error_code='transient-not-accepted',updated_at=?
+              WHERE provider_delivery_id=? AND state='claimed' AND revision=?
+                AND claim_owner_id=? AND claim_generation=? AND claim_expires_at=?
+              RETURNING provider_delivery_id
+            `,
+              [
+                input.now,
+                input.now,
+                input.request.providerDeliveryId,
+                recovery.deliveryRevision,
+                recovery.claimOwnerId,
+                recovery.claimGeneration,
+                recovery.claimExpiresAt,
+              ],
+            );
+            if (invalidated.length !== 1)
+              return yield* fail("pre-invoke-recovery-cas", "stale-owner", admissionId);
+          }
           const admitted = yield* readCurrent(admissionId);
           const intent = yield* readIntent(admissionId);
           const permit =
@@ -1067,8 +1145,8 @@ const make = Effect.gen(function* () {
     // The final pre-invoke check follows the durable delivery-attempted CAS.
     const deliveryRows =
       input.permit.stage === "initial-planning"
-        ? yield* sql<{ readonly count: number }>`
-            SELECT count(*) AS count FROM main.agent_control_initial_planning_deliveries
+        ? yield* sql<{ readonly count: number; readonly attempted: number }>`
+            SELECT count(*) AS count, COALESCE(MAX(state='delivery-attempted'), 0) AS attempted FROM main.agent_control_initial_planning_deliveries
             WHERE provider_delivery_id=${input.permit.providerDeliveryId}
               AND typeof(provider_delivery_id)='text'
               AND handoff_id=${input.permit.handoffId} AND typeof(handoff_id)='text'
@@ -1079,8 +1157,8 @@ const make = Effect.gen(function* () {
               AND typeof(state)='text'
           `
         : input.permit.stage === "implementation"
-          ? yield* sql<{ readonly count: number }>`
-              SELECT count(*) AS count FROM main.agent_control_implementation_deliveries
+          ? yield* sql<{ readonly count: number; readonly attempted: number }>`
+              SELECT count(*) AS count, COALESCE(MAX(state='delivery-attempted'), 0) AS attempted FROM main.agent_control_implementation_deliveries
               WHERE provider_delivery_id=${input.permit.providerDeliveryId}
                 AND typeof(provider_delivery_id)='text'
                 AND handoff_id=${input.permit.handoffId} AND typeof(handoff_id)='text'
@@ -1094,8 +1172,8 @@ const make = Effect.gen(function* () {
                 AND (state='claimed' OR (${input.boundary === "turn-start" ? 1 : 0} AND state='delivery-attempted'))
               AND typeof(state)='text'
             `
-          : yield* sql<{ readonly count: number }>`
-              SELECT count(*) AS count FROM main.agent_control_verification_deliveries
+          : yield* sql<{ readonly count: number; readonly attempted: number }>`
+              SELECT count(*) AS count, COALESCE(MAX(state='delivery-attempted'), 0) AS attempted FROM main.agent_control_verification_deliveries
               WHERE provider_delivery_id=${input.permit.providerDeliveryId}
                 AND typeof(provider_delivery_id)='text'
                 AND handoff_id=${input.permit.handoffId} AND typeof(handoff_id)='text'
@@ -1112,6 +1190,9 @@ const make = Effect.gen(function* () {
     if (deliveryRows[0]?.count !== 1) {
       return yield* fail("pre-effect-delivery", "authority-divergent", input.permit.admissionId);
     }
+    // The first turn guard only authorizes adapter preparation. The immutable
+    // turn-entry marker belongs after the consumer commits delivery-attempted.
+    if (input.boundary === "turn-start" && deliveryRows[0]?.attempted !== 1) return;
     const kind = input.boundary === "session-start" ? "session-entry" : "turn-entry";
     const existingBoundaries = (yield* readCompleteAuthorityChains(
       input.permit.admissionId,
@@ -1157,7 +1238,7 @@ const make = Effect.gen(function* () {
         stageFenceToken: input.permit.stageFenceToken,
       },
     });
-    if (current.status === "admitted") {
+    if (current.status === "admitted" && input.boundary === "turn-start") {
       yield* sql`
         UPDATE main.agent_control_provider_admission_current SET status='entered',
           revision=revision+1,updated_at=${input.enteredAt}
@@ -1381,6 +1462,11 @@ const make = Effect.gen(function* () {
     ORDER BY provider_instance_id,requested_at,admission_id
   `.pipe(Effect.mapError((cause) => fail("list-waiting", "persistence", undefined, cause)));
 
+  const preInvokeRecoveryDeadlines = sql.unsafe<ProviderAdmissionDeadlineWakeup>(
+    PROVIDER_PRE_INVOKE_DEADLINES_SQL,
+    [],
+  );
+
   const listDueDeadlines: ProviderAdmissionStoreShape["listDueDeadlines"] = (now) =>
     Effect.all([
       sql.unsafe<ProviderAdmissionDeadlineWakeup>(PROVIDER_ADMISSION_DUE_WAITING_DEADLINES_SQL, [
@@ -1389,9 +1475,10 @@ const make = Effect.gen(function* () {
       sql.unsafe<ProviderAdmissionDeadlineWakeup>(PROVIDER_ADMISSION_DUE_ADMITTED_DEADLINES_SQL, [
         now,
       ]),
+      preInvokeRecoveryDeadlines,
     ]).pipe(
-      Effect.map(([waiting, admitted]) =>
-        [...waiting, ...admitted].sort(
+      Effect.map(([waiting, admitted, recovery]) =>
+        [...waiting, ...admitted, ...recovery.filter((row) => row.deadlineAt <= now)].sort(
           (left, right) =>
             left.deadlineAt.localeCompare(right.deadlineAt) ||
             left.providerInstanceId.localeCompare(right.providerInstanceId) ||
@@ -1441,11 +1528,14 @@ const make = Effect.gen(function* () {
   const minimumDeadline = Effect.all([
     sql.unsafe<{ readonly deadline: string }>(PROVIDER_ADMISSION_MINIMUM_WAITING_DEADLINE_SQL, []),
     sql.unsafe<{ readonly deadline: string }>(PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_SQL, []),
+    preInvokeRecoveryDeadlines,
   ]).pipe(
-    Effect.map(([waiting, admitted]) => {
-      const deadlines = [waiting[0]?.deadline, admitted[0]?.deadline].filter(
-        (deadline): deadline is string => deadline !== undefined,
-      );
+    Effect.map(([waiting, admitted, recovery]) => {
+      const deadlines = [
+        waiting[0]?.deadline,
+        admitted[0]?.deadline,
+        ...recovery.map((row) => row.deadlineAt),
+      ].filter((deadline): deadline is string => deadline !== undefined);
       return deadlines.length === 0 ? null : deadlines.sort()[0]!;
     }),
     Effect.mapError((cause) => fail("minimum-deadline", "persistence", undefined, cause)),
@@ -1461,11 +1551,14 @@ const make = Effect.gen(function* () {
         PROVIDER_ADMISSION_MINIMUM_ADMITTED_DEADLINE_AFTER_SQL,
         [after],
       ),
+      preInvokeRecoveryDeadlines,
     ]).pipe(
-      Effect.map(([waiting, admitted]) => {
-        const deadlines = [waiting[0]?.deadline, admitted[0]?.deadline].filter(
-          (deadline): deadline is string => deadline !== undefined,
-        );
+      Effect.map(([waiting, admitted, recovery]) => {
+        const deadlines = [
+          waiting[0]?.deadline,
+          admitted[0]?.deadline,
+          ...recovery.filter((row) => row.deadlineAt > after).map((row) => row.deadlineAt),
+        ].filter((deadline): deadline is string => deadline !== undefined);
         return deadlines.length === 0 ? null : deadlines.sort()[0]!;
       }),
       Effect.mapError((cause) => fail("minimum-deadline-after", "persistence", undefined, cause)),
@@ -1739,7 +1832,14 @@ const make = Effect.gen(function* () {
           SELECT count(*) AS count
           FROM main.agent_control_provider_authority_markers
           WHERE admission_id=${current.admissionId}
-            AND authority_kind IN ('session-entry','turn-entry')
+            AND authority_kind = 'turn-entry'
+            AND NOT EXISTS (
+              SELECT 1 FROM main.agent_control_provider_authority_evidence recovery
+              JOIN main.agent_control_provider_authority_evidence entry
+                ON entry.marker_id=agent_control_provider_authority_markers.marker_id
+              WHERE recovery.admission_id=entry.admission_id AND recovery.authority_kind='admission'
+                AND json_extract(recovery.payload_json,'$.preInvokeRecovery.previousFenceToken')=entry.provider_fence_token
+            )
         `;
         if (
           current.ownerId === null ||
@@ -1892,12 +1992,20 @@ const make = Effect.gen(function* () {
       WHERE name IN ${sql.in(PROVIDER_ADMISSION_SCHEMA_OBJECTS)} AND sql IS NOT NULL
       ORDER BY name
     `;
+      const recoveryMigration = yield* sql<{ readonly count: number }>`
+        SELECT count(*) AS count FROM main.effect_sql_agent_control_migrations
+        WHERE migration_id=68 AND name='AgentControlProviderPreInvokeRecovery'
+      `;
+      const expectedFingerprints =
+        recoveryMigration[0]?.count === 1
+          ? {
+              ...EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS,
+              ...PROVIDER_PRE_INVOKE_DDL_FINGERPRINTS,
+            }
+          : EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS;
       if (
         objects.length !== PROVIDER_ADMISSION_SCHEMA_OBJECTS.length ||
-        objects.some(
-          (object) =>
-            EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS[object.name] !== sha256Utf8(object.source),
-        )
+        objects.some((object) => expectedFingerprints[object.name] !== sha256Utf8(object.source))
       ) {
         return yield* fail("startup-ddl-audit", "authority-divergent");
       }
@@ -2135,6 +2243,7 @@ const make = Effect.gen(function* () {
           (chain) =>
             chain.authorityKind === "session-entry" || chain.authorityKind === "turn-entry",
         );
+        const turnEntryChains = entryChains.filter((chain) => chain.authorityKind === "turn-entry");
         const quarantineChains = chains.filter((chain) => chain.authorityKind === "quarantine");
         const supersedeChains = chains.filter((chain) => chain.authorityKind === "supersede");
         const releaseChains = chains.filter((chain) => chain.authorityKind === "release");
@@ -2146,13 +2255,62 @@ const make = Effect.gen(function* () {
         const isNewest = (chain: AuthorityChainRow) =>
           chain.markerSequence === newestMarkerSequence;
 
+        const recoveredFences = new Set<number>();
+        for (const chain of admissionChains) {
+          const recovery = yield* Effect.try({
+            try: () =>
+              decodePreInvokeRecovery(decodeCanonicalUtf8Bytes(chain.payloadBytes))
+                .preInvokeRecovery,
+            catch: () => fail("startup-pre-invoke-recovery", "authority-divergent", admissionId),
+          });
+          if (recovery === undefined) continue;
+          const prior = admissionClaims.filter(
+            (claim) =>
+              claim.providerFenceToken === recovery.previousFenceToken &&
+              claim.ownerId === recovery.previousOwnerId &&
+              claim.leaseExpiresAt === recovery.previousLeaseExpiresAt,
+          );
+          if (
+            prior.length !== 1 ||
+            chain.providerFenceToken !== recovery.previousFenceToken + 1 ||
+            recovery.previousLeaseExpiresAt > chain.occurredAt ||
+            recovery.claimExpiresAt > chain.occurredAt ||
+            !entryChains.some(
+              (entry) => entry.providerFenceToken === recovery.previousFenceToken,
+            ) ||
+            chains.some(
+              (entry) =>
+                entry.providerFenceToken === recovery.previousFenceToken &&
+                entry.markerSequence >= chain.markerSequence,
+            ) ||
+            recoveredFences.has(recovery.previousFenceToken)
+          ) {
+            return yield* fail("startup-pre-invoke-recovery", "authority-divergent", admissionId);
+          }
+          recoveredFences.add(recovery.previousFenceToken);
+        }
+        const unrecoveredEntries = entryChains.filter(
+          (chain) => !recoveredFences.has(chain.providerFenceToken),
+        );
+        const unrecoveredTurns = turnEntryChains.filter(
+          (chain) => !recoveredFences.has(chain.providerFenceToken),
+        );
+        const unrecoveredQuarantines = quarantineChains.filter(
+          (chain) => !recoveredFences.has(chain.providerFenceToken),
+        );
         for (const chain of [...admissionChains, ...entryChains]) {
+          const recovery =
+            chain.authorityKind === "admission"
+              ? decodePreInvokeRecovery(decodeCanonicalUtf8Bytes(chain.payloadBytes))
+                  .preInvokeRecovery
+              : undefined;
           const details =
             chain.authorityKind === "admission"
               ? {
                   handoffId: intent.handoffId,
                   providerDeliveryId: intent.providerDeliveryId,
                   usageEvidenceFingerprint: current.usageEvidenceFingerprint,
+                  ...(recovery === undefined ? {} : { preInvokeRecovery: recovery }),
                 }
               : {
                   handoffId: intent.handoffId,
@@ -2265,19 +2423,26 @@ const make = Effect.gen(function* () {
         }
         if (
           current.status === "admitted" &&
-          (chains.length !== admissionChains.length ||
-            currentAdmissionChain?.[0] === undefined ||
-            !isNewest(currentAdmissionChain[0]))
+          (unrecoveredTurns.length !== 0 ||
+            unrecoveredQuarantines.length !== 0 ||
+            supersedeChains.length !== 0 ||
+            releaseChains.length !== 0 ||
+            ![...admissionChains, ...entryChains].some(
+              (chain) =>
+                chain.providerFenceToken === current.providerFenceToken &&
+                chain.ownerId === current.ownerId &&
+                isNewest(chain),
+            ))
         ) {
           return yield* fail("startup-admitted-history-audit", "authority-divergent", admissionId);
         }
         if (
           current.status === "entered" &&
-          (entryChains.length < 1 ||
-            quarantineChains.length !== 0 ||
+          (unrecoveredEntries.length < 1 ||
+            unrecoveredQuarantines.length !== 0 ||
             supersedeChains.length !== 0 ||
             releaseChains.length !== 0 ||
-            !entryChains.some(
+            !unrecoveredEntries.some(
               (chain) =>
                 chain.providerInstanceId === current.providerInstanceId &&
                 chain.ownerId === current.ownerId &&
@@ -2289,11 +2454,11 @@ const make = Effect.gen(function* () {
         }
         if (
           current.status === "quarantined" &&
-          (entryChains.length < 1 ||
-            quarantineChains.length !== 1 ||
+          (unrecoveredEntries.length < 1 ||
+            unrecoveredQuarantines.length !== 1 ||
             supersedeChains.length !== 0 ||
             releaseChains.length !== 0 ||
-            !quarantineChains.some(
+            !unrecoveredQuarantines.some(
               (chain) =>
                 chain.providerInstanceId === current.providerInstanceId &&
                 chain.ownerId === current.ownerId &&
@@ -2314,7 +2479,7 @@ const make = Effect.gen(function* () {
           (current.status === "superseded" &&
             (supersedeChains.length !== 1 ||
               releaseChains.length !== 0 ||
-              entryChains.length !== 0))
+              unrecoveredTurns.length !== 0))
         ) {
           return yield* fail("startup-terminal-history-audit", "authority-divergent", admissionId);
         }

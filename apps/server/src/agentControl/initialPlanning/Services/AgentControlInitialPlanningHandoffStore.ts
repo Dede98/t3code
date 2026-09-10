@@ -2,6 +2,7 @@ import type {
   AgentControlControlledThreadReservationId,
   CommandId,
   MessageId,
+  ProviderRuntimeEvent,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -159,6 +160,7 @@ export interface AgentControlInitialPlanningHandoffStoreShape {
     readonly state: "completed" | "failed" | "interrupted";
     readonly terminalAt: string;
     readonly errorCode?: string | null;
+    readonly nativeEvent?: ProviderRuntimeEvent;
   }) => Effect.Effect<
     Option.Option<AgentControlInitialPlanningDelivery>,
     AgentControlInitialPlanningStoreError

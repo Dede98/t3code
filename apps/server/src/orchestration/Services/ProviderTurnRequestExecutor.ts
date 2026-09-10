@@ -37,6 +37,7 @@ export interface PreparedProviderTurnRequest {
   readonly providerAdmissionPermit?: ProviderAdmissionPermit;
   readonly sessionAttestation?: ProviderSessionAttestation;
   readonly sessionResumeCursorJson?: string;
+  readonly sessionEvidenceRecordedAt?: string;
   readonly entryState?: {
     adapterEntered: boolean;
     externalOperationStarted: boolean;

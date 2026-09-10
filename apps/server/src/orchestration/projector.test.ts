@@ -1262,6 +1262,8 @@ effectIt.effect.each([false, true] as const)(
   (terminalFirst) =>
     Effect.gen(function* () {
       const now = "2026-09-09T20:10:23.323Z";
+      const checkpointAt = "2026-09-09T20:10:24.000Z";
+      const terminalAt = "2026-09-09T20:10:30.000Z";
       const threadId = "thread-restart-final-assistant";
       const turnId = "turn-restart-final-assistant";
       let sequence = 0;
@@ -1327,13 +1329,17 @@ effectIt.effect.each([false, true] as const)(
           status: "ready",
           files: [],
           assistantMessageId: "assistant:commentary",
-          completedAt: now,
+          completedAt: checkpointAt,
         }),
       );
+      expect(model.threads[0]?.latestTurn).toMatchObject({
+        state: "running",
+        completedAt: checkpointAt,
+      });
       const terminal = () =>
         event("thread.session-set", {
           threadId,
-          session: { ...session, status: "ready", activeTurnId: null },
+          session: { ...session, status: "ready", activeTurnId: null, updatedAt: terminalAt },
         });
       if (terminalFirst) model = yield* projectEvent(model, terminal());
       model = yield* projectEvent(
@@ -1357,12 +1363,13 @@ effectIt.effect.each([false, true] as const)(
         turnId,
         state: "completed",
         assistantMessageId: "assistant:final",
-        completedAt: now,
+        completedAt: terminalAt,
       });
       expect(model.threads[0]?.checkpoints[0]).toMatchObject({
         turnId,
         assistantMessageId: "assistant:final",
         status: "ready",
+        completedAt: terminalAt,
       });
     }),
 );

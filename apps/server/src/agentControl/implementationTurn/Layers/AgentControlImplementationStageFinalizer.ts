@@ -1,3 +1,5 @@
+import { loadNativeTerminalReceipt } from "../../nativeTerminalReceipt.ts";
+import { makeProviderTerminalSessionCommand } from "../../../orchestration/providerTerminalSessionCommand.ts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import {
   AgentControlAttemptId,
@@ -1015,28 +1017,79 @@ const make = Effect.gen(function* () {
       if (!isTerminalDeliveryState(claim.delivery.state)) {
         return { _tag: "Waiting" } as const;
       }
-      const orchestrationResult = yield* loadAgentControlImplementationOrchestrationEvidence(
-        sql,
-        claim,
-        { requireTerminal: true },
-      ).pipe(
-        Effect.catchIf(
-          (cause) => isOrchestrationError(cause) && cause.reason === "ambiguous-terminal",
-          () => Effect.succeed({ _tag: "AmbiguousEvidence" } as const),
-        ),
-        Effect.mapError((cause) =>
-          failure(
-            handoffId,
-            isOrchestrationError(cause) ? cause.operation : "orchestration-evidence",
-            isOrchestrationError(cause) && cause.reason === "persistence"
-              ? "persistence"
-              : "orchestration-history-corrupt",
-            cause,
+      const loadTerminalHistory = (requireTerminal: boolean) =>
+        loadAgentControlImplementationOrchestrationEvidence(sql, claim, { requireTerminal }).pipe(
+          Effect.catchIf(
+            (cause) => isOrchestrationError(cause) && cause.reason === "ambiguous-terminal",
+            () => Effect.succeed({ _tag: "AmbiguousEvidence" } as const),
           ),
-        ),
-      );
-      if (orchestrationResult._tag === "Waiting") return { _tag: "Waiting" } as const;
+          Effect.mapError((cause) =>
+            failure(
+              handoffId,
+              isOrchestrationError(cause) ? cause.operation : "orchestration-evidence",
+              isOrchestrationError(cause) && cause.reason === "persistence"
+                ? "persistence"
+                : "orchestration-history-corrupt",
+              cause,
+            ),
+          ),
+        );
+      let orchestrationResult = yield* loadTerminalHistory(false);
       if (orchestrationResult._tag === "AmbiguousEvidence") return { _tag: "Ambiguous" } as const;
+      if (orchestrationResult._tag === "Waiting") {
+        return yield* failure(
+          handoffId,
+          "native-terminal-start-history-missing",
+          "orchestration-history-corrupt",
+        );
+      }
+      if (orchestrationResult.evidence.terminal === null) {
+        const receipt = yield* loadNativeTerminalReceipt("implementation", claim).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.mapError((cause) =>
+            failure(
+              handoffId,
+              "load-native-terminal-receipt",
+              "orchestration-history-corrupt",
+              cause,
+            ),
+          ),
+        );
+        if (Option.isNone(receipt))
+          return yield* failure(
+            handoffId,
+            "native-terminal-receipt-missing",
+            "orchestration-history-corrupt",
+          );
+        const command = yield* makeProviderTerminalSessionCommand(
+          receipt.value,
+          claim.evidence.runtimeMode,
+        ).pipe(
+          Effect.mapError((cause) =>
+            failure(
+              handoffId,
+              "replay-native-terminal-identity",
+              "orchestration-history-corrupt",
+              cause,
+            ),
+          ),
+        );
+        yield* orchestration
+          .dispatch(command)
+          .pipe(
+            Effect.mapError((cause) =>
+              failure(handoffId, "replay-native-terminal-command", "persistence", cause),
+            ),
+          );
+        orchestrationResult = yield* loadTerminalHistory(true);
+        if (orchestrationResult._tag === "Waiting")
+          return yield* failure(
+            handoffId,
+            "replay-native-terminal-history-missing",
+            "orchestration-history-corrupt",
+          );
+        if (orchestrationResult._tag === "AmbiguousEvidence") return { _tag: "Ambiguous" } as const;
+      }
 
       const stage = yield* loadAuthoritativeStageRunState(
         AgentControlStageRunId.make(claim.evidence.stageRunId),

@@ -133,6 +133,9 @@ const make = Effect.gen(function* () {
   const snapshots = yield* ProjectionSnapshotQuery;
   const provider = yield* ProviderService;
   const executor = yield* ProviderTurnRequestExecutor;
+  // A v2 completion waits for ingestion's checkpoint and result-source seal. Keep
+  // only exact observed terminal facts; they never authorize delivery advancement.
+  const pendingResultSeals = new Map<string, VerificationTerminalObservation>();
   const providerAdmission = Option.getOrUndefined(
     yield* Effect.serviceOption(ProviderAdmissionRuntime),
   );
@@ -179,6 +182,14 @@ const make = Effect.gen(function* () {
           operation: "provider-terminal-binding-missing",
         });
       }
+      const pending = pendingResultSeals.get(claim.evidence.providerDeliveryId);
+      if (pending !== undefined && !Equal.equals(pending, observation)) {
+        return yield* makeAgentControlVerificationCandidateEvidenceError({
+          handoffId: claim.evidence.handoffId,
+          candidateReason: "provider-terminal-conflict",
+          operation: "pending-result-seal-terminal-conflict",
+        });
+      }
       const result = yield* store.observeProviderTerminal({
         handoffId: claim.evidence.handoffId,
         providerDeliveryId: claim.evidence.providerDeliveryId,
@@ -196,6 +207,7 @@ const make = Effect.gen(function* () {
         observedAt: yield* nowIso,
         beforeCas: hooks.beforeProviderTerminalCas?.(claim.evidence.handoffId) ?? Effect.void,
       });
+      pendingResultSeals.delete(claim.evidence.providerDeliveryId);
       if (result._tag === "Observed") {
         yield* hooks.afterProviderTerminalCas?.(claim.evidence.handoffId) ?? Effect.void;
       }
@@ -251,7 +263,33 @@ const make = Effect.gen(function* () {
         });
       }),
     );
-    if (recovered._tag === "Waiting") return;
+    if (recovered._tag === "Waiting") {
+      if (
+        ("terminalObserved" in recovered && recovered.terminalObserved) ||
+        pendingResultSeals.has(claim.evidence.providerDeliveryId)
+      )
+        return;
+      const sessions = yield* provider.listSessions();
+      if (
+        sessions.some(
+          (session) =>
+            session.threadId === claim.evidence.threadId &&
+            session.activeTurnId === claim.delivery.providerTurnId &&
+            session.providerInstanceId === claim.evidence.providerInstanceId &&
+            session.runtimeMode === claim.evidence.runtimeMode &&
+            session.cwd === claim.evidence.worktreePath &&
+            session.model === claim.evidence.modelSelection.model,
+        )
+      )
+        return;
+      // An accepted turn cannot become the pre-acceptance ambiguous state without
+      // losing its durable identity. Report the missing evidence and retain capacity.
+      return yield* makeAgentControlVerificationCandidateEvidenceError({
+        handoffId: claim.evidence.handoffId,
+        candidateReason: "provider-runtime-unavailable",
+        operation: "recover-provider-start-without-terminal-evidence",
+      });
+    }
     if (
       claim.evidence.templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION &&
       recovered.observation.deliveryState === "completed"
@@ -592,7 +630,10 @@ const make = Effect.gen(function* () {
         yield* reconcileTerminalHistory(claim);
         return;
       }
-      if (["completed", "failed", "interrupted"].includes(claim.delivery.state)) return;
+      if (["completed", "failed", "interrupted"].includes(claim.delivery.state)) {
+        pendingResultSeals.delete(claim.evidence.providerDeliveryId);
+        return;
+      }
       if (claim.delivery.state === "delivery-attempted") {
         yield* reconcileAttempted(claim);
         return;
@@ -655,15 +696,6 @@ const make = Effect.gen(function* () {
       ) {
         return;
       }
-      if (
-        claim.value.evidence.templateVersion ===
-          AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION &&
-        event.type === "turn.completed" &&
-        event.payload.state === "completed"
-      ) {
-        yield* reconcileTerminalHistory(claim.value);
-        return;
-      }
       const observation = yield* normalizeVerificationTerminal(event, {
         providerDeliveryId: claim.value.evidence.providerDeliveryId,
         threadId: claim.value.evidence.threadId,
@@ -679,6 +711,23 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
+      if (
+        claim.value.evidence.templateVersion ===
+          AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION &&
+        observation.deliveryState === "completed"
+      ) {
+        const previous = pendingResultSeals.get(claim.value.evidence.providerDeliveryId);
+        if (previous !== undefined && !Equal.equals(previous, observation)) {
+          return yield* makeAgentControlVerificationCandidateEvidenceError({
+            handoffId: claim.value.evidence.handoffId,
+            candidateReason: "provider-terminal-conflict",
+            operation: "pending-result-seal-terminal-conflict",
+          });
+        }
+        pendingResultSeals.set(claim.value.evidence.providerDeliveryId, observation);
+        yield* reconcileTerminalHistory(claim.value);
+        return;
+      }
       yield* observeTerminal(claim.value, observation);
     },
   );

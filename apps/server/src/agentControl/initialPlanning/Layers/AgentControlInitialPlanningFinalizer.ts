@@ -21,6 +21,8 @@ import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { canonicalProviderModelSelectionEvidence } from "../../../provider/Services/ProviderAdapter.ts";
+import { loadNativeTerminalReceipt } from "../../nativeTerminalReceipt.ts";
+import { makeProviderTerminalSessionCommand } from "../../../orchestration/providerTerminalSessionCommand.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { loadOrchestrationEventStreamPage } from "../../../orchestration/orchestrationEventRaw.ts";
 import { ProjectionThreadProposedPlan } from "../../../persistence/Services/ProjectionThreadProposedPlans.ts";
@@ -1787,7 +1789,7 @@ const make = Effect.gen(function* () {
         claim.delivery.state === "interrupted"
           ? claim.delivery.state
           : null;
-      const orchestration = yield* reconstructOrchestrationEvidence({
+      let orchestration = yield* reconstructOrchestrationEvidence({
         handoffId: claim.evidence.handoffId,
         handoffFingerprint: claim.evidence.handoffFingerprint,
         threadId: claim.evidence.threadId,
@@ -1798,6 +1800,52 @@ const make = Effect.gen(function* () {
         terminalAt: claim.delivery.terminalAt,
         deliveryTerminalState,
       });
+      if (orchestration === null && deliveryTerminalState !== null)
+        return yield* finalizerError(
+          handoffId,
+          "recover-provider-start",
+          "missing-provider-start-evidence",
+        );
+      if (deliveryTerminalState !== null && orchestration?.terminal == null) {
+        const nativeReceipt = yield* loadNativeTerminalReceipt("initial-planning", claim).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.mapError((cause) =>
+            finalizerError(handoffId, "load-native-terminal-receipt", "corrupt-handoff", cause),
+          ),
+        );
+        if (Option.isNone(nativeReceipt))
+          return yield* finalizerError(
+            handoffId,
+            "recover-provider-terminal",
+            "missing-provider-terminal-evidence",
+          );
+        const command = yield* makeProviderTerminalSessionCommand(
+          nativeReceipt.value,
+          claim.evidence.runtimeMode,
+        ).pipe(
+          Effect.mapError((cause) =>
+            finalizerError(handoffId, "native-terminal-command", "corrupt-handoff", cause),
+          ),
+        );
+        yield* orchestrationEngine
+          .dispatch(command)
+          .pipe(
+            Effect.mapError((cause) =>
+              finalizerError(handoffId, "replay-native-terminal", "persistence", cause),
+            ),
+          );
+        orchestration = yield* reconstructOrchestrationEvidence({
+          handoffId: claim.evidence.handoffId,
+          handoffFingerprint: claim.evidence.handoffFingerprint,
+          threadId: claim.evidence.threadId,
+          providerInstanceId: claim.evidence.providerInstanceId,
+          providerTurnId,
+          runtimeMode: claim.evidence.runtimeMode,
+          providerAcceptedAt,
+          terminalAt: claim.delivery.terminalAt,
+          deliveryTerminalState,
+        });
+      }
       if (orchestration === null) return { _tag: "Waiting" as const };
       const result = yield* processNew(claim).pipe(
         Effect.catchIf(

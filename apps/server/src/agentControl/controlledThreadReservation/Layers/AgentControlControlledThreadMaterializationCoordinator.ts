@@ -498,8 +498,13 @@ const make = Effect.gen(function* () {
           return yield* error("lease-foreign-runtime", input);
         }
         const expiration = canonicalTimestampMillis(lease.expiresAt);
-        if (expiration === null || expiration <= DateTime.toEpochMillis(yield* DateTime.now)) {
-          return yield* error("lease-expired", input);
+        if (expiration === null) return yield* error("lease-expired", input);
+        if (expiration <= DateTime.toEpochMillis(yield* DateTime.now)) {
+          if (leaseEngine.renewOwnedForProviderEffect === undefined)
+            return yield* error("lease-expired", input);
+          yield* leaseEngine
+            .renewOwnedForProviderEffect(lease)
+            .pipe(Effect.mapError(() => error("lease-expired", input)));
         }
         const worktree = yield* worktreeEngine
           .loadAuthoritative(reservation.worktreeReservationId)

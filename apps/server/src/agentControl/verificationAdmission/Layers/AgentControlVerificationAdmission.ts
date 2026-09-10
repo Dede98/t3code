@@ -896,13 +896,23 @@ const make = Effect.gen(function* () {
         ),
       ),
     );
+    // Finalization records the exact prefix observed at commit. Later checkpoint
+    // and metadata events are valid suffixes, but cannot rewrite that evidence.
+    const finalizedHistoryJson =
+      orchestration._tag === "Ready"
+        ? canonicalJson(
+            orchestration.evidence.history
+              .slice(0, candidate.orchestrationHistoryEventCount)
+              .map((entry) => parseCanonicalJson(entry.envelopeJson)),
+          )
+        : null;
     if (
       orchestration._tag !== "Ready" ||
       orchestration.evidence.outcome !== "succeeded" ||
       orchestration.evidence.terminal === null ||
-      orchestration.evidence.historyDigest !== candidate.orchestrationHistoryDigest ||
-      orchestration.evidence.historyJson !== candidate.orchestrationHistoryJson ||
-      orchestration.evidence.history.length !== candidate.orchestrationHistoryEventCount ||
+      finalizedHistoryJson !== candidate.orchestrationHistoryJson ||
+      sha256Utf8(finalizedHistoryJson!) !== candidate.orchestrationHistoryDigest ||
+      orchestration.evidence.history.length < candidate.orchestrationHistoryEventCount ||
       orchestration.evidence.started.event.eventId !== candidate.orchestrationStartedEventId ||
       orchestration.evidence.started.event.sequence !== candidate.orchestrationStartedSequence ||
       orchestration.evidence.started.streamVersion !==

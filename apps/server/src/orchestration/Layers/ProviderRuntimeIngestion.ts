@@ -19,7 +19,9 @@ import {
   type ProviderInstanceId,
   type VerificationResultCaptureCorrelation,
   RuntimeRequestId,
+  type RuntimeMode,
 } from "@t3tools/contracts";
+import { makeProviderTerminalSessionCommand } from "../providerTerminalSessionCommand.ts";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
@@ -2346,14 +2348,40 @@ const make = Effect.gen(function* () {
               lifecycle: providerRuntimeLifecycle,
             };
           } else {
-            yield* orchestrationEngine.dispatch({
-              type: "thread.session.set",
-              commandId: yield* providerCommandId(event, "thread-session-set"),
-              threadId: thread.id,
-              session,
-              ...(providerRuntimeLifecycle === undefined ? {} : { providerRuntimeLifecycle }),
-              createdAt: now,
-            });
+            const controlledTerminals =
+              isTerminalTurn && eventTurnId !== undefined
+                ? yield* sql<{ readonly runtimeMode: RuntimeMode }>`
+                  SELECT intent.runtime_mode AS "runtimeMode"
+                  FROM agent_control_initial_planning_deliveries delivery
+                  JOIN agent_control_initial_planning_handoff_intents intent
+                    ON intent.provider_delivery_id=delivery.provider_delivery_id
+                  WHERE delivery.thread_id=${thread.id}
+                    AND delivery.provider_turn_id=${eventTurnId}
+                    AND delivery.provider_instance_id=${eventProviderInstanceId}
+                  UNION ALL
+                  SELECT runtime_mode AS "runtimeMode" FROM agent_control_implementation_deliveries
+                  WHERE thread_id=${thread.id} AND provider_turn_id=${eventTurnId}
+                    AND provider_instance_id=${eventProviderInstanceId}
+                `
+                : [];
+            if (controlledTerminals.length > 1) {
+              return yield* Effect.die(
+                new Error("Native terminal has conflicting controlled delivery ownership."),
+              );
+            }
+            const controlledTerminal = controlledTerminals[0];
+            yield* orchestrationEngine.dispatch(
+              controlledTerminal === undefined
+                ? {
+                    type: "thread.session.set",
+                    commandId: yield* providerCommandId(event, "thread-session-set"),
+                    threadId: thread.id,
+                    session,
+                    ...(providerRuntimeLifecycle === undefined ? {} : { providerRuntimeLifecycle }),
+                    createdAt: now,
+                  }
+                : yield* makeProviderTerminalSessionCommand(event, controlledTerminal.runtimeMode),
+            );
           }
         }
       }

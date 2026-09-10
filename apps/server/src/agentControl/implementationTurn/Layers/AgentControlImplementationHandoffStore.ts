@@ -1,4 +1,8 @@
 import {
+  loadNativeTerminalReceipt,
+  recordNativeTerminalReceipt,
+} from "../../nativeTerminalReceipt.ts";
+import {
   AgentControlControlledThreadReservationId,
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
@@ -11,6 +15,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -1140,7 +1145,7 @@ const make = Effect.gen(function* () {
         model_selection_fingerprint, recorded_at) VALUES (${input.providerDeliveryId},
         ${input.providerInstanceId}, ${input.turnModelSelectionJson},
         ${input.turnModelSelectionFingerprint}, ${input.attemptedAt})`;
-            return yield* sql.unsafe<Record<string, unknown>>(
+            const rows = yield* sql.unsafe<Record<string, unknown>>(
               `UPDATE agent_control_implementation_deliveries
         SET state='delivery-attempted', revision=revision+1, provider_session_created_at=?,
           provider_resume_cursor_json=?, updated_at=? WHERE handoff_id=? AND revision=?
@@ -1155,12 +1160,11 @@ const make = Effect.gen(function* () {
                 input.claimGeneration,
               ],
             );
+            return yield* updateOne("mark-delivery-attempted", rows);
           }),
         )
-        .pipe(
-          Effect.mapError((cause) => persistenceError("mark-delivery-attempted", cause)),
-          Effect.flatMap((rows) => updateOne("mark-delivery-attempted", rows)),
-        );
+        .pipe(Effect.mapError((cause) => preserveStoreError("mark-delivery-attempted", cause)));
+
   const markProviderStarted: AgentControlImplementationHandoffStoreShape["markProviderStarted"] = (
     input,
   ) =>
@@ -1218,7 +1222,7 @@ const make = Effect.gen(function* () {
           `UPDATE agent_control_implementation_deliveries
       SET state='ambiguous', revision=revision+1, claim_owner_id=NULL, claim_expires_at=NULL,
         next_attempt_at=NULL, terminal_at=?, last_error_code='provider-acceptance-ambiguous', updated_at=?
-      WHERE handoff_id=? AND revision=? AND state='delivery-attempted' RETURNING ${returning}`,
+      WHERE handoff_id=? AND revision=? AND state IN ('delivery-attempted','provider-started') RETURNING ${returning}`,
           [input.terminalAt, input.terminalAt, input.handoffId, input.expectedRevision],
         ),
       )
@@ -1235,8 +1239,17 @@ const make = Effect.gen(function* () {
       SET state='provider-started', revision=revision+1, claim_owner_id=NULL, claim_expires_at=NULL,
         provider_turn_id=?, provider_accepted_at=?, terminal_at=NULL,
         last_error_code=NULL, updated_at=?
-      WHERE thread_id=? AND state IN ('delivery-attempted','ambiguous') RETURNING ${returning}`,
-            [input.providerTurnId, input.acceptedAt, input.acceptedAt, input.threadId],
+      WHERE thread_id=? AND state IN ('delivery-attempted','ambiguous')
+        AND (provider_turn_id IS NULL OR (provider_turn_id=? AND provider_accepted_at=?))
+      RETURNING ${returning}`,
+            [
+              input.providerTurnId,
+              input.acceptedAt,
+              input.acceptedAt,
+              input.threadId,
+              input.providerTurnId,
+              input.acceptedAt,
+            ],
           ),
         )
         .pipe(
@@ -1251,29 +1264,58 @@ const make = Effect.gen(function* () {
     (input) =>
       sql
         .withTransaction(
-          sql.unsafe<Record<string, unknown>>(
-            `UPDATE agent_control_implementation_deliveries
+          Effect.gen(function* () {
+            const claim =
+              input.nativeEvent === undefined
+                ? Option.none()
+                : yield* loadAcceptedByThreadId(input.threadId);
+            const rows = yield* sql.unsafe<Record<string, unknown>>(
+              `UPDATE agent_control_implementation_deliveries
       SET state=?, revision=revision+1, terminal_at=?, last_error_code=?, updated_at=?
       WHERE thread_id=? AND provider_turn_id=? AND state IN ('provider-started','interrupt-requested','ambiguous')
       RETURNING ${returning}`,
-            [
-              input.state,
-              input.terminalAt,
-              input.errorCode ?? null,
-              input.terminalAt,
-              input.threadId,
-              input.providerTurnId,
-            ],
-          ),
+              [
+                input.state,
+                input.terminalAt,
+                input.errorCode ?? null,
+                input.terminalAt,
+                input.threadId,
+                input.providerTurnId,
+              ],
+            );
+            if (rows.length === 0) {
+              if (
+                input.nativeEvent !== undefined &&
+                Option.isSome(claim) &&
+                claim.value.delivery.providerTurnId === input.providerTurnId
+              ) {
+                const prior = yield* loadNativeTerminalReceipt("implementation", claim.value).pipe(
+                  Effect.provideService(SqlClient.SqlClient, sql),
+                );
+                if (Option.isSome(prior) && !Equal.equals(prior.value, input.nativeEvent)) {
+                  return yield* makeAgentControlImplementationCandidateEvidenceError({
+                    handoffId: claim.value.evidence.handoffId,
+                    candidateReason: "evidence-divergent",
+                    operation: "native-terminal-replay-conflict",
+                  });
+                }
+              }
+              return Option.none();
+            }
+            const delivery = yield* updateOne("observe-provider-terminal", rows);
+            if (input.nativeEvent !== undefined) {
+              if (Option.isNone(claim))
+                return yield* persistenceError("record-native-terminal-missing-handoff");
+              yield* recordNativeTerminalReceipt({
+                stage: "implementation",
+                claim: { evidence: claim.value.evidence, delivery },
+                event: input.nativeEvent,
+              }).pipe(Effect.provideService(SqlClient.SqlClient, sql));
+            }
+            return Option.some(delivery);
+          }),
         )
-        .pipe(
-          Effect.mapError((cause) => persistenceError("observe-provider-terminal", cause)),
-          Effect.flatMap((rows) =>
-            rows.length === 0
-              ? Effect.succeed(Option.none())
-              : updateOne("observe-provider-terminal", rows).pipe(Effect.map(Option.some)),
-          ),
-        );
+        .pipe(Effect.mapError((cause) => preserveStoreError("observe-provider-terminal", cause)));
   const listStageStartCandidates: AgentControlImplementationHandoffStoreShape["listStageStartCandidates"] =
     (limit = 100) =>
       sql<{ readonly handoffId: string }>`

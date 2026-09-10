@@ -899,7 +899,7 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
   }
   if (isPromptV2 && terminalSelection.observation.deliveryState === "completed") {
     if (resultSourceSeal === undefined) {
-      return { _tag: "Waiting" } as const;
+      return { _tag: "Waiting", terminalObserved: true } as const;
     }
     const digestPattern = /^[0-9a-f]{64}$/u;
     const validDisposition =

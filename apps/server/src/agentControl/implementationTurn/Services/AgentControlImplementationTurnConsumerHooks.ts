@@ -2,6 +2,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
 export interface AgentControlImplementationTurnConsumerHooksShape {
+  readonly afterNativeTerminalRecorded?: (handoffId: string) => Effect.Effect<void>;
   readonly beforeClaim: (handoffId: string) => Effect.Effect<void>;
   readonly afterClaim: (handoffId: string) => Effect.Effect<void>;
   readonly beforeDeliveryCas?: (handoffId: string) => Effect.Effect<void>;

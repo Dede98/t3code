@@ -1498,6 +1498,101 @@ const seedRunOnceCommittedVerificationFinalization = Effect.fn(
 });
 
 activationLayer("Controlled thread activation facade", (it) => {
+  it.effect.each([
+    [false, true],
+    [true, true],
+  ] as const)(
+    "materializes one controlled thread after restarting from a ready worktree (prepared=%s, expired=%s)",
+    ([prepareBeforeRestart, expiresDuringRestart]) =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const repo = yield* makeRepository();
+        const buildRuntime = Effect.fn("buildMaterializationRestartRuntime")(function* () {
+          const scope = yield* Scope.make("sequential");
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const controllerContext = yield* buildControllerContext(sql, scope);
+          const reservationContext = yield* Layer.buildWithScope(
+            Layer.fresh(AgentControlControlledThreadReservationLive).pipe(
+              Layer.provide(Layer.succeedContext(controllerContext)),
+            ),
+            scope,
+          );
+          const context = Context.merge(controllerContext, reservationContext);
+          const coordinator = yield* buildCoordinator().pipe(Effect.provide(context));
+          const activation = yield* buildActivation({
+            reservation: Context.get(context, AgentControlControlledThreadReservation),
+            coordinator,
+          });
+          return { scope, context, activation };
+        });
+        const caseId = `${prepareBeforeRestart}-${expiresDuringRestart}`;
+        const projectId = ProjectId.make(`mat-restart-${caseId}`);
+        const first = yield* buildRuntime();
+        const seeded = yield* seedPrepared(projectId, repo.cwd).pipe(Effect.provide(first.context));
+        yield* reserveLease(seeded.stageRun).pipe(Effect.provide(first.context));
+        const worktree = yield* Context.get(
+          first.context,
+          AgentControlWorktreeController,
+        ).reserveAndMaterialize({
+          commandId: CommandId.make(`materialization-restart-worktree-${caseId}`),
+          projectId,
+          taskId: seeded.task.taskId,
+        });
+        assert.equal(worktree.status, "ready");
+        const input = {
+          commandId: CommandId.make(`materialization-restart-prepare-${caseId}`),
+          projectId,
+          taskId: seeded.task.taskId,
+        };
+        if (prepareBeforeRestart) {
+          yield* Context.get(first.context, AgentControlControlledThreadReservation).prepareInitial(
+            input,
+          );
+        }
+        assert.deepStrictEqual(
+          yield* sql`
+          SELECT count(*) AS count FROM projection_threads WHERE project_id = ${projectId}
+        `,
+          [{ count: 0 }],
+        );
+        yield* Scope.close(first.scope, Exit.void);
+        if (expiresDuringRestart) yield* TestClock.adjust("3 minutes");
+        const restarted = yield* buildRuntime();
+
+        const prepared = yield* restarted.activation.activateInitial(input);
+        assert.deepStrictEqual(yield* restarted.activation.activateInitial(input), prepared);
+        const current = yield* Context.get(
+          restarted.context,
+          AgentControlControlledThreadReservation,
+        ).get({
+          projectId,
+          controlledThreadReservationId: prepared.reservation.controlledThreadReservationId,
+        });
+        assert.equal(current.status, "bound");
+        assert.equal(current.revision, 3);
+        assert.deepStrictEqual(
+          yield* sql`
+          SELECT count(*) AS count FROM projection_threads WHERE project_id = ${projectId}
+        `,
+          [{ count: 1 }],
+        );
+        assert.deepStrictEqual(
+          yield* sql`
+          SELECT count(*) AS count FROM agent_control_initial_planning_deliveries delivery
+          JOIN agent_control_initial_planning_handoff_accepted accepted
+            ON accepted.handoff_id = delivery.handoff_id
+          WHERE accepted.coordinator_command_id = ${yield* deriveAgentControlControlledThreadActivationCommandId(
+            input.commandId,
+            prepared.reservation.controlledThreadReservationId,
+          )}
+        `,
+          [{ count: 1 }],
+        );
+        yield* Scope.close(restarted.scope, Exit.void);
+      }),
+    30_000,
+  );
+
   it.effect(
     "dispatches one Run-Once candidate through production Stage Lease Worktree and Thread seams",
     () =>
@@ -3218,21 +3313,29 @@ activationLayer("Controlled thread activation facade", (it) => {
       }),
   );
 
-  it.effect(
-    "recovers a lost wake-up with two consumers and executes one provider delivery outside SQLite",
-    () =>
+  it.effect.each([
+    "delivery",
+    "terminal",
+    "missing-terminal-time",
+    "stale-runtime",
+    "stale-cas",
+  ] as const)(
+    "recovers Initial Planning delivery and restart evidence: %s",
+    (restartCase) =>
       Effect.gen(function* () {
         const repo = yield* makeRepository();
-        const projectId = ProjectId.make("controlled-thread-initial-planning-consumer");
+        const projectId = ProjectId.make(
+          `controlled-thread-initial-planning-consumer-${restartCase}`,
+        );
         const seeded = yield* seedPrepared(projectId, repo.cwd);
         yield* reserveLease(seeded.stageRun);
         yield* (yield* AgentControlWorktreeController).reserveAndMaterialize({
-          commandId: CommandId.make("initial-planning-consumer-ready-worktree"),
+          commandId: CommandId.make(`initial-planning-consumer-ready-worktree-${restartCase}`),
           projectId,
           taskId: seeded.task.taskId,
         });
         const prepared = yield* (yield* AgentControlControlledThreadActivation).activateInitial({
-          commandId: CommandId.make("initial-planning-consumer-prepare"),
+          commandId: CommandId.make(`initial-planning-consumer-prepare-${restartCase}`),
           projectId,
           taskId: seeded.task.taskId,
         });
@@ -3520,6 +3623,109 @@ activationLayer("Controlled thread activation facade", (it) => {
           if (start) yield* consumer.start().pipe(Scope.provide(consumerScope));
           return { consumer, consumerScope };
         });
+        if (restartCase === "stale-cas") {
+          const crashed = yield* buildConsumer({
+            beforeClaim: () => Effect.void,
+            afterClaim: () => Effect.void,
+            beforeDeliveryCas: () => Effect.die("crash-before-delivery-cas"),
+          });
+          yield* crashed.consumer.drain;
+          yield* Scope.close(crashed.consumerScope, Exit.void);
+          const claim = Option.getOrThrow(yield* store.loadAcceptedByHandoffId(handoffId));
+          assert.equal(claim.delivery.state, "claimed");
+          const model = canonicalProviderModelSelectionEvidence(claim.evidence.modelSelection);
+          const failed = yield* Effect.exit(
+            store.markDeliveryAttempted({
+              handoffId,
+              providerDeliveryId: claim.evidence.providerDeliveryId,
+              ownerId: claim.delivery.claimOwnerId!,
+              claimGeneration: claim.delivery.claimGeneration,
+              expectedRevision: claim.delivery.revision + 1,
+              attemptedAt: DateTime.formatIso(yield* DateTime.now),
+              providerSessionCreatedAt: "2026-07-30T12:00:00.000Z",
+              providerResumeCursorJson: "null",
+              providerInstanceId: claim.evidence.providerInstanceId,
+              turnModelSelectionJson: model.modelSelectionJson,
+              turnModelSelectionFingerprint: model.modelSelectionFingerprint,
+            }),
+          );
+          assert.isTrue(Exit.isFailure(failed));
+          assert.deepStrictEqual(
+            yield* sql`
+            SELECT count(*) AS count FROM agent_control_initial_planning_delivery_attestations
+            WHERE provider_delivery_id=${claim.evidence.providerDeliveryId}
+          `,
+            [{ count: 0 }],
+          );
+          assert.deepStrictEqual(
+            Option.getOrThrow(yield* store.loadAcceptedByHandoffId(handoffId)).delivery,
+            claim.delivery,
+          );
+          assert.equal(yield* Ref.get(executeCalls), 0);
+          return;
+        }
+        if (restartCase !== "delivery") {
+          yield* Deferred.succeed(releaseExecute, undefined);
+          const first = yield* buildConsumer();
+          yield* first.consumer.drain;
+          yield* Scope.close(first.consumerScope, Exit.void);
+          const claim = Option.getOrThrow(
+            yield* store.loadAcceptedByThreadId(prepared.reservation.threadId),
+          );
+          const startedAt = DateTime.formatIso(yield* DateTime.now);
+          const turnId = TurnId.make("provider-turn-initial-planning");
+          yield* store.observeProviderStarted({
+            threadId: claim.evidence.threadId,
+            providerTurnId: turnId,
+            acceptedAt: startedAt,
+          });
+          yield* providerRuntime.upsert({
+            threadId: claim.evidence.threadId,
+            providerName: "codex",
+            providerInstanceId: claim.evidence.providerInstanceId,
+            adapterKey: "codex",
+            runtimeMode: claim.evidence.runtimeMode,
+            status: "running",
+            lastSeenAt: startedAt,
+            resumeCursor: null,
+            runtimePayload: null,
+          });
+          if (restartCase !== "stale-runtime") {
+            yield* projectionTurns.upsertByTurnId({
+              threadId: claim.evidence.threadId,
+              turnId,
+              pendingMessageId: null,
+              sourceProposedPlanThreadId: null,
+              sourceProposedPlanId: null,
+              assistantMessageId: null,
+              state: "completed",
+              requestedAt: startedAt,
+              startedAt,
+              completedAt: restartCase === "terminal" ? startedAt : null,
+              checkpointTurnCount: null,
+              checkpointRef: null,
+              checkpointStatus: null,
+              checkpointFiles: [],
+            });
+          }
+          const interruptCallsBeforeRestart = yield* Ref.get(interruptCalls);
+          if (restartCase === "terminal") yield* TestClock.adjust("31 minutes");
+          const restarted = yield* buildConsumer();
+          yield* restarted.consumer.drain;
+          yield* Scope.close(restarted.consumerScope, Exit.void);
+          const recovered = Option.getOrThrow(
+            yield* store.loadAcceptedByHandoffId(claim.evidence.handoffId),
+          );
+          assert.equal(
+            recovered.delivery.state,
+            restartCase === "terminal" ? "completed" : "ambiguous",
+            restartCase,
+          );
+          assert.equal(recovered.delivery.attemptCount, 1, restartCase);
+          assert.equal(yield* Ref.get(interruptCalls), interruptCallsBeforeRestart, restartCase);
+          if (restartCase === "terminal") assert.equal(recovered.delivery.terminalAt, startedAt);
+          return;
+        }
         const initialDeliveryBeforeAdmission = yield* sql`
           SELECT typeof(provider_delivery_id) AS "idStorageClass",
             hex(CAST(provider_delivery_id AS BLOB)) AS "idBytes",state,revision,

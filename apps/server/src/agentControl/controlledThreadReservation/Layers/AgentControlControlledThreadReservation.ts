@@ -400,16 +400,6 @@ const make = Effect.gen(function* () {
               input.taskId,
             );
           }
-          const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
-          const now = yield* DateTime.now;
-          if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
-            return yield* safeError(
-              "lease-expired",
-              "prepare-initial",
-              input.projectId,
-              input.taskId,
-            );
-          }
           if (
             leaseState.taskRevision !== task.revision ||
             leaseState.githubIntakeSequence !== task.githubIntakeSequence ||
@@ -420,6 +410,27 @@ const make = Effect.gen(function* () {
               "prepare-initial",
               input.projectId,
               input.taskId,
+            );
+          }
+          const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
+          const now = yield* DateTime.now;
+          if (
+            expiresAt === null ||
+            (expiresAt <= DateTime.toEpochMillis(now) &&
+              leaseEngine.renewOwnedForProviderEffect === undefined)
+          ) {
+            return yield* safeError(
+              "lease-expired",
+              "prepare-initial",
+              input.projectId,
+              input.taskId,
+            );
+          }
+          if (expiresAt <= DateTime.toEpochMillis(now)) {
+            yield* leaseEngine.renewOwnedForProviderEffect!(leaseState).pipe(
+              Effect.mapError(() =>
+                safeError("lease-expired", "prepare-initial", input.projectId, input.taskId),
+              ),
             );
           }
 

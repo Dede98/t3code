@@ -3351,7 +3351,6 @@ const make = Effect.gen(function* () {
       row.taskRevision !== stageRun.taskRevision ||
       row.githubIntakeSequence !== stageRun.githubIntakeSequence ||
       row.sourceIdentityFingerprint !== stageRun.sourceIdentityFingerprint ||
-      row.leaseHolderId !== holderId ||
       row.terminalAt !== row.finalizedAt ||
       canonicalTimestampMillis(row.finalizedAt) === null ||
       row.orchestrationTerminalSequence <= row.orchestrationStartedSequence ||
@@ -3491,7 +3490,7 @@ const make = Effect.gen(function* () {
         successorEvent.payload.leaseId !== row.leaseId ||
         successorEvent.payload.stageRunId !== successorState.stageRunId ||
         successorEvent.payload.attemptId !== successorState.attemptId ||
-        successorEvent.payload.holderId !== row.leaseHolderId ||
+        successorEvent.payload.holderId !== successorState.holderId ||
         successorEvent.payload.fenceToken !== successorState.fenceToken ||
         ((successorEvent.type === "agentControl.stageRunLease.reserved" ||
           successorEvent.type === "agentControl.stageRunLease.releasedAfterPlanning" ||
@@ -3506,8 +3505,7 @@ const make = Effect.gen(function* () {
         successorState.taskId !== row.taskId ||
         successorState.taskRevision !== row.taskRevision ||
         successorState.githubIntakeSequence !== row.githubIntakeSequence ||
-        successorState.sourceIdentityFingerprint !== row.sourceIdentityFingerprint ||
-        successorState.holderId !== row.leaseHolderId
+        successorState.sourceIdentityFingerprint !== row.sourceIdentityFingerprint
       ) {
         return yield* error("source-snapshot-stale", operation, projectId, taskId, reservationId);
       }
@@ -3613,7 +3611,7 @@ const make = Effect.gen(function* () {
         if (stageRun.status === "prepared" && leaseState.status !== "reserved") {
           return yield* error("lease-not-reserved", operation, projectId, taskId);
         }
-        if (leaseState.holderId !== holderId) {
+        if (leaseState.status === "reserved" && leaseState.holderId !== holderId) {
           return yield* error("lease-foreign-runtime", operation, projectId, taskId);
         }
         if (
@@ -3633,8 +3631,15 @@ const make = Effect.gen(function* () {
         if (stageRun.status === "prepared") {
           const expiresAt = canonicalTimestampMillis(leaseState.expiresAt);
           const now = yield* DateTime.now;
-          if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
+          if (expiresAt === null)
             return yield* error("lease-expired", operation, projectId, taskId);
+          if (expiresAt <= DateTime.toEpochMillis(now)) {
+            if (leaseEngine.renewOwnedForProviderEffect === undefined) {
+              return yield* error("lease-expired", operation, projectId, taskId);
+            }
+            yield* leaseEngine
+              .renewOwnedForProviderEffect(leaseState)
+              .pipe(Effect.mapError(() => error("lease-expired", operation, projectId, taskId)));
           }
           if (readyReuseReservationId !== null) {
             const controlledThreadReservationId =

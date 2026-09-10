@@ -58,6 +58,7 @@ import {
   type AgentControlThreadMaterializationTransactionResult,
 } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { fingerprintAgentControlThreadMaterializationCommand } from "../../../orchestration/agentControlThreadMaterializationIntent.ts";
+import { loadControlledThreadMaterializationReplay } from "../../controlledThreadReservation/materializationReplay.ts";
 import { loadAuthoritativeControlledThreadReservation } from "../../controlledThreadReservation/authoritative.ts";
 import { decideAgentControlControlledThreadReservationCommand } from "../../controlledThreadReservation/decider.ts";
 import {
@@ -377,6 +378,9 @@ const make = Effect.gen(function* () {
           error(evidence.handoffId, "lease-history", "admission-corrupt", cause),
         ),
       );
+      const leaseReservation = Option.isSome(lease)
+        ? lease.value.events[evidence.verificationLeaseEventStreamVersion - 1]
+        : undefined;
       if (
         Option.isNone(lease) ||
         lease.value.state.status !== "reserved" ||
@@ -384,9 +388,26 @@ const make = Effect.gen(function* () {
         lease.value.state.attemptId !== state.attemptId ||
         lease.value.state.holderId !== evidence.leaseHolderId ||
         lease.value.state.fenceToken !== evidence.verificationFenceToken ||
-        lease.value.events.at(-1)?.eventId !== evidence.verificationLeaseEventId ||
-        lease.value.events.at(-1)?.sequence !== evidence.verificationLeaseEventSequence ||
-        lease.value.events.at(-1)?.streamVersion !== evidence.verificationLeaseEventStreamVersion ||
+        leaseReservation?.type !== "agentControl.stageRunLease.reserved" ||
+        leaseReservation.eventId !== evidence.verificationLeaseEventId ||
+        leaseReservation.sequence !== evidence.verificationLeaseEventSequence ||
+        leaseReservation.streamVersion !== evidence.verificationLeaseEventStreamVersion ||
+        leaseReservation.payload.stageRunId !== state.stageRunId ||
+        leaseReservation.payload.attemptId !== state.attemptId ||
+        leaseReservation.payload.holderId !== evidence.leaseHolderId ||
+        leaseReservation.payload.fenceToken !== evidence.verificationFenceToken ||
+        // Admission records the reserve boundary; later same-owner renewals
+        // extend its lifetime without replacing that immutable evidence.
+        lease.value.events
+          .slice(evidence.verificationLeaseEventStreamVersion)
+          .some(
+            (event) =>
+              event.type !== "agentControl.stageRunLease.renewed" ||
+              event.payload.stageRunId !== state.stageRunId ||
+              event.payload.attemptId !== state.attemptId ||
+              event.payload.holderId !== evidence.leaseHolderId ||
+              event.payload.fenceToken !== evidence.verificationFenceToken,
+          ) ||
         canonicalTimestampMillis(lease.value.state.expiresAt) === null ||
         canonicalTimestampMillis(lease.value.state.expiresAt)! <=
           DateTime.toEpochMillis(yield* DateTime.now)
@@ -832,22 +853,28 @@ const make = Effect.gen(function* () {
       if (orchestrationResult.lastSequence !== row.orchestrationResultSequence) {
         return yield* error(handoffId, "replay-orchestration-sequence", "admission-corrupt");
       }
-      const acceptedReservation = yield* reservationEngine
-        .validateAcceptedReplayEvidence({
-          controlledThreadReservationId: AgentControlControlledThreadReservationId.make(
-            row.controlledThreadReservationId,
-          ),
-          projectId: command.projectId,
-        })
-        .pipe(
-          Effect.mapError((cause) =>
-            error(handoffId, "replay-reservation", "admission-corrupt", cause),
-          ),
-        );
+      const acceptedReservation = yield* loadControlledThreadMaterializationReplay(
+        command,
+        replayedCommandFingerprint,
+        reservationEvents,
+        reservationStates,
+      ).pipe(
+        Effect.mapError((cause) =>
+          error(handoffId, "replay-reservation", "admission-corrupt", cause),
+        ),
+      );
       if (
         acceptedReservation.history.length < 3 ||
         acceptedReservation.history[1]?.eventId !== row.reservationMaterializingEventId ||
-        acceptedReservation.history[2]?.eventId !== row.reservationBoundEventId
+        acceptedReservation.history[2]?.eventId !== row.reservationBoundEventId ||
+        acceptedReservation.history[1]?.sequence !== row.reservationMaterializingEventSequence ||
+        acceptedReservation.history[2]?.sequence !== row.reservationBoundEventSequence ||
+        acceptedReservation.currentState.leaseHolderId !== claim.value.evidence.leaseHolderId ||
+        acceptedReservation.currentState.coordinatorCommandId !== row.coordinatorCommandId ||
+        acceptedReservation.currentState.coordinatorCommandFingerprint !==
+          row.coordinatorCommandFingerprint ||
+        acceptedReservation.currentState.orchestrationResultSequence !==
+          row.orchestrationResultSequence
       ) {
         return yield* error(handoffId, "replay-reservation-events", "admission-corrupt");
       }

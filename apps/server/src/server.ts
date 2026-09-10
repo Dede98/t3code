@@ -38,6 +38,7 @@ import {
   AgentControlRunOnceControllerLayerLive,
   AgentControlRuntimeLayerLive,
   AgentControlTaskConsumerGuardLayerLive,
+  AgentControlStageRunLeaseEngineLayerLive,
   AgentControlWorktreeControllerLayerLive,
 } from "./agentControl/runtimeLayer.ts";
 import { AgentControlControlledThreadActivationLive } from "./agentControl/controlledThreadReservation/Layers/AgentControlControlledThreadActivation.ts";
@@ -382,6 +383,7 @@ const ProviderAdmissionTaskGuardLayerLive = AgentControlTaskConsumerGuardLayerLi
   Layer.provide(PersistenceLayerLive),
 );
 const ProviderAdmissionGuardLayerLive = ProviderAdmissionGuardLive.pipe(
+  Layer.provide(AgentControlStageRunLeaseEngineLayerLive.pipe(Layer.provide(PersistenceLayerLive))),
   Layer.provideMerge(ProviderAdmissionStoreLayerLive),
   Layer.provide(ProviderAdmissionTaskGuardLayerLive),
 );

@@ -8,6 +8,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -39,6 +40,13 @@ import {
   type AgentControlInitialPlanningHandoffStoreShape,
   type AgentControlInitialPlanningTurnAcceptance,
 } from "../Services/AgentControlInitialPlanningHandoffStore.ts";
+
+import {
+  loadNativeTerminalReceipt,
+  recordNativeTerminalReceipt,
+} from "../../nativeTerminalReceipt.ts";
+
+const isStoreError = Schema.is(AgentControlInitialPlanningStoreError);
 
 const EvidenceRow = Schema.Struct({
   handoffId: Schema.String,
@@ -704,7 +712,7 @@ const make = Effect.gen(function* () {
             if (attestations[0]?.count !== 1) {
               return yield* storeError("delivery-attestation-conflict");
             }
-            return yield* sql.unsafe<Record<string, unknown>>(
+            const rows = yield* sql.unsafe<Record<string, unknown>>(
               `UPDATE agent_control_initial_planning_deliveries
          SET state = 'delivery-attempted', revision = revision + 1,
              provider_session_created_at = ?,
@@ -723,11 +731,13 @@ const make = Effect.gen(function* () {
                 input.claimGeneration,
               ],
             );
+            return yield* updateOne("mark-delivery-attempted", rows);
           }),
         )
         .pipe(
-          Effect.mapError((cause) => storeError("mark-delivery-attempted", cause)),
-          Effect.flatMap((rows) => updateOne("mark-delivery-attempted", rows)),
+          Effect.mapError((cause) =>
+            isStoreError(cause) ? cause : storeError("mark-delivery-attempted", cause),
+          ),
         );
 
   const markProviderStarted: AgentControlInitialPlanningHandoffStoreShape["markProviderStarted"] = (
@@ -881,28 +891,58 @@ const make = Effect.gen(function* () {
   const observeProviderTerminal: AgentControlInitialPlanningHandoffStoreShape["observeProviderTerminal"] =
     (input) =>
       sql
-        .unsafe<Record<string, unknown>>(
-          `UPDATE agent_control_initial_planning_deliveries
+        .withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql.unsafe<Record<string, unknown>>(
+              `UPDATE agent_control_initial_planning_deliveries
          SET state = ?, revision = revision + 1, terminal_at = ?,
              last_error_code = ?, updated_at = ?
          WHERE thread_id = ? AND provider_turn_id = ?
            AND state IN ('provider-started', 'interrupt-requested', 'ambiguous')
          RETURNING ${deliveryReturning}`,
-          [
-            input.state,
-            input.terminalAt,
-            input.errorCode ?? null,
-            input.terminalAt,
-            input.threadId,
-            input.providerTurnId,
-          ],
+              [
+                input.state,
+                input.terminalAt,
+                input.errorCode ?? null,
+                input.terminalAt,
+                input.threadId,
+                input.providerTurnId,
+              ],
+            );
+            if (rows.length === 0) {
+              if (input.nativeEvent !== undefined) {
+                const claim = yield* loadAcceptedByThreadId(input.threadId);
+                if (
+                  Option.isSome(claim) &&
+                  claim.value.delivery.providerTurnId === input.providerTurnId
+                ) {
+                  const prior = yield* loadNativeTerminalReceipt(
+                    "initial-planning",
+                    claim.value,
+                  ).pipe(Effect.provideService(SqlClient.SqlClient, sql));
+                  if (Option.isSome(prior) && !Equal.equals(prior.value, input.nativeEvent))
+                    return yield* storeError("native-terminal-replay-conflict");
+                }
+              }
+              return Option.none();
+            }
+            const delivery = yield* updateOne("observe-provider-terminal", rows);
+            if (input.nativeEvent !== undefined) {
+              const claim = yield* loadAcceptedByThreadId(input.threadId);
+              if (Option.isNone(claim))
+                return yield* storeError("observe-provider-terminal-missing-handoff");
+              yield* recordNativeTerminalReceipt({
+                stage: "initial-planning",
+                claim: claim.value,
+                event: input.nativeEvent,
+              }).pipe(Effect.provideService(SqlClient.SqlClient, sql));
+            }
+            return Option.some(delivery);
+          }),
         )
         .pipe(
-          Effect.mapError((cause) => storeError("observe-provider-terminal", cause)),
-          Effect.flatMap((rows) =>
-            rows.length === 0
-              ? Effect.succeed(Option.none())
-              : updateOne("observe-provider-terminal", rows).pipe(Effect.map(Option.some)),
+          Effect.mapError((cause) =>
+            isStoreError(cause) ? cause : storeError("observe-provider-terminal", cause),
           ),
         );
 

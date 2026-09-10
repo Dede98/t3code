@@ -18,6 +18,8 @@ export class AgentControlInitialPlanningFinalizerError extends Schema.TaggedErro
       "corrupt-lease-history",
       "ambiguous-plan",
       "missing-plan",
+      "missing-provider-terminal-evidence",
+      "missing-provider-start-evidence",
       "identity-mismatch",
       "revision-conflict",
       "receipt-mismatch",

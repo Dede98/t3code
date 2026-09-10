@@ -1,4 +1,4 @@
-import type { CommandId, ThreadId } from "@t3tools/contracts";
+import type { CommandId, ThreadId, ProviderRuntimeEvent } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -172,6 +172,7 @@ export interface AgentControlImplementationHandoffStoreShape {
     AgentControlImplementationStoreError
   >;
   readonly observeProviderTerminal: (input: {
+    readonly nativeEvent?: ProviderRuntimeEvent;
     readonly threadId: ThreadId;
     readonly providerTurnId: string;
     readonly state: "completed" | "failed" | "interrupted";

@@ -12,6 +12,7 @@ import {
   type AgentControlStageRunLeaseReceiptableRejectionCode as LeaseReceiptCode,
   type AgentControlStageRunLeaseState,
   type AgentControlStageRunLeaseView,
+  CommandId,
   EventId,
   ProjectId as ProjectIdSchema,
 } from "@t3tools/contracts";
@@ -33,12 +34,14 @@ import {
 import { decideAgentControlStageRunLeaseCommand } from "../decider.ts";
 import { makeAgentControlStageRunLeaseHolderId } from "../identity.ts";
 import { canonicalTimestampMillis } from "../invariant.ts";
+import { acquireStageRunLeaseRuntimeOwnership } from "../runtimeOwnership.ts";
 import { projectAgentControlStageRunLeaseEvent } from "../projector.ts";
 import {
   AgentControlStageRunLeaseEngine,
   type AgentControlStageRunLeaseDispatchInput,
   type AgentControlStageRunLeaseDispatchOutcome,
   type AgentControlStageRunLeaseEngineShape,
+  type AgentControlStageRunLeaseRenewalBinding,
 } from "../Services/AgentControlStageRunLeaseEngine.ts";
 import { requireRunOnceMethod } from "../../runOnce/context.ts";
 import { AgentControlStageRunLeaseEventStore } from "../Services/AgentControlStageRunLeaseEventStore.ts";
@@ -258,7 +261,6 @@ const make = Effect.gen(function* () {
         }),
     ),
   );
-  const holderId = yield* makeAgentControlStageRunLeaseHolderId(runtimeAttemptId);
   const receipts = yield* AgentControlCommandReceiptRepository;
   const events = yield* AgentControlStageRunLeaseEventStore;
   const projection = yield* AgentControlStageRunLeaseProjection;
@@ -269,6 +271,21 @@ const make = Effect.gen(function* () {
   const transactionHooks = yield* AgentControlStageRunLeaseTransactionHooks;
 
   yield* projection.bootstrap.pipe(
+    Effect.mapError(
+      () =>
+        new AgentControlStageRunLeaseRpcError({
+          code: "internal-persistence-error",
+          operation: "dispatch",
+          projectId: internalProjectId,
+          taskId: null,
+        }),
+    ),
+  );
+
+  const holderId = yield* acquireStageRunLeaseRuntimeOwnership({
+    holderId: yield* makeAgentControlStageRunLeaseHolderId(runtimeAttemptId),
+    ownerToken: runtimeAttemptId,
+  }).pipe(
     Effect.mapError(
       () =>
         new AgentControlStageRunLeaseRpcError({
@@ -717,6 +734,51 @@ const make = Effect.gen(function* () {
   const dispatchSystem: AgentControlStageRunLeaseEngineShape["dispatchSystem"] = (input) =>
     dispatchFor("system", input);
 
+  const renewOwnedForProviderEffect = Effect.fn(
+    "AgentControlStageRunLeaseEngine.renewOwnedForProviderEffect",
+  )(function* (input: AgentControlStageRunLeaseRenewalBinding) {
+    const loaded = yield* loadAuthoritativeLeaseState(input.leaseId, events, states).pipe(
+      Effect.mapError(() => rpcError("lease-projection-corrupt", input)),
+    );
+    if (Option.isNone(loaded)) return yield* rpcError("lease-missing", input);
+    const state = loaded.value.state;
+    if (state.status !== "reserved") return yield* rpcError("state-not-available", input);
+    if (input.holderId !== holderId || state.holderId !== holderId)
+      return yield* rpcError("holder-mismatch", input);
+    if (state.fenceToken !== input.fenceToken)
+      return yield* rpcError("fence-token-mismatch", input);
+    if (
+      state.projectId !== input.projectId ||
+      state.taskId !== input.taskId ||
+      state.stageRunId !== input.stageRunId ||
+      state.attemptId !== input.attemptId
+    )
+      return yield* rpcError("command-identity-mismatch", input);
+    const expiresAt = canonicalTimestampMillis(state.expiresAt);
+    const renewedAt = canonicalTimestampMillis(state.renewedAt);
+    if (expiresAt === null || renewedAt === null || expiresAt <= renewedAt)
+      return yield* rpcError("lease-projection-corrupt", input);
+    if (expiresAt > DateTime.toEpochMillis(yield* DateTime.now)) return;
+    // Expiry is not ownership transfer. The existing renew decider rechecks
+    // holder, fence, source identity and revision atomically before appending.
+    const outcome = yield* dispatchSystem({
+      type: "agentControl.stageRunLease.renew",
+      commandId: CommandId.make(`stage-lease-renew:${state.leaseId}:${state.revision}`),
+      leaseId: state.leaseId,
+      projectId: state.projectId,
+      taskId: state.taskId,
+      stageRunId: state.stageRunId,
+      attemptId: state.attemptId,
+      taskRevision: state.taskRevision,
+      githubIntakeSequence: state.githubIntakeSequence,
+      sourceIdentityFingerprint: state.sourceIdentityFingerprint,
+      fenceToken: state.fenceToken,
+      expectedRevision: state.revision,
+      leaseDurationMs: expiresAt - renewedAt,
+    });
+    if (outcome._tag === "Rejected") return yield* outcome.error;
+  });
+
   const toView: AgentControlStageRunLeaseEngineShape["toView"] = (state) =>
     DateTime.now.pipe(
       Effect.map((now) => {
@@ -780,6 +842,7 @@ const make = Effect.gen(function* () {
     dispatchController,
     dispatchControllerForRunOnce,
     dispatchSystem,
+    renewOwnedForProviderEffect,
     toView,
     runtimeHolderId: Effect.succeed(holderId),
     rebuild,

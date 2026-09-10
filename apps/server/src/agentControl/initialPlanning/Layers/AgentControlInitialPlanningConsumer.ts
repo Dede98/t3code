@@ -13,7 +13,6 @@ import * as Stream from "effect/Stream";
 
 import { ProviderService } from "../../../provider/Services/ProviderService.ts";
 import { ProviderAdapterRequestError } from "../../../provider/Errors.ts";
-import { ProviderSessionRuntimeRepository } from "../../../persistence/ProviderSessionRuntime.ts";
 import { ProjectionTurnRepository } from "../../../persistence/Services/ProjectionTurns.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -88,7 +87,6 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
-  const providerRuntimeRepository = yield* ProviderSessionRuntimeRepository;
   const providerService = yield* ProviderService;
   const turnRequestExecutor = yield* ProviderTurnRequestExecutor;
   const providerAdmission = Option.getOrUndefined(
@@ -183,8 +181,8 @@ const make = Effect.gen(function* () {
     return delivery;
   });
 
-  const reconcileProviderStarted = Effect.fn(
-    "AgentControlInitialPlanningConsumer.reconcileProviderStarted",
+  const reconcilePersistedTerminal = Effect.fn(
+    "AgentControlInitialPlanningConsumer.reconcilePersistedTerminal",
   )(function* (claim: AgentControlInitialPlanningClaim) {
     const providerTurnId = claim.delivery.providerTurnId;
     if (providerTurnId === null) {
@@ -197,7 +195,10 @@ const make = Effect.gen(function* () {
     if (Option.isSome(turn)) {
       const terminal = terminalDeliveryState(turn.value.state);
       if (terminal !== undefined) {
-        const at = turn.value.completedAt ?? (yield* nowIso);
+        if (turn.value.completedAt === null) {
+          return yield* markAmbiguousAndSettle(claim, yield* nowIso);
+        }
+        const at = turn.value.completedAt;
         return yield* markTerminal(
           claim,
           terminal,
@@ -210,6 +211,13 @@ const make = Effect.gen(function* () {
         );
       }
     }
+    return undefined;
+  });
+
+  const reconcileProviderStarted = Effect.fn(
+    "AgentControlInitialPlanningConsumer.reconcileProviderStarted",
+  )(function* (claim: AgentControlInitialPlanningClaim) {
+    const providerTurnId = claim.delivery.providerTurnId;
     const sessions = yield* providerService.listSessions();
     const active = sessions.find((session) => session.threadId === claim.evidence.threadId);
     if (
@@ -218,17 +226,6 @@ const make = Effect.gen(function* () {
       active.runtimeMode === claim.evidence.runtimeMode &&
       active.cwd === claim.evidence.worktreePath &&
       active.model === claim.evidence.modelSelection.model
-    ) {
-      return claim.delivery;
-    }
-    const runtime = yield* providerRuntimeRepository.getByThreadId({
-      threadId: claim.evidence.threadId,
-    });
-    if (
-      Option.isSome(runtime) &&
-      runtime.value.providerInstanceId === claim.evidence.providerInstanceId &&
-      runtime.value.runtimeMode === claim.evidence.runtimeMode &&
-      runtime.value.status === "running"
     ) {
       return claim.delivery;
     }
@@ -540,6 +537,14 @@ const make = Effect.gen(function* () {
     ) {
       return;
     }
+    if (
+      claim.delivery.state === "provider-started" ||
+      claim.delivery.state === "interrupt-requested"
+    ) {
+      // A stored terminal outcome wins over a deadline that elapsed while offline.
+      const terminal = yield* reconcilePersistedTerminal(claim);
+      if (terminal !== undefined) return;
+    }
     if (claim.delivery.planningDeadlineAt <= (yield* nowIso)) {
       return yield* processDeadline(claim);
     }
@@ -636,6 +641,7 @@ const make = Effect.gen(function* () {
         providerTurnId: String(event.turnId),
         state: terminal,
         terminalAt: event.createdAt,
+        nativeEvent: event,
         ...(terminal === "completed"
           ? {}
           : {
@@ -648,6 +654,7 @@ const make = Effect.gen(function* () {
             }),
       });
       if (Option.isSome(observed)) {
+        yield* hooks.afterNativeTerminalRecorded?.(claim.evidence.handoffId) ?? Effect.void;
         yield* settleThreadProjection(
           { ...claim, delivery: observed.value },
           terminal,

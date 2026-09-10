@@ -108,6 +108,12 @@ import AgentMigration0064 from "./Migrations/064_AgentControlArmedSingleFlight.t
 import AgentMigration0065 from "./Migrations/065_AgentControlProviderCapacityAdmission.ts";
 
 import AgentMigration0066 from "./Migrations/066_AgentControlMainLifecycleEvents.ts";
+import AgentMigration0067 from "./Migrations/067_AgentControlLeaseRuntimeOwnership.ts";
+import AgentMigration0068 from "./Migrations/068_AgentControlProviderPreInvokeRecovery.ts";
+import AgentMigration0069 from "./Migrations/069_AgentControlVerificationLeaseRenewal.ts";
+
+import AgentMigration0070 from "./Migrations/070_AgentControlPreparedSessionRecovery.ts";
+import AgentMigration0071 from "./Migrations/071_AgentControlNativeTerminalReceipts.ts";
 
 const agentMigrationEntries = [
   [34, "OrchestrationCommandAuthority", AgentMigration0034],
@@ -143,6 +149,11 @@ const agentMigrationEntries = [
   [64, "AgentControlArmedSingleFlight", AgentMigration0064],
   [65, "AgentControlProviderCapacityAdmission", AgentMigration0065],
   [66, "AgentControlMainLifecycleEvents", AgentMigration0066],
+  [67, "AgentControlLeaseRuntimeOwnership", AgentMigration0067],
+  [68, "AgentControlProviderPreInvokeRecovery", AgentMigration0068],
+  [69, "AgentControlVerificationLeaseRenewal", AgentMigration0069],
+  [70, "AgentControlPreparedSessionRecovery", AgentMigration0070],
+  [71, "AgentControlNativeTerminalReceipts", AgentMigration0071],
 ] as const;
 
 const migrationEntries = [

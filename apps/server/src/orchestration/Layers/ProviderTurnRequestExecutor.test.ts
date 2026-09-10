@@ -284,7 +284,7 @@ it.effect(
     ),
 );
 
-it.effect("quarantines a committed session entry when session evidence persistence fails", () =>
+it.effect("does not invoke a turn when atomic session evidence persistence fails", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const scope = yield* Scope.make("sequential");
@@ -320,28 +320,177 @@ it.effect("quarantines a committed session entry when session evidence persisten
             quarantineCalls += 1;
           }),
       });
-      const context = yield* buildExecutor(scope, sql, providerService, () =>
-        Effect.succeed({ sequence: 1 }),
+      const context = yield* buildExecutor(
+        scope,
+        sql,
+        ProviderService.of({
+          ...providerService,
+          sendTurnAtPreInvokeBoundary: (_input, boundary) =>
+            Effect.gen(function* () {
+              yield* boundary.beforeDeliveryCas();
+              yield* boundary.persistDeliveryAttempted({
+                ...modelEvidence,
+                providerInstanceId,
+                effectiveModelSelection: modelSelection,
+              });
+              return yield* Effect.die("Failed evidence must not reach adapter");
+            }),
+        }),
+        () => Effect.succeed({ sequence: 1 }),
       );
       const executor = Context.get(context, ProviderTurnRequestExecutor);
 
+      const prepared = yield* executor.prepareTurnDelivery({
+        threadId,
+        messageText: "persist session evidence",
+        attachments: [],
+        modelSelection,
+        interactionMode: "plan",
+        createdAt,
+        providerDeliveryId: permit.providerDeliveryId,
+        durableDeliveryKind: "initial-planning",
+        providerAdmissionPermit: permit,
+      });
       const result = yield* Effect.exit(
-        executor.prepareTurnDelivery({
-          threadId,
-          messageText: "persist session evidence",
-          attachments: [],
-          modelSelection,
-          interactionMode: "plan",
-          createdAt,
-          providerDeliveryId: permit.providerDeliveryId,
-          durableDeliveryKind: "initial-planning",
-          providerAdmissionPermit: permit,
+        executor.sendPreparedTurnAtPreInvokeBoundary(prepared, {
+          beforeDeliveryCas: () => Effect.void,
+          persistDeliveryAttempted: () =>
+            Effect.die("Missing evidence storage must prevent delivery CAS"),
+          afterDeliveryCas: () => Effect.die("Missing evidence storage must prevent invoke"),
         }),
       );
       assert.isTrue(Exit.isFailure(result));
-      assert.equal(quarantineCalls, 1);
+      assert.equal(quarantineCalls, 0);
     }),
   ),
+);
+
+it.effect(
+  "keeps prepared sessions replaceable until the delivery CAS and rolls evidence back with a rejected CAS",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const scope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        const sqlContext = yield* Layer.buildWithScope(
+          SqlitePersistenceMemory.pipe(Layer.provideMerge(NodeServices.layer)),
+          scope,
+        );
+        const sql = Context.get(sqlContext, SqlClient.SqlClient);
+        // Seed durable authority directly; this test exercises executor/session transaction ownership.
+        yield* sql`PRAGMA foreign_keys = OFF`;
+        yield* sql`DROP TRIGGER agent_control_initial_planning_delivery_insert_validate`;
+        yield* sql`DROP TRIGGER agent_control_initial_planning_session_evidence_validate`;
+        yield* sql.withTransaction(sql`
+      INSERT INTO agent_control_initial_planning_deliveries (
+        provider_delivery_id, handoff_id, handoff_fingerprint, controlled_thread_reservation_id,
+        thread_id, turn_request_command_id, message_id, provider_instance_id,
+        state, revision, claim_owner_id, claim_generation, claim_expires_at,
+        attempt_count, planning_deadline_at, interrupt_requested, updated_at
+      ) VALUES (${permit.providerDeliveryId}, 'handoff', ${"a".repeat(64)}, 'reservation',
+        ${threadId}, 'turn-command', 'message', ${providerInstanceId}, 'claimed', 1,
+        'claim-owner', 1, '2099-09-06T10:00:00.000Z', 1, '2099-09-06T10:00:00.000Z', 0, ${createdAt})
+    `);
+        let current = session;
+        let started = false;
+        const service = makeProvider({
+          startSession: () =>
+            Effect.sync(() => {
+              started = true;
+              return current;
+            }),
+          listSessions: () => Effect.succeed(started ? [current] : []),
+          quarantineAdmissionIfEntered: () => Effect.void,
+        });
+        const providerService = ProviderService.of({
+          ...service,
+          getSessionAttestation: () => Effect.succeed(current.initialPlanningAttestation),
+          sendTurnAtPreInvokeBoundary: (_input, boundary) =>
+            Effect.gen(function* () {
+              yield* boundary.beforeDeliveryCas();
+              yield* boundary.persistDeliveryAttempted({
+                ...modelEvidence,
+                providerInstanceId,
+                effectiveModelSelection: modelSelection,
+              });
+              yield* boundary.afterDeliveryCas();
+              return {} as never;
+            }),
+        });
+        const context = yield* buildExecutor(scope, sql, providerService, () =>
+          Effect.succeed({ sequence: 1 }),
+        );
+        const executor = Context.get(context, ProviderTurnRequestExecutor);
+        const input = {
+          threadId,
+          messageText: "prepared restart",
+          modelSelection,
+          createdAt,
+          providerDeliveryId: permit.providerDeliveryId,
+          durableDeliveryKind: "initial-planning" as const,
+          providerAdmissionPermit: permit,
+        };
+        yield* executor.prepareTurnDelivery(input);
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_initial_planning_session_evidence`,
+          [],
+        );
+        // A process restart may resume an empty native thread by legitimately starting fresh.
+        started = false;
+        current = attestProviderSessionNativeConfiguration(
+          {
+            ...session,
+            createdAt: "2026-09-06T10:03:00.000Z",
+            resumeCursor: { threadId: "fresh-native-thread" },
+          },
+          modelSelection,
+        );
+        const prepared = yield* executor.prepareTurnDelivery(input);
+        const rejected = yield* Effect.exit(
+          executor.sendPreparedTurnAtPreInvokeBoundary(prepared, {
+            beforeDeliveryCas: () => Effect.void,
+            persistDeliveryAttempted: () =>
+              Effect.gen(function* () {
+                const rows =
+                  yield* sql`SELECT session_created_at FROM agent_control_initial_planning_session_evidence`;
+                assert.deepStrictEqual(rows, [{ session_created_at: current.createdAt }]);
+                return yield* new ProviderAdapterRequestError({
+                  provider,
+                  method: "thread.turn.start",
+                  detail: "stale delivery claim",
+                });
+              }).pipe(
+                Effect.mapError(
+                  () =>
+                    new ProviderAdapterRequestError({
+                      provider,
+                      method: "thread.turn.start",
+                      detail: "stale delivery claim",
+                    }),
+                ),
+              ),
+            afterDeliveryCas: () => Effect.die("Rejected CAS must not reach adapter"),
+          }),
+        );
+        assert.isTrue(Exit.isFailure(rejected));
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_initial_planning_session_evidence`,
+          [],
+        );
+        yield* executor.sendPreparedTurnAtPreInvokeBoundary(prepared, {
+          beforeDeliveryCas: () => Effect.void,
+          persistDeliveryAttempted: () => Effect.void,
+          afterDeliveryCas: () => Effect.void,
+        });
+        assert.deepStrictEqual(
+          yield* sql`SELECT session_created_at FROM agent_control_initial_planning_session_evidence`,
+          [{ session_created_at: current.createdAt }],
+        );
+        // Once delivery evidence has committed, a changed runtime must still fail closed.
+        current = session;
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(executor.prepareTurnDelivery(input))));
+      }),
+    ),
 );
 
 class SemanticAnnotation extends Context.Service<SemanticAnnotation, { readonly value: string }>()(

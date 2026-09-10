@@ -38,6 +38,7 @@ export class AgentControlVerificationStoreError extends Schema.TaggedError<Agent
         "orchestration-history-undecodable",
         "orchestration-history-divergent",
         "provider-start-missing",
+        "provider-runtime-unavailable",
         "provider-terminal-conflict",
         "terminal-identity-divergent",
         "runtime-session-divergent",

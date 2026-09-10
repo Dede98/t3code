@@ -27,7 +27,17 @@ export type AgentControlStageRunLeaseDispatchOutcome =
   | ({ readonly _tag: "Accepted" } & AgentControlStageRunLeaseDispatchCommit)
   | { readonly _tag: "Rejected"; readonly error: AgentControlStageRunLeaseRpcError };
 
+export type AgentControlStageRunLeaseRenewalBinding = Pick<
+  AgentControlStageRunLeaseState,
+  "leaseId" | "projectId" | "taskId" | "stageRunId" | "attemptId" | "holderId" | "fenceToken"
+>;
+
 export interface AgentControlStageRunLeaseEngineShape {
+  /** Renew an expired reservation only while its original runtime still owns the exact fence. */
+  readonly renewOwnedForProviderEffect?: (
+    input: AgentControlStageRunLeaseRenewalBinding,
+  ) => Effect.Effect<void, AgentControlStageRunLeaseRpcError>;
+
   readonly dispatchController: (
     input: AgentControlStageRunLeaseDispatchInput,
   ) => Effect.Effect<AgentControlStageRunLeaseDispatchOutcome, AgentControlStageRunLeaseRpcError>;

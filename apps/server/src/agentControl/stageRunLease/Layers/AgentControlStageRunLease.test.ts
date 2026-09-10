@@ -21,6 +21,8 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
+import * as Scope from "effect/Scope";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -1627,5 +1629,138 @@ layer("Agent Control stage-run lease foundation", (it) => {
         );
       }),
     30_000,
+  );
+
+  it.effect("resumes a reserved lease after its previous runtime scope has closed", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const projectId = ProjectId.make("lease-closed-runtime-restart");
+      const { task, stageRun } = yield* seedPrepared(projectId);
+      const runtimeLayer = Layer.fresh(AgentControlStageRunLeaseEngineLayerLive).pipe(
+        Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, sql)),
+        Layer.provideMerge(NodeServices.layer),
+      );
+      const scopeA = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(scopeA, Exit.void));
+      const runtimeA = yield* Layer.buildWithScope(runtimeLayer, scopeA);
+      const engineA = Context.get(runtimeA, AgentControlStageRunLeaseEngine);
+      const input = yield* resolvedReserveInput(stageRun, "lease-closed-runtime-reserve", 0, 1);
+      const accepted = yield* engineA.dispatchController(input);
+      assert.equal(accepted._tag, "Accepted");
+      if (accepted._tag !== "Accepted") return;
+      // An idle concurrent runtime must not obscure the sole persisted lineage.
+      const idleScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(idleScope, Exit.void));
+      yield* Layer.buildWithScope(Layer.fresh(runtimeLayer), idleScope);
+      yield* Scope.close(idleScope, Exit.void);
+      yield* Scope.close(scopeA, Exit.void);
+
+      const runtimeB = yield* Layer.build(Layer.fresh(runtimeLayer));
+      const engineB = Context.get(runtimeB, AgentControlStageRunLeaseEngine);
+      const replay = yield* engineB.dispatchController(input);
+      assert.equal(replay._tag, "Accepted");
+      if (replay._tag !== "Accepted") return;
+      assert.deepStrictEqual(replay.result, accepted.result);
+      assert.lengthOf(replay.events, 0);
+      assert.equal((yield* engineB.toView(replay.result.state)).ownership, "current-runtime");
+      const renewed = yield* engineB.dispatchController({
+        type: "agentControl.stageRunLease.renew",
+        commandId: CommandId.make("lease-closed-runtime-renew"),
+        leaseId: input.leaseId,
+        projectId,
+        taskId: task.taskId,
+        stageRunId: stageRun.stageRunId,
+        attemptId: stageRun.attemptId,
+        ...commandSnapshot(stageRun),
+        fenceToken: 1,
+        expectedRevision: 1,
+        leaseDurationMs: 60_000,
+      });
+      assert.equal(renewed._tag, "Accepted");
+    }),
+  );
+  it.effect("does not choose between two closed runtimes with durable lease lineages", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const runtimeLayer = Layer.fresh(AgentControlStageRunLeaseEngineLayerLive).pipe(
+        Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, sql)),
+        Layer.provideMerge(NodeServices.layer),
+      );
+      const scopes = [yield* Scope.make("sequential"), yield* Scope.make("sequential")];
+      const reservations: LeaseState[] = [];
+      for (const [index, scope] of scopes.entries()) {
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        const runtime = yield* Layer.buildWithScope(Layer.fresh(runtimeLayer), scope);
+        const engine = Context.get(runtime, AgentControlStageRunLeaseEngine);
+        const { stageRun } = yield* seedPrepared(
+          ProjectId.make(`lease-ambiguous-runtime-${index}`),
+        );
+        const reserved = yield* engine.dispatchController(
+          yield* resolvedReserveInput(stageRun, `lease-ambiguous-reserve-${index}`, 0, 1),
+        );
+        assert.equal(reserved._tag, "Accepted");
+        if (reserved._tag === "Accepted") reservations.push(reserved.result.state);
+      }
+      for (const scope of scopes) yield* Scope.close(scope, Exit.void);
+      const restarted = Context.get(
+        yield* Layer.build(Layer.fresh(runtimeLayer)),
+        AgentControlStageRunLeaseEngine,
+      );
+      for (const reserved of reservations) {
+        const view = yield* restarted.toView(reserved);
+        assert.equal(view.ownership, "foreign-runtime");
+        assert.equal(view.health, "recovery-required");
+      }
+    }),
+  );
+});
+
+layer("owned provider renewal", (it) => {
+  it.effect("renews an expired owned lease without changing its fence or duration", () =>
+    Effect.gen(function* () {
+      const engine = yield* AgentControlStageRunLeaseEngine;
+      const states = yield* AgentControlStageRunLeaseStateRepository;
+      const projectId = ProjectId.make("provider-renew-expired");
+      const { stageRun } = yield* seedPrepared(projectId);
+      const reserved = yield* engine.dispatchController(
+        yield* resolvedReserveInput(stageRun, "provider-renew-reserve", 0, 1, 60_000),
+      );
+      assert.equal(reserved._tag, "Accepted");
+      if (reserved._tag !== "Accepted") return;
+      const original = reserved.result.state;
+      yield* TestClock.adjust(Duration.millis(120_001));
+      yield* engine.renewOwnedForProviderEffect!(original);
+      const renewed = Option.getOrThrow(yield* states.get(original.leaseId));
+      assert.equal(renewed.revision, original.revision + 1);
+      assert.equal(renewed.holderId, original.holderId);
+      assert.equal(renewed.fenceToken, original.fenceToken);
+      assert.equal(Date.parse(renewed.expiresAt) - Date.parse(renewed.renewedAt), 60_000);
+      yield* engine.renewOwnedForProviderEffect!(original);
+      assert.equal(
+        Option.getOrThrow(yield* states.get(original.leaseId)).revision,
+        renewed.revision,
+      );
+      const foreign = yield* Effect.exit(
+        engine.renewOwnedForProviderEffect!({
+          ...original,
+          holderId: AgentControlStageRunLeaseHolderId.make("foreign-owner"),
+        }),
+      );
+      assert.isTrue(Exit.isFailure(foreign));
+      const stale = yield* Effect.exit(
+        engine.renewOwnedForProviderEffect!({ ...original, fenceToken: original.fenceToken + 1 }),
+      );
+      assert.isTrue(Exit.isFailure(stale));
+      const released = yield* engine.dispatchController({
+        type: "agentControl.stageRunLease.releaseBeforeExecution",
+        commandId: CommandId.make("provider-renew-release"),
+        ...original,
+        expectedRevision: renewed.revision,
+      });
+      assert.equal(released._tag, "Accepted");
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(engine.renewOwnedForProviderEffect!(original))),
+      );
+    }),
   );
 });

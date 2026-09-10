@@ -1,3 +1,4 @@
+import { ProjectionTurnRepositoryLive } from "../../../persistence/Layers/ProjectionTurns.ts";
 import * as CheckpointStore from "../../../checkpointing/CheckpointStore.ts";
 import * as ThreadPlanProgress from "../../../orchestration/ThreadPlanProgress.ts";
 import * as ThreadBackgroundLiveness from "../../../orchestration/ThreadBackgroundLiveness.ts";
@@ -190,6 +191,8 @@ import {
 import { layer as AgentControlWorktreeEventStoreLive } from "../../worktree/Layers/AgentControlWorktreeEventStore.ts";
 import { layer as AgentControlWorktreeStateRepositoryLive } from "../../worktree/Layers/AgentControlWorktreeStateRepository.ts";
 import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
+import { layer as AgentControlControlledThreadReservationEngineLive } from "../../controlledThreadReservation/Layers/AgentControlControlledThreadReservationEngine.ts";
+import { AgentControlWorktree } from "../../worktree/Services/AgentControlWorktree.ts";
 import { AgentControlWorktreeEngine } from "../../worktree/Services/AgentControlWorktreeEngine.ts";
 import { AgentControlWorktreeEventStore } from "../../worktree/Services/AgentControlWorktreeEventStore.ts";
 import { AgentControlWorktreeStateRepository } from "../../worktree/Services/AgentControlWorktreeStateRepository.ts";
@@ -250,6 +253,7 @@ import {
 } from "../../implementationTurn/Services/AgentControlImplementationTurnConsumerHooks.ts";
 import {
   AgentControlImplementationTurnCoordinator,
+  AgentControlImplementationTurnCoordinatorError,
   type AgentControlImplementationTurnCoordinatorShape,
 } from "../../implementationTurn/Services/AgentControlImplementationTurnCoordinator.ts";
 import {
@@ -357,6 +361,7 @@ import {
   initialPlanningMessagePayload,
   initialPlanningTurnRequestPayload,
   sha256Utf8,
+  parseJsonStrict,
   type JsonValue,
 } from "../eventEvidence.ts";
 import {
@@ -635,6 +640,7 @@ const buildFinalizer = Effect.fn("buildInitialPlanningFinalizerHarness")(functio
   hooks: AgentControlInitialPlanningFinalizerHooksShape = noopHooks,
   runtimeHolderId = "runtime-holder",
   providerAdmissionRelease: ProviderAdmissionReleaseAuthorityShape = noopProviderAdmissionRelease,
+  orchestrationOverride?: OrchestrationEngineService["Service"],
 ) {
   const sqlLayer = Layer.succeed(SqlClient.SqlClient, sql);
   const build = <I, E>(layer: Layer.Layer<I, E, never>) => Layer.buildWithScope(layer, scope);
@@ -722,7 +728,8 @@ const buildFinalizer = Effect.fn("buildInitialPlanningFinalizerHarness")(functio
     publishCommitted: (events: ReadonlyArray<AgentControlStageRunLeaseEvent>) =>
       Ref.update(leasePublished, (current) => [...current, ...events]),
   } as AgentControlStageRunLeaseEngine["Service"];
-  const orchestrationEngine = {} as OrchestrationEngineService["Service"];
+  const orchestrationEngine =
+    orchestrationOverride ?? ({} as OrchestrationEngineService["Service"]);
   const dependencies = Layer.mergeAll(
     sqlLayer,
     Layer.succeed(AgentControlInitialPlanningHandoffStore, store),
@@ -1381,6 +1388,7 @@ const appendOrchestration = Effect.fn("appendInitialPlanningOrchestrationEvidenc
   sql: SqlClient.SqlClient,
   input: {
     readonly suffix: string;
+    readonly actorKind?: "provider" | "server";
     readonly threadId: ThreadId;
     readonly type: "thread.session-set" | "thread.proposed-plan-upserted";
     readonly occurredAt: string;
@@ -1397,7 +1405,7 @@ const appendOrchestration = Effect.fn("appendInitialPlanningOrchestrationEvidenc
       ? 1
       : versionRows[0].version + 1;
   const eventId = EventId.make(`provider-event-${input.suffix}-${streamVersion}`);
-  const commandId = CommandId.make(`provider:${eventId}:${input.type}`);
+  const commandId = CommandId.make(`${input.actorKind ?? "provider"}:${eventId}:${input.type}`);
   const payloadJson = canonicalJson(input.payload);
   const metadataJson = canonicalJson(input.metadata ?? {});
   const rows = yield* sql<{ readonly sequence: number }>`
@@ -1407,7 +1415,7 @@ const appendOrchestration = Effect.fn("appendInitialPlanningOrchestrationEvidenc
       actor_kind, payload_json, metadata_json
     ) VALUES (
       ${eventId}, 'thread', ${input.threadId}, ${streamVersion}, ${input.type},
-      ${input.occurredAt}, ${commandId}, NULL, ${commandId}, 'provider',
+      ${input.occurredAt}, ${commandId}, NULL, ${commandId}, ${input.actorKind ?? "provider"},
       ${payloadJson}, ${metadataJson}
     ) RETURNING sequence
   `;
@@ -2044,6 +2052,7 @@ const buildImplementationCoordinator = Effect.fn("buildImplementationCoordinator
     readonly task: AgentControlTaskState;
     readonly worktree: AgentControlWorktreeReservationState;
     readonly hooks?: AgentControlImplementationTurnCoordinatorHooksShape;
+    readonly liveReservationReplay?: boolean;
   }) {
     const sqlLayer = Layer.succeed(SqlClient.SqlClient, input.sql);
     const build = <I, E>(layer: Layer.Layer<I, E, never>) =>
@@ -2236,9 +2245,37 @@ const buildImplementationCoordinator = Effect.fn("buildImplementationCoordinator
         ),
       ),
     );
+    const liveReservationContext = input.liveReservationReplay
+      ? yield* build(
+          AgentControlControlledThreadReservationEngineLive.pipe(
+            Layer.provide(dependencies),
+            Layer.provide(AgentControlCommandReceiptRepositoryLive.pipe(Layer.provide(sqlLayer))),
+            Layer.provide(
+              Layer.succeed(AgentControlWorktree, {
+                getReservation: () => Effect.die("unused"),
+                listReservations: () => Effect.die("unused"),
+              }),
+            ),
+            Layer.provide(NodeServices.layer),
+          ),
+        )
+      : undefined;
     const coordinatorContext = yield* build(
       Layer.fresh(AgentControlImplementationTurnCoordinatorLive).pipe(
-        Layer.provide(dependencies),
+        Layer.provide(
+          liveReservationContext === undefined
+            ? dependencies
+            : Layer.merge(
+                dependencies,
+                Layer.succeed(
+                  AgentControlControlledThreadReservationEngine,
+                  Context.get(
+                    liveReservationContext,
+                    AgentControlControlledThreadReservationEngine,
+                  ),
+                ),
+              ),
+        ),
         Layer.provideMerge(NodeServices.layer),
       ),
     );
@@ -2268,6 +2305,7 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
     readonly scope: Scope.Closeable;
     readonly coordinator: ImplementationCoordinatorHarness;
     readonly executorCalls: Ref.Ref<number>;
+    readonly listSessions?: ProviderService["Service"]["listSessions"];
     readonly preparedMessages?: Ref.Ref<ReadonlyArray<string>>;
     readonly providerEvents: PubSub.PubSub<ProviderRuntimeEvent>;
     readonly responseLoss?: boolean;
@@ -2275,6 +2313,7 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
     readonly store?: AgentControlImplementationHandoffStore["Service"];
     readonly providerAdmissionRuntime?: ProviderAdmissionRuntime["Service"];
   }) {
+    const activeSessions = yield* Ref.make<ReadonlyArray<ProviderSession>>([]);
     const store = input.store ?? input.coordinator.handoffStore;
     const provider = ProviderService.of({
       compactThread: () => Effect.die("Unexpected compactThread"),
@@ -2286,7 +2325,7 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
       respondToRequest: () => Effect.die("unused"),
       respondToUserInput: () => Effect.die("unused"),
       stopSession: () => Effect.die("unused"),
-      listSessions: () => Effect.succeed([]),
+      listSessions: input.listSessions ?? (() => Ref.get(activeSessions)),
       getCapabilities: () => Effect.die("unused"),
       getInstanceInfo: () => Effect.die("unused"),
       rollbackConversation: () => Effect.die("unused"),
@@ -2379,6 +2418,23 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
             return yield* Effect.die(new Error("provider response lost after acceptance"));
           }
           if (prepared.entryState !== undefined) prepared.entryState.adapterReturned = true;
+          if (prepared.sessionAttestation !== undefined) {
+            yield* Ref.set(activeSessions, [
+              {
+                provider: ProviderDriverKind.make("codex"),
+                providerInstanceId: prepared.input.modelSelection.instanceId,
+                threadId: prepared.input.threadId,
+                runtimeMode: prepared.sessionAttestation.runtimeMode,
+                cwd: prepared.sessionAttestation.cwd,
+                model: prepared.input.modelSelection.model,
+                activeTurnId: TurnId.make("implementation-provider-turn"),
+                status: "running",
+                createdAt: prepared.sessionAttestation.sessionCreatedAt,
+                updatedAt: DateTime.formatIso(yield* DateTime.now),
+              },
+            ]);
+          }
+
           yield* consumer
             .processRuntimeEvent({
               type: "turn.started",
@@ -2402,6 +2458,11 @@ const buildImplementationConsumer = Effect.fn("buildImplementationConsumerHarnes
     });
     const context = yield* Layer.buildWithScope(
       Layer.fresh(AgentControlImplementationTurnConsumerLive).pipe(
+        Layer.provide(
+          ProjectionTurnRepositoryLive.pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, input.sql)),
+          ),
+        ),
         Layer.provide(
           Layer.mergeAll(
             Layer.succeed(SqlClient.SqlClient, input.sql),
@@ -2932,6 +2993,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
     readonly scope: Scope.Closeable;
     readonly coordinator: VerificationTurnConsumerDependencies;
     readonly executorCalls: Ref.Ref<number>;
+    readonly listSessions?: ProviderService["Service"]["listSessions"];
     readonly responseLossDefect?: unknown;
     readonly responseLossCause?: Cause.Cause<never>;
     readonly prepareFailures?: Ref.Ref<number>;
@@ -2945,6 +3007,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
     readonly providerTurnId?: TurnId;
     readonly providerAdmissionRuntime?: ProviderAdmissionRuntime["Service"];
   }) {
+    const activeSessions = yield* Ref.make<ReadonlyArray<ProviderSession>>([]);
     const providerEvents =
       input.providerEvents ?? (yield* PubSub.unbounded<ProviderRuntimeEvent>());
     const provider =
@@ -2959,7 +3022,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
         respondToRequest: () => Effect.die("unused"),
         respondToUserInput: () => Effect.die("unused"),
         stopSession: () => Effect.die("unused"),
-        listSessions: () => Effect.succeed([]),
+        listSessions: input.listSessions ?? (() => Ref.get(activeSessions)),
         getCapabilities: () => Effect.die("unused"),
         getInstanceInfo: () => Effect.die("unused"),
         rollbackConversation: () => Effect.die("unused"),
@@ -3074,6 +3137,23 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
               return yield* Effect.failCause(input.responseLossCause);
             }
             if (prepared.entryState !== undefined) prepared.entryState.adapterReturned = true;
+            if (prepared.sessionAttestation !== undefined) {
+              yield* Ref.set(activeSessions, [
+                {
+                  provider: ProviderDriverKind.make("codex"),
+                  providerInstanceId: prepared.input.modelSelection.instanceId,
+                  threadId: prepared.input.threadId,
+                  runtimeMode: prepared.sessionAttestation.runtimeMode,
+                  cwd: prepared.sessionAttestation.cwd,
+                  model: prepared.input.modelSelection.model,
+                  activeTurnId: input.providerTurnId ?? TurnId.make("verification-provider-turn"),
+                  status: "running",
+                  createdAt: prepared.sessionAttestation.sessionCreatedAt,
+                  updatedAt: DateTime.formatIso(yield* DateTime.now),
+                },
+              ]);
+            }
+
             yield* consumer
               .processRuntimeEvent({
                 type: "turn.started",
@@ -22092,7 +22172,7 @@ it.effect(
 );
 
 it.effect(
-  "Verification terminal recovery keeps pre-059 session completion without lifecycle metadata waiting",
+  "Verification terminal recovery reports an orphaned pre-059 session without inventing completion",
   () =>
     withNode(
       Effect.scoped(
@@ -22161,7 +22241,16 @@ it.effect(
             coordinator: { ...prepared.coordinator, handoffStore: storeB },
             executorCalls,
           });
-          yield* recovered.processHandoff(prepared.handoffId);
+          const recovery = yield* Effect.exit(recovered.processHandoff(prepared.handoffId));
+          assert.isTrue(Exit.isFailure(recovery));
+          if (Exit.isFailure(recovery)) {
+            const error = Cause.squash(recovery.cause);
+            assert.isTrue(isVerificationStoreError(error));
+            if (isVerificationStoreError(error)) {
+              assert.equal(error.candidateReason, "provider-runtime-unavailable");
+            }
+          }
+          assert.equal(yield* Ref.get(executorCalls), 1);
           const waiting = Option.getOrThrow(
             yield* storeB.loadAcceptedByHandoffId(prepared.handoffId),
           );
@@ -25240,7 +25329,7 @@ it.effect.each<{
   readonly terminalSessionStatus: "ready" | "error" | null;
   readonly occurredAt: string;
   readonly updatedAt: string;
-  readonly expected: "Ambiguous" | "Waiting" | "Finalized";
+  readonly expected: "Ambiguous" | "MissingReceipt" | "Finalized";
 }>([
   {
     caseName: "completed-error",
@@ -25288,7 +25377,7 @@ it.effect.each<{
     terminalSessionStatus: null,
     occurredAt: terminalAt,
     updatedAt: terminalAt,
-    expected: "Waiting",
+    expected: "MissingReceipt",
   },
   {
     caseName: "matching-terminal",
@@ -25346,8 +25435,17 @@ it.effect.each<{
 
           yield* Ref.set(planningFinalizer.stagePublished, []);
           yield* Ref.set(planningFinalizer.leasePublished, []);
-          const result = yield* setup.finalizer.finalizer.processHandoff(setup.handoffId);
-          assert.equal(result._tag, expected);
+          if (expected === "MissingReceipt") {
+            const missing = yield* Effect.result(
+              setup.finalizer.finalizer.processHandoff(setup.handoffId),
+            );
+            assert.equal(missing._tag, "Failure");
+            if (missing._tag === "Failure")
+              assert.equal(missing.failure.operation, "native-terminal-receipt-missing");
+          } else {
+            const result = yield* setup.finalizer.finalizer.processHandoff(setup.handoffId);
+            assert.equal(result._tag, expected);
+          }
 
           const counts = yield* implementationFinalizationCounts(database.sqlA, setup.handoffId);
           const leaseRows = yield* database.sqlA<{
@@ -27108,58 +27206,103 @@ it.effect("a real admission recovery fiber interrupt preserves its cause and sto
   ),
 );
 
-it.effect.each<{ readonly stale: "task" | "worktree" | "runtime-holder" }>([
-  { stale: "task" },
-  { stale: "worktree" },
-  { stale: "runtime-holder" },
-])("a stale $stale preflight cannot create any admission companion", ({ stale }) =>
-  withNode(
-    Effect.gen(function* () {
-      const database = yield* makeSharedDatabase();
-      const finalizerA = yield* buildFinalizer(database.sqlA, database.scopeA);
-      const candidate = yield* prepareImplementationAdmissionCandidate(
-        database,
-        finalizerA,
-        `admission-stale-${stale}`,
-      );
-      const finalizerB = yield* buildFinalizer(
-        database.sqlB,
-        database.scopeB,
-        noopHooks,
-        stale === "runtime-holder" ? "foreign-runtime-holder" : "runtime-holder",
-      );
-      const task =
-        stale === "task"
-          ? ({
-              ...candidate.task,
-              revision: candidate.task.revision + 1,
-            } satisfies AgentControlTaskState)
-          : candidate.task;
-      const worktree =
-        stale === "worktree"
-          ? ({
-              ...candidate.worktree,
-              revision: candidate.worktree.revision + 1,
-            } satisfies AgentControlWorktreeReservationState)
-          : candidate.worktree;
-      const admissionB = yield* buildAdmission(
-        database.sqlB,
-        database.scopeB,
-        finalizerB,
-        task,
-        worktree,
-        noopAdmissionHooks,
-      );
-      const exit = yield* Effect.exit(
-        admissionB.admission.processHandoff(candidate.seeded.evidence.handoffId),
-      );
-      assert.isTrue(Exit.isFailure(exit));
-      assert.deepStrictEqual(
-        yield* implementationAdmissionCounts(database.sqlB, candidate.seeded.evidence.handoffId),
-        noImplementationAdmission,
-      );
-    }),
-  ),
+it.effect.each<{ readonly stale: "task" | "worktree" }>([{ stale: "task" }, { stale: "worktree" }])(
+  "a stale $stale preflight cannot create any admission companion",
+  ({ stale }) =>
+    withNode(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizerA = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidate = yield* prepareImplementationAdmissionCandidate(
+          database,
+          finalizerA,
+          `admission-stale-${stale}`,
+        );
+        const finalizerB = yield* buildFinalizer(
+          database.sqlB,
+          database.scopeB,
+          noopHooks,
+          "runtime-holder",
+        );
+        const task =
+          stale === "task"
+            ? ({
+                ...candidate.task,
+                revision: candidate.task.revision + 1,
+              } satisfies AgentControlTaskState)
+            : candidate.task;
+        const worktree =
+          stale === "worktree"
+            ? ({
+                ...candidate.worktree,
+                revision: candidate.worktree.revision + 1,
+              } satisfies AgentControlWorktreeReservationState)
+            : candidate.worktree;
+        const admissionB = yield* buildAdmission(
+          database.sqlB,
+          database.scopeB,
+          finalizerB,
+          task,
+          worktree,
+          noopAdmissionHooks,
+        );
+        const exit = yield* Effect.exit(
+          admissionB.admission.processHandoff(candidate.seeded.evidence.handoffId),
+        );
+        assert.isTrue(Exit.isFailure(exit));
+        assert.deepStrictEqual(
+          yield* implementationAdmissionCounts(database.sqlB, candidate.seeded.evidence.handoffId),
+          noImplementationAdmission,
+        );
+      }),
+    ),
+);
+
+it.effect(
+  "a new runtime reserves the next fence after historical planning releases its lease",
+  () =>
+    withNode(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const original = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const candidate = yield* prepareImplementationAdmissionCandidate(
+          database,
+          original,
+          "admission-released-runtime-restart",
+        );
+        const restarted = yield* buildFinalizer(
+          database.sqlB,
+          database.scopeB,
+          noopHooks,
+          "restarted-runtime-holder",
+        );
+        const next = yield* buildAdmission(
+          database.sqlB,
+          database.scopeB,
+          restarted,
+          candidate.task,
+          candidate.worktree,
+          noopAdmissionHooks,
+        );
+        const admitted = yield* next.admission.processHandoff(candidate.seeded.evidence.handoffId);
+        assert.equal(admitted._tag, "Admitted");
+        const leases = yield* database.sqlB`
+        SELECT holder_id, fence_token, status FROM agent_control_stage_run_lease_states
+        WHERE lease_id = ${candidate.seeded.evidence.leaseId}
+      `;
+        assert.deepStrictEqual(leases, [
+          {
+            holder_id: "restarted-runtime-holder",
+            fence_token: candidate.seeded.evidence.fenceToken + 1,
+            status: "reserved",
+          },
+        ]);
+        assert.equal(
+          (yield* next.admission.processHandoff(candidate.seeded.evidence.handoffId))._tag,
+          "Replayed",
+        );
+      }),
+    ),
 );
 
 it.effect("accepted replay precedes stale task, worktree, and runtime preflight", () =>
@@ -28045,4 +28188,1187 @@ it.effect.each<{ readonly phase: "defect" | "interrupt" }>([
       assert.equal((yield* Ref.get(harnessB.leasePublished)).length, 0);
     }),
   ),
+);
+
+it.effect("restart replays implementation admission after its thread has materialized", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const planning = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const [prepared] = yield* prepareImplementationDeliveryRecoveryCandidates(
+          database,
+          planning,
+          ["restart-admission-bound"],
+        );
+        assert.isDefined(prepared);
+        assert.equal(
+          (yield* prepared!.candidate.admissionHarness.admission.processHandoff(
+            prepared!.candidate.seeded.evidence.handoffId,
+          ))._tag,
+          "Replayed",
+        );
+        const restarted = yield* buildImplementationCoordinator({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          suffix: "restart-admission-bound",
+          admission: prepared!.candidate.admissionHarness.admission,
+          finalizer: planning,
+          admissionHarness: prepared!.candidate.admissionHarness,
+          task: prepared!.candidate.task,
+          worktree: prepared!.candidate.worktree,
+          liveReservationReplay: true,
+        });
+        assert.equal(
+          (yield* restarted.coordinator.processHandoff(
+            prepared!.candidate.seeded.evidence.handoffId,
+          ))._tag,
+          "Replayed",
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect(
+  "restart admits verification after a legitimate implementation orchestration suffix",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const planning = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepared = yield* prepareSucceededImplementationFinalization(
+            database,
+            planning,
+            "restart-orchestration-suffix",
+          );
+          yield* prepared.setup.coordinator.orchestration.dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.make("restart-orchestration-suffix-title"),
+            threadId: prepared.claim.evidence.threadId,
+            title: "Completed implementation",
+          });
+          const verification = yield* buildVerificationAdmission({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            planningFinalizer: planning,
+            implementationFinalizer: prepared.setup.finalizer.finalizer,
+            handoffStore: prepared.setup.coordinator.handoffStore,
+            admissionHarness: prepared.setup.candidate.admissionHarness,
+          });
+          assert.equal(
+            (yield* verification.admission.processResultEvidence(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Admitted",
+          );
+          const coordinator = yield* buildVerificationTurnCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            admission: verification.admission,
+            planningFinalizer: planning,
+            admissionHarness: prepared.setup.candidate.admissionHarness,
+            task: prepared.setup.candidate.task,
+            worktree: prepared.setup.candidate.worktree,
+            orchestration: prepared.setup.coordinator.orchestration,
+            snapshots: prepared.setup.coordinator.snapshots,
+          });
+          assert.equal(
+            (yield* coordinator.coordinator.processHandoff(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Materialized",
+          );
+          yield* prepared.setup.coordinator.orchestration.dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.make("restart-orchestration-suffix-title-again"),
+            threadId: prepared.claim.evidence.threadId,
+            title: "Verified implementation",
+          });
+          const changesBeforeReplay = (yield* database.sqlA<{
+            readonly count: number;
+          }>`SELECT total_changes() AS count`)[0]!.count;
+          assert.equal(
+            (yield* verification.admission.processResultEvidence(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Replayed",
+          );
+          assert.equal(
+            (yield* coordinator.coordinator.processHandoff(
+              prepared.implementation.resultEvidenceId,
+            ))._tag,
+            "Replayed",
+          );
+          assert.equal(
+            (yield* database.sqlA<{ readonly count: number }>`SELECT total_changes() AS count`)[0]!
+              .count,
+            changesBeforeReplay,
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "replays an actual Implementation terminal receipt after a crash before native history",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const setup = yield* prepareImplementationStageFinalizationCandidate(
+            database,
+            planningFinalizer,
+            "implementation-native-receipt-crash",
+          );
+          const claim = setup.claim;
+          const terminalAt = shiftIso(claim.delivery.providerAcceptedAt!, 1);
+          const event = {
+            type: "turn.completed",
+            eventId: EventId.make("implementation-native-receipt-crash-terminal"),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: claim.evidence.providerInstanceId,
+            threadId: claim.evidence.threadId,
+            turnId: TurnId.make(claim.delivery.providerTurnId!),
+            createdAt: terminalAt,
+            payload: { state: "completed" },
+          } satisfies ProviderRuntimeEvent;
+          const executorCalls = yield* Ref.make(0);
+          const crashed = yield* buildImplementationConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: setup.coordinator,
+            executorCalls,
+            providerEvents: yield* PubSub.unbounded<ProviderRuntimeEvent>(),
+            hooks: {
+              beforeClaim: () => Effect.void,
+              afterClaim: () => Effect.void,
+              afterNativeTerminalRecorded: () => Effect.interrupt,
+            },
+          });
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                setup.coordinator.handoffStore.observeProviderTerminal({
+                  nativeEvent: { ...event, turnId: TurnId.make("foreign-native-turn") },
+                  threadId: claim.evidence.threadId,
+                  providerTurnId: claim.delivery.providerTurnId!,
+                  state: "completed",
+                  terminalAt,
+                }),
+              ),
+            ),
+          );
+          assert.equal(
+            Option.getOrThrow(
+              yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+            ).delivery.state,
+            "provider-started",
+          );
+          const crashExit = yield* Effect.exit(crashed.consumer.processRuntimeEvent(event));
+          assert.equal(
+            Option.getOrThrow(
+              yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+            ).delivery.state,
+            "completed",
+          );
+          yield* crashed.consumer.processRuntimeEvent(event);
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                crashed.consumer.processRuntimeEvent({
+                  ...event,
+                  eventId: EventId.make("conflicting-native-terminal"),
+                }),
+              ),
+            ),
+          );
+          const planningFinalizerB = yield* buildFinalizer(database.sqlB, database.scopeB);
+          const admissionB = yield* buildAdmission(
+            database.sqlB,
+            database.scopeB,
+            planningFinalizerB,
+            setup.candidate.task,
+            setup.candidate.worktree,
+            noopAdmissionHooks,
+          );
+          const coordinatorB = yield* buildImplementationCoordinator({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            suffix: "implementation-native-receipt-crash-restarted",
+            admission: admissionB.admission,
+            finalizer: planningFinalizerB,
+            admissionHarness: admissionB,
+            task: setup.candidate.task,
+            worktree: setup.candidate.worktree,
+          });
+          const starterB = yield* buildImplementationStageStarter({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: coordinatorB,
+            finalizer: planningFinalizerB,
+          });
+          const restarted = yield* buildImplementationStageFinalizer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: coordinatorB,
+            planningFinalizer: planningFinalizerB,
+            starter: starterB,
+          });
+          assert.equal(
+            (yield* restarted.finalizer.processHandoff(setup.handoffId))._tag,
+            "Finalized",
+          );
+          assert.isTrue(Exit.isFailure(crashExit));
+          assert.equal(
+            (yield* restarted.finalizer.processHandoff(setup.handoffId))._tag,
+            "Replayed",
+          );
+          assert.equal(yield* Ref.get(executorCalls), 0);
+          assert.deepStrictEqual(
+            yield* database.sqlB`SELECT count(*) AS count FROM orchestration_events WHERE command_id=${`provider:${event.eventId}:native-terminal-session`}`,
+            [{ count: 1 }],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "recovers a persisted Implementation terminal after restart without resending the turn",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const setup = yield* prepareImplementationStageFinalizationCandidate(
+            database,
+            planningFinalizer,
+            "implementation-missed-terminal-restart",
+          );
+          const claim = setup.claim;
+          const completedAt = DateTime.formatIso(yield* DateTime.now);
+          yield* setup.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:implementation-missed-terminal-restart:terminal"),
+            threadId: claim.evidence.threadId,
+            session: {
+              threadId: claim.evidence.threadId,
+              status: "ready",
+              providerName: ProviderDriverKind.make("codex"),
+              providerInstanceId: claim.evidence.providerInstanceId,
+              runtimeMode: claim.evidence.runtimeMode,
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: completedAt,
+            },
+            createdAt: completedAt,
+          });
+          yield* database.sqlA`
+          UPDATE projection_turns SET state='completed', completed_at=${completedAt}
+          WHERE thread_id=${claim.evidence.threadId}
+            AND turn_id=${claim.delivery.providerTurnId}
+        `;
+          const executorCalls = yield* Ref.make(0);
+          const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+          const restarted = yield* buildImplementationConsumer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: setup.coordinator,
+            executorCalls,
+            providerEvents,
+          });
+          yield* restarted.consumer.recover;
+          const recovered = Option.getOrThrow(
+            yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+          );
+          assert.equal(recovered.delivery.state, "completed");
+          assert.equal(recovered.delivery.terminalAt, completedAt);
+          assert.equal(yield* Ref.get(executorCalls), 0);
+          assert.equal(
+            (yield* setup.finalizer.finalizer.processHandoff(setup.handoffId))._tag,
+            "Finalized",
+          );
+          yield* restarted.consumer.recover;
+          assert.equal(yield* Ref.get(executorCalls), 0);
+          assert.equal(
+            (yield* setup.finalizer.finalizer.processHandoff(setup.handoffId))._tag,
+            "Replayed",
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect.each(["prepared", "attempted"] as const)(
+  "rechecks a restarted Implementation %s delivery when its persisted claim expires",
+  (boundary) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepared = (yield* prepareImplementationDeliveryRecoveryCandidates(
+            database,
+            finalizer,
+            [`implementation-expiry-restart-${boundary}`],
+          ))[0]!;
+          const executorCalls = yield* Ref.make(0);
+          const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+          const crashed = yield* buildImplementationConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            providerEvents,
+            hooks: {
+              ...noopImplementationConsumerHooks,
+              ...(boundary === "prepared"
+                ? { afterClaim: () => Effect.die("crash-before-provider-prepare") }
+                : { afterDeliveryCas: () => Effect.die("crash-after-attempt-marker") }),
+            },
+          });
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(crashed.consumer.processHandoff(prepared.handoffId))),
+          );
+          const before = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(
+            before.delivery.state,
+            boundary === "prepared" ? "claimed" : "delivery-attempted",
+          );
+          const restarted = yield* buildImplementationConsumer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            providerEvents,
+          });
+          yield* restarted.consumer.start();
+          yield* restarted.consumer.drain;
+          assert.equal(yield* Ref.get(executorCalls), 0);
+          yield* TestClock.adjust("2 minutes");
+          yield* restarted.consumer.drain;
+          const after = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(
+            after.delivery.state,
+            boundary === "prepared" ? "provider-started" : "ambiguous",
+          );
+          assert.equal(yield* Ref.get(executorCalls), boundary === "prepared" ? 1 : 0);
+          if (boundary === "attempted")
+            assert.equal(after.delivery.lastErrorCode, "provider-acceptance-ambiguous");
+        }),
+      ),
+    ),
+);
+
+const isImplementationCoordinatorReplayError = Schema.is(
+  AgentControlImplementationTurnCoordinatorError,
+);
+
+it.effect.each(["projection", "bound-history", "receipt"] as const)(
+  "restart rejects corrupt successor materialization %s without replay writes",
+  (corruption) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const planning = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const [prepared] = yield* prepareImplementationDeliveryRecoveryCandidates(
+            database,
+            planning,
+            [`restart-replay-corrupt-${corruption}`],
+          );
+          assert.isDefined(prepared);
+          const table =
+            corruption === "projection"
+              ? "agent_control_implementation_thread_reservation_states"
+              : corruption === "bound-history"
+                ? "agent_control_events"
+                : "agent_control_implementation_materialization_receipts";
+          const triggers = yield* database.sqlA<{ readonly name: string; readonly sql: string }>`
+      SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ${table}
+    `;
+          yield* database.sqlA.withTransaction(
+            Effect.gen(function* () {
+              for (const trigger of triggers) {
+                yield* database.sqlA.unsafe(`DROP TRIGGER "${trigger.name}"`).unprepared;
+              }
+              if (corruption === "projection") {
+                yield* database.sqlA`UPDATE agent_control_implementation_thread_reservation_states
+          SET state_json = json_set(state_json, '$.sequence', last_event_sequence + 1)`;
+              } else if (corruption === "bound-history") {
+                yield* database.sqlA`UPDATE agent_control_events
+          SET payload_json = json_set(payload_json, '$.coordinatorCommandFingerprint', ${"f".repeat(64)})
+          WHERE aggregate_kind = 'controlled-thread-reservation' AND stream_version = 3
+            AND json_extract(payload_json, '$.roleId') = 'implementer'`;
+              } else {
+                yield* database.sqlA`UPDATE agent_control_implementation_materialization_receipts
+          SET materialization_fingerprint = ${"f".repeat(64)}`;
+              }
+              for (const trigger of triggers) yield* database.sqlA.unsafe(trigger.sql).unprepared;
+            }),
+          );
+          const before = (yield* database.sqlA<{
+            readonly count: number;
+          }>`SELECT total_changes() AS count`)[0]!.count;
+          const result = yield* Effect.exit(
+            prepared!.coordinator.coordinator.processHandoff(
+              prepared!.candidate.seeded.evidence.handoffId,
+            ),
+          );
+          assert.isTrue(Exit.isFailure(result));
+          if (Exit.isFailure(result)) {
+            const error = Cause.findErrorOption(result.cause);
+            assert.isTrue(Option.isSome(error));
+            if (Option.isSome(error)) {
+              assert.isTrue(isImplementationCoordinatorReplayError(error.value));
+            }
+          }
+          assert.equal(
+            (yield* database.sqlA<{ readonly count: number }>`SELECT total_changes() AS count`)[0]!
+              .count,
+            before,
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect.each([
+  { stage: "implementation", live: false },
+  { stage: "implementation", live: true },
+  { stage: "verification", live: false },
+  { stage: "verification", live: true },
+] as const)(
+  "reconciles a known $stage provider start after restart (live=$live)",
+  ({ stage, live }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const executorCalls = yield* Ref.make(0);
+          const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+          if (stage === "implementation") {
+            const database = yield* makeSharedDatabase();
+            const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+            const setup = yield* prepareImplementationStageFinalizationCandidate(
+              database,
+              finalizer,
+              `known-start-${stage}-${live}`,
+            );
+            const claim = setup.claim;
+            const restarted = yield* buildImplementationConsumer({
+              sql: database.sqlB,
+              scope: database.scopeB,
+              coordinator: setup.coordinator,
+              executorCalls,
+              providerEvents,
+              listSessions: () =>
+                Effect.succeed(
+                  live
+                    ? [
+                        {
+                          provider: ProviderDriverKind.make("codex"),
+                          providerInstanceId: claim.evidence.providerInstanceId,
+                          threadId: claim.evidence.threadId,
+                          runtimeMode: claim.evidence.runtimeMode,
+                          cwd: claim.evidence.worktreePath,
+                          model: claim.evidence.modelSelection.model,
+                          activeTurnId: TurnId.make(claim.delivery.providerTurnId!),
+                          status: "running",
+                          createdAt: claim.delivery.providerSessionCreatedAt!,
+                          updatedAt: claim.delivery.providerAcceptedAt!,
+                        },
+                      ]
+                    : [],
+                ),
+            });
+            yield* restarted.consumer.processHandoff(setup.handoffId);
+            const after = Option.getOrThrow(
+              yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+            );
+            assert.equal(after.delivery.state, live ? "provider-started" : "ambiguous");
+            assert.equal(after.delivery.providerTurnId, claim.delivery.providerTurnId);
+            assert.equal(after.delivery.providerAcceptedAt, claim.delivery.providerAcceptedAt);
+            assert.equal(yield* Ref.get(executorCalls), 0);
+            if (!live) {
+              const unrelated = yield* setup.coordinator.handoffStore.observeProviderStarted({
+                threadId: claim.evidence.threadId,
+                providerTurnId: "unrelated-provider-turn",
+                acceptedAt: claim.delivery.providerAcceptedAt!,
+              });
+              assert.isTrue(Option.isNone(unrelated));
+              yield* restarted.consumer.processHandoff(setup.handoffId);
+              assert.deepStrictEqual(
+                Option.getOrThrow(
+                  yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+                ).delivery,
+                after.delivery,
+              );
+              const lateTerminal = yield* setup.coordinator.handoffStore.observeProviderTerminal({
+                threadId: claim.evidence.threadId,
+                providerTurnId: claim.delivery.providerTurnId!,
+                state: "completed",
+                terminalAt: DateTime.formatIso(yield* DateTime.now),
+              });
+              assert.equal(Option.getOrThrow(lateTerminal).state, "completed");
+            }
+          } else {
+            const setup = yield* prepareVerificationTurnDelivery(`known-start-${stage}-${live}`);
+            const consumer = yield* buildVerificationTurnConsumer({
+              sql: setup.database.sqlA,
+              scope: setup.database.scopeA,
+              coordinator: setup.coordinator,
+              executorCalls,
+              providerEvents,
+            });
+            yield* consumer.processHandoff(setup.handoffId);
+            const claim = Option.getOrThrow(
+              yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+            );
+            assert.equal(claim.delivery.state, "provider-started");
+            const restarted = yield* buildVerificationTurnConsumer({
+              sql: setup.database.sqlB,
+              scope: setup.database.scopeB,
+              coordinator: setup.coordinator,
+              executorCalls,
+              providerEvents,
+              listSessions: () =>
+                Effect.succeed(
+                  live
+                    ? [
+                        {
+                          provider: ProviderDriverKind.make("codex"),
+                          providerInstanceId: claim.evidence.providerInstanceId,
+                          threadId: claim.evidence.threadId,
+                          runtimeMode: claim.evidence.runtimeMode,
+                          cwd: claim.evidence.worktreePath,
+                          model: claim.evidence.modelSelection.model,
+                          activeTurnId: TurnId.make(claim.delivery.providerTurnId!),
+                          status: "running",
+                          createdAt: claim.delivery.providerSessionCreatedAt!,
+                          updatedAt: claim.delivery.providerAcceptedAt!,
+                        },
+                      ]
+                    : [],
+                ),
+            });
+            const result = yield* Effect.exit(restarted.processHandoff(setup.handoffId));
+            assert.equal(Exit.isSuccess(result), live);
+            if (Exit.isFailure(result)) {
+              const error = Cause.squash(result.cause);
+              assert.isTrue(isVerificationStoreError(error));
+              if (isVerificationStoreError(error)) {
+                assert.equal(error.candidateReason, "provider-runtime-unavailable");
+              }
+            }
+            const after = Option.getOrThrow(
+              yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+            );
+            assert.deepStrictEqual(after.delivery, claim.delivery);
+            assert.equal(yield* Ref.get(executorCalls), 1);
+          }
+        }),
+      ),
+    ),
+);
+
+it.effect("rolls back Implementation delivery attestation when a stale claim loses its CAS", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase();
+        const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const setup = (yield* prepareImplementationDeliveryRecoveryCandidates(database, finalizer, [
+          "stale-attestation-cas",
+        ]))[0]!;
+        const executorCalls = yield* Ref.make(0);
+        const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+        const consumer = yield* buildImplementationConsumer({
+          sql: database.sqlA,
+          scope: database.scopeA,
+          coordinator: setup.coordinator,
+          executorCalls,
+          providerEvents,
+          hooks: {
+            ...noopImplementationConsumerHooks,
+            beforeDeliveryCas: () => Effect.die("crash-before-delivery-cas"),
+          },
+        });
+        assert.isTrue(
+          Exit.isFailure(yield* Effect.exit(consumer.consumer.processHandoff(setup.handoffId))),
+        );
+        const claim = Option.getOrThrow(
+          yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+        );
+        assert.equal(claim.delivery.state, "claimed");
+        const model = canonicalProviderModelSelectionEvidence(claim.evidence.modelSelection);
+        const failed = yield* Effect.exit(
+          setup.coordinator.handoffStore.markDeliveryAttempted({
+            handoffId: setup.handoffId,
+            providerDeliveryId: claim.evidence.providerDeliveryId,
+            ownerId: claim.delivery.claimOwnerId!,
+            claimGeneration: claim.delivery.claimGeneration,
+            expectedRevision: claim.delivery.revision + 1,
+            attemptedAt: DateTime.formatIso(yield* DateTime.now),
+            providerSessionCreatedAt: createdAt,
+            providerResumeCursorJson: "null",
+            providerInstanceId: claim.evidence.providerInstanceId,
+            turnModelSelectionJson: model.modelSelectionJson,
+            turnModelSelectionFingerprint: model.modelSelectionFingerprint,
+          }),
+        );
+        assert.isTrue(Exit.isFailure(failed));
+        assert.deepStrictEqual(
+          yield* database.sqlA`
+      SELECT count(*) AS count FROM agent_control_implementation_delivery_attestations
+      WHERE provider_delivery_id=${claim.evidence.providerDeliveryId}
+    `,
+          [{ count: 0 }],
+        );
+        assert.deepStrictEqual(
+          Option.getOrThrow(
+            yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+          ).delivery,
+          claim.delivery,
+        );
+        assert.equal(yield* Ref.get(executorCalls), 0);
+      }),
+    ),
+  ),
+);
+
+const renewAdmittedStageLease = Effect.fn("renewAdmittedStageLease")(function* (
+  harness: FinalizerHarness,
+  leaseId: AgentControlStageRunLeaseId,
+  suffix: string,
+  verifyIdentityGuards = false,
+) {
+  const lease = Option.getOrThrow(yield* harness.leaseStates.get(leaseId));
+  const renewedAt = shiftIso(lease.renewedAt, 1);
+  const commandId = CommandId.make(`renew-admitted-${suffix}`);
+  const draft: AgentControlStageRunLeaseEventDraft = {
+    eventId: EventId.make(`renew-admitted-${suffix}`),
+    type: "agentControl.stageRunLease.renewed",
+    aggregateKind: "stage-run-lease",
+    aggregateId: leaseId,
+    occurredAt: renewedAt,
+    commandId,
+    causationEventId: null,
+    correlationId: commandId,
+    authority: "controller",
+    metadata: { schemaVersion: 1 },
+    payload: {
+      leaseId,
+      stageRunId: lease.stageRunId,
+      attemptId: lease.attemptId,
+      holderId: lease.holderId,
+      fenceToken: lease.fenceToken,
+      renewedAt,
+      expiresAt: shiftIso(lease.expiresAt, 60_000),
+    },
+  };
+  if (verifyIdentityGuards) {
+    for (const invalidPayload of [
+      {
+        ...draft.payload,
+        holderId: AgentControlStageRunLeaseHolderId.make("foreign-renewal-owner"),
+      },
+      { ...draft.payload, fenceToken: lease.fenceToken + 1 },
+    ]) {
+      const invalid = yield* Effect.exit(
+        harness.leaseEvents.append({
+          leaseId,
+          expectedStreamVersion: lease.revision,
+          events: [{ ...draft, payload: invalidPayload }],
+        }),
+      );
+      assert.isTrue(Exit.isFailure(invalid));
+      assert.deepStrictEqual(Option.getOrThrow(yield* harness.leaseStates.get(leaseId)), lease);
+    }
+  }
+  const [event] = yield* harness.leaseEvents.append({
+    leaseId,
+    expectedStreamVersion: lease.revision,
+    events: [draft],
+  });
+  yield* harness.leaseProjection.projectEvent(event!);
+});
+
+it.effect(
+  "materializes admitted Implementation after same-owner lease renewal and replays once",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const suffix = "implementation-renewed-before-materialization";
+          const database = yield* makeSharedDatabase();
+          const finalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const candidate = yield* prepareImplementationAdmissionCandidate(
+            database,
+            finalizer,
+            suffix,
+          );
+          const handoffId = candidate.seeded.evidence.handoffId;
+          assert.equal(
+            (yield* candidate.admissionHarness.admission.processHandoff(handoffId))._tag,
+            "Admitted",
+          );
+          yield* renewAdmittedStageLease(
+            finalizer,
+            AgentControlStageRunLeaseId.make(candidate.seeded.evidence.leaseId),
+            suffix,
+          );
+          const harness = yield* buildImplementationCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            suffix,
+            admission: candidate.admissionHarness.admission,
+            finalizer,
+            admissionHarness: candidate.admissionHarness,
+            task: candidate.task,
+            worktree: candidate.worktree,
+          });
+          assert.equal((yield* harness.coordinator.processHandoff(handoffId))._tag, "Materialized");
+          yield* renewAdmittedStageLease(
+            finalizer,
+            AgentControlStageRunLeaseId.make(candidate.seeded.evidence.leaseId),
+            `${suffix}-after-materialization`,
+          );
+          assert.equal((yield* harness.coordinator.processHandoff(handoffId))._tag, "Replayed");
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT count(*) AS count FROM agent_control_implementation_materialization_evidence`,
+            [{ count: 1 }],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "materializes admitted Verification after same-owner lease renewal and replays once",
+  () =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const suffix = "verification-renewed-before-materialization";
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepared = yield* prepareSucceededImplementationFinalization(
+            database,
+            planningFinalizer,
+            suffix,
+            false,
+            false,
+          );
+          const verificationAdmission = yield* buildVerificationAdmission({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            planningFinalizer,
+            implementationFinalizer: prepared.setup.finalizer.finalizer,
+            handoffStore: prepared.setup.coordinator.handoffStore,
+            admissionHarness: prepared.setup.candidate.admissionHarness,
+          });
+          const resultEvidenceId = prepared.implementation.resultEvidenceId;
+          assert.equal(
+            (yield* verificationAdmission.admission.processResultEvidence(resultEvidenceId))._tag,
+            "Admitted",
+          );
+          yield* renewAdmittedStageLease(
+            planningFinalizer,
+            AgentControlStageRunLeaseId.make(prepared.setup.candidate.seeded.evidence.leaseId),
+            suffix,
+            true,
+          );
+          const coordinator = yield* buildVerificationTurnCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            admission: verificationAdmission.admission,
+            planningFinalizer,
+            admissionHarness: prepared.setup.candidate.admissionHarness,
+            task: prepared.setup.candidate.task,
+            worktree: prepared.setup.candidate.worktree,
+            orchestration: prepared.setup.coordinator.orchestration,
+            snapshots: prepared.setup.coordinator.snapshots,
+          });
+          assert.equal(
+            (yield* coordinator.coordinator.processHandoff(resultEvidenceId))._tag,
+            "Materialized",
+          );
+          yield* renewAdmittedStageLease(
+            planningFinalizer,
+            AgentControlStageRunLeaseId.make(prepared.setup.candidate.seeded.evidence.leaseId),
+            `${suffix}-after-materialization`,
+          );
+          assert.equal(
+            (yield* coordinator.coordinator.processHandoff(resultEvidenceId))._tag,
+            "Replayed",
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT count(*) AS count FROM agent_control_verification_materialization_evidence`,
+            [{ count: 1 }],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect.each(["runtime", "history"] as const)(
+  "Verification waits for result sealing after an authoritative %s terminal without claiming runtime loss",
+  (source) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const setup = yield* prepareVerificationTurnDelivery(
+            `verification-terminal-pending-${source}`,
+            false,
+            {
+              database,
+              planningFinalizer,
+              verificationCoordinatorHooks: {
+                ...noopVerificationCoordinatorHooks,
+                promptTemplateVersion: "agent-control-verification-prompt-v2",
+              },
+            },
+          );
+          const executorCalls = yield* Ref.make(0);
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: setup.coordinator,
+            executorCalls,
+            listSessions: () => Effect.succeed([]),
+          });
+          yield* consumer.processHandoff(setup.handoffId);
+          const claim = Option.getOrThrow(
+            yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+          );
+          const turnId = TurnId.make(claim.delivery.providerTurnId!);
+          const terminalAt = shiftIso(claim.delivery.providerAcceptedAt!, 1);
+          const terminal = {
+            type: "turn.completed",
+            eventId: EventId.make(`pending-terminal-${source}`),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: claim.evidence.providerInstanceId,
+            threadId: claim.evidence.threadId,
+            turnId,
+            createdAt: terminalAt,
+            payload: { state: "completed" },
+          } satisfies ProviderRuntimeEvent;
+          // An unrelated native completion cannot hide an orphaned accepted turn.
+          yield* consumer.processRuntimeEvent({
+            ...terminal,
+            turnId: TurnId.make("unrelated-turn"),
+          });
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(consumer.processHandoff(setup.handoffId))),
+          );
+          if (source === "runtime") {
+            yield* consumer.processRuntimeEvent(terminal);
+          } else {
+            const session = {
+              threadId: claim.evidence.threadId,
+              providerName: "codex",
+              providerInstanceId: claim.evidence.providerInstanceId,
+              runtimeMode: claim.evidence.runtimeMode,
+              lastError: null,
+            };
+            yield* setup.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make("provider:pending-seal-start"),
+              threadId: claim.evidence.threadId,
+              session: {
+                ...session,
+                status: "running",
+                activeTurnId: turnId,
+                updatedAt: claim.delivery.providerAcceptedAt!,
+              },
+              providerRuntimeLifecycle: {
+                runtimeEventId: EventId.make("pending-seal-start"),
+                runtimeEventType: "turn.started",
+                providerInstanceId: claim.evidence.providerInstanceId,
+                providerTurnId: turnId,
+              },
+              createdAt: claim.delivery.providerAcceptedAt!,
+            });
+            yield* setup.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make("provider:pending-seal-terminal"),
+              threadId: claim.evidence.threadId,
+              session: { ...session, status: "ready", activeTurnId: null, updatedAt: terminalAt },
+              providerRuntimeLifecycle: {
+                runtimeEventId: terminal.eventId,
+                runtimeEventType: "turn.completed",
+                providerInstanceId: claim.evidence.providerInstanceId,
+                providerTurnId: turnId,
+                providerState: "completed",
+              },
+              createdAt: terminalAt,
+            });
+          }
+          for (let index = 0; index < 3; index += 1)
+            yield* consumer.processHandoff(setup.handoffId);
+          if (source === "runtime") {
+            const conflict = yield* Effect.exit(
+              consumer.processRuntimeEvent({
+                ...terminal,
+                eventId: EventId.make("conflicting-pending-completion"),
+              }),
+            );
+            assert.isTrue(Exit.isFailure(conflict));
+            yield* consumer.processRuntimeEvent(terminal);
+          }
+          const restarted = yield* buildVerificationTurnConsumer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: setup.coordinator,
+            executorCalls,
+            listSessions: () => Effect.succeed([]),
+          });
+          // A process-local observation never fabricates durable evidence on the next restart.
+          const restart = yield* Effect.exit(restarted.processHandoff(setup.handoffId));
+          assert.equal(Exit.isSuccess(restart), source === "history");
+          assert.deepStrictEqual(
+            Option.getOrThrow(
+              yield* setup.coordinator.handoffStore.loadAcceptedByHandoffId(setup.handoffId),
+            ).delivery,
+            claim.delivery,
+          );
+          assert.equal(yield* Ref.get(executorCalls), 1);
+        }),
+      ),
+    ),
+);
+
+it.effect.each([
+  { withReceipt: true, withStart: true },
+  { withReceipt: false, withStart: true },
+  { withReceipt: true, withStart: false },
+] as const)(
+  "restart after native Planning terminal consumption before ingestion %j",
+  ({ withReceipt, withStart }) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const first = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const suffix = `native-planning-terminal-restart-${withReceipt}-${withStart}`;
+          const seeded = yield* seedPlanning(database.sqlA, first, suffix);
+          if (withStart) yield* appendProviderStart(database.sqlA, seeded, suffix);
+          yield* appendPlan(database.sqlA, seeded, suffix);
+          const nativeEvent: ProviderRuntimeEvent = {
+            eventId: EventId.make(`native-terminal-${suffix}`),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: seeded.evidence.providerInstanceId,
+            threadId: seeded.evidence.threadId,
+            turnId: seeded.providerTurnId,
+            createdAt: terminalAt,
+            type: "turn.completed",
+            payload: { state: "completed" },
+          };
+          if (withReceipt) {
+            const before = Option.getOrThrow(
+              yield* first.store.loadAcceptedByHandoffId(seeded.evidence.handoffId),
+            );
+            const invalid = yield* Effect.exit(
+              first.store.observeProviderTerminal({
+                threadId: seeded.evidence.threadId,
+                providerTurnId: seeded.providerTurnId,
+                state: "completed",
+                terminalAt,
+                nativeEvent: {
+                  ...nativeEvent,
+                  providerInstanceId: ProviderInstanceId.make("foreign-provider"),
+                },
+              }),
+            );
+            assert.isTrue(Exit.isFailure(invalid));
+            assert.deepStrictEqual(
+              Option.getOrThrow(
+                yield* first.store.loadAcceptedByHandoffId(seeded.evidence.handoffId),
+              ).delivery,
+              before.delivery,
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`SELECT count(*) AS count FROM agent_control_native_terminal_receipts`,
+              [{ count: 0 }],
+            );
+          }
+          yield* first.store.observeProviderTerminal({
+            threadId: seeded.evidence.threadId,
+            providerTurnId: seeded.providerTurnId,
+            state: "completed",
+            terminalAt,
+            ...(withReceipt ? { nativeEvent } : {}),
+          });
+          if (withReceipt) {
+            const repeated = yield* first.store.observeProviderTerminal({
+              threadId: seeded.evidence.threadId,
+              providerTurnId: seeded.providerTurnId,
+              state: "completed",
+              terminalAt,
+              nativeEvent,
+            });
+            assert.isTrue(Option.isNone(repeated));
+            const conflict = yield* Effect.exit(
+              first.store.observeProviderTerminal({
+                threadId: seeded.evidence.threadId,
+                providerTurnId: seeded.providerTurnId,
+                state: "completed",
+                terminalAt,
+                nativeEvent: { ...nativeEvent, eventId: EventId.make("conflicting-native-event") },
+              }),
+            );
+            assert.isTrue(Exit.isFailure(conflict));
+            assert.deepStrictEqual(
+              yield* database.sqlA`SELECT count(*) AS count FROM agent_control_native_terminal_receipts`,
+              [{ count: 1 }],
+            );
+          }
+          yield* appendOrchestration(database.sqlA, {
+            suffix: `${suffix}-consumer-terminal`,
+            actorKind: "server",
+            threadId: seeded.evidence.threadId,
+            type: "thread.session-set",
+            occurredAt: terminalAt,
+            payload: {
+              threadId: seeded.evidence.threadId,
+              session: {
+                threadId: seeded.evidence.threadId,
+                status: "ready",
+                providerName: "codex",
+                providerInstanceId: seeded.evidence.providerInstanceId,
+                runtimeMode: seeded.evidence.runtimeMode,
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: terminalAt,
+              },
+            },
+          });
+          const dispatches = yield* Ref.make(0);
+          const orchestration = OrchestrationEngineService.of({
+            readEvents: () => Stream.die("unexpected readEvents"),
+            readThreadEvents: () => Stream.die("unexpected readThreadEvents"),
+            getThreadReplayStats: () => Effect.die("unexpected getThreadReplayStats"),
+            dispatchClient: () => Effect.die("unexpected dispatchClient"),
+            dispatchAgentControl: () => Effect.die("unexpected dispatchAgentControl"),
+            streamDomainEvents: Stream.never,
+            subscribeDomainEvents: Effect.succeed(Stream.never),
+            latestSequence: Effect.succeed(0),
+            dispatch: (command) =>
+              Effect.gen(function* () {
+                if (command.type !== "thread.session.set")
+                  return yield* Effect.die("unexpected command");
+                assert.equal(command.providerRuntimeLifecycle?.runtimeEventId, nativeEvent.eventId);
+                yield* Ref.update(dispatches, (value) => value + 1);
+                const entry = yield* appendOrchestration(database.sqlB, {
+                  suffix: `${suffix}-recovered`,
+                  threadId: command.threadId,
+                  type: "thread.session-set",
+                  occurredAt: command.createdAt,
+                  payload: parseJsonStrict(
+                    encodeUnknownJson({ threadId: command.threadId, session: command.session }),
+                  ),
+                  metadata: { providerRuntimeLifecycle: command.providerRuntimeLifecycle! },
+                });
+                return { sequence: entry.sequence };
+              }).pipe(Effect.orDie),
+          });
+          const restarted = yield* buildFinalizer(
+            database.sqlB,
+            database.scopeB,
+            noopHooks,
+            "runtime-holder",
+            noopProviderAdmissionRelease,
+            orchestration,
+          );
+          if (withReceipt && withStart) {
+            assert.equal(
+              (yield* restarted.finalizer.processHandoff(seeded.evidence.handoffId))._tag,
+              "Finalized",
+            );
+            assert.equal(
+              (yield* restarted.finalizer.processHandoff(seeded.evidence.handoffId))._tag,
+              "Replayed",
+            );
+            assert.equal(yield* Ref.get(dispatches), 1);
+          } else {
+            const result = yield* Effect.exit(
+              restarted.finalizer.processHandoff(seeded.evidence.handoffId),
+            );
+            assert.isTrue(Exit.isFailure(result));
+            if (Exit.isFailure(result)) {
+              const error = Cause.squash(result.cause);
+              assert.isTrue(isFinalizerError(error));
+              if (isFinalizerError(error))
+                assert.equal(
+                  error.reason,
+                  withStart
+                    ? "missing-provider-terminal-evidence"
+                    : "missing-provider-start-evidence",
+                );
+            }
+            assert.equal(yield* Ref.get(dispatches), 0);
+          }
+        }),
+      ),
+    ),
+);
+
+it.effect.each(["missing-type", "missing-state", "wrong-provider"] as const)(
+  "native terminal receipt SQL rejects %s despite matching copied event fields",
+  (mutation) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase();
+          const first = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const seeded = yield* seedPlanning(
+            database.sqlA,
+            first,
+            `receipt-sql-${mutation}`,
+            "completed",
+          );
+          const claim = Option.getOrThrow(
+            yield* first.store.loadAcceptedByHandoffId(seeded.evidence.handoffId),
+          );
+          const provider =
+            mutation === "wrong-provider" ? "foreign-provider" : seeded.evidence.providerInstanceId;
+          const event = {
+            eventId: `native-sql-${mutation}`,
+            provider: "codex",
+            providerInstanceId: provider,
+            threadId: seeded.evidence.threadId,
+            turnId: seeded.providerTurnId,
+            createdAt: terminalAt,
+            ...(mutation === "missing-type" ? {} : { type: "turn.completed" }),
+            payload: mutation === "missing-state" ? {} : { state: "completed" },
+          };
+          const inserted = yield* Effect.exit(database.sqlA`
+      INSERT INTO agent_control_native_terminal_receipts
+      (stage,handoff_id,handoff_fingerprint,provider_delivery_id,thread_id,provider_instance_id,
+       provider_turn_id,runtime_mode,delivery_revision,terminal_state,terminal_at,native_event_id,event_json)
+      VALUES ('initial-planning',${seeded.evidence.handoffId},${seeded.evidence.handoffFingerprint},
+       ${seeded.evidence.providerDeliveryId},${seeded.evidence.threadId},${provider},${seeded.providerTurnId},
+       ${seeded.evidence.runtimeMode},${claim.delivery.revision},'completed',${terminalAt},${event.eventId},${encodeUnknownJson(event)})
+    `);
+          assert.isTrue(Exit.isFailure(inserted));
+          if (Exit.isFailure(inserted))
+            assert.include(Cause.pretty(inserted.cause), "invalid native terminal receipt");
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT count(*) AS count FROM agent_control_native_terminal_receipts`,
+            [{ count: 0 }],
+          );
+        }),
+      ),
+    ),
 );

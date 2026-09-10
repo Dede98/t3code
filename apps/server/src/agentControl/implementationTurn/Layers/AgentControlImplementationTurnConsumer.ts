@@ -1,5 +1,5 @@
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
-import type { ProviderRuntimeEvent } from "@t3tools/contracts";
+import { type ProviderRuntimeEvent, TurnId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -11,6 +11,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 
+import { ProjectionTurnRepository } from "../../../persistence/Services/ProjectionTurns.ts";
 import { ProviderAdapterRequestError } from "../../../provider/Errors.ts";
 import { ProviderService } from "../../../provider/Services/ProviderService.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
@@ -33,6 +34,7 @@ import type { ProviderAdmissionPermit } from "../../providerAdmission/model.ts";
 
 const CLAIM_DURATION = Duration.minutes(2);
 const RETRY_DELAY = Duration.seconds(30);
+const RECOVERY_INTERVAL = Duration.seconds(5);
 
 type ConsumerInput =
   | { readonly _tag: "handoff"; readonly handoffId: string }
@@ -80,6 +82,7 @@ const make = Effect.gen(function* () {
   const wakeup = yield* AgentControlImplementationTurnWakeup;
   const orchestration = yield* OrchestrationEngineService;
   const snapshots = yield* ProjectionSnapshotQuery;
+  const projectionTurns = yield* ProjectionTurnRepository;
   const provider = yield* ProviderService;
   const executor = yield* ProviderTurnRequestExecutor;
   const providerAdmission = Option.getOrUndefined(
@@ -232,6 +235,78 @@ const make = Effect.gen(function* () {
       });
     },
   );
+
+  const reconcileMissingTerminal = Effect.fn(
+    "AgentControlImplementationTurnConsumer.reconcileMissingTerminal",
+  )(function* (claim: AgentControlImplementationClaim) {
+    const sessions = yield* provider.listSessions();
+    if (
+      sessions.some(
+        (session) =>
+          session.threadId === claim.evidence.threadId &&
+          session.activeTurnId === claim.delivery.providerTurnId &&
+          session.providerInstanceId === claim.evidence.providerInstanceId &&
+          session.runtimeMode === claim.evidence.runtimeMode &&
+          session.cwd === claim.evidence.worktreePath &&
+          session.model === claim.evidence.modelSelection.model,
+      )
+    )
+      return;
+    if (claim.delivery.state !== "provider-started") {
+      return yield* makeAgentControlImplementationCandidateEvidenceError({
+        handoffId: claim.evidence.handoffId,
+        candidateReason: "history-missing",
+        operation: "provider-runtime-unavailable-without-terminal-evidence",
+      });
+    }
+    yield* store.markAmbiguous({
+      handoffId: claim.evidence.handoffId,
+      expectedRevision: claim.delivery.revision,
+      terminalAt: yield* nowIso,
+    });
+    yield* wakeup.wake(claim.evidence.handoffId);
+  });
+
+  const reconcileProviderStarted = Effect.fn(
+    "AgentControlImplementationTurnConsumer.reconcileProviderStarted",
+  )(function* (claim: AgentControlImplementationClaim) {
+    if (claim.delivery.providerTurnId === null) return;
+    const turn = yield* projectionTurns.getByTurnId({
+      threadId: claim.evidence.threadId,
+      turnId: TurnId.make(claim.delivery.providerTurnId),
+    });
+    if (Option.isNone(turn)) return yield* reconcileMissingTerminal(claim);
+    const state =
+      turn.value.state === "completed"
+        ? "completed"
+        : turn.value.state === "interrupted"
+          ? "interrupted"
+          : turn.value.state === "error"
+            ? "failed"
+            : undefined;
+    if (state === undefined) return yield* reconcileMissingTerminal(claim);
+    if (turn.value.completedAt === null) {
+      return yield* makeAgentControlImplementationCandidateEvidenceError({
+        handoffId: claim.evidence.handoffId,
+        candidateReason: "projection-divergent",
+        operation: "recover-terminal-completed-at-missing",
+      });
+    }
+    // Recover the missed consumer observation; finalization still validates the
+    // immutable provider history before advancing the stage or releasing capacity.
+    const observed = yield* store.observeProviderTerminal({
+      threadId: claim.evidence.threadId,
+      providerTurnId: claim.delivery.providerTurnId,
+      state,
+      terminalAt: turn.value.completedAt,
+      ...(state === "completed"
+        ? {}
+        : {
+            errorCode: state === "interrupted" ? "provider-aborted" : "provider-defect",
+          }),
+    });
+    if (Option.isSome(observed)) yield* wakeup.wake(claim.evidence.handoffId);
+  });
 
   const requestProviderAdmission = Effect.fn(
     "AgentControlImplementationTurnConsumer.requestProviderAdmission",
@@ -401,10 +476,15 @@ const make = Effect.gen(function* () {
         claim.delivery.state === "completed" ||
         claim.delivery.state === "failed" ||
         claim.delivery.state === "interrupted" ||
-        claim.delivery.state === "ambiguous" ||
+        claim.delivery.state === "ambiguous"
+      ) {
+        return;
+      }
+      if (
         claim.delivery.state === "provider-started" ||
         claim.delivery.state === "interrupt-requested"
       ) {
+        yield* reconcileProviderStarted(claim);
         return;
       }
       if (claim.delivery.state === "delivery-attempted") {
@@ -448,13 +528,17 @@ const make = Effect.gen(function* () {
     if (event.type !== "turn.completed" && event.type !== "turn.aborted") return;
     const state = terminalState(event);
     const observed = yield* store.observeProviderTerminal({
+      nativeEvent: event,
       threadId: event.threadId,
       providerTurnId: String(event.turnId),
       state,
       terminalAt: event.createdAt,
       ...(state === "completed" ? {} : { errorCode: "provider-terminal" }),
     });
-    if (Option.isSome(observed)) yield* wakeup.wake(claim.value.evidence.handoffId);
+    if (Option.isSome(observed)) {
+      yield* hooks.afterNativeTerminalRecorded?.(claim.value.evidence.handoffId) ?? Effect.void;
+      yield* wakeup.wake(claim.value.evidence.handoffId);
+    }
   });
 
   const recover = Effect.gen(function* () {
@@ -504,6 +588,11 @@ const make = Effect.gen(function* () {
         ),
       );
       yield* worker.enqueue({ _tag: "recover" });
+      yield* Effect.forkScoped(
+        Effect.forever(
+          Effect.sleep(RECOVERY_INTERVAL).pipe(Effect.andThen(worker.enqueue({ _tag: "recover" }))),
+        ),
+      );
     },
   );
   return AgentControlImplementationTurnConsumer.of({

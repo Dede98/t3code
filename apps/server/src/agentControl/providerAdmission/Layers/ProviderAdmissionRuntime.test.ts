@@ -1,3 +1,4 @@
+import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ModelSelection,
@@ -575,9 +576,9 @@ it.effect(
                 ${originalRequest.providerDeliveryId},${originalRequest.handoffId},
                 ${"b".repeat(64)},'reservation-lease-deadline',${originalRequest.threadId},
                 'command-lease-deadline','message-lease-deadline',
-                ${originalRequest.providerInstanceId},'claimed',1,'delivery-owner',1,
+                ${originalRequest.providerInstanceId},'delivery-attempted',1,'delivery-owner',1,
                 '2099-01-01T00:00:00.000Z',0,NULL,'2099-01-01T00:00:00.000Z',
-                NULL,NULL,NULL,NULL,NULL,NULL,0,${epoch}
+                NULL,NULL,${epoch},'{}',NULL,NULL,0,${epoch}
               )
             `;
           }),
@@ -603,6 +604,7 @@ it.effect(
 
         const guardContext = yield* Layer.buildWithScope(
           Layer.fresh(ProviderAdmissionGuardLive).pipe(
+            Layer.provide(Layer.mock(AgentControlStageRunLeaseEngine)({})),
             Layer.provide(Layer.succeed(SqlClient.SqlClient, secondSql.sql)),
             Layer.provide(Layer.succeed(ProviderAdmissionStore, second.store)),
             Layer.provide(Layer.succeed(AgentControlTaskConsumerGuard, taskGuardShape)),
@@ -610,7 +612,7 @@ it.effect(
           second.scope,
         );
         const guard = Context.get(guardContext, ProviderAdmissionGuard);
-        yield* guard.enter(firstDecision.permit, "session-start");
+        yield* guard.enter(firstDecision.permit, "turn-start");
         assert.deepStrictEqual(
           yield* secondSql.sql<{ readonly status: string }>`
             SELECT status FROM main.agent_control_provider_admission_current

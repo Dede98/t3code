@@ -915,60 +915,9 @@ const make = Effect.gen(function* () {
             detail: `${durableStageLabel} session '${input.threadId}' conflicts with persisted model evidence.`,
           });
         }
-      } else {
-        const insertSessionEvidence =
-          durableDeliveryKind === "implementation"
-            ? sql`
-                INSERT INTO agent_control_implementation_session_evidence (
-                  provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
-                  cwd, model_selection_json, model_selection_fingerprint,
-                  session_created_at, resume_cursor_json, recorded_at
-                ) VALUES (
-                  ${expected.providerDeliveryId}, ${expected.threadId},
-                  ${expected.providerInstanceId}, ${expected.runtimeMode}, ${expected.cwd},
-                  ${expected.modelSelectionJson}, ${expected.modelSelectionFingerprint},
-                  ${expected.sessionCreatedAt}, ${expected.resumeCursorJson}, ${input.createdAt}
-                )
-              `
-            : durableDeliveryKind === "verification"
-              ? sql`
-                  INSERT INTO main.agent_control_verification_session_evidence (
-                    provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
-                    cwd, model_selection_json, model_selection_fingerprint,
-                    session_created_at, resume_cursor_json, recorded_at
-                  ) VALUES (
-                    ${expected.providerDeliveryId}, ${expected.threadId},
-                    ${expected.providerInstanceId}, ${expected.runtimeMode}, ${expected.cwd},
-                    ${expected.modelSelectionJson}, ${expected.modelSelectionFingerprint},
-                    ${expected.sessionCreatedAt}, ${expected.resumeCursorJson}, ${input.createdAt}
-                  )
-                `
-              : sql`
-                INSERT INTO agent_control_initial_planning_session_evidence (
-                  provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
-                  cwd, model_selection_json, model_selection_fingerprint,
-                  session_created_at, resume_cursor_json, recorded_at
-                ) VALUES (
-                  ${expected.providerDeliveryId}, ${expected.threadId},
-                  ${expected.providerInstanceId}, ${expected.runtimeMode}, ${expected.cwd},
-                  ${expected.modelSelectionJson}, ${expected.modelSelectionFingerprint},
-                  ${expected.sessionCreatedAt}, ${expected.resumeCursorJson}, ${input.createdAt}
-                )
-              `;
-        yield* (
-          durableDeliveryKind === "implementation" || durableDeliveryKind === "verification"
-            ? sql.withTransaction(insertSessionEvidence)
-            : insertSessionEvidence
-        ).pipe(
-          Effect.mapError(() =>
-            sessionEvidenceError(
-              providerErrorLabel(activeSession.provider),
-              `${durableStageLabel} session '${input.threadId}' evidence could not be persisted.`,
-            ),
-          ),
-        );
       }
     }
+
     yield* Effect.annotateCurrentSpan(
       input.providerDeliveryId === undefined
         ? {}
@@ -992,6 +941,7 @@ const make = Effect.gen(function* () {
         : {
             providerDeliveryId: input.providerDeliveryId,
             durableDeliveryKind,
+            sessionEvidenceRecordedAt: input.createdAt,
             ...(admissionPermit === undefined ? {} : { providerAdmissionPermit: admissionPermit }),
             ...(sessionAttestation === undefined ? {} : { sessionAttestation }),
             ...(sessionResumeCursorJson === undefined ? {} : { sessionResumeCursorJson }),
@@ -1048,7 +998,75 @@ const make = Effect.gen(function* () {
           expected: attestation,
           providerAdmissionPermit,
           beforeDeliveryCas: boundary.beforeDeliveryCas,
-          persistDeliveryAttempted: boundary.persistDeliveryAttempted,
+          persistDeliveryAttempted: (turnAttestation) =>
+            sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  if (
+                    prepared.providerDeliveryId === undefined ||
+                    prepared.sessionResumeCursorJson === undefined ||
+                    prepared.sessionEvidenceRecordedAt === undefined
+                  ) {
+                    return yield* sessionEvidenceError(
+                      "unknown",
+                      "Durable session evidence is incomplete at the delivery boundary.",
+                    );
+                  }
+                  const expected = buildInitialPlanningSessionEvidence({
+                    providerDeliveryId: prepared.providerDeliveryId,
+                    attestation,
+                    resumeCursorJson: prepared.sessionResumeCursorJson,
+                  });
+                  const table = sql.literal(
+                    prepared.durableDeliveryKind === "implementation"
+                      ? "main.agent_control_implementation_session_evidence"
+                      : prepared.durableDeliveryKind === "verification"
+                        ? "main.agent_control_verification_session_evidence"
+                        : "main.agent_control_initial_planning_session_evidence",
+                  );
+                  // Session creation is preparatory. Bind its immutable evidence only when the
+                  // owned delivery CAS commits; failed claims must leave no session binding.
+                  yield* sql`
+              INSERT INTO ${table} (
+                provider_delivery_id, thread_id, provider_instance_id, runtime_mode,
+                cwd, model_selection_json, model_selection_fingerprint,
+                session_created_at, resume_cursor_json, recorded_at
+              ) SELECT ${expected.providerDeliveryId}, ${expected.threadId},
+                ${expected.providerInstanceId}, ${expected.runtimeMode}, ${expected.cwd},
+                ${expected.modelSelectionJson}, ${expected.modelSelectionFingerprint},
+                ${expected.sessionCreatedAt}, ${expected.resumeCursorJson}, ${prepared.sessionEvidenceRecordedAt}
+              WHERE NOT EXISTS (SELECT 1 FROM ${table} WHERE provider_delivery_id = ${expected.providerDeliveryId})
+            `;
+                  const matched = yield* sql<{ readonly count: number }>`
+              SELECT count(*) AS count FROM ${table}
+              WHERE provider_delivery_id = ${expected.providerDeliveryId}
+                AND thread_id = ${expected.threadId}
+                AND provider_instance_id = ${expected.providerInstanceId}
+                AND runtime_mode = ${expected.runtimeMode} AND cwd = ${expected.cwd}
+                AND model_selection_json = ${expected.modelSelectionJson}
+                AND model_selection_fingerprint = ${expected.modelSelectionFingerprint}
+                AND session_created_at = ${expected.sessionCreatedAt}
+                AND resume_cursor_json = ${expected.resumeCursorJson}
+            `;
+                  if (matched[0]?.count !== 1) {
+                    return yield* sessionEvidenceError(
+                      "unknown",
+                      "Durable session evidence conflicts at the delivery boundary.",
+                    );
+                  }
+                  yield* boundary.persistDeliveryAttempted(turnAttestation);
+                }),
+              )
+              .pipe(
+                Effect.catchTag("SqlError", () =>
+                  Effect.fail(
+                    sessionEvidenceError(
+                      "unknown",
+                      "Durable session evidence and delivery attempt could not be committed.",
+                    ),
+                  ),
+                ),
+              ),
           afterDeliveryCas: boundary.afterDeliveryCas,
           onAdapterEntered: () => {
             entryState.adapterEntered = true;
