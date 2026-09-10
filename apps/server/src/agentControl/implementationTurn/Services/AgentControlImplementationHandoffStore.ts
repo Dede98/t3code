@@ -171,6 +171,12 @@ export interface AgentControlImplementationHandoffStoreShape {
     Option.Option<AgentControlImplementationDelivery>,
     AgentControlImplementationStoreError
   >;
+  readonly reconcileAcceptedAmbiguousTerminal: (
+    handoffId: string,
+  ) => Effect.Effect<
+    Option.Option<AgentControlImplementationDelivery>,
+    AgentControlImplementationStoreError
+  >;
   readonly observeProviderTerminal: (input: {
     readonly nativeEvent?: ProviderRuntimeEvent;
     readonly threadId: ThreadId;

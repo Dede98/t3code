@@ -154,6 +154,12 @@ export interface AgentControlInitialPlanningHandoffStoreShape {
     Option.Option<AgentControlInitialPlanningDelivery>,
     AgentControlInitialPlanningStoreError
   >;
+  readonly reconcileAcceptedAmbiguousTerminal: (
+    handoffId: string,
+  ) => Effect.Effect<
+    Option.Option<AgentControlInitialPlanningDelivery>,
+    AgentControlInitialPlanningStoreError
+  >;
   readonly observeProviderTerminal: (input: {
     readonly threadId: ThreadId;
     readonly providerTurnId: string;

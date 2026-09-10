@@ -371,52 +371,53 @@ const make = Effect.gen(function* () {
       ) {
         return yield* error(evidence.handoffId, "stage-history", "admission-corrupt");
       }
-      const lease = yield* loadAuthoritativeLeaseState(
-        state.leaseId,
-        leaseEvents,
-        leaseStates,
-      ).pipe(
-        Effect.mapError((cause) =>
-          error(evidence.handoffId, "lease-history", "admission-corrupt", cause),
-        ),
-      );
-      const leaseReservation = Option.isSome(lease)
-        ? lease.value.events[evidence.implementationLeaseEventStreamVersion - 1]
-        : undefined;
-      if (
-        Option.isNone(lease) ||
-        lease.value.state.status !== "reserved" ||
-        lease.value.state.stageRunId !== state.stageRunId ||
-        lease.value.state.attemptId !== state.attemptId ||
-        lease.value.state.holderId !== evidence.implementationLeaseHolderId ||
-        lease.value.state.holderId !== runtimeHolderId ||
-        lease.value.state.fenceToken !== evidence.implementationFenceToken ||
-        leaseReservation?.type !== "agentControl.stageRunLease.reserved" ||
-        leaseReservation.eventId !== evidence.implementationLeaseEventId ||
-        leaseReservation.sequence !== evidence.implementationLeaseEventSequence ||
-        leaseReservation.streamVersion !== evidence.implementationLeaseEventStreamVersion ||
-        leaseReservation.payload.stageRunId !== state.stageRunId ||
-        leaseReservation.payload.attemptId !== state.attemptId ||
-        leaseReservation.payload.holderId !== evidence.implementationLeaseHolderId ||
-        leaseReservation.payload.fenceToken !== evidence.implementationFenceToken ||
-        // Admission records the reserve boundary; later same-owner renewals
-        // extend its lifetime without replacing that immutable evidence.
-        lease.value.events
-          .slice(evidence.implementationLeaseEventStreamVersion)
-          .some(
-            (event) =>
-              event.type !== "agentControl.stageRunLease.renewed" ||
-              event.payload.stageRunId !== state.stageRunId ||
-              event.payload.attemptId !== state.attemptId ||
-              event.payload.holderId !== evidence.implementationLeaseHolderId ||
-              event.payload.fenceToken !== evidence.implementationFenceToken,
-          ) ||
-        canonicalTimestampMillis(lease.value.state.expiresAt) === null ||
-        canonicalTimestampMillis(lease.value.state.expiresAt)! <=
-          DateTime.toEpochMillis(yield* DateTime.now)
-      ) {
-        return yield* error(evidence.handoffId, "lease-history", "admission-corrupt");
-      }
+      const leaseAuthority = Effect.gen(function* () {
+        const lease = yield* loadAuthoritativeLeaseState(
+          state.leaseId,
+          leaseEvents,
+          leaseStates,
+        ).pipe(
+          Effect.mapError((cause) =>
+            error(evidence.handoffId, "lease-history", "admission-corrupt", cause),
+          ),
+        );
+        const leaseReservation = Option.isSome(lease)
+          ? lease.value.events[evidence.implementationLeaseEventStreamVersion - 1]
+          : undefined;
+        if (
+          Option.isNone(lease) ||
+          lease.value.state.status !== "reserved" ||
+          lease.value.state.stageRunId !== state.stageRunId ||
+          lease.value.state.attemptId !== state.attemptId ||
+          lease.value.state.holderId !== evidence.implementationLeaseHolderId ||
+          lease.value.state.holderId !== runtimeHolderId ||
+          lease.value.state.fenceToken !== evidence.implementationFenceToken ||
+          leaseReservation?.type !== "agentControl.stageRunLease.reserved" ||
+          leaseReservation.eventId !== evidence.implementationLeaseEventId ||
+          leaseReservation.sequence !== evidence.implementationLeaseEventSequence ||
+          leaseReservation.streamVersion !== evidence.implementationLeaseEventStreamVersion ||
+          leaseReservation.payload.stageRunId !== state.stageRunId ||
+          leaseReservation.payload.attemptId !== state.attemptId ||
+          leaseReservation.payload.holderId !== evidence.implementationLeaseHolderId ||
+          leaseReservation.payload.fenceToken !== evidence.implementationFenceToken ||
+          // Admission records the reserve boundary; later same-owner renewals
+          // extend its lifetime without replacing that immutable evidence.
+          lease.value.events
+            .slice(evidence.implementationLeaseEventStreamVersion)
+            .some(
+              (event) =>
+                event.type !== "agentControl.stageRunLease.renewed" ||
+                event.payload.stageRunId !== state.stageRunId ||
+                event.payload.attemptId !== state.attemptId ||
+                event.payload.holderId !== evidence.implementationLeaseHolderId ||
+                event.payload.fenceToken !== evidence.implementationFenceToken,
+            )
+        ) {
+          return yield* error(evidence.handoffId, "lease-history", "admission-corrupt");
+        }
+        return lease.value.state;
+      });
+      let currentLease = yield* leaseAuthority;
       if (!sameAdmissionWorktree(evidence, guardedWorktree)) {
         return yield* error(evidence.handoffId, "guarded-worktree", "source-stale");
       }
@@ -492,6 +493,29 @@ const make = Effect.gen(function* () {
       );
       if (!Equal.equals(task, historicalTask.state)) {
         return yield* error(evidence.handoffId, "task-persisted-history", "admission-corrupt");
+      }
+      let expiresAt = canonicalTimestampMillis(currentLease.expiresAt);
+      if (expiresAt === null) {
+        return yield* error(evidence.handoffId, "lease-history", "admission-corrupt");
+      }
+      if (expiresAt <= DateTime.toEpochMillis(yield* DateTime.now)) {
+        if (leaseEngine.renewOwnedForProviderEffect === undefined) {
+          return yield* error(evidence.handoffId, "lease-expired", "admission-corrupt");
+        }
+        // Renew only the fully validated reservation. Re-read its authority before
+        // materializing so a changed owner, fence or history cannot authorize work.
+        yield* leaseEngine
+          .renewOwnedForProviderEffect(currentLease)
+          .pipe(
+            Effect.mapError((cause) =>
+              error(evidence.handoffId, "lease-renewal", "admission-corrupt", cause),
+            ),
+          );
+        currentLease = yield* leaseAuthority;
+        expiresAt = canonicalTimestampMillis(currentLease.expiresAt);
+        if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(yield* DateTime.now)) {
+          return yield* error(evidence.handoffId, "lease-expired", "admission-corrupt");
+        }
       }
       return {
         task: historicalTask.state,

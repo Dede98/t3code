@@ -42,6 +42,8 @@ import {
 } from "../Services/AgentControlInitialPlanningHandoffStore.ts";
 
 import {
+  acceptedAmbiguousNativeTerminalPredicate,
+  loadAcceptedAmbiguousNativeTerminal,
   loadNativeTerminalReceipt,
   recordNativeTerminalReceipt,
 } from "../../nativeTerminalReceipt.ts";
@@ -529,6 +531,7 @@ const make = Effect.gen(function* () {
         OR (delivery.state = 'delivery-attempted' AND delivery.claim_expires_at <= ?)
         OR delivery.state = 'provider-started'
         OR delivery.state = 'interrupt-requested'
+        OR (delivery.state = 'ambiguous' AND ${acceptedAmbiguousNativeTerminalPredicate("initial-planning", "delivery")})
       )`,
       [now, now, now],
       limit,
@@ -888,6 +891,43 @@ const make = Effect.gen(function* () {
         Effect.flatMap((rows) => updateOne("request-interrupt", rows)),
       );
 
+  const reconcileAcceptedAmbiguousTerminal: AgentControlInitialPlanningHandoffStoreShape["reconcileAcceptedAmbiguousTerminal"] =
+    (handoffId) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const claim = yield* loadAcceptedByHandoffId(handoffId);
+            if (
+              Option.isNone(claim) ||
+              claim.value.delivery.state !== "ambiguous" ||
+              claim.value.delivery.providerTurnId === null
+            )
+              return Option.none();
+            const terminal = yield* loadAcceptedAmbiguousNativeTerminal(
+              "initial-planning",
+              handoffId,
+            ).pipe(Effect.provideService(SqlClient.SqlClient, sql));
+            if (Option.isNone(terminal)) return Option.none();
+            return yield* observeProviderTerminal({
+              threadId: claim.value.evidence.threadId,
+              providerTurnId: claim.value.delivery.providerTurnId,
+              state: terminal.value.state,
+              terminalAt: terminal.value.terminalAt,
+              ...(terminal.value.state === "completed"
+                ? {}
+                : {
+                    errorCode:
+                      terminal.value.state === "interrupted"
+                        ? "provider-aborted"
+                        : "provider-defect",
+                  }),
+            });
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) => storeError("reconcile-accepted-ambiguous-terminal", cause)),
+        );
+
   const observeProviderTerminal: AgentControlInitialPlanningHandoffStoreShape["observeProviderTerminal"] =
     (input) =>
       sql
@@ -899,6 +939,7 @@ const make = Effect.gen(function* () {
              last_error_code = ?, updated_at = ?
          WHERE thread_id = ? AND provider_turn_id = ?
            AND state IN ('provider-started', 'interrupt-requested', 'ambiguous')
+           AND (state <> 'ambiguous' OR ? OR ${acceptedAmbiguousNativeTerminalPredicate("initial-planning", "agent_control_initial_planning_deliveries", true)})
          RETURNING ${deliveryReturning}`,
               [
                 input.state,
@@ -907,6 +948,9 @@ const make = Effect.gen(function* () {
                 input.terminalAt,
                 input.threadId,
                 input.providerTurnId,
+                input.nativeEvent === undefined ? 0 : 1,
+                input.terminalAt,
+                input.state,
               ],
             );
             if (rows.length === 0) {
@@ -998,6 +1042,7 @@ const make = Effect.gen(function* () {
     markTerminal,
     observeProviderStarted,
     observeProviderTerminal,
+    reconcileAcceptedAmbiguousTerminal,
     requestInterrupt,
     listExpired,
     listStageFinalizationCandidates,

@@ -275,7 +275,9 @@ const make = Effect.gen(function* () {
       threadId: claim.evidence.threadId,
       turnId: TurnId.make(claim.delivery.providerTurnId),
     });
-    if (Option.isNone(turn)) return yield* reconcileMissingTerminal(claim);
+    if (Option.isNone(turn)) {
+      return yield* reconcileMissingTerminal(claim);
+    }
     const state =
       turn.value.state === "completed"
         ? "completed"
@@ -284,7 +286,9 @@ const make = Effect.gen(function* () {
           : turn.value.state === "error"
             ? "failed"
             : undefined;
-    if (state === undefined) return yield* reconcileMissingTerminal(claim);
+    if (state === undefined) {
+      return yield* reconcileMissingTerminal(claim);
+    }
     if (turn.value.completedAt === null) {
       return yield* makeAgentControlImplementationCandidateEvidenceError({
         handoffId: claim.evidence.handoffId,
@@ -472,11 +476,15 @@ const make = Effect.gen(function* () {
   const processHandoff = Effect.fn("AgentControlImplementationTurnConsumer.processHandoff")(
     function* (handoffId: string) {
       let claim = yield* load(handoffId);
+      if (claim.delivery.state === "ambiguous") {
+        const observed = yield* store.reconcileAcceptedAmbiguousTerminal(handoffId);
+        if (Option.isSome(observed)) yield* wakeup.wake(handoffId);
+        return;
+      }
       if (
         claim.delivery.state === "completed" ||
         claim.delivery.state === "failed" ||
-        claim.delivery.state === "interrupted" ||
-        claim.delivery.state === "ambiguous"
+        claim.delivery.state === "interrupted"
       ) {
         return;
       }

@@ -168,15 +168,19 @@ const make = Effect.gen(function* () {
     return delivery;
   });
 
-  const markAmbiguousAndSettle = Effect.fn(
-    "AgentControlInitialPlanningConsumer.markAmbiguousAndSettle",
+  const markAmbiguousAndWake = Effect.fn(
+    "AgentControlInitialPlanningConsumer.markAmbiguousAndWake",
   )(function* (claim: AgentControlInitialPlanningClaim, at: string) {
     const delivery = yield* store.markAmbiguous({
       handoffId: claim.evidence.handoffId,
       expectedRevision: claim.delivery.revision,
       terminalAt: at,
     });
-    yield* settleThreadProjection({ ...claim, delivery }, "failed", at);
+    // Missing delivery evidence does not establish a known provider turn's
+    // outcome. Its native terminal event may still be queued or arrive later.
+    if (claim.delivery.providerTurnId === null || claim.delivery.providerAcceptedAt === null) {
+      yield* settleThreadProjection({ ...claim, delivery }, "failed", at);
+    }
     yield* wakeup.wake(claim.evidence.handoffId);
     return delivery;
   });
@@ -186,7 +190,7 @@ const make = Effect.gen(function* () {
   )(function* (claim: AgentControlInitialPlanningClaim) {
     const providerTurnId = claim.delivery.providerTurnId;
     if (providerTurnId === null) {
-      return yield* markAmbiguousAndSettle(claim, yield* nowIso);
+      return yield* markAmbiguousAndWake(claim, yield* nowIso);
     }
     const turn = yield* projectionTurnRepository.getByTurnId({
       threadId: claim.evidence.threadId,
@@ -196,13 +200,12 @@ const make = Effect.gen(function* () {
       const terminal = terminalDeliveryState(turn.value.state);
       if (terminal !== undefined) {
         if (turn.value.completedAt === null) {
-          return yield* markAmbiguousAndSettle(claim, yield* nowIso);
+          return yield* markAmbiguousAndWake(claim, yield* nowIso);
         }
-        const at = turn.value.completedAt;
         return yield* markTerminal(
           claim,
           terminal,
-          at,
+          turn.value.completedAt,
           terminal === "completed"
             ? undefined
             : terminal === "interrupted"
@@ -229,7 +232,7 @@ const make = Effect.gen(function* () {
     ) {
       return claim.delivery;
     }
-    return yield* markAmbiguousAndSettle(claim, yield* nowIso);
+    return yield* markAmbiguousAndWake(claim, yield* nowIso);
   });
 
   const reconcileAttempted = Effect.fn("AgentControlInitialPlanningConsumer.reconcileAttempted")(
@@ -260,7 +263,7 @@ const make = Effect.gen(function* () {
       ) {
         return Option.none<AgentControlInitialPlanningDelivery>();
       }
-      return Option.some(yield* markAmbiguousAndSettle(claim, yield* nowIso));
+      return Option.some(yield* markAmbiguousAndWake(claim, yield* nowIso));
     },
   );
 
@@ -488,7 +491,7 @@ const make = Effect.gen(function* () {
             persisted.delivery.state === "delivery-attempted" &&
             prepareExit.value.entryState?.externalOperationStarted === true
           ) {
-            yield* markAmbiguousAndSettle(persisted, yield* nowIso);
+            yield* markAmbiguousAndWake(persisted, yield* nowIso);
           } else if (hasExceptionalReasons(exit.cause)) {
             return exit;
           } else if (persisted.delivery.state === "claimed") {
@@ -529,8 +532,12 @@ const make = Effect.gen(function* () {
     handoffId: string,
   ) {
     let claim = yield* load(handoffId);
+    if (claim.delivery.state === "ambiguous") {
+      const observed = yield* store.reconcileAcceptedAmbiguousTerminal(handoffId);
+      if (Option.isSome(observed)) yield* wakeup.wake(handoffId);
+      return;
+    }
     if (
-      claim.delivery.state === "ambiguous" ||
       claim.delivery.state === "completed" ||
       claim.delivery.state === "failed" ||
       claim.delivery.state === "interrupted"
@@ -592,7 +599,7 @@ const make = Effect.gen(function* () {
           ),
         );
         if (Exit.isFailure(interruptExit)) {
-          yield* markAmbiguousAndSettle(interrupting, at);
+          yield* markAmbiguousAndWake(interrupting, at);
           return yield* Effect.failCause(interruptExit.cause);
         }
         return;
@@ -602,7 +609,7 @@ const make = Effect.gen(function* () {
         return;
       }
       if (claim.delivery.state === "delivery-attempted") {
-        yield* markAmbiguousAndSettle(claim, at);
+        yield* markAmbiguousAndWake(claim, at);
         return;
       }
       yield* markTerminal(claim, "failed", at, "planning-deadline");

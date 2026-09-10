@@ -123,3 +123,88 @@ export const loadNativeTerminalReceipt = Effect.fn("loadNativeTerminalReceipt")(
     return yield* new NativeTerminalReceiptError({ operation: "load-binding" });
   return Option.some(event);
 });
+
+const nativeTerminalDeliveryTable = (stage: NativeTerminalStage) =>
+  `agent_control_${stage === "initial-planning" ? "initial_planning" : "implementation"}_deliveries`;
+
+const nativeTerminalOutcomeSql = (stage: NativeTerminalStage, delivery: string) => `CASE
+  WHEN json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.runtimeEventType') = 'turn.aborted'
+    THEN ${stage === "initial-planning" ? `CASE WHEN ${delivery}.interrupt_requested = 1 THEN 'interrupted' ELSE 'failed' END` : "'failed'"}
+  WHEN json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.providerState') IN ('interrupted', 'cancelled') THEN 'interrupted'
+  ELSE json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.providerState') END`;
+
+const acceptedAmbiguousNativeTerminalQuery = (
+  stage: NativeTerminalStage,
+  delivery: string,
+  loadDelivery = false,
+): string => `SELECT ${nativeTerminalOutcomeSql(stage, delivery)} AS "state", terminal_turn.completed_at AS "terminalAt"
+    FROM ${loadDelivery ? `${nativeTerminalDeliveryTable(stage)} ${delivery},` : ""} projection_turns terminal_turn
+    JOIN orchestration_events native_terminal
+      ON native_terminal.aggregate_kind = 'thread'
+      AND native_terminal.stream_id = terminal_turn.thread_id
+    JOIN agent_control_${stage === "initial-planning" ? "initial_planning" : "implementation"}_handoff_intents native_intent
+      ON native_intent.handoff_id = ${delivery}.handoff_id
+    WHERE ${delivery}.provider_turn_id IS NOT NULL AND ${delivery}.provider_accepted_at IS NOT NULL
+      ${loadDelivery ? `AND ${delivery}.handoff_id = ? AND ${delivery}.state = 'ambiguous'` : ""}
+      AND terminal_turn.thread_id = ${delivery}.thread_id
+      AND terminal_turn.turn_id = ${delivery}.provider_turn_id
+      AND terminal_turn.completed_at >= ${delivery}.provider_accepted_at
+      AND strftime('%Y-%m-%dT%H:%M:%fZ', terminal_turn.completed_at) = terminal_turn.completed_at
+      AND native_terminal.event_type = 'thread.session-set'
+      AND native_terminal.actor_kind = 'provider'
+      AND substr(native_terminal.command_id, 1, 9) = 'provider:'
+      AND native_terminal.occurred_at = terminal_turn.completed_at
+      AND json_extract(native_terminal.payload_json, '$.threadId') = ${delivery}.thread_id
+      AND json_extract(native_terminal.payload_json, '$.session.threadId') = ${delivery}.thread_id
+      AND json_extract(native_terminal.payload_json, '$.session.providerInstanceId') = ${delivery}.provider_instance_id
+      AND json_extract(native_terminal.payload_json, '$.session.providerInstanceId') = native_intent.provider_instance_id
+      AND json_extract(native_terminal.payload_json, '$.session.runtimeMode') = native_intent.runtime_mode
+      AND json_type(native_terminal.payload_json, '$.session.activeTurnId') = 'null'
+      AND json_extract(native_terminal.payload_json, '$.session.updatedAt') = terminal_turn.completed_at
+      AND json_type(native_terminal.metadata_json, '$.providerRuntimeLifecycle.runtimeEventId') = 'text'
+      AND length(json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.runtimeEventId')) > 0
+      AND json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.providerTurnId') = ${delivery}.provider_turn_id
+      AND json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.providerInstanceId') = ${delivery}.provider_instance_id
+      AND (
+        (json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.runtimeEventType') = 'turn.completed'
+          AND json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.providerState') IN ('completed', 'interrupted', 'cancelled')
+          AND json_extract(native_terminal.payload_json, '$.session.status') = 'ready'
+          AND terminal_turn.state IN ('completed', 'interrupted'))
+        OR
+        ((json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.runtimeEventType') = 'turn.aborted'
+          OR (json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.runtimeEventType') = 'turn.completed'
+            AND json_extract(native_terminal.metadata_json, '$.providerRuntimeLifecycle.providerState') = 'failed'))
+          AND json_extract(native_terminal.payload_json, '$.session.status') = 'error'
+          AND terminal_turn.state = 'error')
+      )`;
+
+/** Candidate selection and delivery CAS require the same native authority, never projection alone. */
+export const acceptedAmbiguousNativeTerminalPredicate = (
+  stage: NativeTerminalStage,
+  delivery: string,
+  matchObservation = false,
+): string =>
+  `(SELECT count(*) = 1 ${matchObservation ? 'AND MAX("terminalAt") = ? AND MAX("state") = ?' : ""}
+    FROM (${acceptedAmbiguousNativeTerminalQuery(stage, delivery)}))`;
+
+const decodeRecoveredTerminal = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    state: Schema.Literals(["completed", "failed", "interrupted"]),
+    terminalAt: Schema.String,
+  }),
+);
+
+export const loadAcceptedAmbiguousNativeTerminal = Effect.fn("loadAcceptedAmbiguousNativeTerminal")(
+  function* (stage: NativeTerminalStage, handoffId: string) {
+    const sql = yield* SqlClient.SqlClient;
+    const rows = yield* sql.unsafe(acceptedAmbiguousNativeTerminalQuery(stage, "delivery", true), [
+      handoffId,
+    ]);
+    if (rows.length === 0) return Option.none();
+    if (rows.length !== 1)
+      return yield* new NativeTerminalReceiptError({
+        operation: "ambiguous-native-terminal-evidence",
+      });
+    return Option.some(yield* decodeRecoveredTerminal(rows[0]));
+  },
+);

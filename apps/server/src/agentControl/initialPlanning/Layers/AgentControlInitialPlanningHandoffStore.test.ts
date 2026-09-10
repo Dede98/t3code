@@ -2,10 +2,13 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AgentControlControlledThreadReservationId,
   CommandId,
+  EventId,
   ModelSelection,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
@@ -476,17 +479,46 @@ it.effect(
       assert.equal(ambiguous.providerTurnId, "provider-turn-wal");
       assert.equal(ambiguous.providerAcceptedAt, "2026-07-30T12:02:33.000Z");
 
+      assert.isTrue(
+        Option.isNone(
+          yield* storeA.observeProviderTerminal({
+            threadId,
+            providerTurnId: "provider-turn-wal",
+            state: "completed",
+            terminalAt: "2026-07-30T12:02:36.000Z",
+          }),
+        ),
+      );
+      assert.deepStrictEqual(
+        Option.getOrThrow(yield* storeB.loadAcceptedByHandoffId(handoffId)).delivery,
+        ambiguous,
+      );
       const completed = Option.getOrThrow(
         yield* storeA.observeProviderTerminal({
           threadId,
           providerTurnId: "provider-turn-wal",
           state: "completed",
           terminalAt: "2026-07-30T12:02:36.000Z",
+          nativeEvent: {
+            type: "turn.completed",
+            eventId: EventId.make("native-terminal-wal"),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+            turnId: TurnId.make("provider-turn-wal"),
+            createdAt: "2026-07-30T12:02:36.000Z",
+            payload: { state: "completed" },
+          },
         }),
       );
       assert.equal(completed.state, "completed");
       assert.equal(completed.providerTurnId, "provider-turn-wal");
       assert.equal(completed.providerAcceptedAt, "2026-07-30T12:02:33.000Z");
+      assert.deepStrictEqual(
+        yield* sqlB`SELECT native_event_id, delivery_revision
+          FROM agent_control_native_terminal_receipts WHERE handoff_id=${handoffId}`,
+        [{ native_event_id: "native-terminal-wal", delivery_revision: completed.revision }],
+      );
       assert.isTrue(
         Option.isNone(
           yield* storeB.observeProviderTerminal({
