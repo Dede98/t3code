@@ -648,11 +648,44 @@ export function projectEvent(
             )
           : [...thread.messages, message];
         const cappedMessages = messages.slice(-MAX_THREAD_MESSAGES);
+        const assistantTurnId = message.role === "assistant" ? message.turnId : null;
+        const turnStillRunning =
+          thread.session?.status === "running" && thread.session.activeTurnId === assistantTurnId;
+        const settlesTurn = !message.streaming && !turnStillRunning;
+        const latestTurn = thread.latestTurn;
 
         return {
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
             messages: cappedMessages,
+            // The SQL turn projection links every assistant update to both the
+            // latest turn and its checkpoint, including messages after capture.
+            ...(assistantTurnId === null
+              ? {}
+              : {
+                  checkpoints: thread.checkpoints.map((checkpoint) =>
+                    checkpoint.turnId === assistantTurnId
+                      ? { ...checkpoint, assistantMessageId: message.id }
+                      : checkpoint,
+                  ),
+                  latestTurn:
+                    latestTurn?.turnId === assistantTurnId
+                      ? {
+                          ...latestTurn,
+                          assistantMessageId: message.id,
+                          state:
+                            settlesTurn &&
+                            latestTurn.state !== "interrupted" &&
+                            latestTurn.state !== "error"
+                              ? "completed"
+                              : latestTurn.state,
+                          completedAt: settlesTurn
+                            ? (latestTurn.completedAt ?? message.updatedAt)
+                            : latestTurn.completedAt,
+                          startedAt: latestTurn.startedAt ?? message.createdAt,
+                        }
+                      : latestTurn,
+                }),
             updatedAt: event.occurredAt,
           }),
         };

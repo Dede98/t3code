@@ -1256,3 +1256,113 @@ describe("orchestration projector", () => {
     expect(thread?.checkpoints.at(-1)?.turnId).toBe("turn-599");
   });
 });
+
+effectIt.effect.each([false, true] as const)(
+  "replays final assistant linkage after a checkpoint with terminal session first=%s",
+  (terminalFirst) =>
+    Effect.gen(function* () {
+      const now = "2026-09-09T20:10:23.323Z";
+      const threadId = "thread-restart-final-assistant";
+      const turnId = "turn-restart-final-assistant";
+      let sequence = 0;
+      const event = (type: OrchestrationEvent["type"], payload: unknown) =>
+        makeEvent({
+          sequence: ++sequence,
+          type,
+          payload,
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: now,
+          commandId: `restart-final-assistant-${sequence}`,
+        });
+      let model = yield* projectEvent(
+        createEmptyReadModel(now),
+        event("thread.created", {
+          threadId,
+          projectId: "project-1",
+          title: "Verification",
+          modelSelection: { instanceId: "codex", model: "test" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: now,
+          updatedAt: now,
+        }),
+      );
+      const session = {
+        threadId,
+        providerName: "codex",
+        runtimeMode: "full-access",
+        lastError: null,
+        updatedAt: now,
+      };
+      model = yield* projectEvent(
+        model,
+        event("thread.session-set", {
+          threadId,
+          session: { ...session, status: "running", activeTurnId: turnId },
+        }),
+      );
+      model = yield* projectEvent(
+        model,
+        event("thread.message-sent", {
+          threadId,
+          messageId: "assistant:commentary",
+          role: "assistant",
+          text: "Checking",
+          turnId,
+          streaming: false,
+          createdAt: now,
+          updatedAt: now,
+        }),
+      );
+      model = yield* projectEvent(
+        model,
+        event("thread.turn-diff-completed", {
+          threadId,
+          turnId,
+          checkpointTurnCount: 1,
+          checkpointRef: "refs/t3/checkpoints/thread-restart/turn/1",
+          status: "ready",
+          files: [],
+          assistantMessageId: "assistant:commentary",
+          completedAt: now,
+        }),
+      );
+      const terminal = () =>
+        event("thread.session-set", {
+          threadId,
+          session: { ...session, status: "ready", activeTurnId: null },
+        });
+      if (terminalFirst) model = yield* projectEvent(model, terminal());
+      model = yield* projectEvent(
+        model,
+        event("thread.message-sent", {
+          threadId,
+          messageId: "assistant:final",
+          role: "assistant",
+          text: "Verified",
+          turnId,
+          streaming: false,
+          createdAt: now,
+          updatedAt: now,
+        }),
+      );
+      if (!terminalFirst) {
+        expect(model.threads[0]?.latestTurn?.state).toBe("running");
+        model = yield* projectEvent(model, terminal());
+      }
+      expect(model.threads[0]?.latestTurn).toMatchObject({
+        turnId,
+        state: "completed",
+        assistantMessageId: "assistant:final",
+        completedAt: now,
+      });
+      expect(model.threads[0]?.checkpoints[0]).toMatchObject({
+        turnId,
+        assistantMessageId: "assistant:final",
+        status: "ready",
+      });
+    }),
+);
