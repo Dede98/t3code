@@ -92,6 +92,21 @@ export const validateAgentControlStageRunLeaseState = Effect.fn(
     stageOrdinal: 3,
   });
   const verificationAttemptId = yield* deriveAgentControlAttemptId(verificationStageRunId, 1);
+  const repairStageRunId = yield* deriveAgentControlStageRunId({
+    ...state,
+    stageKind: "implementation",
+    stageOrdinal: 4,
+  });
+  const repairAttemptId = yield* deriveAgentControlAttemptId(repairStageRunId, 1);
+  const repairVerificationStageRunId = yield* deriveAgentControlStageRunId({
+    ...state,
+    stageKind: "verification",
+    stageOrdinal: 5,
+  });
+  const repairVerificationAttemptId = yield* deriveAgentControlAttemptId(
+    repairVerificationStageRunId,
+    1,
+  );
   const verification =
     state.stageRunId === verificationStageRunId && state.attemptId === verificationAttemptId;
   if (
@@ -101,7 +116,13 @@ export const validateAgentControlStageRunLeaseState = Effect.fn(
       (state.stageRunId === planningStageRunId && state.attemptId === planningAttemptId) ||
       (state.stageRunId === implementationStageRunId &&
         state.attemptId === implementationAttemptId) ||
-      verification
+      verification ||
+      (state.stageRunId === repairStageRunId &&
+        state.attemptId === repairAttemptId &&
+        state.fenceToken >= 4) ||
+      (state.stageRunId === repairVerificationStageRunId &&
+        state.attemptId === repairVerificationAttemptId &&
+        state.fenceToken >= 5)
     )
   ) {
     return yield* corrupt();

@@ -1,3 +1,4 @@
+import { loadRunOnceRepair } from "../../runOnce/repair.ts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import {
   AgentControlControlledThreadReservationId,
@@ -322,7 +323,7 @@ const make = Effect.gen(function* () {
         state.attemptId !== evidence.implementationAttemptId ||
         state.roleId !== "implementer" ||
         state.stageKind !== "implementation" ||
-        state.stageOrdinal !== 2 ||
+        (state.stageOrdinal !== 2 && state.stageOrdinal !== 4) ||
         state.attemptOrdinal !== 1 ||
         state.leaseId !== evidence.implementationLeaseId ||
         state.fenceToken !== evidence.implementationFenceToken ||
@@ -364,7 +365,7 @@ const make = Effect.gen(function* () {
         stage.value.state.revision !== 1 ||
         stage.value.state.stageKind !== "implementation" ||
         stage.value.state.roleId !== "implementer" ||
-        stage.value.state.stageOrdinal !== 2 ||
+        (stage.value.state.stageOrdinal !== 2 && stage.value.state.stageOrdinal !== 4) ||
         stage.value.state.attemptOrdinal !== 1 ||
         stage.value.events[0]?.eventId !== evidence.implementationStageEventId ||
         stage.value.events[0]?.sequence !== evidence.implementationStageEventSequence
@@ -523,8 +524,10 @@ const make = Effect.gen(function* () {
         worktreeEvent: historicalWorktree.event,
         worktree: historicalWorktree.state,
         coordinatorCommandId,
+        stageOrdinal: state.stageOrdinal,
       } satisfies CurrentAuthority & {
         readonly coordinatorCommandId: CommandId;
+        readonly stageOrdinal: number;
       };
     },
   );
@@ -836,12 +839,14 @@ const make = Effect.gen(function* () {
       attemptId: evidence.implementationAttemptId,
       roleId: "implementer",
       stageKind: "implementation",
-      stageOrdinal: 2,
+      stageOrdinal: current.stageOrdinal === 4 ? 4 : 2,
       attemptOrdinal: 1,
       leaseId: evidence.implementationLeaseId,
       fenceToken: evidence.implementationFenceToken,
       worktreeReservationId: evidence.worktreeReservationId,
-      title: current.task.sourceSnapshot.title.trim() || `Implementation ${evidence.taskId}`,
+      title:
+        (current.stageOrdinal === 4 ? "Repair: " : "") +
+        (current.task.sourceSnapshot.title.trim() || `Implementation ${evidence.taskId}`),
       modelSelection: runtime.modelSelection,
       runtimeMode: runtime.runtimeMode,
       interactionMode: "default",
@@ -1151,7 +1156,9 @@ const make = Effect.gen(function* () {
       )
     `;
 
+    const repair = yield* loadRunOnceRepair(sql, evidence.handoffId);
     const handoffAuthority = {
+      ...(Option.isSome(repair) ? { repairReportJson: repair.value.reportJson } : {}),
       materializationEvidenceId,
       materializationReceiptId,
       materializationMarkerId,

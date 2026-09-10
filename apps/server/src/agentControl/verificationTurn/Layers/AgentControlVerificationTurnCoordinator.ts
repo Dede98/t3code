@@ -323,7 +323,7 @@ const make = Effect.gen(function* () {
         state.attemptId !== evidence.verificationAttemptId ||
         state.roleId !== "verifier" ||
         state.stageKind !== "verification" ||
-        state.stageOrdinal !== 3 ||
+        (state.stageOrdinal !== 3 && state.stageOrdinal !== 5) ||
         state.attemptOrdinal !== 1 ||
         state.leaseId !== evidence.leaseId ||
         state.fenceToken !== evidence.verificationFenceToken ||
@@ -365,7 +365,7 @@ const make = Effect.gen(function* () {
         stage.value.state.revision !== 1 ||
         stage.value.state.stageKind !== "verification" ||
         stage.value.state.roleId !== "verifier" ||
-        stage.value.state.stageOrdinal !== 3 ||
+        (stage.value.state.stageOrdinal !== 3 && stage.value.state.stageOrdinal !== 5) ||
         stage.value.state.attemptOrdinal !== 1 ||
         stage.value.events[0]?.eventId !== evidence.verificationStageEventId ||
         stage.value.events[0]?.sequence !== evidence.verificationStageEventSequence
@@ -523,8 +523,10 @@ const make = Effect.gen(function* () {
         worktreeEvent: historicalWorktree.event,
         worktree: historicalWorktree.state,
         coordinatorCommandId,
+        stageOrdinal: state.stageOrdinal,
       } satisfies CurrentAuthority & {
         readonly coordinatorCommandId: CommandId;
+        readonly stageOrdinal: number;
       };
     },
   );
@@ -948,7 +950,7 @@ const make = Effect.gen(function* () {
       attemptId: evidence.verificationAttemptId,
       roleId: "verifier",
       stageKind: "verification",
-      stageOrdinal: 3,
+      stageOrdinal: current.stageOrdinal === 5 ? 5 : 3,
       attemptOrdinal: 1,
       leaseId: evidence.leaseId,
       fenceToken: evidence.verificationFenceToken,
@@ -1174,7 +1176,7 @@ const make = Effect.gen(function* () {
       fenceToken: evidence.verificationFenceToken,
       stageKind: "verification",
       roleId: "verifier",
-      stageOrdinal: 3,
+      stageOrdinal: current.stageOrdinal === 5 ? 5 : 3,
       attemptOrdinal: 1,
     });
     const immutablePromptInputs = {

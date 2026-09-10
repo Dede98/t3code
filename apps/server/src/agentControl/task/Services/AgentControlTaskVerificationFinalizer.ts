@@ -21,6 +21,7 @@ export class AgentControlTaskVerificationFinalizerError extends Schema.TaggedErr
 ) {}
 
 export type AgentControlTaskVerificationFinalizerResult =
+  | { readonly _tag: "RepairPending"; readonly repairHandoffId: string }
   | { readonly _tag: "Finalized"; readonly taskFinalizationEvidenceId: string }
   | { readonly _tag: "Replayed"; readonly taskFinalizationEvidenceId: string };
 

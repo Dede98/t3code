@@ -114,6 +114,7 @@ import AgentMigration0069 from "./Migrations/069_AgentControlVerificationLeaseRe
 
 import AgentMigration0070 from "./Migrations/070_AgentControlPreparedSessionRecovery.ts";
 import AgentMigration0071 from "./Migrations/071_AgentControlNativeTerminalReceipts.ts";
+import AgentMigration0073 from "./Migrations/073_AgentControlRunOnceRepair.ts";
 import AgentMigration0072 from "./Migrations/072_AgentControlArchivedPreparationCapacityRecovery.ts";
 
 const agentMigrationEntries = [
@@ -156,6 +157,7 @@ const agentMigrationEntries = [
   [70, "AgentControlPreparedSessionRecovery", AgentMigration0070],
   [71, "AgentControlNativeTerminalReceipts", AgentMigration0071],
   [72, "AgentControlArchivedPreparationCapacityRecovery", AgentMigration0072],
+  [73, "AgentControlRunOnceRepair", AgentMigration0073],
 ] as const;
 
 const migrationEntries = [

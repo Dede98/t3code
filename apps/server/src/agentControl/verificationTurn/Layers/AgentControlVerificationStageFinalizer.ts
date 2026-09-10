@@ -1338,7 +1338,7 @@ const make = Effect.gen(function* () {
       stage.value.state.revision !== 2 ||
       stage.value.state.roleId !== "verifier" ||
       stage.value.state.stageKind !== "verification" ||
-      stage.value.state.stageOrdinal !== 3 ||
+      (stage.value.state.stageOrdinal !== 3 && stage.value.state.stageOrdinal !== 5) ||
       stage.value.state.attemptOrdinal !== 1 ||
       stage.value.state.attemptId !== claim.evidence.attemptId ||
       stage.value.state.taskRevision !== claim.evidence.taskRevision ||
@@ -1473,7 +1473,7 @@ const make = Effect.gen(function* () {
       attemptId: AgentControlAttemptId.make(claim.evidence.attemptId),
       roleId: "verifier" as const,
       stageKind: "verification" as const,
-      stageOrdinal: 3 as const,
+      stageOrdinal: stage.value.state.stageOrdinal === 5 ? (5 as const) : (3 as const),
       attemptOrdinal: 1 as const,
       taskRevision: claim.evidence.taskRevision,
       githubIntakeSequence: claim.evidence.githubIntakeSequence,

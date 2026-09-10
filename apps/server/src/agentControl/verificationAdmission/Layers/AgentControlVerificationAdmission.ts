@@ -465,6 +465,26 @@ const make = Effect.gen(function* () {
   const hooks = yield* AgentControlVerificationAdmissionHooks;
   const publications = yield* PubSub.unbounded<AgentControlVerificationAdmissionPublication>();
 
+  const nextVerificationOrdinal = Effect.fn(
+    "AgentControlVerificationAdmission.nextVerificationOrdinal",
+  )(function* (candidate: ImplementationResult) {
+    const rows = yield* sql<{ ordinal: number }>`SELECT stage_ordinal AS ordinal
+      FROM agent_control_stage_run_states WHERE stage_run_id = ${candidate.stageRunId}`.pipe(
+      Effect.mapError((cause) =>
+        failure(candidate.resultEvidenceId, "predecessor-position", "persistence", cause),
+      ),
+    );
+    const ordinal = rows[0]?.ordinal;
+    if (rows.length !== 1 || (ordinal !== 2 && ordinal !== 4)) {
+      return yield* failure(
+        candidate.resultEvidenceId,
+        "predecessor-position",
+        "stage-history-corrupt",
+      );
+    }
+    return ordinal === 4 ? (5 as const) : (3 as const);
+  });
+
   const readOutcome = Effect.fn("AgentControlVerificationAdmission.readOutcome")(function* (
     implementationResultEvidenceId: string,
   ) {
@@ -935,6 +955,7 @@ const make = Effect.gen(function* () {
     "AgentControlVerificationAdmission.loadAuthoritativeContext",
   )(function* (candidate: ImplementationResult) {
     const { claim } = yield* loadImmutablePredecessorContext(candidate);
+    const stageOrdinal = yield* nextVerificationOrdinal(candidate);
 
     const taskProjectHistory = yield* loadAuthoritativeTaskProjectHistory(
       candidate.projectId,
@@ -1046,9 +1067,11 @@ const make = Effect.gen(function* () {
       (state) =>
         state.stageKind === "implementation" &&
         state.roleId === "implementer" &&
-        state.stageOrdinal === 2,
+        state.stageOrdinal === stageOrdinal - 1,
     );
-    const verificationStages = stageHistory.filter((state) => state.stageKind === "verification");
+    const verificationStages = stageHistory.filter(
+      (state) => state.stageKind === "verification" && state.stageOrdinal >= stageOrdinal,
+    );
     const implementationStage = yield* loadAuthoritativeStageRunState(
       candidate.stageRunId,
       stageEvents,
@@ -1164,10 +1187,13 @@ const make = Effect.gen(function* () {
       (state) => state.stageKind === "planning" && state.roleId === "planning",
     );
     const implementationReservations = reservationHistory.filter(
-      (state) => state.stageKind === "implementation" && state.roleId === "implementer",
+      (state) =>
+        state.stageKind === "implementation" &&
+        state.roleId === "implementer" &&
+        state.stageOrdinal === stageOrdinal - 1,
     );
     const verificationReservations = reservationHistory.filter(
-      (state) => state.stageKind === "verification",
+      (state) => state.stageKind === "verification" && state.stageOrdinal >= stageOrdinal,
     );
     if (
       planningReservations.length !== 1 ||
@@ -1196,7 +1222,7 @@ const make = Effect.gen(function* () {
       githubIntakeSequence: candidate.githubIntakeSequence,
       sourceIdentityFingerprint: candidate.sourceIdentityFingerprint,
       stageKind: "verification",
-      stageOrdinal: 3,
+      stageOrdinal,
     });
     const verificationAttemptId = yield* deriveAgentControlAttemptId(verificationStageRunId, 1);
     const stableIdentity = {
@@ -1209,7 +1235,7 @@ const make = Effect.gen(function* () {
       attemptId: verificationAttemptId,
       roleId: AgentControlRoleId.make("verifier"),
       stageKind: "verification" as const,
-      stageOrdinal: 3,
+      stageOrdinal,
       attemptOrdinal: 1,
     };
     const verificationControlledThreadReservationId =
@@ -1521,7 +1547,7 @@ const make = Effect.gen(function* () {
       !isJsonObject(documentVerification) ||
       documentVerification.stageKind !== "verification" ||
       documentVerification.roleId !== "verifier" ||
-      documentVerification.stageOrdinal !== 3 ||
+      (documentVerification.stageOrdinal !== 3 && documentVerification.stageOrdinal !== 5) ||
       documentVerification.attemptOrdinal !== 1 ||
       documentVerification.stageRunId !== text.stageRunId ||
       documentVerification.attemptId !== text.attemptId ||
@@ -1591,6 +1617,7 @@ const make = Effect.gen(function* () {
 
     const candidate = yield* readImplementationResult(implementationResultEvidenceId);
     const { claim } = yield* loadImmutablePredecessorContext(candidate);
+    const stageOrdinal = yield* nextVerificationOrdinal(candidate);
     const verificationStageRunId = yield* deriveAgentControlStageRunId({
       projectId: candidate.projectId,
       taskId: candidate.taskId,
@@ -1598,7 +1625,7 @@ const make = Effect.gen(function* () {
       githubIntakeSequence: candidate.githubIntakeSequence,
       sourceIdentityFingerprint: candidate.sourceIdentityFingerprint,
       stageKind: "verification",
-      stageOrdinal: 3,
+      stageOrdinal,
     });
     const verificationAttemptId = yield* deriveAgentControlAttemptId(verificationStageRunId, 1);
     const verificationIdentity = {
@@ -1611,7 +1638,7 @@ const make = Effect.gen(function* () {
       attemptId: verificationAttemptId,
       roleId: AgentControlRoleId.make("verifier"),
       stageKind: "verification" as const,
-      stageOrdinal: 3,
+      stageOrdinal,
       attemptOrdinal: 1,
     };
     const verificationControlledThreadReservationId =
@@ -1892,7 +1919,7 @@ const make = Effect.gen(function* () {
               attemptId: context.verificationAttemptId,
               roleId: context.stableIdentity.roleId,
               stageKind: "verification",
-              stageOrdinal: 3,
+              stageOrdinal: context.stableIdentity.stageOrdinal,
               attemptOrdinal: 1,
               status: "prepared",
               taskRevision: candidate.taskRevision,
@@ -2029,7 +2056,7 @@ const make = Effect.gen(function* () {
               attemptId: context.verificationAttemptId,
               roleId: context.stableIdentity.roleId,
               stageKind: "verification",
-              stageOrdinal: 3,
+              stageOrdinal: context.stableIdentity.stageOrdinal,
               attemptOrdinal: 1,
               leaseId: candidate.leaseId,
               fenceToken: context.verificationFenceToken,
@@ -2147,7 +2174,7 @@ const make = Effect.gen(function* () {
             verification: {
               stageKind: "verification",
               roleId: "verifier",
-              stageOrdinal: 3,
+              stageOrdinal: context.stableIdentity.stageOrdinal,
               attemptOrdinal: 1,
               stageRunId: context.verificationStageRunId,
               attemptId: context.verificationAttemptId,

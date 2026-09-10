@@ -1,3 +1,4 @@
+import { loadRunOnceRepair } from "../../runOnce/repair.ts";
 import {
   acceptedAmbiguousNativeTerminalPredicate,
   loadAcceptedAmbiguousNativeTerminal,
@@ -782,8 +783,22 @@ const make = Effect.gen(function* () {
     });
     const evidenceWithModel = { ...evidence, modelSelection };
     const authority = yield* authorityFromRaw(raw, taskAuthority, worktreeAuthority, handoffId);
+    const admissions = yield* sql<{ handoffId: string }>`SELECT handoff_id AS "handoffId"
+      FROM agent_control_implementation_admission_evidence
+      WHERE implementation_stage_run_id = ${evidence.stageRunId}`;
+    const repair =
+      admissions.length === 1
+        ? yield* loadRunOnceRepair(sql, admissions[0]!.handoffId)
+        : Option.none();
     const authorityMismatch = yield* Effect.try({
-      try: () => implementationHandoffAuthorityMismatch(authority, evidenceWithModel),
+      try: () =>
+        implementationHandoffAuthorityMismatch(
+          {
+            ...authority,
+            ...(Option.isSome(repair) ? { repairReportJson: repair.value.reportJson } : {}),
+          },
+          evidenceWithModel,
+        ),
       catch: (cause) =>
         candidateEvidenceError(
           "handoff-authority-reconstruction",

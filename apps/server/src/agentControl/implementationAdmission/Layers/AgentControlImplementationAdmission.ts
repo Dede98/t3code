@@ -1,3 +1,4 @@
+import { loadRunOnceRepair, type RunOnceRepair } from "../../runOnce/repair.ts";
 import {
   AgentControlAttemptId,
   AgentControlControlledThreadReservationId,
@@ -538,6 +539,11 @@ const make = Effect.gen(function* () {
     const replay = yield* readAdmissionReplay(handoffId);
     if (Option.isNone(replay)) return replay;
     const row = replay.value;
+    const repair = yield* loadRunOnceRepair(sql, handoffId).pipe(
+      Effect.mapError((cause) =>
+        admissionError(handoffId, "repair-replay", "receipt-mismatch", cause),
+      ),
+    );
     const expectedCommandId = deriveImplementationAdmissionCommandId(
       row.handoffId,
       row.resultEvidenceId,
@@ -594,7 +600,7 @@ const make = Effect.gen(function* () {
       return yield* admissionError(handoffId, "validate-replay-identity", "receipt-mismatch");
     }
     const planningReplay = yield* finalizer
-      .processHandoff(handoffId)
+      .processHandoff(Option.isSome(repair) ? repair.value.planningHandoffId : handoffId)
       .pipe(
         Effect.mapError((cause) =>
           admissionError(handoffId, "validate-planning-replay", "planning-evidence-corrupt", cause),
@@ -677,7 +683,7 @@ const make = Effect.gen(function* () {
       preparedStageState.status !== "prepared" ||
       preparedStageState.revision !== 1 ||
       preparedStageState.stageKind !== "implementation" ||
-      preparedStageState.stageOrdinal !== 2 ||
+      preparedStageState.stageOrdinal !== (Option.isSome(repair) ? 4 : 2) ||
       preparedStageState.attemptOrdinal !== 1 ||
       preparedStageState.roleId !== "implementer" ||
       preparedStageState.attemptId !== row.implementationAttemptId ||
@@ -708,7 +714,10 @@ const make = Effect.gen(function* () {
 
   const processNew = Effect.fn("AgentControlImplementationAdmission.processNew")(function* (
     planning: PlanningEvidence,
+    repair: RunOnceRepair | null = null,
   ) {
+    const stageOrdinal = repair === null ? 2 : 4;
+    const predecessor = repair ?? planning;
     const reservationHistory = yield* loadAuthoritativeControlledThreadReservationTaskHistory(
       planning.projectId,
       planning.taskId,
@@ -778,8 +787,22 @@ const make = Effect.gen(function* () {
               }
               return yield* useTask(planning.projectId, planning.taskId, (task) =>
                 Effect.gen(function* () {
+                  if (repair !== null) {
+                    const activeRun = yield* sql`SELECT 1 FROM agent_control_run_once_states run
+                      JOIN agent_control_project_states project ON project.project_id = run.project_id
+                      WHERE run.run_id = ${repair.runId} AND run.project_id = ${planning.projectId}
+                        AND run.task_id = ${planning.taskId} AND run.status = 'active'
+                        AND run.last_step = 'thread-activated' AND project.mode = 'run-once'
+                        AND project.paused_from_mode IS NULL`;
+                    if (activeRun.length !== 1)
+                      return yield* admissionError(
+                        planning.handoffId,
+                        "repair-run-inactive",
+                        "task-evidence-stale",
+                      );
+                  }
                   const currentPlanning = yield* finalizer
-                    .processHandoff(planning.handoffId)
+                    .processHandoff(repair?.planningHandoffId ?? planning.handoffId)
                     .pipe(
                       Effect.mapError((cause) =>
                         admissionError(
@@ -872,7 +895,8 @@ const make = Effect.gen(function* () {
                     (state) => state.stageKind === "planning" && state.stageOrdinal === 1,
                   );
                   const implementationStages = stageHistory.filter(
-                    (state) => state.stageKind === "implementation" && state.stageOrdinal === 2,
+                    (state) =>
+                      state.stageKind === "implementation" && state.stageOrdinal === stageOrdinal,
                   );
                   if (
                     planningStages.length !== 1 ||
@@ -925,14 +949,14 @@ const make = Effect.gen(function* () {
                     lease === undefined ||
                     Option.isNone(authoritativeLease) ||
                     lease.leaseId !== planning.leaseId ||
-                    lease.stageRunId !== planning.stageRunId ||
-                    lease.attemptId !== planning.attemptId ||
-                    lease.holderId !== planning.leaseHolderId ||
-                    lease.fenceToken !== planning.fenceToken ||
+                    lease.stageRunId !== predecessor.stageRunId ||
+                    lease.attemptId !== predecessor.attemptId ||
+                    lease.holderId !== predecessor.leaseHolderId ||
+                    lease.fenceToken !== predecessor.fenceToken ||
                     lease.status !== "released" ||
-                    lease.revision !== planning.leaseEventStreamVersion ||
-                    authoritativeLease.value.events[planning.leaseEventStreamVersion - 1]
-                      ?.eventId !== planning.leaseEventId
+                    lease.revision !== predecessor.leaseEventStreamVersion ||
+                    authoritativeLease.value.events[predecessor.leaseEventStreamVersion - 1]
+                      ?.eventId !== predecessor.leaseEventId
                   ) {
                     return yield* admissionError(
                       planning.handoffId,
@@ -950,8 +974,15 @@ const make = Effect.gen(function* () {
                     githubIntakeSequence: planning.githubIntakeSequence,
                     sourceIdentityFingerprint: planning.sourceIdentityFingerprint,
                     stageKind: "implementation",
-                    stageOrdinal: 2,
+                    stageOrdinal,
                   });
+                  if (repair !== null && repair.repairStageRunId !== implementationStageRunId) {
+                    return yield* admissionError(
+                      planning.handoffId,
+                      "repair-stage",
+                      "identity-mismatch",
+                    );
+                  }
                   const implementationAttemptId = yield* deriveAgentControlAttemptId(
                     implementationStageRunId,
                     1,
@@ -966,14 +997,14 @@ const make = Effect.gen(function* () {
                     attemptId: implementationAttemptId,
                     roleId: AgentControlRoleId.make("implementer"),
                     stageKind: "implementation" as const,
-                    stageOrdinal: 2,
+                    stageOrdinal,
                     attemptOrdinal: 1,
                   };
                   const implementationControlledThreadReservationId =
                     yield* deriveAgentControlControlledThreadReservationId(stableIdentity);
                   const implementationThreadId =
                     yield* deriveAgentControlReservedThreadId(stableIdentity);
-                  const implementationFenceToken = planning.fenceToken + 1;
+                  const implementationFenceToken = predecessor.fenceToken + 1;
                   const admissionCommandId = deriveImplementationAdmissionCommandId(
                     planning.handoffId,
                     planning.resultEvidenceId,
@@ -1035,7 +1066,7 @@ const make = Effect.gen(function* () {
                       attemptId: implementationAttemptId,
                       roleId: stableIdentity.roleId,
                       stageKind: "implementation",
-                      stageOrdinal: 2,
+                      stageOrdinal,
                       attemptOrdinal: 1,
                       status: "prepared",
                       taskRevision: planning.taskRevision,
@@ -1170,7 +1201,7 @@ const make = Effect.gen(function* () {
                       attemptId: implementationAttemptId,
                       roleId: stableIdentity.roleId,
                       stageKind: "implementation",
-                      stageOrdinal: 2,
+                      stageOrdinal,
                       attemptOrdinal: 1,
                       leaseId: planning.leaseId,
                       fenceToken: implementationFenceToken,
@@ -1388,8 +1419,14 @@ const make = Effect.gen(function* () {
         resultEvidenceId: accepted.value.resultEvidenceId,
       } satisfies AgentControlImplementationAdmissionResult;
     }
+    const repair = yield* loadRunOnceRepair(sql, handoffId).pipe(
+      Effect.mapError((cause) =>
+        admissionError(handoffId, "repair-source", "receipt-mismatch", cause),
+      ),
+    );
+    const planningHandoffId = Option.isSome(repair) ? repair.value.planningHandoffId : handoffId;
     const planningResult = yield* finalizer
-      .processHandoff(handoffId)
+      .processHandoff(planningHandoffId)
       .pipe(
         Effect.mapError((cause) =>
           admissionError(
@@ -1412,9 +1449,12 @@ const make = Effect.gen(function* () {
     ) {
       return { _tag: "NotCandidate" as const };
     }
-    const planning = yield* readPlanningEvidence(handoffId);
+    const planning = yield* readPlanningEvidence(planningHandoffId);
     if (Option.isNone(planning)) return { _tag: "NotCandidate" as const };
-    const result = yield* processNew(planning.value).pipe(
+    const result = yield* processNew(
+      { ...planning.value, handoffId },
+      Option.getOrNull(repair),
+    ).pipe(
       Effect.catchIf(
         (cause) => cause.reason === "revision-conflict" || cause.reason === "persistence",
         (cause) =>
@@ -1464,8 +1504,15 @@ const make = Effect.gen(function* () {
         admissionError("recovery", "list-candidates", "persistence", cause),
       ),
     );
+    const hasRepairs =
+      yield* sql`SELECT 1 FROM sqlite_schema WHERE name = 'agent_control_run_once_repairs'`;
+    const repairs =
+      hasRepairs.length === 0
+        ? []
+        : yield* sql<{ handoffId: string }>`
+      SELECT verification_handoff_id AS "handoffId" FROM agent_control_run_once_repairs`;
     yield* Effect.forEach(
-      candidates,
+      [...candidates, ...repairs],
       ({ handoffId }) =>
         processHandoff(handoffId).pipe(
           Effect.catchIf(
@@ -1481,7 +1528,13 @@ const make = Effect.gen(function* () {
         ),
       { concurrency: 1, discard: true },
     );
-  });
+  }).pipe(
+    Effect.mapError((cause) =>
+      isAdmissionError(cause)
+        ? cause
+        : admissionError("recovery", "repair-candidates", "persistence", cause),
+    ),
+  );
 
   const processSafely = (handoffId: string | null) =>
     (handoffId === null ? recover : processHandoff(handoffId).pipe(Effect.asVoid)).pipe(

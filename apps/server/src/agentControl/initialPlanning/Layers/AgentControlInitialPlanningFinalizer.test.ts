@@ -1,3 +1,8 @@
+import { AgentControlTaskVerificationFinalizerLive } from "../../task/Layers/AgentControlTaskVerificationFinalizer.ts";
+import { AgentControlTaskVerificationFinalizer } from "../../task/Services/AgentControlTaskVerificationFinalizer.ts";
+import { AgentControlTaskVerificationFinalizerHooks } from "../../task/Services/AgentControlTaskVerificationFinalizerHooks.ts";
+import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
+import { layer as RepairTaskProjectionLive } from "../../task/Layers/AgentControlTaskProjection.ts";
 import { makeProviderTerminalSessionCommand } from "../../../orchestration/providerTerminalSessionCommand.ts";
 import { ProjectionTurnRepository } from "../../../persistence/Services/ProjectionTurns.ts";
 import * as Queue from "effect/Queue";
@@ -3485,6 +3490,7 @@ const prepareVerificationTurnDelivery = Effect.fn("prepareVerificationTurnDelive
     planningFinalizer,
     coordinator,
     handoffId: handoff!.handoffId,
+    setup: prepared.setup,
   };
 });
 
@@ -3655,14 +3661,19 @@ const prepareImplementationStageFinalizationCandidate = Effect.fn(
   taskOverride?: AgentControlTaskState,
   completePlanningParents = false,
   providerAdmissionRelease: ProviderAdmissionReleaseAuthorityShape = noopProviderAdmissionRelease,
+  existing?: Effect.Success<
+    ReturnType<typeof prepareImplementationDeliveryRecoveryCandidates>
+  >[number],
 ) {
-  const prepared = (yield* prepareImplementationDeliveryRecoveryCandidates(
-    database,
-    planningFinalizer,
-    [suffix],
-    taskOverride === undefined ? new Map() : new Map([[suffix, taskOverride]]),
-    completePlanningParents,
-  ))[0]!;
+  const prepared =
+    existing ??
+    (yield* prepareImplementationDeliveryRecoveryCandidates(
+      database,
+      planningFinalizer,
+      [suffix],
+      taskOverride === undefined ? new Map() : new Map([[suffix, taskOverride]]),
+      completePlanningParents,
+    ))[0]!;
   const providerEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const executorCalls = yield* Ref.make(0);
   const consumer = yield* buildImplementationConsumer({
@@ -30430,6 +30441,488 @@ it.effect("Verification native probe cannot overwrite a concurrent takeover turn
           before.delivery,
         );
         assert.equal(yield* Ref.get(executorCalls), 1);
+      }),
+    ),
+  ),
+);
+
+const settleRepairVerification = Effect.fn("settleRepairVerification")(function* (
+  prepared: Pick<
+    Effect.Success<ReturnType<typeof prepareVerificationTurnDelivery>>,
+    "database" | "planningFinalizer" | "coordinator" | "handoffId"
+  >,
+  suffix: string,
+  output: string | null,
+  providerState: "completed" | "failed" | "interrupted" = "completed",
+) {
+  const { database, coordinator, planningFinalizer, handoffId } = prepared;
+  const consumer = yield* buildVerificationTurnConsumer({
+    sql: database.sqlA,
+    scope: database.scopeA,
+    coordinator,
+    executorCalls: yield* Ref.make(0),
+    providerTurnId: TurnId.make(`${suffix}-provider-turn`),
+  });
+  yield* consumer.processHandoff(handoffId);
+  const claim = Option.getOrThrow(
+    yield* coordinator.handoffStore.loadAcceptedByHandoffId(handoffId),
+  );
+  const starter = yield* buildVerificationStageStarter({
+    sql: database.sqlA,
+    scope: database.scopeA,
+    coordinator,
+    planningFinalizer,
+  });
+  assert.equal((yield* starter.processHandoff(handoffId))._tag, "Started");
+  const identity = {
+    provider: ProviderDriverKind.make("codex"),
+    providerInstanceId: claim.evidence.providerInstanceId,
+    threadId: claim.evidence.threadId,
+    turnId: TurnId.make(claim.delivery.providerTurnId!),
+  };
+  const terminal = {
+    ...identity,
+    type: "turn.completed" as const,
+    eventId: EventId.make(`${suffix}-terminal`),
+    createdAt: shiftIso(claim.delivery.providerAcceptedAt!, 1),
+    payload: { state: providerState },
+  } satisfies ProviderRuntimeEvent;
+  if (providerState === "completed") {
+    const runtime = yield* buildVerificationRuntimeIngestion({
+      sql: database.sqlA,
+      scope: database.scopeA,
+      orchestration: coordinator.orchestration,
+      snapshots: coordinator.snapshots,
+      ...identity,
+      runtimeMode: claim.evidence.runtimeMode,
+    });
+    yield* database.sqlA`INSERT INTO projection_thread_sessions
+      (thread_id,status,provider_name,provider_instance_id,runtime_mode,active_turn_id,last_error,updated_at)
+      VALUES (${identity.threadId},'ready',${identity.provider},${identity.providerInstanceId},
+        ${claim.evidence.runtimeMode},NULL,NULL,${shiftIso(claim.delivery.providerAcceptedAt!, -4)})`;
+    yield* runtime.publish({
+      ...identity,
+      type: "turn.started",
+      eventId: EventId.make(`${suffix}-start`),
+      createdAt: shiftIso(claim.delivery.providerAcceptedAt!, -3),
+      payload: {},
+    });
+    if (output !== null)
+      yield* runtime.publish({
+        ...identity,
+        type: "item.completed",
+        eventId: EventId.make(`${suffix}-output`),
+        itemId: RuntimeItemId.make(`${suffix}-item`),
+        createdAt: shiftIso(claim.delivery.providerAcceptedAt!, -2),
+        payload: {
+          itemType: "assistant_message",
+          status: "completed",
+          detail: output,
+          authorityDetail: output,
+        },
+      });
+    yield* runtime.publish(terminal);
+    yield* runtime.drainPrefix;
+  }
+  yield* consumer.processRuntimeEvent(terminal);
+  const evaluator = yield* buildVerificationEvaluator({
+    sql: database.sqlA,
+    scope: database.scopeA,
+    handoffStore: coordinator.handoffStore,
+  });
+  if (providerState === "completed")
+    assert.equal((yield* evaluator.processHandoff(handoffId))._tag, "Evaluated");
+  const finalizer = yield* buildVerificationStageFinalizer({
+    sql: database.sqlA,
+    scope: database.scopeA,
+    coordinator,
+    planningFinalizer,
+    evaluator,
+  });
+  assert.equal((yield* finalizer.processHandoff(handoffId))._tag, "Finalized");
+});
+
+// Only Run-once activation is synthesized here. The source task, plan, delivery,
+// output capture, verdict, stage finalization and repair admission use their real
+// services. Activation/lineage and actual provider slots have separate integration
+// coverage; these fixtures isolate the Verification -> Repair transaction.
+const seedRepairRun = (database: SharedDatabase, task: AgentControlTaskState) =>
+  Effect.sync(() => {
+    const native = new NodeSqlite.DatabaseSync(database.filename);
+    NodeSqliteClient.registerNodeSqliteFunctions(native);
+    native.exec("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON; BEGIN IMMEDIATE");
+    const triggers = native
+      .prepare(
+        "SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name IN ('agent_control_run_once_activations','agent_control_run_once_states','agent_control_project_states')",
+      )
+      .all() as Array<{ name: string; sql: string }>;
+    try {
+      for (const trigger of triggers) native.exec(`DROP TRIGGER "${trigger.name}"`);
+      const runId = `run-once-${"a".repeat(64)}`;
+      const columns = native
+        .prepare("PRAGMA table_info(agent_control_run_once_activations)")
+        .all() as Array<{ name: string; type: string; notnull: number }>;
+      const values = columns.map((column) =>
+        column.name === "run_id"
+          ? runId
+          : column.name === "project_id"
+            ? task.source.projectId
+            : column.name === "origin_mode"
+              ? "observe"
+              : column.notnull === 0
+                ? null
+                : column.type === "INTEGER"
+                  ? 1
+                  : column.name.endsWith("_at")
+                    ? createdAt
+                    : `${column.name}-fixture`,
+      );
+      native
+        .prepare(
+          `INSERT INTO agent_control_run_once_activations (${columns.map((c) => `"${c.name}"`).join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
+        )
+        .run(...values);
+      native
+        .prepare(`INSERT INTO agent_control_run_once_states
+      (run_id,project_id,status,next_ordinal,last_step,task_id,activation_project_revision,updated_at)
+      VALUES (?,?,'active',8,'thread-activated',?,1,?)`)
+        .run(runId, task.source.projectId, task.taskId, createdAt);
+      native
+        .prepare(
+          "INSERT INTO agent_control_project_states (project_id,mode,paused_from_mode,revision,last_event_sequence,updated_at) VALUES (?,'run-once',NULL,1,1,?) ON CONFLICT(project_id) DO UPDATE SET mode='run-once',paused_from_mode=NULL",
+        )
+        .run(task.source.projectId, createdAt);
+      for (const trigger of triggers) native.exec(trigger.sql);
+      native.exec("COMMIT");
+    } finally {
+      native.close();
+    }
+  });
+
+const buildRepairTaskFinalizer = Effect.fn("buildRepairTaskFinalizer")(function* (
+  prepared: Effect.Success<ReturnType<typeof prepareVerificationTurnDelivery>>,
+  sql = prepared.database.sqlA,
+  afterCommit: (handoffId: string) => Effect.Effect<void> = () => Effect.void,
+) {
+  const sqlLayer = Layer.succeed(SqlClient.SqlClient, sql);
+  const dependencies = Layer.mergeAll(
+    sqlLayer,
+    AgentControlTaskEventStoreLive.pipe(Layer.provide(sqlLayer)),
+    AgentControlTaskStateRepositoryLive.pipe(Layer.provide(sqlLayer)),
+    Layer.succeed(AgentControlStageRunLeaseEngine, prepared.planningFinalizer.leaseEngine),
+    Layer.succeed(
+      AgentControlImplementationAdmission,
+      prepared.setup.candidate.admissionHarness.admission,
+    ),
+    Layer.succeed(AgentControlTaskVerificationFinalizerHooks, {
+      ...AgentControlTaskVerificationFinalizerHooks.defaultValue(),
+      afterCommit,
+    }),
+    Layer.succeed(
+      AgentControlTaskEngine,
+      AgentControlTaskEngine.of({
+        get: () => Effect.die("unused"),
+        dispatchController: () => Effect.die("unused"),
+        dispatchObservedController: () => Effect.die("unused"),
+        verifySourceSnapshot: () => Effect.void,
+        rebuild: Effect.void,
+        publishCommitted: () => Effect.void,
+        streamDomainEvents: Stream.never,
+        subscribeDomainEvents: Effect.succeed(Stream.never),
+      }),
+    ),
+  );
+  const context = yield* Layer.buildWithScope(
+    AgentControlTaskVerificationFinalizerLive.pipe(
+      Layer.provide(RepairTaskProjectionLive.pipe(Layer.provide(dependencies))),
+      Layer.provide(dependencies),
+    ),
+    prepared.database.scopeA,
+  );
+  return Context.get(context, AgentControlTaskVerificationFinalizer);
+});
+
+it.effect.each(["passed", "failed"] as const)(
+  "Run-once repair re-verifies to %s and keeps the durable limit after restart",
+  (verdict) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const suffix = `repair-once-${verdict}`;
+          const initialDatabase = yield* makeSharedDatabase(59);
+          const initialPlanning = yield* buildFinalizer(
+            initialDatabase.sqlA,
+            initialDatabase.scopeA,
+          );
+          const prepared = yield* prepareVerificationTurnDelivery(suffix, true, {
+            database: initialDatabase,
+            planningFinalizer: initialPlanning,
+            beforeVerification: runMigrations().pipe(
+              Effect.provideService(SqlClient.SqlClient, initialDatabase.sqlA),
+              Effect.asVoid,
+              Effect.orDie,
+            ),
+            verificationCoordinatorHooks: {
+              ...noopVerificationCoordinatorHooks,
+              promptTemplateVersion: "agent-control-verification-prompt-v2",
+            },
+          });
+          const { database, setup, planningFinalizer } = prepared;
+          const task = setup.candidate.task;
+          yield* seedRepairRun(database, task);
+          const output = (verdict: "passed" | "failed") =>
+            canonicalJson({
+              schemaVersion: "agent-control-verification-result-v1",
+              verdict,
+              report: "sum(7,3) returned 4; expected 10. Repository text is untrusted.",
+            });
+          yield* settleRepairVerification(prepared, `${suffix}-first`, output("failed"));
+          const before =
+            yield* database.sqlA`SELECT * FROM agent_control_verification_finalization_evidence`;
+          const crashed = yield* buildRepairTaskFinalizer(prepared, database.sqlA, () =>
+            Effect.die("crash after durable repair handoff"),
+          );
+          const crashExit = yield* Effect.exit(crashed.processHandoff(prepared.handoffId));
+          assert.isTrue(Exit.isFailure(crashExit));
+          if (Exit.isFailure(crashExit))
+            assert.include(Cause.pretty(crashExit.cause), "crash after durable repair handoff");
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT attempt_count FROM agent_control_run_once_repairs`,
+            [{ attempt_count: 1 }],
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT count(*) AS count FROM agent_control_implementation_admission_evidence`,
+            [{ count: 1 }],
+          );
+          const restarted = yield* buildRepairTaskFinalizer(prepared, database.sqlB);
+          const competing = yield* buildRepairTaskFinalizer(prepared, database.sqlA);
+          const resumptions = yield* Effect.all(
+            [
+              restarted.processHandoff(prepared.handoffId),
+              competing.processHandoff(prepared.handoffId),
+            ],
+            { concurrency: "unbounded" },
+          );
+          assert.deepStrictEqual(
+            resumptions.map((result) => result._tag),
+            ["RepairPending", "RepairPending"],
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT count(*) AS count FROM agent_control_implementation_admission_evidence`,
+            [{ count: 2 }],
+          );
+          const coordinator = yield* buildImplementationCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            suffix,
+            admission: setup.candidate.admissionHarness.admission,
+            finalizer: planningFinalizer,
+            admissionHarness: setup.candidate.admissionHarness,
+            task,
+            worktree: setup.candidate.worktree,
+            liveReservationReplay: true,
+          });
+          assert.equal(
+            (yield* coordinator.coordinator.processHandoff(prepared.handoffId))._tag,
+            "Materialized",
+          );
+          const [repair] = yield* database.sqlA<{
+            handoffId: string;
+          }>`SELECT handoff_id AS "handoffId" FROM agent_control_implementation_handoff_accepted ORDER BY rowid DESC LIMIT 1`;
+          assert.isDefined(repair);
+          const repaired = yield* prepareImplementationStageFinalizationCandidate(
+            database,
+            planningFinalizer,
+            `${suffix}-repair`,
+            true,
+            undefined,
+            false,
+            noopProviderAdmissionRelease,
+            { candidate: setup.candidate, coordinator, handoffId: repair!.handoffId },
+          );
+          const claim = repaired.claim;
+          assert.include(claim.evidence.promptText, "only repair attempt");
+          assert.include(claim.evidence.promptText, "sum(7,3) returned 4");
+          const at = shiftIso(claim.delivery.providerAcceptedAt!, 1);
+          yield* coordinator.handoffStore.observeProviderTerminal({
+            threadId: claim.evidence.threadId,
+            providerTurnId: claim.delivery.providerTurnId!,
+            state: "completed",
+            terminalAt: at,
+          });
+          yield* coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(`provider:${suffix}-repair-terminal`),
+            threadId: claim.evidence.threadId,
+            session: {
+              threadId: claim.evidence.threadId,
+              status: "ready",
+              providerName: ProviderDriverKind.make("codex"),
+              providerInstanceId: claim.evidence.providerInstanceId,
+              runtimeMode: claim.evidence.runtimeMode,
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: at,
+            },
+            createdAt: at,
+          });
+          assert.equal(
+            (yield* repaired.finalizer.finalizer.processHandoff(repair!.handoffId))._tag,
+            "Finalized",
+          );
+          const [result] = yield* database.sqlA<{
+            id: string;
+          }>`SELECT result_evidence_id AS id FROM agent_control_implementation_result_evidence WHERE handoff_id=${repair!.handoffId}`;
+          const admission = yield* buildVerificationAdmission({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            planningFinalizer,
+            implementationFinalizer: repaired.finalizer.finalizer,
+            handoffStore: coordinator.handoffStore,
+            admissionHarness: setup.candidate.admissionHarness,
+          });
+          assert.equal(
+            (yield* admission.admission.processResultEvidence(result!.id))._tag,
+            "Admitted",
+          );
+          const verification = yield* buildVerificationTurnCoordinator({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            admission: admission.admission,
+            planningFinalizer,
+            admissionHarness: setup.candidate.admissionHarness,
+            task,
+            worktree: setup.candidate.worktree,
+            orchestration: coordinator.orchestration,
+            snapshots: coordinator.snapshots,
+            hooks: {
+              ...noopVerificationCoordinatorHooks,
+              promptTemplateVersion: "agent-control-verification-prompt-v2",
+            },
+          });
+          assert.equal(
+            (yield* verification.coordinator.processHandoff(result!.id))._tag,
+            "Materialized",
+          );
+          const [next] = yield* database.sqlA<{
+            id: string;
+          }>`SELECT handoff_id AS id FROM agent_control_verification_handoff_accepted ORDER BY rowid DESC LIMIT 1`;
+          yield* settleRepairVerification(
+            { ...prepared, coordinator: verification, handoffId: next!.id },
+            `${suffix}-second`,
+            output(verdict),
+          );
+          assert.equal((yield* restarted.processHandoff(next!.id))._tag, "Finalized");
+          assert.equal((yield* restarted.processHandoff(next!.id))._tag, "Replayed");
+          assert.equal((yield* restarted.processHandoff(prepared.handoffId))._tag, "RepairPending");
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT * FROM agent_control_verification_finalization_evidence ORDER BY rowid LIMIT 1`,
+            before,
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT stage_ordinal,status FROM agent_control_stage_run_states ORDER BY stage_ordinal`,
+            [
+              { stage_ordinal: 1, status: "succeeded" },
+              { stage_ordinal: 2, status: "succeeded" },
+              { stage_ordinal: 3, status: "failed" },
+              { stage_ordinal: 4, status: "succeeded" },
+              { stage_ordinal: 5, status: verdict === "passed" ? "succeeded" : "failed" },
+            ],
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT status FROM agent_control_task_states`,
+            [{ status: verdict === "passed" ? "succeeded" : "failed" }],
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT attempt_count FROM agent_control_run_once_repairs`,
+            [{ attempt_count: 1 }],
+          );
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                database.sqlA`UPDATE agent_control_run_once_repairs SET attempt_count=0`,
+              ),
+            ),
+          );
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(database.sqlA`DELETE FROM agent_control_run_once_repairs`),
+            ),
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect.each([
+  {
+    name: "direct pass",
+    output: canonicalJson({
+      schemaVersion: "agent-control-verification-result-v1",
+      verdict: "passed",
+      report: "All checks passed.",
+    }),
+    state: "completed",
+    status: "succeeded",
+  },
+  {
+    name: "empty failure report",
+    output: canonicalJson({
+      schemaVersion: "agent-control-verification-result-v1",
+      verdict: "failed",
+      report: "  ",
+    }),
+    state: "completed",
+    status: "failed",
+  },
+  { name: "provider failure", output: null, state: "failed", status: "failed" },
+  { name: "provider interruption", output: null, state: "interrupted", status: "cancelled" },
+  {
+    name: "malformed verdict",
+    output: '{"verdict":"failed"}',
+    state: "completed",
+    status: "failed",
+  },
+  { name: "missing final message", output: null, state: "completed", status: "failed" },
+] as const)("Run-once does not repair $name", ({ name, output, state, status }) =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const database = yield* makeSharedDatabase(59);
+        const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+        const prepared = yield* prepareVerificationTurnDelivery(
+          `no-repair-${name.replaceAll(" ", "-")}`,
+          true,
+          {
+            database,
+            planningFinalizer,
+            beforeVerification: runMigrations().pipe(
+              Effect.provideService(SqlClient.SqlClient, database.sqlA),
+              Effect.asVoid,
+              Effect.orDie,
+            ),
+            verificationCoordinatorHooks: {
+              ...noopVerificationCoordinatorHooks,
+              promptTemplateVersion: "agent-control-verification-prompt-v2",
+            },
+          },
+        );
+        yield* seedRepairRun(database, prepared.setup.candidate.task);
+        yield* settleRepairVerification(prepared, name, output, state);
+        const finalizer = yield* buildRepairTaskFinalizer(prepared);
+        assert.equal((yield* finalizer.processHandoff(prepared.handoffId))._tag, "Finalized");
+        assert.equal((yield* finalizer.processHandoff(prepared.handoffId))._tag, "Replayed");
+        assert.deepStrictEqual(
+          yield* database.sqlA`SELECT * FROM agent_control_run_once_repairs`,
+          [],
+        );
+        assert.deepStrictEqual(yield* database.sqlA`SELECT status FROM agent_control_task_states`, [
+          { status },
+        ]);
+        assert.deepStrictEqual(
+          yield* database.sqlA`SELECT count(*) AS count FROM agent_control_stage_run_states`,
+          [{ count: 3 }],
+        );
       }),
     ),
   ),

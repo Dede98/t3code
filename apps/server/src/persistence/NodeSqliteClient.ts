@@ -1077,7 +1077,8 @@ const verificationStageProjectionMatch = (
       state.sequence === sequence &&
       state.stageKind === "verification" &&
       state.roleId === "verifier" &&
-      state.stageOrdinal === 3 &&
+      (state.stageOrdinal === 3 || state.stageOrdinal === 5) &&
+      state.stageOrdinal === payload.stageOrdinal &&
       state.attemptOrdinal === 1 &&
       state.revision === 3 &&
       state.projectId === payload.projectId &&

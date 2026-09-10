@@ -227,7 +227,7 @@ const make = Effect.gen(function* () {
       prepared.streamVersion !== 1 ||
       prepared.payload.roleId !== "verifier" ||
       prepared.payload.stageKind !== "verification" ||
-      prepared.payload.stageOrdinal !== 3 ||
+      (prepared.payload.stageOrdinal !== 3 && prepared.payload.stageOrdinal !== 5) ||
       prepared.payload.attemptOrdinal !== 1 ||
       prepared.payload.attemptId !== claim.evidence.attemptId ||
       prepared.payload.taskRevision !== claim.evidence.taskRevision ||
@@ -276,7 +276,7 @@ const make = Effect.gen(function* () {
         stage.value.state.revision !== 1 ||
         stage.value.state.roleId !== "verifier" ||
         stage.value.state.stageKind !== "verification" ||
-        stage.value.state.stageOrdinal !== 3 ||
+        (stage.value.state.stageOrdinal !== 3 && stage.value.state.stageOrdinal !== 5) ||
         stage.value.state.attemptOrdinal !== 1 ||
         stage.value.state.attemptId !== claim.evidence.attemptId ||
         stage.value.state.taskRevision !== claim.evidence.taskRevision ||
@@ -348,7 +348,7 @@ const make = Effect.gen(function* () {
           attemptId: AgentControlAttemptId.make(claim.evidence.attemptId),
           roleId: "verifier",
           stageKind: "verification",
-          stageOrdinal: 3,
+          stageOrdinal: stage.value.state.stageOrdinal === 5 ? 5 : 3,
           attemptOrdinal: 1,
           status: "running",
           taskRevision: claim.evidence.taskRevision,

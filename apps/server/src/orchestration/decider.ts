@@ -593,14 +593,14 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       const implementationForm =
         command.stageKind === "implementation" &&
         command.roleId === "implementer" &&
-        command.stageOrdinal === 2 &&
+        (command.stageOrdinal === 2 || command.stageOrdinal === 4) &&
         command.attemptOrdinal === 1 &&
         command.sourceProposedPlan !== undefined &&
         command.interactionMode === "default";
       const verificationForm =
         command.stageKind === "verification" &&
         command.roleId === "verifier" &&
-        command.stageOrdinal === 3 &&
+        (command.stageOrdinal === 3 || command.stageOrdinal === 5) &&
         command.attemptOrdinal === 1 &&
         command.sourceProposedPlan !== undefined &&
         command.interactionMode === "default";

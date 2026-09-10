@@ -55,9 +55,11 @@ export const validateAgentControlControlledThreadReservationState = Effect.fn(
   const implementation =
     state.stageKind === "implementation" &&
     state.roleId === "implementer" &&
-    state.stageOrdinal === 2;
+    (state.stageOrdinal === 2 || state.stageOrdinal === 4);
   const verification =
-    state.stageKind === "verification" && state.roleId === "verifier" && state.stageOrdinal === 3;
+    state.stageKind === "verification" &&
+    state.roleId === "verifier" &&
+    (state.stageOrdinal === 3 || state.stageOrdinal === 5);
   if (!planning && !implementation && !verification) {
     return yield* corrupt();
   }

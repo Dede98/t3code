@@ -202,7 +202,7 @@ const make = Effect.gen(function* () {
       stage.value.state.revision !== 2 ||
       stage.value.state.roleId !== "implementer" ||
       stage.value.state.stageKind !== "implementation" ||
-      stage.value.state.stageOrdinal !== 2 ||
+      (stage.value.state.stageOrdinal !== 2 && stage.value.state.stageOrdinal !== 4) ||
       stage.value.state.attemptOrdinal !== 1 ||
       stage.value.state.attemptId !== claim.evidence.attemptId ||
       stage.value.state.taskRevision !== claim.evidence.taskRevision ||
@@ -255,7 +255,7 @@ const make = Effect.gen(function* () {
         stage.value.state.revision !== 1 ||
         stage.value.state.roleId !== "implementer" ||
         stage.value.state.stageKind !== "implementation" ||
-        stage.value.state.stageOrdinal !== 2 ||
+        (stage.value.state.stageOrdinal !== 2 && stage.value.state.stageOrdinal !== 4) ||
         stage.value.state.attemptOrdinal !== 1 ||
         stage.value.state.attemptId !== claim.evidence.attemptId ||
         stage.value.state.taskRevision !== claim.evidence.taskRevision ||
@@ -327,7 +327,7 @@ const make = Effect.gen(function* () {
           attemptId: AgentControlAttemptId.make(claim.evidence.attemptId),
           roleId: "implementer",
           stageKind: "implementation",
-          stageOrdinal: 2,
+          stageOrdinal: stage.value.state.stageOrdinal === 4 ? 4 : 2,
           attemptOrdinal: 1,
           status: "running",
           taskRevision: claim.evidence.taskRevision,

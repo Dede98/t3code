@@ -55,6 +55,7 @@ export interface AgentControlImplementationHandoffAuthority {
   readonly planId: string;
   readonly proposedPlanJson: string;
   readonly proposedPlanDigest: string;
+  readonly repairReportJson?: string;
   readonly repositoryDisplay: string;
   readonly sourceRevision: string;
   readonly taskTitle: string;
@@ -86,6 +87,9 @@ export const buildExpectedAgentControlImplementationHandoff = (
     planId: authority.planId,
     proposedPlanJson: authority.proposedPlanJson,
     proposedPlanDigest: authority.proposedPlanDigest,
+    ...(authority.repairReportJson === undefined
+      ? {}
+      : { repairReportJson: authority.repairReportJson }),
   });
   const messageEventTemplateJson = canonicalInitialPlanningEventTemplate({
     streamVersion: 3,

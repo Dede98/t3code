@@ -104,12 +104,12 @@ export const decideAgentControlControlledThreadReservationCommand = Effect.fn(
   const isImplementationIdentity =
     command.stageKind === "implementation" &&
     command.roleId === "implementer" &&
-    command.stageOrdinal === 2 &&
+    (command.stageOrdinal === 2 || command.stageOrdinal === 4) &&
     command.attemptOrdinal === 1;
   const isVerificationIdentity =
     command.stageKind === "verification" &&
     command.roleId === "verifier" &&
-    command.stageOrdinal === 3 &&
+    (command.stageOrdinal === 3 || command.stageOrdinal === 5) &&
     command.attemptOrdinal === 1;
   if (!isPlanningIdentity && !isImplementationIdentity && !isVerificationIdentity) {
     return yield* error("controlled-thread-reservation-identity-conflict", command);

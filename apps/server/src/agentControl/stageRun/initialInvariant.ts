@@ -60,12 +60,12 @@ export const validateAgentControlStageRunState = Effect.fn("validateAgentControl
     const implementation =
       state.stageKind === "implementation" &&
       state.roleId === "implementer" &&
-      state.stageOrdinal === 2 &&
+      (state.stageOrdinal === 2 || state.stageOrdinal === 4) &&
       state.attemptOrdinal === 1;
     const verification =
       state.stageKind === "verification" &&
       state.roleId === "verifier" &&
-      state.stageOrdinal === 3 &&
+      (state.stageOrdinal === 3 || state.stageOrdinal === 5) &&
       state.attemptOrdinal === 1;
     const expectedRevision = state.status === "prepared" ? 1 : state.status === "running" ? 2 : 3;
     if (

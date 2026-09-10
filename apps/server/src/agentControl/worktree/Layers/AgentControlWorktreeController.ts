@@ -42,6 +42,7 @@ import {
   requireRunOnceMethod,
   withAgentControlRunOnceProjectFence,
 } from "../../runOnce/context.ts";
+import { loadRunOnceRepair } from "../../runOnce/repair.ts";
 import {
   loadAuthoritativeInitialStageRunHistory,
   loadAuthoritativeLeaseState,
@@ -3713,6 +3714,46 @@ const make = Effect.gen(function* () {
             operation,
           );
         }
+        const reuseStage =
+          stageHistory.find(
+            (candidate) =>
+              candidate.stageRunId === leaseState.stageRunId &&
+              candidate.attemptId === leaseState.attemptId,
+          ) ?? null;
+        let repairMayReuseEdits = false;
+        if (
+          readyReuseAuthority !== null &&
+          ((reuseStage?.stageOrdinal === 3 &&
+            reuseStage.status === "failed" &&
+            leaseState.status === "released") ||
+            (reuseStage?.stageOrdinal === 4 &&
+              reuseStage.status === "prepared" &&
+              leaseState.status === "reserved"))
+        ) {
+          const available =
+            yield* sql`SELECT 1 FROM sqlite_schema WHERE name = 'agent_control_run_once_repairs'`;
+          if (available.length !== 0) {
+            const repairs = yield* sql<{
+              handoffId: string;
+            }>`SELECT repair.verification_handoff_id AS "handoffId"
+              FROM agent_control_run_once_repairs repair
+              JOIN agent_control_verification_finalization_evidence verification
+                ON verification.handoff_id = repair.verification_handoff_id
+              WHERE verification.project_id = ${projectId} AND verification.task_id = ${taskId}
+                AND (verification.stage_run_id = ${leaseState.stageRunId}
+                  OR repair.repair_stage_run_id = ${leaseState.stageRunId})`;
+            if (repairs.length === 1) {
+              const repair = yield* loadRunOnceRepair(sql, repairs[0]!.handoffId);
+              repairMayReuseEdits =
+                Option.isSome(repair) &&
+                (reuseStage?.stageOrdinal === 4
+                  ? repair.value.repairStageRunId === leaseState.stageRunId &&
+                    repair.value.fenceToken + 1 === leaseState.fenceToken
+                  : repair.value.stageRunId === leaseState.stageRunId &&
+                    repair.value.fenceToken === leaseState.fenceToken);
+            }
+          }
+        }
         return {
           task,
           projectWorkspace: project.workspaceRoot,
@@ -3721,12 +3762,8 @@ const make = Effect.gen(function* () {
           stageRun,
           lease: leaseState,
           readyReuseAuthority,
-          reuseStage:
-            stageHistory.find(
-              (candidate) =>
-                candidate.stageRunId === leaseState.stageRunId &&
-                candidate.attemptId === leaseState.attemptId,
-            ) ?? null,
+          reuseStage,
+          repairMayReuseEdits,
         };
       });
     return yield* (
@@ -3786,6 +3823,7 @@ const make = Effect.gen(function* () {
       JSON.stringify(canonical.lease),
       JSON.stringify(canonical.readyReuseAuthority),
       JSON.stringify(canonical.reuseStage),
+      String(canonical.repairMayReuseEdits),
     ]);
 
   const ensureCanonicalBinding = Effect.fn("AgentControlWorktreeController.ensureCanonicalBinding")(
@@ -4214,14 +4252,15 @@ const make = Effect.gen(function* () {
     | { readonly _tag: "attention"; readonly code: AgentControlWorktreeAttentionCode },
     AgentControlWorktreeRpcError
   > {
-    // Verification consumes the implementation's edits and commits. Ownership,
-    // source history and the current lease still have to pass the same guards.
+    // Verification and its durably authorized repair consume existing edits and
+    // commits. Ownership, source history and the lease retain their usual guards.
     const inspectingImplementation =
       requireOwnership &&
       canonical.readyReuseAuthority !== null &&
-      canonical.reuseStage?.stageKind === "verification" &&
-      canonical.reuseStage.status === "prepared" &&
-      canonical.lease.status === "reserved";
+      ((canonical.reuseStage?.stageKind === "verification" &&
+        canonical.reuseStage.status === "prepared" &&
+        canonical.lease.status === "reserved") ||
+        canonical.repairMayReuseEdits);
     const pathIdentity = yield* validateExistingAgentControlWorktreePath({
       target: state.internalWorktreePath,
       repositoryWorkspace: state.repositoryWorkspace,

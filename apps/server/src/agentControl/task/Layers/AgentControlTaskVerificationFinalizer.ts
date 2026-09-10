@@ -7,6 +7,10 @@ import {
   AgentControlTaskId,
   AgentControlStageRunLeaseReleasedAfterVerificationPayloadStorage,
   AgentControlStageRunVerificationTerminalPayloadStorage,
+  ProjectId,
+  ThreadId,
+  ProviderInstanceId,
+  TurnId,
   CommandId,
   EventId,
   IsoDateTime,
@@ -33,6 +37,10 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { loadRunOnceRepair } from "../../runOnce/repair.ts";
+import { AgentControlImplementationAdmission } from "../../implementationAdmission/Services/AgentControlImplementationAdmission.ts";
+import { loadSealableVerificationResultSource } from "../../verificationTurn/orchestrationResultSource.ts";
+import { decodeVerificationResult } from "../../verificationTurn/verificationResult.ts";
 import {
   canonicalJson,
   decodeCanonicalUtf8Bytes,
@@ -41,7 +49,10 @@ import {
   sha256Utf8,
   type JsonValue,
 } from "../../initialPlanning/eventEvidence.ts";
-import { fingerprintAgentControlSourceIdentity } from "../../stageRun/identity.ts";
+import {
+  deriveAgentControlStageRunId,
+  fingerprintAgentControlSourceIdentity,
+} from "../../stageRun/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
 import { NodeSqliteTransactionHooks } from "../../../persistence/Services/NodeSqliteTransactionHooks.ts";
 import {
@@ -427,6 +438,21 @@ const taskIdentity = (prefix: string, domain: string, parts: ReadonlyArray<strin
     canonicalJson({ domain: `agent-control-task-${domain}-v1`, parts } as unknown as JsonValue),
   )}`;
 
+const decodeRepairEvaluation = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    providerTurnId: TurnId,
+    sealedAtStreamVersion: PositiveInt,
+    handoffId: Schema.String,
+    providerDeliveryId: Schema.String,
+    resultSchemaFingerprint: Schema.String,
+    outputDigest: Schema.String,
+    semanticDigest: Schema.String,
+  }),
+);
+const decodeRepairReport = Schema.decodeUnknownEffect(Schema.Struct({ report: Schema.String }));
+
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   // Durable lease authority belongs to this layer, never to a processHandoff caller context.
@@ -436,6 +462,7 @@ const make = Effect.gen(function* () {
   const taskEngine = yield* AgentControlTaskEngine;
   const leaseEngine = yield* AgentControlStageRunLeaseEngine;
   const hooks = yield* AgentControlTaskVerificationFinalizerHooks;
+  const implementationAdmission = yield* AgentControlImplementationAdmission;
   const publicationOwnerId = hooks.publicationOwnerId ?? NodeCrypto.randomUUID();
   if (publicationOwnerId.length === 0) {
     return yield* Effect.die(new Error("task Verification publication owner must not be empty"));
@@ -1770,11 +1797,91 @@ const make = Effect.gen(function* () {
     return Option.some(yield* validateReplay(handoffId, source));
   });
 
+  const prepareRepair = Effect.fn("AgentControlTaskVerificationFinalizer.prepareRepair")(function* (
+    source: VerificationSourceAuthority,
+  ) {
+    const { row, document } = source;
+    const available = yield* sql`SELECT 1 FROM main.sqlite_schema
+      WHERE name = 'agent_control_run_once_repairs' AND type = 'table'`;
+    if (available.length === 0) return false;
+    const existing = yield* loadRunOnceRepair(sql, row.handoffId);
+    if (Option.isSome(existing)) return true;
+    if (
+      row.deliveryTerminalState !== "completed" ||
+      row.terminalCause !== "verification-failed" ||
+      row.evaluationAuthority !== "accepted-evaluation" ||
+      row.evaluationDisposition !== "evaluated" ||
+      row.verificationVerdict !== "failed" ||
+      row.invalidOutputCode !== null ||
+      document.stagePayload.stageOrdinal !== 3
+    )
+      return false;
+    const runs = yield* sql<{ runId: string }>`
+      SELECT run.run_id AS "runId" FROM agent_control_run_once_states run
+      WHERE run.project_id = ${row.projectId} AND run.task_id = ${row.taskId}
+        AND run.status = 'active' AND run.last_step = 'thread-activated'
+        AND NOT EXISTS (SELECT 1 FROM agent_control_run_once_repairs repair WHERE repair.run_id = run.run_id)
+    `;
+    if (runs.length === 0) return false;
+    if (runs.length !== 1) return yield* error(row.handoffId, "repair-run", "authority-conflict");
+    const evaluations = yield* sql`SELECT thread_id AS "threadId",
+      provider_instance_id AS "providerInstanceId", provider_turn_id AS "providerTurnId",
+      terminal_stream_version AS "sealedAtStreamVersion", handoff_id AS "handoffId",
+      provider_delivery_id AS "providerDeliveryId", result_schema_fingerprint AS "resultSchemaFingerprint",
+      raw_output_digest AS "outputDigest", semantic_result_digest AS "semanticDigest"
+      FROM agent_control_verification_evaluation_evidence
+      WHERE evidence_id = ${row.evaluationEvidenceId} AND verdict = 'failed' AND disposition = 'evaluated'`;
+    if (evaluations.length !== 1)
+      return yield* error(row.handoffId, "repair-evaluation", "authority-conflict");
+    const evaluation = yield* decodeRepairEvaluation(evaluations[0]);
+    const captured = yield* loadSealableVerificationResultSource(sql, {
+      ...evaluation,
+      afterStreamVersion: 4,
+    });
+    const decoded = yield* decodeVerificationResult(captured.bytes);
+    if (
+      decoded.verdict !== "failed" ||
+      decoded.semanticDigest !== evaluation.semanticDigest ||
+      captured.outputDigest !== evaluation.outputDigest ||
+      evaluation.handoffId !== row.handoffId
+    ) {
+      return yield* error(row.handoffId, "repair-source-digest", "authority-conflict");
+    }
+    const report = yield* decodeRepairReport(
+      parseJsonStrict(new TextDecoder("utf-8", { fatal: true }).decode(captured.bytes)),
+    );
+    if (report.report.trim().length === 0) return false;
+    const planning = yield* sql<{ handoffId: string }>`
+      SELECT handoff_id AS "handoffId" FROM agent_control_initial_planning_result_evidence
+      WHERE project_id = ${row.projectId} AND task_id = ${row.taskId} AND outcome = 'succeeded'
+    `;
+    if (planning.length !== 1)
+      return yield* error(row.handoffId, "repair-plan", "authority-conflict");
+    const repairStageRunId = yield* deriveAgentControlStageRunId({
+      projectId: ProjectId.make(row.projectId),
+      taskId: AgentControlTaskId.make(row.taskId),
+      taskRevision: row.verificationTaskRevision,
+      githubIntakeSequence: row.githubIntakeSequence,
+      sourceIdentityFingerprint: row.sourceIdentityFingerprint,
+      stageKind: "implementation",
+      stageOrdinal: 4,
+    });
+    yield* sql`INSERT INTO agent_control_run_once_repairs
+      (run_id, verification_handoff_id, verification_marker_id, verification_fingerprint,
+        planning_handoff_id, repair_stage_run_id, report_json, report_digest, attempt_count, created_at)
+      VALUES (${runs[0]!.runId}, ${row.handoffId}, ${row.verificationMarkerId},
+        ${row.verificationFingerprint}, ${planning[0]!.handoffId}, ${repairStageRunId},
+        ${canonicalJson(parseJsonStrict(new TextDecoder("utf-8", { fatal: true }).decode(captured.bytes)))},
+        ${decoded.semanticDigest}, 1, ${row.finalizedAt})`;
+    return true;
+  });
+
   const finalizeInTransaction = Effect.fn(
     "AgentControlTaskVerificationFinalizer.finalizeInTransaction",
   )(function* (handoffId: string) {
     const source = yield* loadSource(handoffId);
     const authority = yield* loadTaskAuthority(source);
+    if (yield* prepareRepair(source)) return { repairHandoffId: handoffId } as const;
     const previous = authority.projection;
     const taskSourceEvent = authority.events[source.row.verificationTaskRevision - 1];
     if (taskSourceEvent === undefined) {
@@ -1969,6 +2076,11 @@ const make = Effect.gen(function* () {
           return yield* Effect.failCause(transactionExit.cause);
         }
         const publication = transactionExit.value;
+        if ("repairHandoffId" in publication) {
+          yield* restore(hooks.afterCommit(handoffId));
+          yield* restore(implementationAdmission.processHandoff(handoffId));
+          return { _tag: "RepairPending", repairHandoffId: handoffId } as const;
+        }
         const afterCommitExit = yield* Effect.exit(restore(hooks.afterCommit(handoffId)));
         const publicationExit = yield* Effect.exit(drainPublication(handoffId, publication.event));
         if (Exit.isFailure(afterCommitExit)) {

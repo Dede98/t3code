@@ -791,6 +791,7 @@ const AgentControlVerificationStageFinalizerLayerLive =
 
 const AgentControlTaskVerificationFinalizerLayerLive =
   AgentControlTaskVerificationFinalizerLive.pipe(
+    Layer.provide(AgentControlImplementationAdmissionLayerLive),
     Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
     Layer.provide(RuntimeCoreDependenciesBaseLive),
   );
