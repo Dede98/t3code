@@ -1132,8 +1132,18 @@ const make = Effect.gen(function* () {
     if (current === undefined || intent === undefined || capacity === undefined) {
       return yield* fail("pre-effect-read", "authority-missing", input.permit.admissionId);
     }
+    const continuingVerification = input.boundary === "verification-check";
+    if (continuingVerification && input.permit.stage !== "verification") {
+      return yield* fail("pre-effect-validate", "authority-divergent", input.permit.admissionId);
+    }
+    // The claim deadline bounds entry into a provider turn. Once entered, its
+    // capacity stays reserved until explicit release/quarantine; expiry cannot
+    // reclaim a delivery that was invoked. Checks use that still-owned turn,
+    // including its durable entry proof, rather than extending the claim TTL.
     const exact =
-      (current.status === "admitted" || current.status === "entered") &&
+      (continuingVerification
+        ? current.status === "entered"
+        : current.status === "admitted" || current.status === "entered") &&
       current.providerInstanceId === String(input.permit.providerInstanceId) &&
       current.leaseExpiresAt !== null &&
       current.ownerId === input.permit.admissionOwnerId &&
@@ -1142,14 +1152,18 @@ const make = Effect.gen(function* () {
       current.admissionMarkerId === input.permit.admissionMarkerId &&
       current.admissionMarkerFingerprint === input.permit.admissionMarkerFingerprint &&
       current.usageEvidenceFingerprint === input.permit.usageEvidenceFingerprint &&
-      current.leaseExpiresAt > input.enteredAt &&
+      (continuingVerification || current.leaseExpiresAt > input.enteredAt) &&
       capacity.activeAdmissionId === input.permit.admissionId &&
-      (capacity.activeState === "admitted" || capacity.activeState === "entered") &&
+      (continuingVerification
+        ? capacity.activeState === "entered"
+        : capacity.activeState === "admitted" || capacity.activeState === "entered") &&
       capacity.activeOwnerId === input.permit.admissionOwnerId &&
       capacity.activeLeaseExpiresAt === input.permit.admissionLeaseExpiresAt &&
       capacity.activeFenceToken === input.permit.providerFenceToken &&
       capacity.lastFenceToken === input.permit.providerFenceToken &&
       capacity.activeMarkerFingerprint === input.permit.admissionMarkerFingerprint &&
+      current.stage === input.permit.stage &&
+      intent.stage === input.permit.stage &&
       intent.projectId === input.permit.projectId &&
       intent.taskId === input.permit.taskId &&
       intent.stageRunId === input.permit.stageRunId &&
@@ -1164,6 +1178,34 @@ const make = Effect.gen(function* () {
       decodeCanonicalUtf8Bytes(intent.modelSelectionJson) === input.permit.modelSelectionJson;
     if (!exact) {
       return yield* fail("pre-effect-validate", "authority-divergent", input.permit.admissionId);
+    }
+    if (continuingVerification) {
+      const turns = (yield* readCompleteAuthorityChains(input.permit.admissionId)).filter(
+        (chain) =>
+          chain.authorityKind === "turn-entry" &&
+          chain.providerFenceToken === input.permit.providerFenceToken,
+      );
+      if (
+        turns.length !== 1 ||
+        !authorityChainMatches(turns[0]!, {
+          admissionId: input.permit.admissionId,
+          authorityKind: "turn-entry",
+          providerInstanceId: String(input.permit.providerInstanceId),
+          ownerId: input.permit.admissionOwnerId,
+          providerFenceToken: input.permit.providerFenceToken,
+          details: {
+            handoffId: input.permit.handoffId,
+            providerDeliveryId: input.permit.providerDeliveryId,
+            stageFenceToken: input.permit.stageFenceToken,
+          },
+        })
+      ) {
+        return yield* fail(
+          "pre-effect-turn-authority",
+          "authority-divergent",
+          input.permit.admissionId,
+        );
+      }
     }
     // A stage becomes running only after the provider accepts its first turn.
     const stageRows = yield* sql<{ readonly count: number }>`

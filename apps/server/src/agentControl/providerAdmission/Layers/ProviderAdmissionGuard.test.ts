@@ -1,10 +1,13 @@
 import { AgentControlStageRunLeaseEngine } from "../../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqlite from "node:sqlite";
+// @effect-diagnostics-next-line nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
 import { ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -13,9 +16,15 @@ import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as TestClock from "effect/testing/TestClock";
 
 import { runMigrations } from "../../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
+import Migration076 from "../../../persistence/Migrations/076_AgentControlVerificationChecks.ts";
+import {
+  executeVerificationCheck,
+  prepareVerificationCheckManifest,
+} from "../../verificationTurn/checkEvidence.ts";
 import { canonicalProviderModelSelectionEvidence } from "../../../provider/Services/ProviderAdapter.ts";
 import { canonicalJson } from "../../initialPlanning/eventEvidence.ts";
 import {
@@ -1858,11 +1867,12 @@ for (const obstacle of [
   );
 }
 
-it.live(
-  "admits verification checks only for the live started delivery without creating another turn entry",
+it.effect(
+  "retains live verification check authority across admission expiry and revokes it on quarantine",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
+        yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe(at)));
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const directory = yield* fs.makeTempDirectoryScoped({
@@ -1881,6 +1891,7 @@ it.live(
         );
         const store = Context.get(storeContext, ProviderAdmissionStore);
         const value = request("verification", ProviderInstanceId.make("verification-check-guard"));
+        const admissionExpiry = "2026-09-06T08:02:00.000Z";
         const decision = yield* store.request({
           request: value,
           usage: providerAdmissionUsageEvidence({
@@ -1891,7 +1902,7 @@ it.live(
             nextRelevantAt: null,
           }),
           ownerId: "check-owner",
-          leaseExpiresAt: leaseExpiry,
+          leaseExpiresAt: admissionExpiry,
           now: at,
         });
         assert.equal(decision._tag, "Admitted");
@@ -1968,6 +1979,84 @@ it.live(
           yield* sql`SELECT * FROM agent_control_provider_authority_markers WHERE admission_id=${permit.admissionId} ORDER BY marker_id`;
         const capacity =
           yield* sql`SELECT * FROM agent_control_provider_capacity_current WHERE provider_instance_id=${String(permit.providerInstanceId)}`;
+        yield* Migration076.pipe(Effect.provideService(SqlClient.SqlClient, sql));
+        const cwd = path.join(directory, "code");
+        yield* fs.makeDirectory(cwd);
+        yield* fs.writeFileString(
+          path.join(cwd, "focused.test.cjs"),
+          "require('node:test')('focused check', () => require('node:assert/strict').equal(1, 1));\n",
+        );
+        yield* Effect.sync(() => {
+          NodeChildProcess.execFileSync("git", ["init", "--quiet"], { cwd });
+          NodeChildProcess.execFileSync("git", ["add", "focused.test.cjs"], { cwd });
+          NodeChildProcess.execFileSync(
+            "git",
+            [
+              "-c",
+              "user.name=Test",
+              "-c",
+              "user.email=test@example.invalid",
+              "commit",
+              "-qm",
+              "fixture",
+            ],
+            { cwd },
+          );
+        });
+        const manifest = yield* prepareVerificationCheckManifest(sql, {
+          permit,
+          cwd,
+          checks: ["cross-expiry", "after-expiry", "quarantined", "after-quarantine"].map((id) => ({
+            id,
+            command: process.execPath,
+            args: ["--test", "--test-reporter=tap", "focused.test.cjs"],
+            cwd: ".",
+            required: true,
+            timeoutMs: 300_000,
+            allowTemporaryFiles: false,
+            resultFormat: "node-test" as const,
+          })),
+        });
+        let executions = 0;
+        const command = Effect.sync(() => {
+          executions += 1;
+          return {
+            exitCode: 0,
+            stdout: NodeChildProcess.execFileSync(
+              process.execPath,
+              ["--test", "--test-reporter=tap", "focused.test.cjs"],
+              { cwd, encoding: "utf8" },
+            ),
+            stderr: "",
+          };
+        });
+        const execute = <E = never>(
+          checkId: string,
+          during: Effect.Effect<void, E> = Effect.void,
+        ) =>
+          executeVerificationCheck(sql, {
+            manifest,
+            checkId,
+            providerTurnId: "native-check-turn",
+            authorize: guard.enter(permit, "verification-check"),
+            execute: command.pipe(Effect.tap(() => during)),
+          });
+        yield* TestClock.adjust("119 seconds");
+        assert.equal((yield* execute("cross-expiry", TestClock.adjust("121 seconds"))).exitCode, 0);
+        assert.equal((yield* execute("after-expiry")).exitCode, 0);
+        yield* TestClock.adjust("121 seconds");
+        assert.equal((yield* execute("after-expiry")).exitCode, 0);
+        assert.equal(executions, 2);
+        for (const boundary of ["session-start", "turn-start"] as const) {
+          assert.isTrue(Exit.isFailure(yield* Effect.exit(guard.enter(permit, boundary))));
+        }
+        assert.deepStrictEqual(
+          yield* sql`SELECT check_id AS id,status FROM agent_control_verification_check_results ORDER BY check_id`,
+          [
+            { id: "after-expiry", status: "passed" },
+            { id: "cross-expiry", status: "passed" },
+          ],
+        );
         yield* guard.enter(permit, "verification-check");
         yield* guard.enter(permit, "verification-check");
         assert.deepStrictEqual(
@@ -1984,6 +2073,7 @@ it.live(
           { ...permit, admissionOwnerId: "other-owner" },
           { ...permit, stageLeaseHolderId: "other-holder" },
           { ...permit, providerDeliveryId: "old-verification-delivery" },
+          { ...permit, stage: "implementation" as const },
         ])
           assert.isTrue(
             Exit.isFailure(yield* Effect.exit(guard.enter(invalid, "verification-check"))),
@@ -1997,6 +2087,32 @@ it.live(
         });
         assert.isTrue(
           Exit.isFailure(yield* Effect.exit(guard.enter(permit, "verification-check"))),
+        );
+        yield* mutateFixture(() => {
+          fixture
+            .prepare(
+              "UPDATE agent_control_stage_run_lease_states SET expires_at=? WHERE lease_id=?",
+            )
+            .run(leaseExpiry, permit.stageLeaseId);
+        });
+        assert.equal(
+          (yield* execute("quarantined", guard.quarantineIfEntered(permit))).exitCode,
+          125,
+        );
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(execute("after-quarantine"))));
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(execute("after-expiry"))));
+        assert.equal(executions, 3);
+        assert.deepStrictEqual(
+          yield* sql`SELECT check_id AS id,status FROM agent_control_verification_check_results ORDER BY check_id`,
+          [
+            { id: "after-expiry", status: "passed" },
+            { id: "cross-expiry", status: "passed" },
+            { id: "quarantined", status: "unavailable" },
+          ],
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT status FROM agent_control_provider_admission_current WHERE admission_id=${permit.admissionId}`,
+          [{ status: "quarantined" }],
         );
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
