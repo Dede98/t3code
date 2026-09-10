@@ -9,7 +9,6 @@ import {
   claimTerminalPrimarySelection,
   clearPrimedTerminalCopyInput,
   ghosttyMouseButton,
-  isLinuxTerminalPlatform,
   isTerminalAltGraphText,
   isTerminalCompositionCommitInput,
   isTerminalCompositionKey,
@@ -21,7 +20,6 @@ import {
   resolveTerminalMouseTrackingState,
   shouldBlinkTerminalCursor,
   shouldOpenTerminalSelectionContextMenu,
-  shouldPositionTerminalInputForPrimaryPaste,
   shouldReportTerminalMouse,
   shouldScrollTerminalToBottomOnUserInput,
   terminalGridCellAt,
@@ -86,6 +84,7 @@ describe("GhosttyTerminalSurface visibility", () => {
       focus() {
         this.dispatchEvent(new Event("focus"));
       }
+      select() {}
       setPointerCapture(pointerId: number) {
         this.captures.add(pointerId);
       }
@@ -172,13 +171,13 @@ describe("GhosttyTerminalSurface visibility", () => {
       resize() {
         for (const callback of resizeCallbacks) callback();
       },
-      pointer(type: string, clientX: number, buttons: number, shiftKey = false) {
+      pointer(type: string, clientX: number, buttons: number, shiftKey = false, button = 0) {
         canvas.dispatchEvent(
           Object.assign(new Event(type, { cancelable: true }), {
             clientX,
             clientY: 5,
             pointerId: 1,
-            button: 0,
+            button,
             buttons,
             shiftKey,
           }),
@@ -283,6 +282,31 @@ describe("GhosttyTerminalSurface visibility", () => {
     expect(surface.getSelection()).toBe("");
     expect(surface.getSelectionPosition()).toBeNull();
     expect(harness.renderedSnapshot.rowData[0]?.cells.some((cell) => cell.selected)).toBe(false);
+  });
+
+  it("pastes the terminal selection, and only that, on a Linux middle click", async () => {
+    const harness = createHarness();
+    const readText = vi.fn(async () => "clipboard text");
+    vi.stubGlobal("navigator", { platform: "Linux x86_64", clipboard: { readText } });
+    const surface = await harness.create();
+    surface.write("hello world");
+    harness.flushFrame();
+    harness.pointer("pointerdown", 5, 1);
+    harness.pointer("pointermove", 37, 1);
+    harness.pointer("pointerup", 37, 0);
+    expect(surface.getSelection()).toBe("hello");
+
+    harness.onData.mockClear();
+    harness.pointer("pointerdown", 5, 4, false, 1);
+    await vi.waitFor(() => expect(harness.onData).toHaveBeenCalled());
+    expect(harness.onData.mock.calls.at(-1)?.[0]).toBe("hello");
+    expect(surface.getSelection()).toBe("hello");
+
+    // Without a selection there is no primary buffer to paste; the clipboard
+    // holds what the user copied and must not be substituted.
+    surface.clearSelection();
+    harness.pointer("pointerdown", 5, 4, false, 1);
+    expect(readText).not.toHaveBeenCalled();
   });
 
   it("starts a selection when dragging from a link", async () => {
@@ -677,14 +701,6 @@ describe("terminal selection clipboard ownership", () => {
     input.value = "unchanged";
     expect(claimTerminalPrimarySelection(input, "selected output", "MacIntel")).toBe(false);
     expect(input.value).toBe("unchanged");
-  });
-
-  it("positions the textarea only for Linux middle-click paste", () => {
-    expect(isLinuxTerminalPlatform("Linux x86_64")).toBe(true);
-    expect(isLinuxTerminalPlatform("MacIntel")).toBe(false);
-    expect(shouldPositionTerminalInputForPrimaryPaste({ button: 1 }, "Linux x86_64")).toBe(true);
-    expect(shouldPositionTerminalInputForPrimaryPaste({ button: 0 }, "Linux x86_64")).toBe(false);
-    expect(shouldPositionTerminalInputForPrimaryPaste({ button: 1 }, "MacIntel")).toBe(false);
   });
 });
 

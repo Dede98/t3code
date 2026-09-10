@@ -667,6 +667,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("managed-runtime-mcp");
       McpProviderSession.setMcpProviderSession({
+        preview: true,
         environmentId: EnvironmentId.make("environment-test"),
         threadId,
         providerSessionId: "provider-session-test",

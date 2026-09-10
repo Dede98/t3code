@@ -7,6 +7,7 @@ import {
   ApprovalRequestId,
   CodexSettings,
   EventId,
+  EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderItemId,
@@ -35,6 +36,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as CodexErrors from "effect-codex-app-server/errors";
 
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
@@ -526,6 +528,7 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
       const first = runtimeFactory.lastRuntime?.options;
       NodeAssert.ok(first);
       NodeAssert.equal(first.environment?.T3_EXTERNAL_MCP_BEARER_0, "token-1");
+      NodeAssert.equal(first.browserToolsAvailable, false);
       NodeAssert.ok(
         first.appServerArgs?.includes(
           'mcp_servers.assets_1.bearer_token_env_var="T3_EXTERNAL_MCP_BEARER_0"',
@@ -545,6 +548,44 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
       NodeAssert.equal(resolution, 2);
       NodeAssert.equal(second.environment?.T3_EXTERNAL_MCP_BEARER_0, "token-2");
       NodeAssert.ok(second.appServerArgs?.some((arg) => arg.includes("assets_2")));
+
+      for (const preview of [false, true]) {
+        const threadId = asThreadId(`external-mcp-preview-${preview}`);
+        yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            McpProviderSession.setMcpProviderSession({
+              environmentId: EnvironmentId.make("mcp-test"),
+              threadId,
+              providerSessionId: `session-${preview}`,
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              endpoint: "http://127.0.0.1:1234/mcp",
+              authorizationHeader: "Bearer internal-token",
+              preview,
+            }),
+          ),
+          () => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+        );
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const combined: CodexSessionRuntimeOptions | undefined =
+          runtimeFactory.lastRuntime?.options;
+        NodeAssert.ok(combined);
+        NodeAssert.equal(combined.browserToolsAvailable, preview);
+        NodeAssert.equal(combined.environment?.T3_MCP_BEARER_TOKEN, "internal-token");
+        NodeAssert.equal(combined.environment?.T3_EXTERNAL_MCP_BEARER_0, `token-${resolution}`);
+        NodeAssert.ok(
+          combined.appServerArgs?.some((arg) => arg.includes("mcp_servers.t3-code.url=")),
+        );
+        NodeAssert.ok(
+          combined.appServerArgs?.some((arg) =>
+            arg.includes(`mcp_servers.assets_${resolution}.url=`),
+          ),
+        );
+        NodeAssert.ok(combined.appServerArgs?.every((arg) => !arg.includes("internal-token")));
+      }
     }).pipe(Effect.provide(layer));
   });
 

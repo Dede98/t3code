@@ -2316,6 +2316,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? {
                 environment: mcpEnvironment,
                 appServerArgs,
+                browserToolsAvailable: mcpSession?.preview ?? false,
               }
             : {}),
         };

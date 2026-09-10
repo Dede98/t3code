@@ -411,18 +411,20 @@ export function claimTerminalPrimarySelection(
   return true;
 }
 
-export function shouldPositionTerminalInputForPrimaryPaste(
-  event: Pick<MouseEvent, "button">,
-  platform = navigator.platform,
-): boolean {
-  return event.button === 1 && isLinuxTerminalPlatform(platform);
-}
-
 export function shouldScrollTerminalToBottomOnUserInput(
   data: string,
   viewportActive: boolean,
 ): boolean {
   return data.length > 0 && !viewportActive;
+}
+
+/**
+ * Middle-click paste is an X11/Wayland convention. macOS and Windows have no
+ * primary selection and use the button for autoscroll, so only desktops that
+ * expect the gesture get it.
+ */
+function isMiddleClickPastePlatform(): boolean {
+  return /linux|bsd/i.test(navigator.platform);
 }
 
 export function isTerminalCompositionCommitInput(event: Pick<InputEvent, "inputType">): boolean {
@@ -610,7 +612,6 @@ export class GhosttyTerminalSurface {
   private cursorTimer: number | null = null;
   private compositionInputToSuppress: string | null = null;
   private compositionSuppressionTimer: number | null = null;
-  private primaryPastePositionTimer: number | null = null;
   private cursorOn = true;
   private renderedCursorY: number | null = null;
   private forceFullRender = true;
@@ -976,7 +977,21 @@ export class GhosttyTerminalSurface {
     this.pasteShortcutToken += 1;
     if (text.length === 0) return;
     const encoded = this.core.encodePaste(text);
-    if (encoded.length > 0) this.options.onData(encoded);
+    this.sendUserData(encoded);
+  }
+
+  /**
+   * Middle-click pastes the terminal's own selection, which is the only
+   * primary-selection-like buffer a browser can read. It goes through
+   * pasteFromClipboard so it joins the same paste race as every other path.
+   * With nothing selected here there is no buffer to paste, and CLIPBOARD is
+   * deliberately not substituted: middle-click must never emit text the user
+   * only ever copied.
+   */
+  private pasteTerminalSelection(): void {
+    const selection = this.getSelection();
+    if (selection.length === 0) return;
+    void this.pasteFromClipboard(() => Promise.resolve(selection));
   }
 
   hasSelection(): boolean {
@@ -1061,9 +1076,6 @@ export class GhosttyTerminalSurface {
     this.cancelRender();
     if (this.compositionSuppressionTimer !== null) {
       window.clearTimeout(this.compositionSuppressionTimer);
-    }
-    if (this.primaryPastePositionTimer !== null) {
-      window.clearTimeout(this.primaryPastePositionTimer);
     }
     this.removeEvents();
     this.core.dispose();
@@ -1323,6 +1335,12 @@ export class GhosttyTerminalSurface {
       this.canvas.setPointerCapture(event.pointerId);
       return;
     }
+    if (event.button === 1 && isMiddleClickPastePlatform()) {
+      // Left uncancelled on purpose: cancelling pointerdown drops the
+      // compatibility mousedown, which is what activates a split pane.
+      this.pasteTerminalSelection();
+      return;
+    }
     if (event.button !== 0) return;
     const clickCount = this.recordSelectionClick(event);
     const link = this.linkAt(event.clientX, event.clientY);
@@ -1566,6 +1584,10 @@ export class GhosttyTerminalSurface {
     if (this.canvas.hasPointerCapture(event.pointerId)) {
       this.canvas.releasePointerCapture(event.pointerId);
     }
+    if (event.button === 1 && isMiddleClickPastePlatform()) {
+      event.preventDefault();
+      return;
+    }
     if (event.button !== 0) return;
     if (!this.selectionMoved && this.selectionMode === "cell") {
       this.clearSelection();
@@ -1605,36 +1627,17 @@ export class GhosttyTerminalSurface {
   };
 
   private readonly onMouseDown = (event: MouseEvent) => {
-    if (event.button === 0) event.preventDefault();
+    // Cancelling the middle button here stops autoscroll while still letting
+    // the event bubble to the drawer handler that activates a split pane.
+    if (event.button === 0 || (event.button === 1 && isMiddleClickPastePlatform())) {
+      event.preventDefault();
+    }
     this.focus();
   };
 
-  private readonly onAuxClick = (event: MouseEvent) => {
-    if (shouldReportTerminalMouse(this.core.isMouseTracking(), event)) {
-      event.preventDefault();
-      return;
-    }
-    if (!shouldPositionTerminalInputForPrimaryPaste(event)) return;
-    const bounds = this.canvas.getBoundingClientRect();
-    this.input.style.left = `${event.clientX - bounds.left - 10}px`;
-    this.input.style.top = `${event.clientY - bounds.top - 10}px`;
-    this.input.style.width = "20px";
-    this.input.style.height = "20px";
-    this.input.style.zIndex = "1000";
-    this.input.focus({ preventScroll: true });
-    if (this.primaryPastePositionTimer !== null) {
-      window.clearTimeout(this.primaryPastePositionTimer);
-    }
-    this.primaryPastePositionTimer = window.setTimeout(() => {
-      this.primaryPastePositionTimer = null;
-      if (this.disposed) return;
-      this.input.style.width = "1px";
-      this.input.style.height = `${this.metrics.height}px`;
-      this.input.style.zIndex = "";
-      this.inputLeft = -1;
-      this.inputTop = -1;
-      this.positionInput();
-    }, 0);
+  /** Prevent Chromium's native PRIMARY paste from duplicating the selection paste. */
+  private readonly onMouseUp = (event: MouseEvent) => {
+    if (event.button === 1 && isMiddleClickPastePlatform()) event.preventDefault();
   };
 
   private readonly onContextMenu = (event: MouseEvent) => {
@@ -1737,7 +1740,7 @@ export class GhosttyTerminalSurface {
     this.canvas.addEventListener("pointercancel", this.onPointerUp);
     this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
     this.canvas.addEventListener("mousedown", this.onMouseDown);
-    this.canvas.addEventListener("auxclick", this.onAuxClick);
+    this.canvas.addEventListener("mouseup", this.onMouseUp);
     this.canvas.addEventListener("contextmenu", this.onContextMenu);
     this.scrollbar.addEventListener("pointerdown", this.onScrollbarPointerDown);
     this.scrollbar.addEventListener("pointermove", this.onScrollbarPointerMove);
@@ -1763,7 +1766,7 @@ export class GhosttyTerminalSurface {
     this.canvas.removeEventListener("pointercancel", this.onPointerUp);
     this.canvas.removeEventListener("wheel", this.onWheel);
     this.canvas.removeEventListener("mousedown", this.onMouseDown);
-    this.canvas.removeEventListener("auxclick", this.onAuxClick);
+    this.canvas.removeEventListener("mouseup", this.onMouseUp);
     this.canvas.removeEventListener("contextmenu", this.onContextMenu);
     this.scrollbar.removeEventListener("pointerdown", this.onScrollbarPointerDown);
     this.scrollbar.removeEventListener("pointermove", this.onScrollbarPointerMove);
