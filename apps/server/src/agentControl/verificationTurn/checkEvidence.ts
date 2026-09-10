@@ -1,3 +1,4 @@
+import { AgentControlRunOnceReadNotifications } from "../runOnce/readNotifications.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
@@ -238,6 +239,8 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
     return unavailableResult(
       "Verification check execution is incomplete; automatic duplicate execution is forbidden.",
     );
+  const readNotifications = yield* AgentControlRunOnceReadNotifications;
+  yield* readNotifications.publish(manifest.handoffId);
   const before = yield* snapshotVerificationCode(manifest.worktreePath).pipe(
     Effect.catch(() => Effect.succeed(null)),
   );
@@ -268,6 +271,7 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
   yield* sql`INSERT INTO agent_control_verification_check_results
     (provider_delivery_id,check_id,provider_turn_id,manifest_digest,code_digest,status,result_json,result_digest,completed_at)
     VALUES (${manifest.providerDeliveryId},${input.checkId},${input.providerTurnId},${manifest.manifestDigest},${after ?? "unavailable"},${status},${resultJson},${sha256Utf8(resultJson)},${yield* now})`;
+  yield* readNotifications.publish(manifest.handoffId);
   return status === "stale" || !authorized
     ? unavailableResult("Verification code state or authorization changed.")
     : result;

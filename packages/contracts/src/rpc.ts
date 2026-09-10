@@ -1,3 +1,8 @@
+import {
+  AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
+  AgentControlRunOnceSnapshotInput,
+  AgentControlRunOnceSnapshot,
+} from "./agentControlRunOnce.ts";
 import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
@@ -471,6 +476,24 @@ export const WS_METHODS = {
   subscribeBackgroundPolicy: "subscribeBackgroundPolicy",
   subscribeResourceTelemetry: "subscribeResourceTelemetry",
 } as const;
+
+export const WsAgentControlRunOnceGetSnapshotRpc = Rpc.make(
+  AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot,
+  {
+    payload: AgentControlRunOnceSnapshotInput,
+    success: AgentControlRunOnceSnapshot,
+    error: Schema.Union([AgentControlRuntimeRpcError, EnvironmentAuthorizationError]),
+  },
+);
+export const WsAgentControlRunOnceSubscribeRpc = Rpc.make(
+  AGENT_CONTROL_RUN_ONCE_RPC_METHODS.subscribe,
+  {
+    payload: AgentControlRunOnceSnapshotInput,
+    success: AgentControlRunOnceSnapshot,
+    error: Schema.Union([AgentControlRuntimeRpcError, EnvironmentAuthorizationError]),
+    stream: true,
+  },
+);
 
 export const WsAgentControlGetPolicyRpc = Rpc.make(AGENT_CONTROL_RPC_METHODS.getPolicy, {
   payload: AgentControlGetPolicyInput,
@@ -1543,6 +1566,8 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
 });
 
 export const WsRpcGroup = RpcGroup.make(
+  WsAgentControlRunOnceGetSnapshotRpc,
+  WsAgentControlRunOnceSubscribeRpc,
   WsAgentControlGetPolicyRpc,
   WsAgentControlSetProjectPolicyRpc,
   WsAgentControlClearProjectPolicyRpc,

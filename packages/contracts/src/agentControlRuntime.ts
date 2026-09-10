@@ -12,6 +12,7 @@
 import * as Schema from "effect/Schema";
 
 import {
+  AgentControlTaskId,
   CommandId,
   EventId,
   IsoDateTime,
@@ -61,6 +62,7 @@ export const AgentControlSetProjectModeInput = Schema.Struct({
   projectId: ProjectId,
   expectedRevision: NonNegativeInt,
   mode: AgentControlRequestedProjectMode,
+  runOnceTaskId: Schema.optionalKey(AgentControlTaskId),
 });
 export type AgentControlSetProjectModeInput = typeof AgentControlSetProjectModeInput.Type;
 
@@ -70,6 +72,7 @@ export const AgentControlSetProjectModeCommand = Schema.Struct({
   projectId: ProjectId,
   expectedRevision: NonNegativeInt,
   mode: AgentControlRequestedProjectMode,
+  runOnceTaskId: Schema.optionalKey(AgentControlTaskId),
 });
 export type AgentControlSetProjectModeCommand = typeof AgentControlSetProjectModeCommand.Type;
 
@@ -80,6 +83,7 @@ export const AgentControlProjectModeChangedPayload = Schema.Struct({
   previousPausedFromMode: Schema.NullOr(AgentControlProjectMode),
   pausedFromMode: Schema.NullOr(AgentControlProjectMode),
   changedAt: IsoDateTime,
+  runOnceTaskId: Schema.optionalKey(AgentControlTaskId),
 });
 export type AgentControlProjectModeChangedPayload =
   typeof AgentControlProjectModeChangedPayload.Type;
@@ -136,6 +140,7 @@ export type AgentControlSetProjectModeResult = typeof AgentControlSetProjectMode
 
 export const AgentControlRejectedCommandErrorCode = Schema.Literals([
   "validation",
+  "run-once-task-changed",
   "project-missing",
   "project-deleted",
   "revision-conflict",
@@ -296,7 +301,18 @@ export class AgentControlInternalPersistenceError extends Schema.TaggedError<Age
   },
 ) {}
 
+export class AgentControlRunOnceTaskChangedError extends Schema.TaggedError<AgentControlRunOnceTaskChangedError>()(
+  "AgentControlRunOnceTaskChangedError",
+  {
+    code: Schema.Literal("run-once-task-changed"),
+    projectId: ProjectId,
+    expectedTaskId: AgentControlTaskId,
+    actualTaskId: Schema.NullOr(AgentControlTaskId),
+  },
+) {}
+
 export const AgentControlRuntimeRpcError = Schema.Union([
+  AgentControlRunOnceTaskChangedError,
   AgentControlRuntimeValidationError,
   AgentControlProjectMissingError,
   AgentControlProjectDeletedError,

@@ -1,3 +1,4 @@
+import { AgentControlRunOnceReadModel } from "./agentControl/runOnce/Services/AgentControlRunOnceReadModel.ts";
 import {
   sameUsageLimitCommandCoverage,
   withUsageLimitsCommands,
@@ -17,6 +18,7 @@ import * as Stream from "effect/Stream";
 import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
   AGENT_CONTROL_RPC_METHODS,
+  AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AGENT_CONTROL_GITHUB_RPC_METHODS,
   AGENT_CONTROL_TASK_RPC_METHODS,
@@ -499,6 +501,7 @@ const makeWsRpcLayer = (
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
+      const agentControlRunOnce = yield* AgentControlRunOnceReadModel;
       const agentControlPolicy = yield* AgentControlPolicy.AgentControlPolicyService;
       const agentControlRuntime = yield* AgentControlRuntime.AgentControlEngine;
       const agentControlGithub = yield* AgentControlGithubIntake.AgentControlGithubIntake;
@@ -1479,6 +1482,18 @@ const makeWsRpcLayer = (
             AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS.prepareInitial,
             agentControlControlledThreadActivation.activateInitial(input),
             { "rpc.aggregate": "agent-control-controlled-thread-reservation" },
+          ),
+        [AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot,
+            agentControlRunOnce.getSnapshot(input),
+            { "rpc.aggregate": "agent-control" },
+          ),
+        [AGENT_CONTROL_RUN_ONCE_RPC_METHODS.subscribe]: (input) =>
+          observeRpcStreamEffect(
+            AGENT_CONTROL_RUN_ONCE_RPC_METHODS.subscribe,
+            agentControlRunOnce.subscribe(input),
+            { "rpc.aggregate": "agent-control" },
           ),
         [AGENT_CONTROL_RPC_METHODS.getPolicy]: (input) =>
           observeRpcEffect(

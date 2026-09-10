@@ -115,6 +115,7 @@ import {
   ProjectFaviconPickerDialog,
 } from "./ProjectFaviconPickerDialog";
 import { projectGroupTitleNeedsUpdate } from "./ProjectSettingsPanel.logic";
+import { AgentControlProjectPanel } from "./AgentControlProjectPanel";
 
 const ProjectIconPickerDialog = lazy(() =>
   import("./ProjectIconPickerDialog").then((module) => ({
@@ -1239,6 +1240,13 @@ function ProjectDetail({
             }
           />
         </SettingsSection>
+
+        <AgentControlProjectPanel
+          key={selectedCheckout.physicalProjectKey}
+          environmentId={selectedCheckout.environmentId}
+          projectId={selectedCheckout.id}
+          workspaceRoot={selectedCheckout.workspaceRoot}
+        />
 
         <SettingsSection title="Checkout">
           {hasMultipleCheckouts ? (

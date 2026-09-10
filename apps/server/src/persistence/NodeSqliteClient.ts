@@ -285,6 +285,7 @@ const runOnceModeCommandFingerprintMatch = (
   projectId: unknown,
   expectedRevision: unknown,
   mode: unknown,
+  runOnceTaskId: unknown = undefined,
 ): number => {
   if (
     typeof actual !== "string" ||
@@ -293,7 +294,12 @@ const runOnceModeCommandFingerprintMatch = (
     typeof expectedRevision !== "number" ||
     !Number.isSafeInteger(expectedRevision) ||
     expectedRevision < 0 ||
-    typeof mode !== "string"
+    typeof mode !== "string" ||
+    (runOnceTaskId != null &&
+      (typeof runOnceTaskId !== "string" ||
+        runOnceTaskId.trim() !== runOnceTaskId ||
+        runOnceTaskId.length === 0 ||
+        mode !== "run-once"))
   ) {
     return 0;
   }
@@ -303,6 +309,7 @@ const runOnceModeCommandFingerprintMatch = (
     projectId,
     String(expectedRevision),
     mode,
+    ...(typeof runOnceTaskId === "string" ? [runOnceTaskId] : []),
   ]
     .map((part) => `${part.length}:${part}`)
     .join("");
@@ -318,6 +325,7 @@ const runOnceModeEventMatch = (
   previousPausedFromMode: unknown,
   pausedFromMode: unknown,
   changedAt: unknown,
+  runOnceTaskId: unknown = undefined,
 ): number => {
   try {
     if (
@@ -326,7 +334,15 @@ const runOnceModeEventMatch = (
       typeof mode !== "string" ||
       (previousPausedFromMode !== null && typeof previousPausedFromMode !== "string") ||
       (pausedFromMode !== null && typeof pausedFromMode !== "string") ||
-      typeof changedAt !== "string"
+      typeof changedAt !== "string" ||
+      (runOnceTaskId != null &&
+        (typeof runOnceTaskId !== "string" ||
+          runOnceTaskId.trim() !== runOnceTaskId ||
+          runOnceTaskId.length === 0 ||
+          mode !== "run-once" ||
+          previousMode !== "observe" ||
+          previousPausedFromMode !== null ||
+          pausedFromMode !== null))
     ) {
       return 0;
     }
@@ -338,6 +354,7 @@ const runOnceModeEventMatch = (
         previousMode,
         previousPausedFromMode,
         projectId,
+        ...(typeof runOnceTaskId === "string" ? { runOnceTaskId } : {}),
       }) &&
       canonicalJson(parseJsonStrict(decodeCanonicalUtf8Bytes(metadataBytes))) ===
         canonicalJson({ schemaVersion: 1 })
@@ -1289,6 +1306,47 @@ export const registerNodeSqliteFunctions = (database: NodeSqlite.DatabaseSync): 
     NODE_SQLITE_RUN_ONCE_MODE_EVENT_MATCH_FUNCTION,
     { deterministic: true },
     runOnceModeEventMatch,
+  );
+  // Explicit overloads keep legacy five/eight-argument guards strict. Only the
+  // selected-task activation trigger supplies the separately bound task ID.
+  database.function(
+    NODE_SQLITE_RUN_ONCE_MODE_COMMAND_FINGERPRINT_MATCH_FUNCTION,
+    { deterministic: true },
+    (actual, commandId, projectId, expectedRevision, mode, taskId) =>
+      runOnceModeCommandFingerprintMatch(
+        actual,
+        commandId,
+        projectId,
+        expectedRevision,
+        mode,
+        taskId,
+      ),
+  );
+  database.function(
+    NODE_SQLITE_RUN_ONCE_MODE_EVENT_MATCH_FUNCTION,
+    { deterministic: true },
+    (
+      payload,
+      metadata,
+      projectId,
+      previousMode,
+      mode,
+      previousPausedMode,
+      pausedMode,
+      changedAt,
+      taskId,
+    ) =>
+      runOnceModeEventMatch(
+        payload,
+        metadata,
+        projectId,
+        previousMode,
+        mode,
+        previousPausedMode,
+        pausedMode,
+        changedAt,
+        taskId,
+      ),
   );
   database.function(
     NODE_SQLITE_RUN_ONCE_THREAD_ACTIVATION_IDENTITY_MATCH_FUNCTION,

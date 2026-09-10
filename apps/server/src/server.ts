@@ -1,3 +1,6 @@
+import { makeAgentControlRunOnceReadModel } from "./agentControl/runOnce/readModel.ts";
+import { AgentControlRunOnceReadModel } from "./agentControl/runOnce/Services/AgentControlRunOnceReadModel.ts";
+import { AgentControlRunOnceReadNotificationsLive } from "./agentControl/runOnce/readNotifications.ts";
 import { EnvironmentHttpApi, ProviderDriverKind } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
@@ -604,6 +607,7 @@ const RuntimeCoreDependenciesAdmissionLive = ReactorLayerLive.pipe(
   Layer.provideMerge(ProviderAdmissionReleaseAuthorityLayerLive),
 );
 const RuntimeCoreDependenciesBaseLive = RuntimeCoreDependenciesAdmissionLive.pipe(
+  Layer.provideMerge(AgentControlRunOnceReadNotificationsLive),
   Layer.provideMerge(Layer.mergeAll(TerminalLayerLive, PreviewLayerLive)),
   Layer.provideMerge(PersistenceLayerLive),
   // Both read a user-owned file out of the state directory and stream changes
@@ -846,7 +850,21 @@ const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
   Layer.provideMerge(RuntimeCoreDependenciesBaseLive),
 );
 
+const AgentControlRunOnceReadModelLive = Layer.effect(
+  AgentControlRunOnceReadModel,
+  makeAgentControlRunOnceReadModel,
+).pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      AgentControlRuntimeServicesLayerLive,
+      AgentControlRunOnceControllerServiceLayerLive,
+      RuntimeCoreDependenciesBaseLive,
+    ),
+  ),
+);
+
 const RuntimeCoreDependenciesLive = Layer.mergeAll(
+  AgentControlRunOnceReadModelLive,
   RuntimeCoreDependenciesBaseLive,
   AgentControlPolicyLayerLive,
   AgentControlRuntimeServicesLayerLive,

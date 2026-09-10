@@ -1,3 +1,4 @@
+import { AgentControlRunOnceReadNotifications } from "../../runOnce/readNotifications.ts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -486,8 +487,12 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const readNotifications = yield* AgentControlRunOnceReadNotifications;
   const processHandoff: AgentControlVerificationEvaluatorShape["processHandoff"] = (handoffId) =>
     processUnchecked(handoffId).pipe(
+      Effect.tap((result) =>
+        result._tag === "Evaluated" ? readNotifications.publish(handoffId) : Effect.void,
+      ),
       Effect.mapError((cause) =>
         isEvaluationError(cause)
           ? cause

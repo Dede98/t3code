@@ -95,6 +95,7 @@ export const fingerprintRunOnceModeCommand = (input: {
   readonly projectId: string;
   readonly expectedRevision: number;
   readonly mode: string;
+  readonly runOnceTaskId?: string;
 }) =>
   sha256Utf8(
     [
@@ -103,6 +104,7 @@ export const fingerprintRunOnceModeCommand = (input: {
       input.projectId,
       String(input.expectedRevision),
       input.mode,
+      ...(input.runOnceTaskId === undefined ? [] : [input.runOnceTaskId]),
     ]
       .map((part) => `${part.length}:${part}`)
       .join(""),
@@ -139,6 +141,9 @@ export const loadRunOnceModeAuthority = Effect.fn("loadRunOnceModeAuthority")(fu
     projectId,
     expectedRevision,
     mode: event.payload.mode,
+    ...(event.payload.runOnceTaskId === undefined
+      ? {}
+      : { runOnceTaskId: event.payload.runOnceTaskId }),
   });
   if (
     rows.length !== 1 ||

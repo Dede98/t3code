@@ -100,6 +100,7 @@ export const decideAgentControlProjectCommand = Effect.fn("decideAgentControlPro
           previousPausedFromMode: state.pausedFromMode,
           pausedFromMode,
           changedAt: occurredAt,
+          ...(command.runOnceTaskId === undefined ? {} : { runOnceTaskId: command.runOnceTaskId }),
         },
         metadata: { schemaVersion: 1 },
       },

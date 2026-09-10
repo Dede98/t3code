@@ -15,6 +15,7 @@ import {
   AgentControlSetProjectModeInput,
   type AgentControlSetProjectModeResult,
   AgentControlRuntimeValidationError,
+  AgentControlRunOnceTaskChangedError,
   EventId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -52,6 +53,7 @@ import { AgentControlCommandReceiptRepository } from "../../persistence/Services
 import { AgentControlEventStore } from "../../persistence/Services/AgentControlEventStore.ts";
 import { AgentControlProjectAvailability } from "../../persistence/Services/AgentControlProjectAvailability.ts";
 import { AgentControlProjectStateRepository } from "../../persistence/Services/AgentControlProjectStates.ts";
+import { selectAgentControlRunOnceCandidate } from "../runOnce/selection.ts";
 import { withAgentControlRunOnceProjectFence } from "../runOnce/context.ts";
 
 interface CommandEnvelope {
@@ -144,6 +146,7 @@ const makeAgentControlEngine = Effect.gen(function* () {
       command.projectId,
       String(command.expectedRevision),
       command.mode,
+      ...(command.runOnceTaskId === undefined ? [] : [command.runOnceTaskId]),
     ]
       .map((part) => `${part.length}:${part}`)
       .join("");
@@ -328,6 +331,36 @@ const makeAgentControlEngine = Effect.gen(function* () {
               })
               .pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
             return { _tag: "Rejected" as const, error };
+          }
+
+          if (envelope.command.runOnceTaskId !== undefined) {
+            if (envelope.command.mode !== "run-once" || currentState.mode !== "observe") {
+              return yield* new AgentControlRuntimeValidationError({
+                code: "validation",
+                operation: "set-project-mode",
+              });
+            }
+            const intake = yield* sql<{ sequence: number | null }>`
+              SELECT MAX(github_intake_sequence) AS sequence FROM main.agent_control_task_states
+              WHERE project_id = ${envelope.command.projectId}
+            `;
+            const sequence = intake[0]?.sequence;
+            const candidate =
+              sequence == null
+                ? null
+                : yield* selectAgentControlRunOnceCandidate(
+                    sql,
+                    envelope.command.projectId,
+                    sequence,
+                  ).pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
+            if (candidate !== envelope.command.runOnceTaskId) {
+              return yield* new AgentControlRunOnceTaskChangedError({
+                code: "run-once-task-changed",
+                projectId: envelope.command.projectId,
+                expectedTaskId: envelope.command.runOnceTaskId,
+                actualTaskId: candidate,
+              });
+            }
           }
 
           const decision = yield* Effect.result(

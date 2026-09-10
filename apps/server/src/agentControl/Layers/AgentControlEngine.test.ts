@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { CommandId, ProjectId } from "@t3tools/contracts";
+import { AgentControlTaskId, CommandId, ProjectId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -160,6 +160,55 @@ layer("AgentControlEngine", (it) => {
         );
         assert.equal(takeover.state.mode, "observe");
       }),
+  );
+
+  it.effect("binds the selected task durably and admits concurrent duplicate starts once", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const engine = yield* AgentControlEngine;
+      const events = yield* AgentControlEventStore;
+      const projectId = ProjectId.make("selected-task-start");
+      const taskId = AgentControlTaskId.make("selected-task");
+      yield* addProject(sql, projectId);
+      yield* engine.dispatchHuman(setMode("selected-observe", projectId, 0, "observe"));
+      yield* sql`INSERT INTO agent_control_task_states (
+        task_id, project_id, repository_node_id, issue_node_id, issue_number, issue_url,
+        status, source_gate, stage, source_updated_at, github_intake_sequence, state_json,
+        created_at, updated_at, revision, last_event_sequence
+      ) VALUES (${taskId}, ${projectId}, 'repo', 'issue', 1, 'https://example.invalid/1',
+        'candidate', 'eligible', 'intake', '2026-09-01T00:00:00.000Z', 7, '{}',
+        '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z', 1, 1)`;
+      const wrong = yield* Effect.result(
+        engine.dispatchHuman({
+          ...setMode("selected-wrong", projectId, 1, "run-once"),
+          runOnceTaskId: AgentControlTaskId.make("different-task"),
+        }),
+      );
+      assert.equal(wrong._tag, "Failure");
+      if (wrong._tag === "Failure") assert.equal(wrong.failure.code, "run-once-task-changed");
+      assert.equal((yield* engine.getProjectState({ projectId })).revision, 1);
+      const command = {
+        ...setMode("selected-start", projectId, 1, "run-once"),
+        runOnceTaskId: taskId,
+      };
+      const starts = yield* Effect.all(
+        [engine.dispatchHuman(command), engine.dispatchHuman(command)],
+        { concurrency: "unbounded" },
+      );
+      assert.deepStrictEqual(starts[0], starts[1]);
+      const history = yield* events.readStream(projectId, 0, 20);
+      assert.equal(history.length, 2);
+      assert.equal(history[1]?.payload.runOnceTaskId, taskId);
+      yield* engine.dispatchHuman(setMode("selected-takeover", projectId, 2, "observe"));
+      assert.deepStrictEqual(yield* engine.dispatchHuman(command), starts[0]);
+      assert.equal((yield* engine.getProjectState({ projectId })).mode, "observe");
+      const changedIdentity = yield* Effect.result(
+        engine.dispatchHuman({ ...command, runOnceTaskId: AgentControlTaskId.make("other") }),
+      );
+      assert.equal(changedIdentity._tag, "Failure");
+      if (changedIdentity._tag === "Failure")
+        assert.equal(changedIdentity.failure.code, "command-identity-mismatch");
+    }),
   );
 
   it.effect("persists rejected commands and requires a new id for a corrected request", () =>

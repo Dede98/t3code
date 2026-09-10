@@ -85,7 +85,7 @@ function deriveProjectEmptyState(catalogState: WorkspaceState): {
 export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRouteParams | undefined>) {
   const projects = useProjects();
   const { projectScopes, selectedEnvironmentId, setProject } = useNewTaskFlow();
-  const { state: catalogState } = useWorkspaceState();
+  const { state: catalogState, environments } = useWorkspaceState();
   const navigation = useNavigation();
   const isFocused = useIsFocused();
   const { layout } = useAdaptiveWorkspaceLayout();
@@ -311,6 +311,34 @@ export function NewTaskRouteScreen({ route }: StaticScreenProps<NewTaskRoutePara
                       type="monochrome"
                     />
                   </Pressable>
+                  {!incomingShare
+                    ? scope.projects.map((project) => (
+                        <Pressable
+                          key={`${project.environmentId}:${project.id}`}
+                          accessibilityRole="button"
+                          onPress={() =>
+                            navigation.navigate("AutonomousTasks", {
+                              environmentId: project.environmentId,
+                              projectId: project.id,
+                            })
+                          }
+                          className="border-t border-border-subtle px-4 py-3 active:opacity-70"
+                        >
+                          <Text className="text-sm font-t3-bold text-primary">
+                            Autonomous tasks
+                          </Text>
+                          {hasMultipleProjects ? (
+                            <Text className="text-xs text-foreground-muted">
+                              {environments.find(
+                                (environment) =>
+                                  environment.environmentId === project.environmentId,
+                              )?.environmentLabel ?? project.environmentId}{" "}
+                              · {project.workspaceRoot}
+                            </Text>
+                          ) : null}
+                        </Pressable>
+                      ))
+                    : null}
                 </View>
               );
             })}

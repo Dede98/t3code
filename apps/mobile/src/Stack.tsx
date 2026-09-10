@@ -50,6 +50,7 @@ import {
 } from "./features/threads/ThreadSettingsSheet";
 import { NewTaskFlowProvider } from "./features/threads/new-task-flow-provider";
 import { NewTaskRouteScreen } from "./features/threads/NewTaskRouteScreen";
+import { AutonomousTasksRouteScreen } from "./features/threads/AutonomousTasksRouteScreen";
 import { SettingsAppearanceRouteScreen } from "./features/settings/SettingsAppearanceRouteScreen";
 import { SettingsClientStorageRouteScreen } from "./features/settings/SettingsClientStorageRouteScreen";
 import { SettingsAuthRouteScreen } from "./features/settings/SettingsAuthRouteScreen";
@@ -466,6 +467,11 @@ export const RootStack = createNativeStackNavigator({
         headerBackVisible: false,
         ...getCompactBrandHeaderOptions(),
       },
+    }),
+    AutonomousTasks: createNativeStackScreen({
+      screen: AutonomousTasksRouteScreen,
+      linking: "environments/:environmentId/projects/:projectId/autonomous",
+      options: { ...SOLID_HEADER_OPTIONS, title: "Autonomous tasks" },
     }),
     Thread: createNativeStackScreen({
       screen: ThreadRouteScreen,

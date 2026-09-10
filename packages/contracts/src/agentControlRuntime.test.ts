@@ -1,3 +1,4 @@
+import { CommandId, ProjectId } from "./baseSchemas.ts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -51,8 +52,8 @@ it.effect("keeps command authority out of the client input contract", () =>
       authority: "system",
     });
     assert.deepStrictEqual(decoded, {
-      commandId: "command-observe",
-      projectId: "project-observe",
+      commandId: CommandId.make("command-observe"),
+      projectId: ProjectId.make("project-observe"),
       expectedRevision: 0,
       mode: "observe",
     });

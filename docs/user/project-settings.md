@@ -19,6 +19,26 @@ Reset that list to use shared actions again. Existing project actions are preser
 Project names, icons, removal, and importing actions from a checkout remain project-specific.
 When there are several checkouts, the checkout picker selects which actions and grouping to edit.
 
+## Run one autonomous task
+
+For projects with GitHub task intake and provider routing already configured, open the project's
+**Autonomous task** section. Select the checkout on the environment where the work should run.
+On mobile, open **New Task**, choose the project's **Autonomous tasks** entry, and select its environment.
+
+Enable task intake, select the next eligible task, review provider/model readiness and verification
+checks, then choose **Run once**. Tasks follow issue-number order; selecting a later task explains
+why it cannot start yet. Start blockers identify missing readiness or an existing run. Intake can
+be disabled again when no run is active. This view does not configure GitHub intake or provider routing.
+
+The latest saved run shows Planning, Implementation, Verification, and any Repair with its own
+subsequent Verification. Expand check results to inspect their exit codes and captured output.
+Missing evidence never counts as verified success. Reloading or reconnecting resumes the saved
+progress without starting work again.
+
+Open a stage's thread or changes to review the result. Web and desktop offer the available editor
+or file-manager actions for its worktree. Mobile can copy the worktree path; its files remain on
+the connected environment.
+
 ## Project icons
 
 Choose an icon, emoji, or image from the project to make it easier to recognize. The choice applies

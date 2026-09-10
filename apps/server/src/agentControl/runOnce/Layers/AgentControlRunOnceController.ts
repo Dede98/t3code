@@ -1,3 +1,4 @@
+import { persistRunOnceDiagnostic } from "../diagnostics.ts";
 import {
   AgentControlRunOnceId,
   EventId,
@@ -1529,6 +1530,17 @@ const make = Effect.gen(function* () {
                   projectId,
                   activation.githubIntakeSequence,
                 );
+                const requestedTaskId = authority.project.events.find(
+                  (event) => event.eventId === activation.activationEventId,
+                )?.payload.runOnceTaskId;
+                if (requestedTaskId !== undefined && requestedTaskId !== taskId) {
+                  return yield* error(
+                    projectId,
+                    run!.runId,
+                    "task-selected",
+                    "source-watermark-stale",
+                  );
+                }
                 const expected =
                   [...authority.tasks]
                     .filter(
@@ -1865,7 +1877,13 @@ const make = Effect.gen(function* () {
 
   const processProject: AgentControlRunOnceControllerShape["processProject"] = (projectId) =>
     projectLocks
-      .withPermit(projectId, processSerialized(projectId))
+      .withPermit(
+        projectId,
+        processSerialized(projectId).pipe(
+          Effect.tap(() => persistRunOnceDiagnostic(sql, projectId, null)),
+          Effect.tapError((failure) => persistRunOnceDiagnostic(sql, projectId, failure)),
+        ),
+      )
       .pipe(
         Effect.mapError((cause) =>
           isRunOnceError(cause) ? cause : error(projectId, null, null, "persistence", cause),
