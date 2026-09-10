@@ -9,6 +9,7 @@ import {
 } from "@t3tools/contracts";
 import {
   agentControlRunStatus,
+  agentControlModeChangeBlocker,
   agentControlSnapshotReady,
   agentControlStageHeading,
   agentControlVerificationPassed,
@@ -30,6 +31,7 @@ import { agentControlEnvironment } from "../../state/agent-control";
 import { useProject } from "../../state/entities";
 import { useEnvironmentPresentation } from "../../state/presentation";
 import { useEnvironmentQuery } from "../../state/query";
+import { environmentSession } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useSavedRemoteConnection } from "../../state/use-remote-environment-registry";
 
@@ -189,6 +191,8 @@ export function AutonomousTasksRouteScreen({
   const snapshotAtom = agentControlEnvironment.snapshot(target);
   const snapshot = useEnvironmentQuery(snapshotAtom);
   const snapshotResult = useAtomValue(snapshotAtom);
+  const sessionResult = useAtomValue(environmentSession.sessionStateAtom(environmentId));
+  const modeChangeBlocker = agentControlModeChangeBlocker(sessionResult);
   const preflight = useEnvironmentQuery(agentControlEnvironment.preflight(target));
   const policy = useEnvironmentQuery(agentControlEnvironment.policy(target));
   const setMode = useAtomCommand(agentControlEnvironment.setMode);
@@ -205,10 +209,11 @@ export function AutonomousTasksRouteScreen({
     selectedTaskId,
     connected,
     pending,
+    modeChangeBlocker,
   });
 
   async function changeMode(input: AgentControlSetProjectModeInput) {
-    if (pendingRef.current) return;
+    if (pendingRef.current || modeChangeBlocker !== null) return;
     pendingRef.current = true;
     setPending(true);
     setError(null);
@@ -308,7 +313,7 @@ export function AutonomousTasksRouteScreen({
         {snapshot.data?.projectState.mode === "manual" ||
         snapshot.data?.projectState.mode === "paused" ? (
           <Action
-            disabled={!snapshotReady || pending}
+            disabled={!snapshotReady || pending || modeChangeBlocker !== null}
             onPress={() => {
               if (!snapshotReady || !snapshot.data) return;
               void changeMode({
@@ -325,7 +330,7 @@ export function AutonomousTasksRouteScreen({
         {snapshot.data?.projectState.mode === "observe" &&
         !snapshot.data.runs.some((run) => run.state.status === "active") ? (
           <Action
-            disabled={!snapshotReady || pending}
+            disabled={!snapshotReady || pending || modeChangeBlocker !== null}
             onPress={() => {
               if (!snapshotReady || !snapshot.data) return;
               void changeMode({

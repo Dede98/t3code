@@ -29,6 +29,9 @@ Enable task intake, select the next eligible task, review provider/model readine
 checks, then choose **Run once**. Tasks follow issue-number order; selecting a later task explains
 why it cannot start yet. Start blockers identify missing readiness or an existing run. Intake can
 be disabled again when no run is active. This view does not configure GitHub intake or provider routing.
+Starting runs and changing intake require an admin session on the selected environment. Standard
+pairing and relay sessions can review saved runs; ask the environment administrator for an admin
+pairing link to enable these actions.
 
 The latest saved run shows Planning, Implementation, Verification, and any Repair with its own
 subsequent Verification. Expand check results to inspect their exit codes and captured output.

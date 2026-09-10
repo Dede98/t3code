@@ -1,4 +1,9 @@
 import {
+  AGENT_CONTROL_RUNTIME_RPC_METHODS,
+  AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
+  AuthAccessWriteScope,
+  AuthAdministrativeScopes,
+  AuthStandardClientScopes,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   AuthRelayReadScope,
@@ -11,6 +16,16 @@ import { describe, expect, it } from "@effect/vitest";
 import { RPC_REQUIRED_SCOPES, requiredScopeForRpcMethod } from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
+  it("keeps Run Once and intake changes administrative while standard clients can read runs", () => {
+    const required = requiredScopeForRpcMethod(AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode);
+    expect(required).toBe(AuthAccessWriteScope);
+    expect(new Set<string>(AuthStandardClientScopes).has(required)).toBe(false);
+    expect(new Set<string>(AuthAdministrativeScopes).has(required)).toBe(true);
+    for (const method of Object.values(AGENT_CONTROL_RUN_ONCE_RPC_METHODS)) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    }
+  });
+
   it("declares exactly one scope for every RPC in the server group", () => {
     expect(new Set(Object.keys(RPC_REQUIRED_SCOPES))).toEqual(new Set(WsRpcGroup.requests.keys()));
   });

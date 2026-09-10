@@ -2,6 +2,7 @@ import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   agentControlRunStatus,
+  agentControlModeChangeBlocker,
   agentControlSnapshotReady,
   agentControlStartBlockers,
   agentControlStartInput,
@@ -28,6 +29,7 @@ import { useRightPanelStore } from "../../rightPanelStore";
 import { agentControlEnvironment } from "../../state/agentControl";
 import { useEnvironment } from "../../state/environments";
 import { serverEnvironment } from "../../state/server";
+import { environmentSession } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { OpenInPicker } from "../chat/OpenInPicker";
 import { Button } from "../ui/button";
@@ -88,6 +90,9 @@ export function AgentControlProjectPanel({
   const policy = Option.getOrNull(AsyncResult.value(policyResult));
   const config = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const environment = useEnvironment(environmentId);
+  const sessionResult = useAtomValue(environmentSession.sessionStateAtom(environmentId));
+  const refreshSession = useAtomRefresh(environmentSession.sessionStateAtom(environmentId));
+  const modeChangeBlocker = agentControlModeChangeBlocker(sessionResult);
   const connected = environment?.connection.phase === "connected";
   const setMode = useAtomCommand(agentControlEnvironment.setMode, "start autonomous task");
   const navigate = useNavigate();
@@ -99,6 +104,7 @@ export function AgentControlProjectPanel({
   const selectedTask = snapshot?.tasks.find((task) => task.taskId === selectedTaskId);
   const selectedRun = snapshot?.runs[0];
   const canChangeIntake =
+    modeChangeBlocker === null &&
     agentControlSnapshotReady(snapshotResult, connected) &&
     !pending &&
     !snapshot?.runs.some((run) => run.state.status === "active");
@@ -109,10 +115,11 @@ export function AgentControlProjectPanel({
     selectedTaskId,
     connected: agentControlSnapshotReady(snapshotResult, connected),
     pending,
+    modeChangeBlocker,
   });
 
   const changeMode = async (mode: "manual" | "observe" | "run-once") => {
-    if (!snapshot || requestPending.current) return;
+    if (!snapshot || requestPending.current || modeChangeBlocker !== null) return;
     if (mode === "run-once" && (blockers.length > 0 || !selectedTaskId)) return;
     if (mode !== "run-once" && !canChangeIntake) return;
     if (mode === "manual" && snapshot.projectState.mode !== "observe") return;
@@ -237,6 +244,7 @@ export function AgentControlProjectPanel({
                   refreshPreflight();
                   refreshPolicy();
                   refreshSnapshot();
+                  refreshSession();
                 }}
               >
                 Check readiness again

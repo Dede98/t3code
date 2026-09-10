@@ -3,6 +3,8 @@ import {
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
   CommandId,
+  AuthAccessWriteScope,
+  type AuthSessionState,
   type AgentControlPreflightRuntimeResult,
   type AgentControlPolicyStateResult,
   type AgentControlRunOnceSnapshot,
@@ -61,6 +63,22 @@ export function agentControlSnapshotReady<E>(
   return connected && AsyncResult.isSuccess(result);
 }
 
+/** Start and intake changes share the server's administrative mode-change permission. */
+export function agentControlModeChangeBlocker<E>(
+  session: AsyncResult.AsyncResult<AuthSessionState, E>,
+): string | null {
+  if (session._tag === "Failure") {
+    return "Could not verify your permissions in this environment. Reconnect before starting a run or changing task intake.";
+  }
+  if (session._tag !== "Success" || session.waiting) {
+    return "Checking your permissions in this environment before allowing run starts or task intake changes.";
+  }
+  if (!session.value.authenticated || !session.value.scopes?.includes(AuthAccessWriteScope)) {
+    return "Your session in this environment lacks administrative permission (access:write) to start runs or change task intake. Ask the environment administrator for an admin pairing link; you can still review saved runs.";
+  }
+  return null;
+}
+
 /** Retries of the same displayed selection retain both command identity and revision. */
 export function agentControlStartInput(
   snapshot: AgentControlRunOnceSnapshot,
@@ -84,8 +102,10 @@ export function agentControlStartBlockers(input: {
   selectedTaskId: AgentControlTaskId | null;
   connected: boolean;
   pending: boolean;
+  modeChangeBlocker: string | null;
 }): string[] {
   const blockers: string[] = [];
+  if (input.modeChangeBlocker !== null) blockers.push(input.modeChangeBlocker);
   if (input.policy === null) {
     blockers.push("Load the project's verification configuration before starting.");
   } else if (

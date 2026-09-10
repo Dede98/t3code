@@ -1,6 +1,9 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
   AgentControlRunOnceSnapshot,
+  AuthStandardClientScopes,
+  AuthAdministrativeScopes,
+  type AuthSessionState,
   ProviderInstanceId,
   ProviderDriverKind,
   AgentControlRunOnceStageView,
@@ -12,6 +15,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 
 import {
   agentControlRunStatus,
+  agentControlModeChangeBlocker,
   agentControlSnapshotReady,
   agentControlStageLabel,
   agentControlStageHeading,
@@ -162,6 +166,16 @@ const policy: AgentControlPolicyStateResult = {
     },
   },
 };
+const adminSession: AuthSessionState = {
+  authenticated: true,
+  auth: {
+    policy: "remote-reachable",
+    bootstrapMethods: ["one-time-token"],
+    sessionMethods: ["dpop-access-token"],
+    sessionCookieName: "t3_session",
+  },
+  scopes: AuthAdministrativeScopes,
+};
 const start = {
   policy,
   snapshot,
@@ -169,9 +183,41 @@ const start = {
   selectedTaskId: task.taskId,
   connected: true,
   pending: false,
+  modeChangeBlocker: agentControlModeChangeBlocker(AsyncResult.success(adminSession)),
 };
 
 describe("Run Once client state", () => {
+  it("blocks start and intake changes for a standard session but permits an admin session", () => {
+    const standardSession = { ...adminSession, scopes: AuthStandardClientScopes };
+    const blocked = agentControlModeChangeBlocker(AsyncResult.success(standardSession));
+    expect(blocked).toContain("access:write");
+    expect(blocked).toContain("start runs or change task intake");
+    expect(agentControlStartBlockers({ ...start, modeChangeBlocker: blocked })).toEqual([blocked]);
+    const allowed = agentControlModeChangeBlocker(AsyncResult.success(adminSession));
+    expect(allowed).toBeNull();
+    expect(agentControlStartBlockers({ ...start, modeChangeBlocker: allowed })).toEqual([]);
+    // Returning to a standard environment must not inherit the other environment's admin grant.
+    expect(agentControlModeChangeBlocker(AsyncResult.success(standardSession))).toBe(blocked);
+  });
+
+  it("keeps actions blocked while permissions are unknown, refreshing, failed, or unauthenticated", () => {
+    const { scopes: _scopes, ...withoutScopes } = adminSession;
+    const sessions = [
+      AsyncResult.initial<AuthSessionState>(),
+      AsyncResult.waiting(AsyncResult.success(adminSession)),
+      AsyncResult.fail(new Error("Session unavailable")),
+      AsyncResult.success({ ...adminSession, authenticated: false }),
+      AsyncResult.success(withoutScopes),
+    ];
+    for (const session of sessions) {
+      const blocker = agentControlModeChangeBlocker(session);
+      expect(blocker).not.toBeNull();
+      expect(agentControlStartBlockers({ ...start, modeChangeBlocker: blocker })).toEqual([
+        blocker,
+      ]);
+    }
+  });
+
   it("accepts a received snapshot while its live stream is waiting for the next event", () => {
     const streaming = AsyncResult.waiting(AsyncResult.success(snapshot));
     expect(streaming.waiting).toBe(true);
