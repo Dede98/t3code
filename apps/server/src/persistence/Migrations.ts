@@ -116,6 +116,7 @@ import AgentMigration0070 from "./Migrations/070_AgentControlPreparedSessionReco
 import AgentMigration0071 from "./Migrations/071_AgentControlNativeTerminalReceipts.ts";
 import AgentMigration0073 from "./Migrations/073_AgentControlRunOnceRepair.ts";
 import AgentMigration0072 from "./Migrations/072_AgentControlArchivedPreparationCapacityRecovery.ts";
+import AgentMigration0074 from "./Migrations/074_AgentControlRepairPromptBudget.ts";
 
 const agentMigrationEntries = [
   [34, "OrchestrationCommandAuthority", AgentMigration0034],
@@ -158,6 +159,7 @@ const agentMigrationEntries = [
   [71, "AgentControlNativeTerminalReceipts", AgentMigration0071],
   [72, "AgentControlArchivedPreparationCapacityRecovery", AgentMigration0072],
   [73, "AgentControlRunOnceRepair", AgentMigration0073],
+  [74, "AgentControlRepairPromptBudget", AgentMigration0074],
 ] as const;
 
 const migrationEntries = [

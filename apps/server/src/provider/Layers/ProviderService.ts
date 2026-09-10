@@ -78,7 +78,7 @@ import { withAgentControlRunOnceProjectFence } from "../../agentControl/runOnce/
 import { withProviderAdmissionEffectFence } from "../../agentControl/providerAdmission/context.ts";
 import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
 import { ProviderAdmissionGuard } from "../../agentControl/providerAdmission/Services/ProviderAdmissionGuard.ts";
-import { AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES } from "../../agentControl/verificationTurn/prompt.ts";
+import { AGENT_CONTROL_REPAIR_VERIFICATION_PROMPT_MAX_BYTES } from "../../agentControl/verificationTurn/prompt.ts";
 import { AgentControlVerificationExecution } from "../../agentControl/verificationTurn/executionContext.ts";
 import { ProjectId } from "@t3tools/contracts";
 import {
@@ -426,7 +426,8 @@ const AgentControlSendTurnInput = Schema.Struct({
   input: Schema.optional(
     TrimmedNonEmptyString.check(
       Schema.makeFilter(
-        (value) => Buffer.byteLength(value, "utf8") <= AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES,
+        (value) =>
+          Buffer.byteLength(value, "utf8") <= AGENT_CONTROL_REPAIR_VERIFICATION_PROMPT_MAX_BYTES,
       ),
     ),
   ),

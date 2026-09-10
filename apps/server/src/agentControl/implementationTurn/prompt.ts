@@ -4,10 +4,17 @@ import {
   sha256Utf8,
   type JsonValue,
 } from "../initialPlanning/eventEvidence.ts";
+import { AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES } from "../verificationTurn/verificationResult.ts";
 
 export const AGENT_CONTROL_IMPLEMENTATION_PROMPT_TEMPLATE_VERSION =
   "agent-control-implementation-prompt-v1";
 export const AGENT_CONTROL_IMPLEMENTATION_PROMPT_MAX_BYTES = 120_000;
+// Preserve the complete accepted implementation input and bounded verdict, with
+// room for the repair instruction and JSON field framing.
+export const AGENT_CONTROL_REPAIR_PROMPT_MAX_BYTES =
+  AGENT_CONTROL_IMPLEMENTATION_PROMPT_MAX_BYTES +
+  AGENT_CONTROL_VERIFICATION_RESULT_MAX_BYTES +
+  1_024;
 
 export interface AgentControlImplementationPromptInput {
   readonly repositoryDisplay: string;
@@ -90,8 +97,12 @@ export const buildAgentControlImplementationPrompt = (
     proposedPlan,
   });
   const bytes = Buffer.byteLength(promptText, "utf8");
-  if (bytes < 1 || bytes > AGENT_CONTROL_IMPLEMENTATION_PROMPT_MAX_BYTES) {
-    throw new Error("Implementation prompt cannot be represented within 120000 bytes.");
+  const maxBytes =
+    input.repairReportJson === undefined
+      ? AGENT_CONTROL_IMPLEMENTATION_PROMPT_MAX_BYTES
+      : AGENT_CONTROL_REPAIR_PROMPT_MAX_BYTES;
+  if (bytes < 1 || bytes > maxBytes) {
+    throw new Error(`Implementation prompt cannot be represented within ${maxBytes} bytes.`);
   }
   return { promptText, promptDigest: sha256Utf8(promptText) };
 };

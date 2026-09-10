@@ -3163,7 +3163,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       const session = yield* provider.getSessionAttestation!(threadId);
       assert.isDefined(session);
       if (session === undefined) return;
-      const input = "evidence ".repeat(32_000);
+      const input = "evidence ".repeat(350_000);
       const request = { threadId, input, modelSelection };
       const callsBefore = routing.codex.sendTurn.mock.calls.length;
       const publicFailure = yield* provider.sendTurn(request).pipe(Effect.flip);
@@ -3186,7 +3186,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       const callsAfter = routing.codex.sendTurn.mock.calls.length;
       marked = false;
       const oversized = yield* provider.sendTurnAtPreInvokeBoundary!(
-        { ...request, input: "é".repeat(524_289) },
+        { ...request, input: "é".repeat(2_097_153) },
         boundary,
       ).pipe(Effect.flip);
       assert.instanceOf(oversized, ProviderValidationError);

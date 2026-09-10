@@ -37,7 +37,9 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { loadRunOnceRepair } from "../../runOnce/repair.ts";
+import { loadRunOnceRepair, type RunOnceRepair } from "../../runOnce/repair.ts";
+import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
+import { AgentControlImplementationStageFinalizer } from "../../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlImplementationAdmission } from "../../implementationAdmission/Services/AgentControlImplementationAdmission.ts";
 import { loadSealableVerificationResultSource } from "../../verificationTurn/orchestrationResultSource.ts";
 import { decodeVerificationResult } from "../../verificationTurn/verificationResult.ts";
@@ -452,6 +454,14 @@ const decodeRepairEvaluation = Schema.decodeUnknownEffect(
   }),
 );
 const decodeRepairReport = Schema.decodeUnknownEffect(Schema.Struct({ report: Schema.String }));
+const decodeRepairOutcome = Schema.decodeUnknownEffect(
+  Schema.Struct({ outcome: Schema.Literals(["succeeded", "failed", "cancelled"]) }),
+);
+type TaskFinalizerWakeup =
+  | string
+  | null
+  | { readonly projectId: ProjectId }
+  | { readonly repairStageRunId: string };
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -463,6 +473,8 @@ const make = Effect.gen(function* () {
   const leaseEngine = yield* AgentControlStageRunLeaseEngine;
   const hooks = yield* AgentControlTaskVerificationFinalizerHooks;
   const implementationAdmission = yield* AgentControlImplementationAdmission;
+  const implementationFinalizer = yield* AgentControlImplementationStageFinalizer;
+  const projectEngine = yield* Effect.serviceOption(AgentControlEngine);
   const publicationOwnerId = hooks.publicationOwnerId ?? NodeCrypto.randomUUID();
   if (publicationOwnerId.length === 0) {
     return yield* Effect.die(new Error("task Verification publication owner must not be empty"));
@@ -1797,6 +1809,37 @@ const make = Effect.gen(function* () {
     return Option.some(yield* validateReplay(handoffId, source));
   });
 
+  const repairEndedUnsuccessfully = Effect.fn(
+    "AgentControlTaskVerificationFinalizer.repairEndedUnsuccessfully",
+  )(function* (repair: RunOnceRepair) {
+    const results = yield* sql<{ handoffId: string; resultEvidenceId: string; resultJson: string }>`
+      SELECT result.handoff_id AS "handoffId", result.result_evidence_id AS "resultEvidenceId",
+        result.result_json AS "resultJson"
+      FROM agent_control_implementation_result_evidence result
+      JOIN agent_control_implementation_materialization_evidence materialization
+        ON materialization.materialization_evidence_id = result.materialization_evidence_id
+      WHERE result.stage_run_id = ${repair.repairStageRunId}
+        AND materialization.admission_handoff_id = ${repair.verificationHandoffId}`;
+    if (results.length === 0) return false;
+    if (results.length !== 1)
+      return yield* error(repair.verificationHandoffId, "repair-result", "authority-conflict");
+    const result = results[0]!;
+    // Reuse the implementation finalizer's immutable receipt/marker validation.
+    // A partial result must never allow the task to finish while Repair is active.
+    const accepted = yield* implementationFinalizer.processHandoff(result.handoffId);
+    if (accepted._tag !== "Replayed" || accepted.resultEvidenceId !== result.resultEvidenceId)
+      return yield* error(
+        repair.verificationHandoffId,
+        "repair-result-replay",
+        "authority-conflict",
+      );
+    const document = yield* decodeRepairOutcome(parseJsonStrict(result.resultJson));
+    // The original failed verification remains the task's terminal authority.
+    // A provider failure/cancellation of Repair has its own immutable stage
+    // history; it cannot turn that verified failure into success or another try.
+    return document.outcome === "failed" || document.outcome === "cancelled";
+  });
+
   const prepareRepair = Effect.fn("AgentControlTaskVerificationFinalizer.prepareRepair")(function* (
     source: VerificationSourceAuthority,
   ) {
@@ -1805,7 +1848,12 @@ const make = Effect.gen(function* () {
       WHERE name = 'agent_control_run_once_repairs' AND type = 'table'`;
     if (available.length === 0) return false;
     const existing = yield* loadRunOnceRepair(sql, row.handoffId);
-    if (Option.isSome(existing)) return true;
+    if (Option.isSome(existing)) {
+      if (yield* repairEndedUnsuccessfully(existing.value)) return false;
+      const project = yield* sql<{ mode: string }>`SELECT mode FROM agent_control_project_states
+        WHERE project_id = ${row.projectId}`;
+      return project[0]?.mode === "paused" ? ("waiting" as const) : ("ready" as const);
+    }
     if (
       row.deliveryTerminalState !== "completed" ||
       row.terminalCause !== "verification-failed" ||
@@ -1816,14 +1864,16 @@ const make = Effect.gen(function* () {
       document.stagePayload.stageOrdinal !== 3
     )
       return false;
-    const runs = yield* sql<{ runId: string }>`
-      SELECT run.run_id AS "runId" FROM agent_control_run_once_states run
+    const runs = yield* sql<{ runId: string; mode: string }>`
+      SELECT run.run_id AS "runId", project.mode FROM agent_control_run_once_states run
+      JOIN agent_control_project_states project ON project.project_id = run.project_id
       WHERE run.project_id = ${row.projectId} AND run.task_id = ${row.taskId}
         AND run.status = 'active' AND run.last_step = 'thread-activated'
         AND NOT EXISTS (SELECT 1 FROM agent_control_run_once_repairs repair WHERE repair.run_id = run.run_id)
     `;
     if (runs.length === 0) return false;
     if (runs.length !== 1) return yield* error(row.handoffId, "repair-run", "authority-conflict");
+    if (runs[0]!.mode === "paused") return "waiting" as const;
     const evaluations = yield* sql`SELECT thread_id AS "threadId",
       provider_instance_id AS "providerInstanceId", provider_turn_id AS "providerTurnId",
       terminal_stream_version AS "sealedAtStreamVersion", handoff_id AS "handoffId",
@@ -1873,7 +1923,7 @@ const make = Effect.gen(function* () {
         ${row.verificationFingerprint}, ${planning[0]!.handoffId}, ${repairStageRunId},
         ${canonicalJson(parseJsonStrict(new TextDecoder("utf-8", { fatal: true }).decode(captured.bytes)))},
         ${decoded.semanticDigest}, 1, ${row.finalizedAt})`;
-    return true;
+    return "ready" as const;
   });
 
   const finalizeInTransaction = Effect.fn(
@@ -1881,7 +1931,8 @@ const make = Effect.gen(function* () {
   )(function* (handoffId: string) {
     const source = yield* loadSource(handoffId);
     const authority = yield* loadTaskAuthority(source);
-    if (yield* prepareRepair(source)) return { repairHandoffId: handoffId } as const;
+    const repair = yield* prepareRepair(source);
+    if (repair !== false) return { repairHandoffId: handoffId, ready: repair === "ready" } as const;
     const previous = authority.projection;
     const taskSourceEvent = authority.events[source.row.verificationTaskRevision - 1];
     if (taskSourceEvent === undefined) {
@@ -2078,7 +2129,7 @@ const make = Effect.gen(function* () {
         const publication = transactionExit.value;
         if ("repairHandoffId" in publication) {
           yield* restore(hooks.afterCommit(handoffId));
-          yield* restore(implementationAdmission.processHandoff(handoffId));
+          if (publication.ready) yield* restore(implementationAdmission.processHandoff(handoffId));
           return { _tag: "RepairPending", repairHandoffId: handoffId } as const;
         }
         const afterCommitExit = yield* Effect.exit(restore(hooks.afterCommit(handoffId)));
@@ -2213,8 +2264,37 @@ const make = Effect.gen(function* () {
       if (candidates.length < pageSize) break;
     }
   });
-  const processSafely = (handoffId: string | null) =>
-    handoffId === null ? recover : processCandidateSafely(handoffId);
+  const processSafely = (input: TaskFinalizerWakeup) => {
+    if (input === null) return recover;
+    if (typeof input === "string") return processCandidateSafely(input);
+    return Effect.gen(function* () {
+      let candidates: ReadonlyArray<{ handoffId: string }>;
+      if ("projectId" in input) {
+        candidates = yield* sql<{ handoffId: string }>`
+          SELECT verification.handoff_id AS "handoffId"
+          FROM agent_control_verification_finalization_evidence verification
+          JOIN agent_control_run_once_states run
+            ON run.project_id = verification.project_id AND run.task_id = verification.task_id
+            AND run.status = 'active' AND run.last_step = 'thread-activated'
+          WHERE verification.project_id = ${input.projectId}
+            AND NOT EXISTS (SELECT 1 FROM agent_control_task_verification_finalization_markers task
+              WHERE task.handoff_id = verification.handoff_id)`;
+      } else {
+        const available = yield* sql`SELECT 1 FROM sqlite_schema
+          WHERE type = 'table' AND name = 'agent_control_run_once_repairs'`;
+        if (available.length === 0) return;
+        candidates = yield* sql<{ handoffId: string }>`SELECT verification_handoff_id AS "handoffId"
+          FROM agent_control_run_once_repairs WHERE repair_stage_run_id = ${input.repairStageRunId}`;
+      }
+      yield* Effect.forEach(candidates, ({ handoffId }) => processCandidateSafely(handoffId), {
+        discard: true,
+      });
+    }).pipe(
+      Effect.mapError((cause) =>
+        isFinalizerError(cause) ? cause : error("recovery", "repair-wakeup", "persistence", cause),
+      ),
+    );
+  };
   let nextAttemptId = 0;
   let activeWorker:
     | {
@@ -2276,13 +2356,31 @@ const make = Effect.gen(function* () {
     );
     const leaseEvents = yield* leaseEngine.subscribeDomainEvents;
     yield* Effect.forkScoped(
-      Stream.runForEach(leaseEvents, (event) =>
-        event.type === "agentControl.stageRunLease.releasedAfterVerification"
-          ? activation.pipe(Effect.andThen(worker.enqueue(event.payload.handoffId)))
-          : Effect.void,
-      ),
+      Stream.runForEach(leaseEvents, (event) => {
+        if (event.type === "agentControl.stageRunLease.releasedAfterVerification")
+          return activation.pipe(Effect.andThen(worker.enqueue(event.payload.handoffId)));
+        if (event.type === "agentControl.stageRunLease.releasedAfterImplementation")
+          return activation.pipe(
+            Effect.andThen(worker.enqueue({ repairStageRunId: event.payload.stageRunId })),
+          );
+        return Effect.void;
+      }),
       { startImmediately: true },
     );
+    if (Option.isSome(projectEngine)) {
+      const events = yield* (
+        projectEngine.value.subscribeDomainEvents ??
+          Effect.succeed(projectEngine.value.streamDomainEvents)
+      );
+      yield* Effect.forkScoped(
+        Stream.runForEach(events, (event) =>
+          event.type === "agentControl.project.mode.changed" && event.payload.mode === "run-once"
+            ? activation.pipe(Effect.andThen(worker.enqueue({ projectId: event.aggregateId })))
+            : Effect.void,
+        ),
+        { startImmediately: true },
+      );
+    }
     yield* Effect.forkScoped(activation.pipe(Effect.andThen(worker.enqueue(null))), {
       startImmediately: true,
     });

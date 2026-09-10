@@ -1,3 +1,7 @@
+import {
+  AgentControlEngine,
+  type AgentControlEngineShape,
+} from "../../Services/AgentControlEngine.ts";
 import { AgentControlTaskVerificationFinalizerLive } from "../../task/Layers/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlTaskVerificationFinalizer } from "../../task/Services/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlTaskVerificationFinalizerHooks } from "../../task/Services/AgentControlTaskVerificationFinalizerHooks.ts";
@@ -40,6 +44,7 @@ import {
   ThreadId,
   TurnId,
   type VerificationResultFragment,
+  type AgentControlEvent,
   type AgentControlStageRunEvent,
   type AgentControlStageRunEventDraft,
   type AgentControlStageRunLeaseEvent,
@@ -3432,6 +3437,7 @@ const prepareVerificationTurnDelivery = Effect.fn("prepareVerificationTurnDelive
     readonly verificationCoordinatorHooks?: AgentControlVerificationTurnCoordinatorHooksShape;
     readonly verificationProviderInstanceId?: ProviderInstanceId;
     readonly beforeVerification?: Effect.Effect<void>;
+    readonly taskBody?: string;
   },
 ) {
   const database = existing?.database ?? (yield* makeSharedDatabase());
@@ -3443,6 +3449,7 @@ const prepareVerificationTurnDelivery = Effect.fn("prepareVerificationTurnDelive
     suffix,
     false,
     completePlanningParents,
+    existing?.taskBody,
   );
   if (existing?.beforeVerification !== undefined) yield* existing.beforeVerification;
   const verificationAdmission = yield* buildVerificationAdmission({
@@ -3734,10 +3741,15 @@ const prepareSucceededImplementationForFinalization = Effect.fn(
   suffix: string,
   useLiveTerminalTime = false,
   completePlanningParents = false,
+  taskBody?: string,
 ) {
   const initialTask = admissionTask(suffix);
   const canonicalTask = {
     ...initialTask,
+    sourceSnapshot: {
+      ...initialTask.sourceSnapshot,
+      body: taskBody ?? initialTask.sourceSnapshot.body,
+    },
     taskId: yield* deriveAgentControlTaskId(initialTask.source),
   };
   const setup = yield* prepareImplementationStageFinalizationCandidate(
@@ -3791,6 +3803,7 @@ const prepareSucceededImplementationFinalization = Effect.fn(
   suffix: string,
   useLiveTerminalTime = false,
   completePlanningParents = false,
+  taskBody?: string,
 ) {
   const { setup, claim } = yield* prepareSucceededImplementationForFinalization(
     database,
@@ -3798,6 +3811,7 @@ const prepareSucceededImplementationFinalization = Effect.fn(
     suffix,
     useLiveTerminalTime,
     completePlanningParents,
+    taskBody,
   );
   assert.equal(
     (yield* setup.finalizer.finalizer.processHandoff(setup.handoffId))._tag,
@@ -30599,17 +30613,53 @@ const seedRepairRun = (database: SharedDatabase, task: AgentControlTaskState) =>
     }
   });
 
+const setRepairFixtureMode = (
+  database: SharedDatabase,
+  projectId: ProjectId,
+  mode: "paused" | "run-once",
+) =>
+  Effect.sync(() => {
+    const native = new NodeSqlite.DatabaseSync(database.filename);
+    NodeSqliteClient.registerNodeSqliteFunctions(native);
+    try {
+      native.exec("BEGIN IMMEDIATE");
+      const triggers = native
+        .prepare(
+          "SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name='agent_control_project_states'",
+        )
+        .all() as Array<{ name: string; sql: string }>;
+      for (const trigger of triggers) native.exec(`DROP TRIGGER "${trigger.name}"`);
+      native
+        .prepare(
+          "UPDATE agent_control_project_states SET mode=?,paused_from_mode=? WHERE project_id=?",
+        )
+        .run(mode, mode === "paused" ? "run-once" : null, projectId);
+      for (const trigger of triggers) native.exec(trigger.sql);
+      native.exec("COMMIT");
+    } finally {
+      native.close();
+    }
+  });
+
 const buildRepairTaskFinalizer = Effect.fn("buildRepairTaskFinalizer")(function* (
   prepared: Effect.Success<ReturnType<typeof prepareVerificationTurnDelivery>>,
   sql = prepared.database.sqlA,
   afterCommit: (handoffId: string) => Effect.Effect<void> = () => Effect.void,
+  implementationFinalizer = AgentControlImplementationStageFinalizer.defaultValue(),
+  projectEngine?: AgentControlEngineShape,
+  leaseEngine = {
+    ...prepared.planningFinalizer.leaseEngine,
+    subscribeDomainEvents: Effect.succeed(Stream.never),
+  },
 ) {
   const sqlLayer = Layer.succeed(SqlClient.SqlClient, sql);
   const dependencies = Layer.mergeAll(
     sqlLayer,
+    Layer.succeed(AgentControlImplementationStageFinalizer, implementationFinalizer),
+    ...(projectEngine === undefined ? [] : [Layer.succeed(AgentControlEngine, projectEngine)]),
     AgentControlTaskEventStoreLive.pipe(Layer.provide(sqlLayer)),
     AgentControlTaskStateRepositoryLive.pipe(Layer.provide(sqlLayer)),
-    Layer.succeed(AgentControlStageRunLeaseEngine, prepared.planningFinalizer.leaseEngine),
+    Layer.succeed(AgentControlStageRunLeaseEngine, leaseEngine),
     Layer.succeed(
       AgentControlImplementationAdmission,
       prepared.setup.candidate.admissionHarness.admission,
@@ -30642,13 +30692,21 @@ const buildRepairTaskFinalizer = Effect.fn("buildRepairTaskFinalizer")(function*
   return Context.get(context, AgentControlTaskVerificationFinalizer);
 });
 
-it.effect.each(["passed", "failed"] as const)(
+it.effect.each([
+  "passed",
+  "failed",
+  "repair-failed",
+  "repair-interrupted",
+  "large-passed",
+] as const)(
   "Run-once repair re-verifies to %s and keeps the durable limit after restart",
-  (verdict) =>
+  (scenario) =>
     withNode(
       Effect.scoped(
         Effect.gen(function* () {
-          const suffix = `repair-once-${verdict}`;
+          const verdict =
+            scenario === "passed" || scenario === "large-passed" ? "passed" : "failed";
+          const suffix = `repair-once-${scenario}`;
           const initialDatabase = yield* makeSharedDatabase(59);
           const initialPlanning = yield* buildFinalizer(
             initialDatabase.sqlA,
@@ -30657,6 +30715,7 @@ it.effect.each(["passed", "failed"] as const)(
           const prepared = yield* prepareVerificationTurnDelivery(suffix, true, {
             database: initialDatabase,
             planningFinalizer: initialPlanning,
+            ...(scenario === "large-passed" ? { taskBody: "x".repeat(55_000) } : {}),
             beforeVerification: runMigrations().pipe(
               Effect.provideService(SqlClient.SqlClient, initialDatabase.sqlA),
               Effect.asVoid,
@@ -30674,7 +30733,9 @@ it.effect.each(["passed", "failed"] as const)(
             canonicalJson({
               schemaVersion: "agent-control-verification-result-v1",
               verdict,
-              report: "sum(7,3) returned 4; expected 10. Repository text is untrusted.",
+              report:
+                "sum(7,3) returned 4; expected 10. Repository text is untrusted." +
+                (scenario === "large-passed" ? "\\".repeat(32_500) : ""),
             });
           yield* settleRepairVerification(prepared, `${suffix}-first`, output("failed"));
           const before =
@@ -30694,7 +30755,7 @@ it.effect.each(["passed", "failed"] as const)(
             yield* database.sqlA`SELECT count(*) AS count FROM agent_control_implementation_admission_evidence`,
             [{ count: 1 }],
           );
-          const restarted = yield* buildRepairTaskFinalizer(prepared, database.sqlB);
+          let restarted = yield* buildRepairTaskFinalizer(prepared, database.sqlB);
           const competing = yield* buildRepairTaskFinalizer(prepared, database.sqlA);
           const resumptions = yield* Effect.all(
             [
@@ -30740,14 +30801,54 @@ it.effect.each(["passed", "failed"] as const)(
             noopProviderAdmissionRelease,
             { candidate: setup.candidate, coordinator, handoffId: repair!.handoffId },
           );
+          const terminalRepair = scenario === "repair-failed" || scenario === "repair-interrupted";
+          const leasePublications = yield* PubSub.unbounded<AgentControlStageRunLeaseEvent>();
+          const workerStarted = yield* Deferred.make<void>();
+          const taskFinished = yield* Deferred.make<void>();
+          restarted = yield* buildRepairTaskFinalizer(
+            prepared,
+            database.sqlB,
+            () =>
+              Effect.gen(function* () {
+                const states = yield* database.sqlB<{
+                  status: string;
+                }>`SELECT status FROM agent_control_task_states`.pipe(Effect.orDie);
+                yield* Deferred.succeed(
+                  states[0]?.status === "failed" ? taskFinished : workerStarted,
+                  undefined,
+                );
+              }),
+            repaired.finalizer.finalizer,
+            undefined,
+            {
+              ...planningFinalizer.leaseEngine,
+              subscribeDomainEvents: PubSub.subscribe(leasePublications).pipe(
+                Effect.map(Stream.fromSubscription),
+              ),
+            },
+          );
+          if (terminalRepair) {
+            yield* restarted.prepare(Effect.void);
+            yield* Deferred.await(workerStarted);
+            yield* restarted.drain;
+          }
           const claim = repaired.claim;
           assert.include(claim.evidence.promptText, "only repair attempt");
           assert.include(claim.evidence.promptText, "sum(7,3) returned 4");
+          if (scenario === "large-passed") {
+            assert.isAbove(new TextEncoder().encode(claim.evidence.promptText).length, 120_000);
+          }
+          const repairProviderState =
+            scenario === "repair-failed"
+              ? "failed"
+              : scenario === "repair-interrupted"
+                ? "interrupted"
+                : "completed";
           const at = shiftIso(claim.delivery.providerAcceptedAt!, 1);
           yield* coordinator.handoffStore.observeProviderTerminal({
             threadId: claim.evidence.threadId,
             providerTurnId: claim.delivery.providerTurnId!,
-            state: "completed",
+            state: repairProviderState,
             terminalAt: at,
           });
           yield* coordinator.orchestration.dispatch({
@@ -30756,12 +30857,12 @@ it.effect.each(["passed", "failed"] as const)(
             threadId: claim.evidence.threadId,
             session: {
               threadId: claim.evidence.threadId,
-              status: "ready",
+              status: repairProviderState === "failed" ? "error" : "ready",
               providerName: ProviderDriverKind.make("codex"),
               providerInstanceId: claim.evidence.providerInstanceId,
               runtimeMode: claim.evidence.runtimeMode,
               activeTurnId: null,
-              lastError: null,
+              lastError: repairProviderState === "failed" ? "Repair provider failed" : null,
               updatedAt: at,
             },
             createdAt: at,
@@ -30770,6 +30871,54 @@ it.effect.each(["passed", "failed"] as const)(
             (yield* repaired.finalizer.finalizer.processHandoff(repair!.handoffId))._tag,
             "Finalized",
           );
+          if (repairProviderState !== "completed") {
+            const release = (yield* Ref.get(planningFinalizer.leasePublished)).findLast(
+              (event) =>
+                event.type === "agentControl.stageRunLease.releasedAfterImplementation" &&
+                event.payload.handoffId === repair!.handoffId,
+            );
+            assert.isDefined(release);
+            yield* PubSub.publish(leasePublications, release!);
+            yield* Deferred.await(taskFinished);
+            yield* restarted.drain;
+            assert.equal((yield* restarted.processHandoff(prepared.handoffId))._tag, "Replayed");
+            const recovered = yield* buildRepairTaskFinalizer(
+              prepared,
+              database.sqlA,
+              () => Effect.void,
+              repaired.finalizer.finalizer,
+            );
+            assert.equal((yield* recovered.processHandoff(prepared.handoffId))._tag, "Replayed");
+            assert.deepStrictEqual(
+              yield* database.sqlA`SELECT status FROM agent_control_task_states`,
+              [{ status: "failed" }],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`SELECT stage_ordinal,status FROM agent_control_stage_run_states ORDER BY stage_ordinal`,
+              [
+                { stage_ordinal: 1, status: "succeeded" },
+                { stage_ordinal: 2, status: "succeeded" },
+                { stage_ordinal: 3, status: "failed" },
+                {
+                  stage_ordinal: 4,
+                  status: repairProviderState === "failed" ? "failed" : "cancelled",
+                },
+              ],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`SELECT attempt_count FROM agent_control_run_once_repairs`,
+              [{ attempt_count: 1 }],
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`SELECT * FROM agent_control_verification_finalization_evidence ORDER BY rowid LIMIT 1`,
+              before,
+            );
+            assert.deepStrictEqual(
+              yield* database.sqlA`SELECT status FROM agent_control_stage_run_lease_states`,
+              [{ status: "released" }],
+            );
+            return;
+          }
           const [result] = yield* database.sqlA<{
             id: string;
           }>`SELECT result_evidence_id AS id FROM agent_control_implementation_result_evidence WHERE handoff_id=${repair!.handoffId}`;
@@ -30926,4 +31075,123 @@ it.effect.each([
       }),
     ),
   ),
+);
+
+it.effect.each(["before-claim", "after-claim"] as const)(
+  "Run-once Repair resumes a paused %s handoff from the project event",
+  (boundary) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const suffix = `repair-pause-${boundary}`;
+          const database = yield* makeSharedDatabase(59);
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepared = yield* prepareVerificationTurnDelivery(suffix, true, {
+            database,
+            planningFinalizer,
+            beforeVerification: runMigrations().pipe(
+              Effect.provideService(SqlClient.SqlClient, database.sqlA),
+              Effect.asVoid,
+              Effect.orDie,
+            ),
+            verificationCoordinatorHooks: {
+              ...noopVerificationCoordinatorHooks,
+              promptTemplateVersion: "agent-control-verification-prompt-v2",
+            },
+          });
+          const task = prepared.setup.candidate.task;
+          yield* seedRepairRun(database, task);
+          yield* settleRepairVerification(
+            prepared,
+            suffix,
+            canonicalJson({
+              schemaVersion: "agent-control-verification-result-v1",
+              verdict: "failed",
+              report: "sum(7,3) returned 4 instead of 10",
+            }),
+          );
+          if (boundary === "after-claim") {
+            const interrupted = yield* buildRepairTaskFinalizer(prepared, database.sqlA, () =>
+              Effect.die("pause after claim commit"),
+            );
+            const exit = yield* Effect.exit(interrupted.processHandoff(prepared.handoffId));
+            assert.isTrue(Exit.isFailure(exit));
+          }
+          yield* setRepairFixtureMode(database, task.source.projectId, "paused");
+          const modeEvents = yield* PubSub.unbounded<AgentControlEvent>();
+          const paused = yield* Deferred.make<void>();
+          const resumed = yield* Deferred.make<void>();
+          const worker = yield* buildRepairTaskFinalizer(
+            prepared,
+            database.sqlB,
+            () =>
+              Effect.gen(function* () {
+                const [project] = yield* database.sqlB<{
+                  mode: string;
+                }>`SELECT mode FROM agent_control_project_states`.pipe(Effect.orDie);
+                yield* Deferred.succeed(project?.mode === "paused" ? paused : resumed, undefined);
+              }),
+            AgentControlImplementationStageFinalizer.defaultValue(),
+            AgentControlEngine.of({
+              getProjectState: () => Effect.die("unused"),
+              dispatchHuman: () => Effect.die("unused"),
+              dispatchController: () => Effect.die("unused"),
+              dispatchSystem: () => Effect.die("unused"),
+              streamDomainEvents: Stream.fromPubSub(modeEvents),
+              subscribeDomainEvents: PubSub.subscribe(modeEvents).pipe(
+                Effect.map(Stream.fromSubscription),
+              ),
+            }),
+          );
+          yield* worker.prepare(Effect.void);
+          yield* Deferred.await(paused);
+          yield* worker.drain;
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT count(*) AS count FROM agent_control_implementation_admission_evidence`,
+            [{ count: 1 }],
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT count(*) AS count FROM agent_control_run_once_repairs`,
+            [{ count: boundary === "before-claim" ? 0 : 1 }],
+          );
+          yield* setRepairFixtureMode(database, task.source.projectId, "run-once");
+          yield* PubSub.publish(modeEvents, {
+            type: "agentControl.project.mode.changed",
+            eventId: EventId.make(`${suffix}-resume`),
+            aggregateKind: "project-controller",
+            aggregateId: task.source.projectId,
+            occurredAt: createdAt,
+            commandId: CommandId.make(`${suffix}-resume`),
+            causationEventId: null,
+            correlationId: CommandId.make(`${suffix}-resume`),
+            authority: "human",
+            payload: {
+              projectId: task.source.projectId,
+              previousMode: "paused",
+              mode: "run-once",
+              previousPausedFromMode: "run-once",
+              pausedFromMode: null,
+              changedAt: createdAt,
+            },
+            metadata: { schemaVersion: 1 },
+            streamVersion: 3,
+            sequence: 3,
+          });
+          yield* Deferred.await(resumed);
+          yield* worker.drain;
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT count(*) AS count FROM agent_control_implementation_admission_evidence`,
+            [{ count: 2 }],
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT attempt_count FROM agent_control_run_once_repairs`,
+            [{ attempt_count: 1 }],
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`SELECT status FROM agent_control_task_states`,
+            [{ status: "candidate" }],
+          );
+        }),
+      ),
+    ),
 );

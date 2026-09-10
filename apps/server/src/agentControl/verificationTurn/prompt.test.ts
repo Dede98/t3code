@@ -12,6 +12,7 @@ import {
 } from "./identity.ts";
 import {
   AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES,
+  AGENT_CONTROL_REPAIR_VERIFICATION_PROMPT_MAX_BYTES,
   AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION,
   buildAgentControlVerificationPrompt,
 } from "./prompt.ts";
@@ -156,4 +157,58 @@ it("rejects prompts beyond the immutable byte limit", () => {
       taskBody: "x".repeat(AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES + 1),
     }),
   );
+});
+
+it("reserves the larger evidence budget only for the verification after Repair", () => {
+  const largeInput = {
+    ...input,
+    taskBody: "x".repeat(AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES),
+  };
+  assert.throws(() => buildAgentControlVerificationPrompt(largeInput));
+  const repairIdentityJson = canonicalJson({
+    roleId: "verifier",
+    stageKind: "verification",
+    stageOrdinal: 5,
+  });
+  const afterRepair = {
+    ...largeInput,
+    verificationIdentityJson: repairIdentityJson,
+    verificationIdentityDigest: sha256Utf8(repairIdentityJson),
+  };
+  const rendered = buildAgentControlVerificationPrompt(afterRepair);
+  const atLimit = {
+    ...afterRepair,
+    taskBody:
+      afterRepair.taskBody +
+      "x".repeat(
+        AGENT_CONTROL_REPAIR_VERIFICATION_PROMPT_MAX_BYTES - Buffer.byteLength(rendered.promptText),
+      ),
+  };
+  assert.equal(
+    Buffer.byteLength(buildAgentControlVerificationPrompt(atLimit).promptText),
+    AGENT_CONTROL_REPAIR_VERIFICATION_PROMPT_MAX_BYTES,
+  );
+  assert.throws(() =>
+    buildAgentControlVerificationPrompt({ ...atLimit, taskBody: atLimit.taskBody + "x" }),
+  );
+  assert.throws(() =>
+    buildAgentControlVerificationPrompt({
+      ...afterRepair,
+      verificationIdentityDigest: input.verificationIdentityDigest,
+    }),
+  );
+  for (const identity of [
+    { roleId: "verifier", stageKind: "verification", stageOrdinal: 3 },
+    { roleId: "verifier", stageKind: "verification", stageOrdinal: 7 },
+    { roleId: "implementer", stageKind: "implementation", stageOrdinal: 5 },
+  ]) {
+    const identityJson = canonicalJson(identity);
+    assert.throws(() =>
+      buildAgentControlVerificationPrompt({
+        ...largeInput,
+        verificationIdentityJson: identityJson,
+        verificationIdentityDigest: sha256Utf8(identityJson),
+      }),
+    );
+  }
 });

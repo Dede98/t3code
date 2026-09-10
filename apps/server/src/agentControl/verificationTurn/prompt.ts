@@ -16,6 +16,10 @@ export const AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V1 =
 export const AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION =
   "agent-control-verification-prompt-v2";
 export const AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES = 1_048_576;
+// The Repair report appears in four handoffs (prompt plus escaped event
+// template) and three orchestration histories: up to 30 times its 64KiB
+// serialized budget. Allow that evidence, framing and added stage history.
+export const AGENT_CONTROL_REPAIR_VERIFICATION_PROMPT_MAX_BYTES = 4 * 1_048_576;
 
 export const AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT = sha256Utf8(
   canonicalJson({
@@ -222,10 +226,21 @@ export const buildAgentControlVerificationPrompt = (
       ? renderV1(renderInput)
       : renderV2(renderInput);
   const bytes = Buffer.byteLength(promptText, "utf8");
-  if (bytes < 1 || bytes > AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES) {
-    throw new Error(
-      `Verification prompt cannot be represented within ${AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES} bytes.`,
-    );
+  const afterRepair =
+    verificationIdentity !== null &&
+    typeof verificationIdentity === "object" &&
+    !Array.isArray(verificationIdentity) &&
+    "stageKind" in verificationIdentity &&
+    "roleId" in verificationIdentity &&
+    "stageOrdinal" in verificationIdentity &&
+    verificationIdentity.stageKind === "verification" &&
+    verificationIdentity.roleId === "verifier" &&
+    verificationIdentity.stageOrdinal === 5;
+  const maxBytes = afterRepair
+    ? AGENT_CONTROL_REPAIR_VERIFICATION_PROMPT_MAX_BYTES
+    : AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES;
+  if (bytes < 1 || bytes > maxBytes) {
+    throw new Error(`Verification prompt cannot be represented within ${maxBytes} bytes.`);
   }
   return { promptText, promptDigest: sha256Utf8(promptText) };
 };
