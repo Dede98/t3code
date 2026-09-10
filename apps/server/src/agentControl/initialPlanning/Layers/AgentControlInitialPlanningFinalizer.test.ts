@@ -21699,7 +21699,16 @@ it.effect(
             claim,
             acceptance,
           );
-          assert.deepStrictEqual(waiting, { _tag: "Waiting" });
+          assert.deepStrictEqual(waiting, { _tag: "Waiting", terminalObserved: true });
+          const restarted = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: prepared.database.scopeB,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            listSessions: () => Effect.succeed([]),
+          });
+          yield* restarted.processHandoff(prepared.handoffId);
+          assert.equal(yield* Ref.get(executorCalls), 1);
           const unchanged = Option.getOrThrow(
             yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
           );

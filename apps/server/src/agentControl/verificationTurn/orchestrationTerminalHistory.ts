@@ -797,7 +797,9 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     FROM projection_thread_sessions
     WHERE thread_id IN (${claim.evidence.threadId}, ${threadIdBytes})
   `.pipe(Effect.mapError((cause) => error("read-session-projection", "persistence", cause)));
-  if (projectionRows.length === 0) return { _tag: "Waiting" } as const;
+  if (projectionRows.length === 0) {
+    return { _tag: "Waiting", terminalObserved: terminal !== undefined } as const;
+  }
   if (projectionRows.length !== 1) {
     return yield* error("session-projection-count", "corrupt-history");
   }
@@ -870,7 +872,8 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     return yield* error("session-projection-divergent", "corrupt-history");
   }
   if (latestMatchingSessionPosition !== allSessions.length - 1) {
-    return { _tag: "Waiting" } as const;
+    // Projection catch-up is pending; the validated native terminal remains authoritative.
+    return { _tag: "Waiting", terminalObserved: terminal !== undefined } as const;
   }
 
   if (terminal === undefined) {
