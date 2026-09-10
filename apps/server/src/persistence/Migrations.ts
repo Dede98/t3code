@@ -121,6 +121,9 @@ import AgentMigration0075 from "./Migrations/075_AgentControlVerificationCheckEr
 
 import AgentMigration0076 from "./Migrations/076_AgentControlVerificationChecks.ts";
 import AgentMigration0077 from "./Migrations/077_AgentControlVerificationCheckInvalidations.ts";
+import AgentMigration0078 from "./Migrations/078_AgentControlLegacyVerificationRecovery.ts";
+
+import AgentMigration0079 from "./Migrations/079_AgentControlLegacyVerificationTasks.ts";
 
 const agentMigrationEntries = [
   [34, "OrchestrationCommandAuthority", AgentMigration0034],
@@ -167,6 +170,8 @@ const agentMigrationEntries = [
   [75, "AgentControlVerificationCheckErrors", AgentMigration0075],
   [76, "AgentControlVerificationChecks", AgentMigration0076],
   [77, "AgentControlVerificationCheckInvalidations", AgentMigration0077],
+  [78, "AgentControlLegacyVerificationRecovery", AgentMigration0078],
+  [79, "AgentControlLegacyVerificationTasks", AgentMigration0079],
 ] as const;
 
 const migrationEntries = [

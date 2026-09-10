@@ -90,6 +90,7 @@ import {
 import { AgentControlVerificationStageFinalizerLive } from "./AgentControlVerificationStageFinalizer.ts";
 import { AgentControlVerificationHandoffStoreLive } from "./AgentControlVerificationHandoffStore.ts";
 import checkMigration from "../../../persistence/Migrations/076_AgentControlVerificationChecks.ts";
+import { captureLegacyVerificationEvaluations } from "../../../persistence/Migrations/078_AgentControlLegacyVerificationRecovery.ts";
 import { sealVerificationCheckAssessment, snapshotVerificationCode } from "../checkEvidence.ts";
 
 type Outcome = "passed" | "failed-verdict" | "invalid-output" | "delivery-failed" | "interrupted";
@@ -396,6 +397,7 @@ const seedAuthority = Effect.fn("seedVerificationFinalizerAuthority")(function* 
   claim: AgentControlVerificationClaim,
   outcome: Outcome,
   checkState: "passed" | "missing" | "failed" | "unavailable" = "passed",
+  legacy = false,
 ) {
   const database = new NodeSqlite.DatabaseSync(filename);
   try {
@@ -428,20 +430,25 @@ const seedAuthority = Effect.fn("seedVerificationFinalizerAuthority")(function* 
       ]),
     };
     const manifestDigest = sha256Utf8(canonicalJson(manifest));
-    yield* checkSql`INSERT INTO agent_control_verification_check_manifests VALUES
+    if (!legacy) {
+      yield* checkSql`INSERT INTO agent_control_verification_check_manifests VALUES
       (${manifest.providerDeliveryId}, ${manifest.handoffId}, ${manifest.fenceToken}, ${manifest.worktreePath}, ${manifest.codeDigest}, ${manifest.checksJson}, ${manifestDigest}, ${timestamp})`;
-    yield* checkSql`INSERT INTO agent_control_verification_check_starts VALUES
+      yield* checkSql`INSERT INTO agent_control_verification_check_starts VALUES
       (${manifest.providerDeliveryId}, 'focused-test', ${claim.delivery.providerTurnId}, ${manifestDigest}, ${startedAt})`;
-    const checkResultJson = canonicalJson({
-      exitCode: checkState === "passed" ? 0 : 1,
-      stdout: checkState === "failed" ? "  code: 'ERR_ASSERTION'\n# fail 1\n" : "",
-      stderr: checkState === "unavailable" ? "Cannot find module test-runner" : "",
-    });
-    if (checkState !== "missing") {
-      yield* checkSql`INSERT INTO agent_control_verification_check_results VALUES
+      const checkResultJson = canonicalJson({
+        exitCode: checkState === "passed" ? 0 : 1,
+        stdout:
+          checkState === "failed"
+            ? "  code: 'ERR_ASSERTION'\n# fail 1\n"
+            : "# pass 1\n# fail 0\n# cancelled 0\n",
+        stderr: checkState === "unavailable" ? "Cannot find module test-runner" : "",
+      });
+      if (checkState !== "missing") {
+        yield* checkSql`INSERT INTO agent_control_verification_check_results VALUES
         (${manifest.providerDeliveryId}, 'focused-test', ${claim.delivery.providerTurnId}, ${manifestDigest}, ${manifest.codeDigest}, ${checkState}, ${checkResultJson}, ${sha256Utf8(checkResultJson)}, ${terminalAt})`;
+      }
     }
-    const checks = yield* sealVerificationCheckAssessment(checkSql, claim);
+    const checks = legacy ? null : yield* sealVerificationCheckAssessment(checkSql, claim);
     const preparedEventId = `prepared-${claim.evidence.handoffId}`;
     const startCommandId = deriveVerificationStageStartCommandId(
       claim.evidence.providerDeliveryId,
@@ -796,7 +803,7 @@ const seedAuthority = Effect.fn("seedVerificationFinalizerAuthority")(function* 
           streamVersion: 2,
         },
         threadId: claim.evidence.threadId,
-        verificationChecksDigest: checks.digest,
+        ...(checks === null ? {} : { verificationChecksDigest: checks.digest }),
         verdict,
         worktree: {
           branch: claim.evidence.branch,
@@ -869,6 +876,7 @@ const seedAuthority = Effect.fn("seedVerificationFinalizerAuthority")(function* 
           evaluationFingerprint,
         );
     }
+    yield* captureLegacyVerificationEvaluations.pipe(Effect.provide(checkContext));
   } finally {
     database.close();
   }
@@ -1053,6 +1061,62 @@ it.live.each(["missing", "failed", "unavailable"] as const)(
         assert.deepStrictEqual(yield* counts(runtime.sql), [
           { events: 0, evidence: 0, receipts: 0, markers: 0 },
         ]);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live.each(["passed", "failed-verdict", "invalid-output"] as const)(
+  "recovers a pre-checks %s evaluation as failed without repair and replays after restart",
+  (outcome) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "verification-legacy-" });
+        const filename = `${directory}/state.sqlite`;
+        const claim = yield* makeClaim(`legacy-${outcome}`, outcome);
+        yield* seedAuthority(filename, claim, outcome, "missing", true);
+        const scope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        const releases = yield* Ref.make(0);
+        const runtime = yield* buildRuntime(filename, claim, scope, defaultHooks, {
+          ...noopProviderAdmissionRelease,
+          releaseInTransaction: () =>
+            Ref.update(releases, (count) => count + 1).pipe(Effect.as(null)),
+        });
+        const original =
+          yield* runtime.sql`SELECT * FROM agent_control_verification_evaluation_evidence`;
+        assert.equal(
+          (yield* runtime.finalizer.processHandoff(claim.evidence.handoffId))._tag,
+          "Finalized",
+        );
+        assert.deepStrictEqual(
+          yield* runtime.sql`SELECT outcome, invalid_output_code AS code FROM agent_control_verification_finalization_evidence`,
+          [{ outcome: "failed", code: "verification-checks-missing" }],
+        );
+        assert.deepStrictEqual(
+          yield* runtime.sql`SELECT status FROM agent_control_stage_run_lease_states`,
+          [{ status: "released" }],
+        );
+        assert.equal(yield* Ref.get(releases), 1);
+        yield* Scope.close(scope, Exit.void);
+        const restartScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(restartScope, Exit.void));
+        const restart = yield* buildRuntime(filename, claim, restartScope);
+        assert.equal(
+          (yield* restart.finalizer.processHandoff(claim.evidence.handoffId))._tag,
+          "Replayed",
+        );
+        assert.deepStrictEqual(
+          yield* restart.sql`SELECT * FROM agent_control_verification_evaluation_evidence`,
+          original,
+        );
+        assert.deepStrictEqual(yield* counts(restart.sql), [
+          { events: 2, evidence: 1, receipts: 1, markers: 1 },
+        ]);
+        assert.deepStrictEqual(
+          yield* restart.sql`SELECT count(*) AS count FROM agent_control_verification_check_results`,
+          [{ count: 0 }],
+        );
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
 );

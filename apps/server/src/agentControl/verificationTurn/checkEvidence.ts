@@ -28,51 +28,69 @@ export class VerificationCheckError extends Schema.TaggedError<VerificationCheck
   { cause: Schema.Unknown },
 ) {}
 const failure = (cause: unknown) => new VerificationCheckError({ cause });
+const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string> => {
+  if (depth > 32) throw failure("Verification submodule nesting exceeds the snapshot limit.");
+  const git = async (args: string[]) =>
+    (
+      await exec("git", ["--no-optional-locks", ...args], {
+        cwd,
+        encoding: "buffer",
+        maxBuffer: 32 * 1024 * 1024,
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+      })
+    ).stdout;
+  const hash = NodeCrypto.createHash("sha256");
+  const add = (value: Buffer | string) => {
+    hash.update(String(Buffer.byteLength(value)));
+    hash.update(":");
+    hash.update(value);
+  };
+  add(await git(["rev-parse", "HEAD"]));
+  add(
+    await git([
+      "diff",
+      "HEAD",
+      "--binary",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=none",
+    ]),
+  );
+  const others = (await git(["ls-files", "--others", "--exclude-standard", "-z"]))
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean)
+    .sort();
+  for (const name of others) {
+    const path = NodePath.join(cwd, name);
+    const stat = await NodeFSP.lstat(path);
+    add(name);
+    add(String(stat.mode));
+    add(stat.isSymbolicLink() ? await NodeFSP.readlink(path) : await NodeFSP.readFile(path));
+  }
+  const gitlinks = (await git(["ls-files", "--stage", "-z"]))
+    .toString("utf8")
+    .split("\0")
+    .filter((entry) => entry.startsWith("160000 "));
+  for (const entry of gitlinks) {
+    const name = entry.slice(entry.indexOf("\t") + 1);
+    const path = NodePath.join(cwd, name);
+    add(name);
+    // The superproject records only a commit plus a dirty flag. Bind the
+    // actual submodule files so two different dirty trees cannot share proof.
+    const initialized = await NodeFSP.lstat(NodePath.join(path, ".git")).then(
+      () => true,
+      (cause: NodeJS.ErrnoException) => {
+        if (cause.code === "ENOENT") return false;
+        throw cause;
+      },
+    );
+    add(initialized ? await readVerificationSnapshot(path, depth + 1) : "uninitialized");
+  }
+  return hash.digest("hex");
+};
 export const snapshotVerificationCode = (cwd: string) =>
-  Effect.tryPromise({
-    try: async () => {
-      const git = async (args: string[]) =>
-        (
-          await exec("git", ["--no-optional-locks", ...args], {
-            cwd,
-            encoding: "buffer",
-            maxBuffer: 32 * 1024 * 1024,
-            env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-          })
-        ).stdout;
-      const hash = NodeCrypto.createHash("sha256");
-      const add = (value: Buffer | string) => {
-        hash.update(String(Buffer.byteLength(value)));
-        hash.update(":");
-        hash.update(value);
-      };
-      add(await git(["rev-parse", "HEAD"]));
-      add(
-        await git([
-          "diff",
-          "HEAD",
-          "--binary",
-          "--no-ext-diff",
-          "--no-textconv",
-          "--ignore-submodules=none",
-        ]),
-      );
-      const others = (await git(["ls-files", "--others", "--exclude-standard", "-z"]))
-        .toString("utf8")
-        .split("\0")
-        .filter(Boolean)
-        .sort();
-      for (const name of others) {
-        const path = NodePath.join(cwd, name);
-        const stat = await NodeFSP.lstat(path);
-        add(name);
-        add(String(stat.mode));
-        add(stat.isSymbolicLink() ? await NodeFSP.readlink(path) : await NodeFSP.readFile(path));
-      }
-      return hash.digest("hex");
-    },
-    catch: failure,
-  });
+  Effect.tryPromise({ try: () => readVerificationSnapshot(cwd), catch: failure });
 
 export interface VerificationCheckClaim {
   readonly evidence: {
@@ -294,7 +312,8 @@ export const assessVerificationChecks = Effect.fn("assessVerificationChecks")(fu
   for (const check of required) {
     const result = results.find((item) => item.checkId === check.id);
     if (!result) {
-      code ??= "verification-checks-missing";
+      // Incomplete evidence must prevent repair even when another check proved a code failure.
+      if (code !== "verification-checks-unavailable") code = "verification-checks-missing";
       continue;
     }
     if (

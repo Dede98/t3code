@@ -152,13 +152,48 @@ const VitestReport = Schema.Struct({
   ),
 });
 const decodeVitestReport = Schema.decodeUnknownOption(Schema.fromJsonString(VitestReport));
+const decodeSuccessfulVitestReport = Schema.decodeUnknownOption(
+  Schema.fromJsonString(
+    Schema.Struct({
+      success: Schema.Literal(true),
+      numPassedTests: Schema.Int.check(Schema.isGreaterThan(0)),
+      numFailedTests: Schema.Literal(0),
+      numFailedTestSuites: Schema.Literal(0),
+      testResults: Schema.Array(
+        Schema.Struct({
+          status: Schema.Literal("passed"),
+          assertionResults: Schema.Array(Schema.Struct({ status: Schema.String })),
+        }),
+      ),
+    }),
+  ),
+);
 
 /** A nonzero exit alone cannot distinguish a broken runner from a failed assertion. */
 export const classifyVerificationCheckResult = (
   check: Pick<AgentControlVerificationCheck, "resultFormat">,
   result: { readonly exitCode: number; readonly stdout: string; readonly stderr: string },
 ): "passed" | "failed" | "unavailable" => {
-  if (result.exitCode === 0) return "passed";
+  if (result.exitCode === 0) {
+    if (check.resultFormat === "exit-code") return "passed";
+    if (check.resultFormat === "node-test") {
+      return /^# pass [1-9][0-9]*$/m.test(result.stdout) &&
+        /^# fail 0$/m.test(result.stdout) &&
+        /^# cancelled 0$/m.test(result.stdout)
+        ? "passed"
+        : "unavailable";
+    }
+    const report = decodeSuccessfulVitestReport(result.stdout.slice(result.stdout.indexOf("{")));
+    if (report._tag === "None") return "unavailable";
+    const assertions = report.value.testResults.flatMap((suite) => suite.assertionResults);
+    return assertions.filter((assertion) => assertion.status === "passed").length ===
+      report.value.numPassedTests &&
+      assertions.every((assertion) =>
+        ["passed", "pending", "skipped", "todo"].includes(assertion.status),
+      )
+      ? "passed"
+      : "unavailable";
+  }
   if (result.exitCode !== 1) return "unavailable";
   if (
     /ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|ERR_DLOPEN_FAILED|Cannot find (?:module|package)|No test files found|Failed to load (?:config|url)|T3_CHECK_UNAVAILABLE/.test(

@@ -47,6 +47,10 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import { runMigrations } from "../../../persistence/Migrations.ts";
+import checkErrorsMigration from "../../../persistence/Migrations/075_AgentControlVerificationCheckErrors.ts";
+import checkInvalidationMigration from "../../../persistence/Migrations/077_AgentControlVerificationCheckInvalidations.ts";
+import legacyEvaluationMigration from "../../../persistence/Migrations/078_AgentControlLegacyVerificationRecovery.ts";
+import legacyTaskMigration from "../../../persistence/Migrations/079_AgentControlLegacyVerificationTasks.ts";
 import { AgentControlProjectionStateRepositoryLive } from "../../../persistence/Layers/AgentControlProjectStates.ts";
 import { AgentControlProjectionStateRepository } from "../../../persistence/Services/AgentControlProjectStates.ts";
 import { NodeSqliteTransactionHooks } from "../../../persistence/Services/NodeSqliteTransactionHooks.ts";
@@ -790,6 +794,48 @@ const seedCommittedVerificationFinalization = (
   }
 };
 
+const seedLegacyEvaluation = (filename: string, suffix: string, verdict: "passed" | "failed") => {
+  const database = new NodeSqlite.DatabaseSync(filename);
+  try {
+    database.exec("PRAGMA foreign_keys = OFF");
+    const authorityJson = canonicalJson({ legacy: suffix, verdict });
+    const columns = database
+      .prepare("PRAGMA table_info(agent_control_verification_evaluation_evidence)")
+      .all() as unknown as Array<{ name: string; type: string }>;
+    const values: Record<string, string | number | null> = Object.fromEntries(
+      columns.map((column) => [
+        column.name,
+        column.type === "INTEGER" ? 3 : `${column.name}-${suffix}`,
+      ]),
+    );
+    Object.assign(values, {
+      evaluation_id: `evaluation-${suffix}`,
+      evidence_id: `evaluation-evidence-${suffix}`,
+      revision: 1,
+      authority_json: authorityJson,
+      authority_digest: sha256Utf8(authorityJson),
+      provider_delivery_id: `delivery-${suffix}`,
+      handoff_id: `handoff-${suffix}`,
+      disposition: "evaluated",
+      verdict,
+      error_code: null,
+      source_disposition: "captured",
+      prompt_template_version: "agent-control-verification-prompt-v2",
+      result_schema_version: "agent-control-verification-result-v1",
+      terminal_state: "completed",
+    });
+    withInsertGuardsDisabled(database, "agent_control_verification_evaluation_evidence", () => {
+      database
+        .prepare(
+          `INSERT INTO agent_control_verification_evaluation_evidence (${columns.map((column) => column.name).join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
+        )
+        .run(...columns.map((column) => values[column.name]!));
+    });
+  } finally {
+    database.close();
+  }
+};
+
 const buildRuntime = (
   filename: string,
   scope: Scope.Scope,
@@ -802,6 +848,12 @@ const buildRuntime = (
   Effect.gen(function* () {
     const sqlContext = yield* Layer.buildWithScope(NodeSqliteClient.layer({ filename }), scope);
     const sql = Context.get(sqlContext, SqlClient.SqlClient);
+    yield* sql`CREATE TABLE IF NOT EXISTS agent_control_verification_legacy_evaluations (
+      provider_delivery_id TEXT PRIMARY KEY, evaluation_id TEXT NOT NULL, authority_digest TEXT NOT NULL
+    )`;
+    yield* sql`CREATE TABLE IF NOT EXISTS agent_control_verification_legacy_tasks (
+      handoff_id TEXT PRIMARY KEY, task_finalization_evidence_id TEXT NOT NULL, finalization_fingerprint TEXT NOT NULL
+    )`;
     yield* sql`PRAGMA foreign_keys = ON`;
     assert.deepStrictEqual(yield* sql`PRAGMA journal_mode = WAL`, [{ journal_mode: "wal" }]);
     const sqlLayer = Layer.succeed(SqlClient.SqlClient, sql);
@@ -1313,6 +1365,79 @@ it.live(
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   30_000,
+);
+
+it.live.each(["passed", "failed-verdict"] as const)(
+  "legacy completed %s stage becomes failed without repair and replays after restart",
+  (outcome) =>
+    withDatabase("task-legacy-pending-", (filename, runtime) =>
+      Effect.gen(function* () {
+        yield* runtime.sql.withTransaction(
+          checkErrorsMigration.pipe(Effect.provideService(SqlClient.SqlClient, runtime.sql)),
+        );
+        const suffix = `legacy-${outcome}`;
+        yield* seedTask(runtime, suffix);
+        const source = seedCommittedVerificationFinalization(filename, suffix, outcome);
+        seedLegacyEvaluation(filename, suffix, outcome === "passed" ? "passed" : "failed");
+        yield* runtime.sql`DELETE FROM agent_control_verification_check_assessments`;
+        yield* runtime.sql`DELETE FROM agent_control_verification_check_manifests`;
+        yield* runtime.sql`DROP TABLE agent_control_verification_legacy_evaluations`;
+        yield* runtime.sql`DROP TABLE agent_control_verification_legacy_tasks`;
+        yield* runtime.sql.withTransaction(
+          checkInvalidationMigration.pipe(Effect.provideService(SqlClient.SqlClient, runtime.sql)),
+        );
+        yield* runtime.sql.withTransaction(
+          legacyEvaluationMigration.pipe(Effect.provideService(SqlClient.SqlClient, runtime.sql)),
+        );
+        yield* runtime.sql.withTransaction(
+          legacyTaskMigration.pipe(Effect.provideService(SqlClient.SqlClient, runtime.sql)),
+        );
+        assert.equal((yield* runtime.finalizer.processHandoff(source.handoffId))._tag, "Finalized");
+        assert.equal(Option.getOrThrow(yield* runtime.states.get(source.taskId)).status, "failed");
+        assert.deepStrictEqual(
+          yield* runtime.sql`SELECT verification_outcome AS outcome, invalid_output_code AS code FROM agent_control_task_verification_finalization_evidence`,
+          [{ outcome: "failed", code: "verification-checks-missing" }],
+        );
+        const scope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        const restart = yield* buildRuntime(filename, scope);
+        assert.equal((yield* restart.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
+        assert.equal(yield* Ref.get(restart.publications), 0);
+      }),
+    ),
+);
+
+it.live("replays a fully finalized legacy successful task unchanged after upgrade", () =>
+  withDatabase("task-legacy-complete-", (filename, runtime) =>
+    Effect.gen(function* () {
+      const suffix = "legacy-complete";
+      yield* seedTask(runtime, suffix);
+      const source = seedCommittedVerificationFinalization(filename, suffix, "passed");
+      seedLegacyEvaluation(filename, suffix, "passed");
+      assert.equal((yield* runtime.finalizer.processHandoff(source.handoffId))._tag, "Finalized");
+      yield* runtime.sql`DELETE FROM agent_control_verification_check_assessments`;
+      yield* runtime.sql`DELETE FROM agent_control_verification_check_manifests`;
+      yield* runtime.sql`DROP TABLE agent_control_verification_legacy_evaluations`;
+      yield* runtime.sql`DROP TABLE agent_control_verification_legacy_tasks`;
+      yield* runtime.sql.withTransaction(
+        checkInvalidationMigration.pipe(Effect.provideService(SqlClient.SqlClient, runtime.sql)),
+      );
+      yield* runtime.sql.withTransaction(
+        legacyEvaluationMigration.pipe(Effect.provideService(SqlClient.SqlClient, runtime.sql)),
+      );
+      yield* runtime.sql.withTransaction(
+        legacyTaskMigration.pipe(Effect.provideService(SqlClient.SqlClient, runtime.sql)),
+      );
+      const before = yield* finalizationCounts(runtime.sql);
+      const scope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+      const restart = yield* buildRuntime(filename, scope);
+      assert.equal((yield* restart.finalizer.processHandoff(source.handoffId))._tag, "Replayed");
+      assert.equal(Option.getOrThrow(yield* restart.states.get(source.taskId)).status, "succeeded");
+      assert.deepStrictEqual(yield* finalizationCounts(restart.sql), before);
+      assert.equal(yield* Ref.get(restart.publications), 0);
+    }),
+  ),
 );
 
 it.live.each(["missing", "earlier-turn", "unavailable"] as const)(

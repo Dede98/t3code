@@ -1231,12 +1231,15 @@ const make = Effect.gen(function* () {
                 AND fence_token=${input.permit.stageFenceToken} AND typeof(fence_token)='integer'
                 AND provider_instance_id=${String(input.permit.providerInstanceId)}
                 AND model_selection_fingerprint=${input.permit.modelSelectionFingerprint}
-                AND (( ${input.boundary === "verification-check" ? 1 : 0} AND state='provider-started') OR ( ${input.boundary !== "verification-check" ? 1 : 0} AND (state='claimed' OR (${input.boundary === "turn-start" ? 1 : 0} AND state='delivery-attempted'))))
+                AND (( ${input.boundary === "verification-check" ? 1 : 0} AND state IN ('delivery-attempted','provider-started')) OR ( ${input.boundary !== "verification-check" ? 1 : 0} AND (state='claimed' OR (${input.boundary === "turn-start" ? 1 : 0} AND state='delivery-attempted'))))
               AND typeof(state)='text'
             `;
     if (deliveryRows[0]?.count !== 1) {
       return yield* fail("pre-effect-delivery", "authority-divergent", input.permit.admissionId);
     }
+    // The runtime authenticates the native turn before dispatching its tools.
+    // Its start observation may still be queued behind delivery, so checks can
+    // precede provider-started persistence; claimed deliveries remain forbidden.
     if (input.boundary === "verification-check") return;
     // The first turn guard only authorizes adapter preparation. The immutable
     // turn-entry marker belongs after the consumer commits delivery-attempted.

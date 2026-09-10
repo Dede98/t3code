@@ -196,6 +196,64 @@ describe("verification check outcomes", () => {
     }),
   );
 
+  it.effect("does not accept a successful runner that skipped every selected test", () =>
+    Effect.gen(function* () {
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(
+          NodePath.join(worktree, "skipped.test.cjs"),
+          "require('node:test').skip('selected test', () => {});",
+        ),
+      );
+      const output = yield* Effect.promise(() =>
+        exec(process.execPath, ["--test", "--test-reporter=tap", "skipped.test.cjs"], {
+          cwd: worktree,
+        }),
+      );
+      assert.equal(
+        classifyVerificationCheckResult(check, { exitCode: 0, ...output }),
+        "unavailable",
+      );
+    }),
+  );
+
+  it("requires successful executed assertions in a successful Vitest process", () => {
+    const passed = {
+      success: true,
+      numPassedTests: 1,
+      numFailedTests: 0,
+      numFailedTestSuites: 0,
+      testResults: [{ status: "passed", assertionResults: [{ status: "passed" }] }],
+    };
+    const classify = (report: unknown) =>
+      classifyVerificationCheckResult(
+        { resultFormat: "vitest-json" },
+        { exitCode: 0, stdout: JSON.stringify(report), stderr: "" },
+      );
+    assert.equal(classify(passed), "passed");
+    assert.equal(classify({ ...passed, numPassedTests: 0, testResults: [] }), "unavailable");
+    assert.equal(classify({ ...passed, success: false }), "unavailable");
+    assert.equal(classify({ ...passed, numFailedTests: 1 }), "unavailable");
+    assert.equal(
+      classify({ ...passed, testResults: [{ status: "passed", assertionResults: [] }] }),
+      "unavailable",
+    );
+    assert.equal(
+      classify({
+        ...passed,
+        testResults: [{ status: "passed", assertionResults: [{ status: "failed" }] }],
+      }),
+      "unavailable",
+    );
+    assert.equal(classify("truncated reporter output"), "unavailable");
+    assert.equal(
+      classifyVerificationCheckResult(
+        { resultFormat: "exit-code" },
+        { exitCode: 0, stdout: "", stderr: "" },
+      ),
+      "passed",
+    );
+  });
+
   it("requires an assertion result for a failed Vitest check", () => {
     const classify = (report: unknown) =>
       classifyVerificationCheckResult(

@@ -421,6 +421,7 @@ const decodeTaskVerificationFinalizationReplayRow = Schema.decodeUnknownEffect(
 interface VerificationSourceAuthority {
   readonly row: typeof SourceRow.Type;
   readonly document: AgentControlVerificationStageFinalizationDocumentStorage;
+  readonly legacyMissingChecks?: boolean;
 }
 
 interface BuiltFinalization {
@@ -859,6 +860,7 @@ const make = Effect.gen(function* () {
 
   const loadSource = Effect.fn("AgentControlTaskVerificationFinalizer.loadSource")(function* (
     handoffId: string,
+    replay = false,
   ): Effect.fn.Return<VerificationSourceAuthority, AgentControlTaskVerificationFinalizerError> {
     const rows = yield* sql<Record<string, unknown>>`
       SELECT evidence.handoff_id AS "handoffId",
@@ -1102,7 +1104,34 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error(handoffId, "compare-source-authority", "authority-conflict");
     }
-    if (document.outcome === "succeeded") {
+    const legacy = yield* sql`
+      SELECT legacy.evaluation_id
+      FROM main.agent_control_verification_legacy_evaluations legacy
+      JOIN main.agent_control_verification_evaluation_evidence evaluation
+        ON evaluation.evaluation_id = legacy.evaluation_id
+        AND evaluation.provider_delivery_id = legacy.provider_delivery_id
+        AND evaluation.authority_digest = legacy.authority_digest
+      WHERE legacy.provider_delivery_id = ${document.stagePayload.providerDeliveryId}
+        AND legacy.evaluation_id = ${row.evaluationId}
+    `.pipe(
+      Effect.mapError((cause) => error(handoffId, "load-legacy-evaluation", "persistence", cause)),
+    );
+    const historical = replay
+      ? yield* sql`
+      SELECT legacy.handoff_id FROM main.agent_control_verification_legacy_tasks legacy
+      JOIN main.agent_control_task_verification_finalization_evidence task
+        ON task.handoff_id = legacy.handoff_id
+        AND task.task_finalization_evidence_id = legacy.task_finalization_evidence_id
+        AND task.finalization_fingerprint = legacy.finalization_fingerprint
+      WHERE legacy.handoff_id = ${handoffId}
+    `.pipe(Effect.mapError((cause) => error(handoffId, "load-legacy-task", "persistence", cause)))
+      : [];
+    const legacyMissingChecks =
+      legacy.length === 1 &&
+      historical.length === 0 &&
+      row.deliveryTerminalState === "completed" &&
+      row.evaluationDisposition === "evaluated";
+    if (document.outcome === "succeeded" && !legacyMissingChecks && historical.length === 0) {
       const checks = yield* sql`
         SELECT assessment.digest
         FROM main.agent_control_verification_check_assessments assessment
@@ -1122,7 +1151,7 @@ const make = Effect.gen(function* () {
         return yield* error(handoffId, "load-verification-checks", "authority-conflict");
       }
     }
-    return { row, document };
+    return { row, document, legacyMissingChecks };
   });
 
   /**
@@ -1331,6 +1360,14 @@ const make = Effect.gen(function* () {
     ): Effect.fn.Return<BuiltFinalization, AgentControlTaskVerificationFinalizerError> {
       const row = source.row;
       const document = source.document;
+      const evaluation = source.legacyMissingChecks
+        ? {
+            ...document.evaluation,
+            evaluationDisposition: "invalid-output",
+            verificationVerdict: null,
+            invalidOutputCode: "verification-checks-missing",
+          }
+        : document.evaluation;
       if (
         previous.stage !== "intake" ||
         previous.status === "succeeded" ||
@@ -1406,12 +1443,14 @@ const make = Effect.gen(function* () {
         terminalRuntimeEventId: row.terminalRuntimeEventId,
         taskFinalizationEvidenceId: evidenceId,
         deliveryTerminalState: row.deliveryTerminalState,
-        verificationOutcome: row.verificationOutcome,
-        terminalCause: row.terminalCause,
+        verificationOutcome: source.legacyMissingChecks ? "failed" : row.verificationOutcome,
+        terminalCause: source.legacyMissingChecks
+          ? "verification-invalid-output"
+          : row.terminalCause,
         previousStatus: previous.status,
-        status: row.verificationOutcome,
+        status: source.legacyMissingChecks ? "failed" : row.verificationOutcome,
         stage: "verification",
-        evaluation: document.evaluation,
+        evaluation,
         finalizedAt: row.finalizedAt,
       }).pipe(
         Effect.mapError((cause) =>
@@ -1825,7 +1864,7 @@ const make = Effect.gen(function* () {
         readonly event: AgentControlTaskEvent;
       }>();
     if (count !== 4) return yield* error(handoffId, "replay-partial", "partial-replay");
-    const source = yield* loadSource(handoffId);
+    const source = yield* loadSource(handoffId, true);
     return Option.some(yield* validateReplay(handoffId, source));
   });
 
@@ -1864,6 +1903,7 @@ const make = Effect.gen(function* () {
     source: VerificationSourceAuthority,
   ) {
     const { row, document } = source;
+    if (source.legacyMissingChecks) return false;
     const available = yield* sql`SELECT 1 FROM main.sqlite_schema
       WHERE name = 'agent_control_run_once_repairs' AND type = 'table'`;
     if (available.length === 0) return false;
@@ -2031,12 +2071,12 @@ const make = Effect.gen(function* () {
         ${source.row.taskId}, ${source.row.verificationTaskRevision}, ${previous.revision},
         ${source.row.githubIntakeSequence}, ${source.row.sourceIdentityFingerprint},
         ${taskSourceEvent.eventId}, ${taskSourceEvent.sequence}, ${taskSourceEvent.streamVersion},
-        ${source.row.deliveryTerminalState}, ${source.row.verificationOutcome},
-        ${source.row.terminalCause}, ${source.row.terminalRuntimeEventId},
+        ${source.row.deliveryTerminalState}, ${built.payload.verificationOutcome},
+        ${built.payload.terminalCause}, ${source.row.terminalRuntimeEventId},
         ${source.row.evaluationAuthority}, ${source.row.evaluationId},
         ${source.row.evaluationEvidenceId}, ${source.row.evaluationReceiptId},
-        ${source.row.evaluationMarkerId}, ${source.row.evaluationDisposition},
-        ${source.row.verificationVerdict}, ${source.row.invalidOutputCode},
+        ${source.row.evaluationMarkerId}, ${built.payload.evaluation.evaluationDisposition},
+        ${built.payload.evaluation.verificationVerdict}, ${built.payload.evaluation.invalidOutputCode},
         ${source.row.stageEventId}, ${source.row.stageEventSequence},
         ${source.row.stageRunId}, ${source.row.stageEventStreamVersion}, ${source.row.leaseEventId},
         ${source.row.leaseEventSequence}, ${source.row.leaseEventStreamVersion},

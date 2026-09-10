@@ -1,3 +1,9 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off - This integration fixture creates a real Git code change.
+import * as NodeChildProcess from "node:child_process";
+import {
+  executeVerificationCheck,
+  snapshotVerificationCode,
+} from "../../verificationTurn/checkEvidence.ts";
 import {
   AgentControlEngine,
   type AgentControlEngineShape,
@@ -31239,6 +31245,283 @@ it.effect.each(["before-claim", "after-claim"] as const)(
             yield* database.sqlA`SELECT status FROM agent_control_task_states`,
             [{ status: "candidate" }],
           );
+        }),
+      ),
+    ),
+);
+
+it.effect.each(["legacy-upgrade", "late-code-change"] as const)(
+  "finalizes persisted Verification $0 authority without another provider turn",
+  (scenario) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase(59);
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const prepared = yield* prepareVerificationTurnDelivery(
+            `verification-078-${scenario}`,
+            true,
+            {
+              database,
+              planningFinalizer,
+              beforeVerification: runMigrations({ toMigrationInclusive: 60 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, database.sqlA),
+                Effect.asVoid,
+                Effect.orDie,
+              ),
+              verificationCoordinatorHooks: {
+                ...noopVerificationCoordinatorHooks,
+                promptTemplateVersion: "agent-control-verification-prompt-v2",
+              },
+            },
+          );
+          const executorCalls = yield* Ref.make(0);
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* consumer.processHandoff(prepared.handoffId);
+          const started = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const starter = yield* buildVerificationStageStarter({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            coordinator: prepared.coordinator,
+            planningFinalizer,
+          });
+          assert.equal((yield* starter.processHandoff(prepared.handoffId))._tag, "Started");
+          const provider = ProviderDriverKind.make("codex");
+          const runtime = yield* buildVerificationRuntimeIngestion({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            orchestration: prepared.coordinator.orchestration,
+            snapshots: prepared.coordinator.snapshots,
+            threadId: started.evidence.threadId,
+            provider,
+            providerInstanceId: started.evidence.providerInstanceId,
+            runtimeMode: started.evidence.runtimeMode,
+          });
+          const startAt = shiftIso(started.delivery.providerAcceptedAt!, -3);
+          yield* database.sqlA`
+          INSERT INTO projection_thread_sessions (
+            thread_id,status,provider_name,provider_instance_id,runtime_mode,active_turn_id,last_error,updated_at
+          ) VALUES (${started.evidence.threadId},'ready',${provider},${started.evidence.providerInstanceId},
+            ${started.evidence.runtimeMode},NULL,NULL,${shiftIso(startAt, -1)})`;
+          const identity = {
+            provider,
+            providerInstanceId: started.evidence.providerInstanceId,
+            threadId: started.evidence.threadId,
+            turnId: TurnId.make(started.delivery.providerTurnId!),
+          };
+          yield* runtime.publish({
+            ...identity,
+            type: "turn.started",
+            eventId: EventId.make("legacy-upgrade-start"),
+            createdAt: startAt,
+            payload: {},
+          });
+          const output = canonicalJson({
+            report: "Legacy completed verification.",
+            schemaVersion: "agent-control-verification-result-v1",
+            verdict: "passed",
+          });
+          yield* runtime.publish({
+            ...identity,
+            type: "item.completed",
+            eventId: EventId.make("legacy-upgrade-output"),
+            itemId: RuntimeItemId.make("legacy-upgrade-item"),
+            createdAt: shiftIso(startAt, 1),
+            payload: {
+              itemType: "assistant_message",
+              status: "completed",
+              authorityDetail: output,
+              detail: output,
+            },
+          });
+          const terminal = {
+            ...identity,
+            type: "turn.completed",
+            eventId: EventId.make("legacy-upgrade-terminal"),
+            createdAt: shiftIso(started.delivery.providerAcceptedAt!, 1),
+            payload: { state: "completed" },
+          } satisfies ProviderRuntimeEvent;
+          yield* runtime.publish(terminal);
+          yield* runtime.drainPrefix;
+          yield* consumer.processRuntimeEvent(terminal);
+
+          yield* runMigrations({ toMigrationInclusive: 77 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, database.sqlA),
+          );
+
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          if (scenario === "late-code-change") {
+            yield* runMigrations({ toMigrationInclusive: 78 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, database.sqlA),
+            );
+            yield* fs.makeDirectory(started.evidence.worktreePath, { recursive: true });
+            yield* Effect.addFinalizer(() =>
+              fs
+                .remove(path.dirname(started.evidence.worktreePath), { recursive: true })
+                .pipe(Effect.orDie),
+            );
+            yield* Effect.sync(() => {
+              NodeChildProcess.execFileSync("git", [
+                "init",
+                "--quiet",
+                started.evidence.worktreePath,
+              ]);
+              NodeChildProcess.execFileSync("git", [
+                "-C",
+                started.evidence.worktreePath,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+              ]);
+            });
+            yield* fs.writeFileString(
+              path.join(started.evidence.worktreePath, "source.txt"),
+              "checked source",
+            );
+            const manifest = {
+              providerDeliveryId: started.evidence.providerDeliveryId,
+              handoffId: prepared.handoffId,
+              fenceToken: started.evidence.fenceToken,
+              worktreePath: started.evidence.worktreePath,
+              codeDigest: yield* snapshotVerificationCode(started.evidence.worktreePath),
+              checksJson: canonicalJson([
+                {
+                  id: "scoped-check",
+                  command: "node",
+                  args: ["--test", "test.js"],
+                  cwd: ".",
+                  required: true,
+                  timeoutMs: 1000,
+                  allowTemporaryFiles: false,
+                  resultFormat: "exit-code",
+                },
+              ]),
+            };
+            const manifestDigest = sha256Utf8(canonicalJson(manifest));
+            yield* database.sqlA`INSERT INTO agent_control_verification_check_manifests VALUES
+              (${manifest.providerDeliveryId},${manifest.handoffId},${manifest.fenceToken},${manifest.worktreePath},${manifest.codeDigest},${manifest.checksJson},${manifestDigest},${terminal.createdAt})`;
+            yield* executeVerificationCheck(database.sqlA, {
+              manifest: { ...manifest, manifestDigest },
+              checkId: "scoped-check",
+              providerTurnId: started.delivery.providerTurnId!,
+              authorize: Effect.void,
+              execute: Effect.succeed({ exitCode: 0, stdout: "checked", stderr: "" }),
+            });
+            const evaluator = yield* buildVerificationEvaluator({
+              sql: database.sqlA,
+              scope: database.scopeA,
+              handoffStore: prepared.coordinator.handoffStore,
+            });
+            assert.equal((yield* evaluator.processHandoff(prepared.handoffId))._tag, "Evaluated");
+            yield* fs.writeFileString(
+              path.join(started.evidence.worktreePath, "source.txt"),
+              "changed after checks",
+            );
+          } else {
+            // Build the previous accepted authority format in a pre-upgrade database.
+            // The temporary empty lookup only lets the current evaluator supply the complete source anchors.
+            yield* database.sqlA`CREATE TABLE agent_control_verification_legacy_evaluations (
+          provider_delivery_id TEXT PRIMARY KEY,evaluation_id TEXT NOT NULL,authority_digest TEXT NOT NULL)`;
+            const evaluator = yield* buildVerificationEvaluator({
+              sql: database.sqlA,
+              scope: database.scopeA,
+              handoffStore: prepared.coordinator.handoffStore,
+            });
+            assert.equal((yield* evaluator.processHandoff(prepared.handoffId))._tag, "Evaluated");
+            const [previous] = yield* database.sqlA<{ authority: string }>`
+          SELECT json_set(json_remove(authority_json,'$.verificationChecksDigest'),
+            '$.disposition','evaluated','$.verdict','passed','$.errorCode',NULL,
+            '$.semanticResultDigest',${sha256Utf8(output)}) AS authority
+          FROM agent_control_verification_evaluation_evidence WHERE handoff_id=${prepared.handoffId}`;
+            const authority = canonicalJson(parseJsonStrict(previous!.authority));
+            const fingerprint = fingerprintVerificationTurn("evaluation-fingerprint", [authority]);
+            yield* database.sqlA.withTransaction(
+              Effect.gen(function* () {
+                const triggers = yield* database.sqlA<{ name: string; source: string }>`
+          SELECT name,sql AS source FROM sqlite_schema WHERE type='trigger' AND tbl_name IN (
+            'agent_control_verification_evaluation_evidence','agent_control_verification_evaluation_receipts',
+            'agent_control_verification_evaluation_markers','agent_control_verification_check_assessments')`;
+                for (const trigger of triggers)
+                  yield* database.sqlA.unsafe(`DROP TRIGGER "${trigger.name}"`).unprepared;
+                yield* database.sqlA`UPDATE agent_control_verification_evaluation_evidence
+          SET authority_json=${authority},authority_digest=${sha256Utf8(authority)},
+            evaluation_fingerprint=${fingerprint},disposition='evaluated',verdict='passed',error_code=NULL,
+            semantic_result_digest=${sha256Utf8(output)} WHERE handoff_id=${prepared.handoffId}`;
+                yield* database.sqlA`UPDATE agent_control_verification_evaluation_receipts
+          SET evaluation_fingerprint=${fingerprint},disposition='evaluated',verdict='passed',error_code=NULL`;
+                yield* database.sqlA`UPDATE agent_control_verification_evaluation_markers SET evaluation_fingerprint=${fingerprint}`;
+                yield* database.sqlA`DELETE FROM agent_control_verification_check_assessments`;
+                for (const trigger of triggers)
+                  yield* database.sqlA.unsafe(trigger.source).unprepared;
+                yield* database.sqlA`DROP TABLE agent_control_verification_legacy_evaluations`;
+              }),
+            );
+
+            assert.deepStrictEqual(
+              yield* runMigrations({ toMigrationInclusive: 78 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, database.sqlA),
+              ),
+              [[78, "AgentControlLegacyVerificationRecovery"]],
+            );
+          }
+          const original =
+            yield* database.sqlA`SELECT * FROM agent_control_verification_evaluation_evidence`;
+          const originalCalls = yield* Ref.get(executorCalls);
+          assert.equal(originalCalls, 1);
+
+          const recovered = yield* buildVerificationEvaluator({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            handoffStore: prepared.coordinator.handoffStore,
+          });
+          assert.equal((yield* recovered.processHandoff(prepared.handoffId))._tag, "Replayed");
+          const recoveredPlanning = yield* buildFinalizer(database.sqlB, database.scopeB);
+          const finalizer = yield* buildVerificationStageFinalizer({
+            sql: database.sqlB,
+            scope: database.scopeB,
+            coordinator: prepared.coordinator,
+            planningFinalizer: recoveredPlanning,
+            evaluator: recovered,
+          });
+          assert.equal((yield* finalizer.processHandoff(prepared.handoffId))._tag, "Finalized");
+          assert.deepStrictEqual(
+            yield* database.sqlB`
+          SELECT stage.status AS stage,lease.status AS lease,evidence.invalid_output_code AS code
+          FROM agent_control_stage_run_states stage
+          JOIN agent_control_stage_run_lease_states lease ON lease.lease_id=${started.evidence.leaseId}
+          JOIN agent_control_verification_finalization_evidence evidence ON evidence.stage_run_id=stage.stage_run_id
+          WHERE stage.stage_run_id=${started.evidence.stageRunId}`,
+            [
+              {
+                stage: "failed",
+                lease: "released",
+                code:
+                  scenario === "legacy-upgrade"
+                    ? "verification-checks-missing"
+                    : "verification-checks-stale",
+              },
+            ],
+          );
+          assert.equal((yield* finalizer.processHandoff(prepared.handoffId))._tag, "Replayed");
+          assert.deepStrictEqual(
+            yield* database.sqlB`SELECT * FROM agent_control_verification_evaluation_evidence`,
+            original,
+          );
+          assert.equal(yield* Ref.get(executorCalls), originalCalls);
+          assert.deepStrictEqual(yield* database.sqlB`PRAGMA foreign_key_check`, []);
         }),
       ),
     ),

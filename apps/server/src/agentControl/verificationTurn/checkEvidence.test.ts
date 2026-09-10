@@ -96,7 +96,7 @@ const initialize = Effect.gen(function* () {
 });
 const success: VerificationCheckCommandResult = {
   exitCode: 0,
-  stdout: "# pass 1\n# fail 0\n",
+  stdout: "# pass 1\n# fail 0\n# cancelled 0\n",
   stderr: "",
 };
 const execute = (sql: SqlClient.SqlClient, manifest: VerificationCheckManifest, result = success) =>
@@ -119,7 +119,7 @@ it.effect(
           ["-e", "require('node:fs').appendFileSync(process.argv[1], 'executed\\n')", repo.counter],
           { cwd: repo.cwd },
         );
-        return { exitCode: 0, stdout: result.stdout, stderr: result.stderr };
+        return { exitCode: 0, stdout: success.stdout + result.stdout, stderr: result.stderr };
       });
       const first = yield* Effect.gen(function* () {
         yield* initialize;
@@ -292,6 +292,59 @@ it.effect(
           (yield* assessVerificationChecks(sql, claim(optional))).code,
           "verification-checks-missing",
         );
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
+    }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "prioritizes incomplete or invalid evidence over code failures regardless of check order",
+  () =>
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const sql = yield* SqlClient.SqlClient;
+        const pairs = [
+          ["failed", "missing", "verification-checks-missing"],
+          ["failed", "unavailable", "verification-checks-unavailable"],
+          ["failed", "stale", "verification-checks-stale"],
+          ["missing", "unavailable", "verification-checks-unavailable"],
+          ["missing", "stale", "verification-checks-stale"],
+          ["unavailable", "stale", "verification-checks-stale"],
+        ] as const;
+        for (const [first, second, expected] of pairs) {
+          for (const statuses of [
+            [first, second],
+            [second, first],
+          ]) {
+            const manifest = yield* prepareVerificationCheckManifest(sql, {
+              permit: permit(statuses.join("-")),
+              cwd: repo.cwd,
+              checks: statuses.map((status) => ({ ...checks[0]!, id: status })),
+            });
+            for (const status of statuses) {
+              if (status === "missing") continue;
+              yield* executeVerificationCheck(sql, {
+                manifest,
+                checkId: status,
+                providerTurnId: status === "stale" ? "foreign-turn" : "turn-1",
+                authorize: Effect.void,
+                execute: Effect.succeed(
+                  status === "failed"
+                    ? { exitCode: 1, stdout: "  code: 'ERR_ASSERTION'\n# fail 1\n", stderr: "" }
+                    : status === "unavailable"
+                      ? { exitCode: 124, stdout: "", stderr: "timeout" }
+                      : success,
+                ),
+              });
+            }
+            assert.equal(
+              (yield* assessVerificationChecks(sql, claim(manifest))).code,
+              expected,
+              statuses.join(" then "),
+            );
+          }
+        }
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
     }).pipe(Effect.scoped),
 );

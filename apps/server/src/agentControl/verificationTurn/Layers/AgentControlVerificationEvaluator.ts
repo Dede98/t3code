@@ -33,6 +33,7 @@ import { AgentControlVerificationEvaluatorHooks } from "../Services/AgentControl
 import { AgentControlVerificationHandoffStore } from "../Services/AgentControlVerificationHandoffStore.ts";
 import { evaluateCheckedVerificationResult } from "../checkedResult.ts";
 import { sealVerificationCheckAssessment } from "../checkEvidence.ts";
+import { isLegacyVerificationEvaluation } from "../legacyEvaluation.ts";
 
 const RECOVERY_INTERVAL = Duration.seconds(5);
 const isEvaluationError = Schema.is(AgentControlVerificationEvaluationError);
@@ -225,14 +226,17 @@ const make = Effect.gen(function* () {
       if (sourceResult._tag === "Waiting") return sourceResult;
       yield* hooks.afterSourceLoad(handoffId);
 
-      const checks = yield* sealVerificationCheckAssessment(sql, claim).pipe(
-        Effect.mapError((cause) =>
-          evaluationError("assess-verification-checks", "persistence", handoffId, cause),
-        ),
-      );
+      const legacy = yield* isLegacyVerificationEvaluation(sql, claim.evidence.providerDeliveryId);
+      const checks = legacy
+        ? null
+        : yield* sealVerificationCheckAssessment(sql, claim).pipe(
+            Effect.mapError((cause) =>
+              evaluationError("assess-verification-checks", "persistence", handoffId, cause),
+            ),
+          );
       const evaluation = yield* evaluateCheckedVerificationResult(
         sourceResult.source.bytes,
-        checks.code,
+        checks?.code ?? null,
         sourceResult.source.sourceDisposition === "oversize",
       );
 
@@ -325,7 +329,7 @@ const make = Effect.gen(function* () {
           streamVersion: sourceResult.source.terminalEventStreamVersion,
         },
         threadId: claim.evidence.threadId,
-        verificationChecksDigest: checks.digest,
+        ...(checks === null ? {} : { verificationChecksDigest: checks.digest }),
         verdict: evaluation.verdict,
         worktree: {
           branch: claim.evidence.branch,

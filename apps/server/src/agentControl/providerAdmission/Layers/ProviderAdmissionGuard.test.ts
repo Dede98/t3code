@@ -1944,8 +1944,18 @@ it.live(
             .run(at, value.providerDeliveryId);
         });
         yield* guard.enter(permit, "turn-start");
-        assert.isTrue(
-          Exit.isFailure(yield* Effect.exit(guard.enter(permit, "verification-check"))),
+        const earlyMarkers =
+          yield* sql`SELECT * FROM agent_control_provider_authority_markers WHERE admission_id=${permit.admissionId} ORDER BY marker_id`;
+        const earlyCapacity =
+          yield* sql`SELECT * FROM agent_control_provider_capacity_current WHERE provider_instance_id=${String(permit.providerInstanceId)}`;
+        yield* guard.enter(permit, "verification-check");
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_provider_authority_markers WHERE admission_id=${permit.admissionId} ORDER BY marker_id`,
+          earlyMarkers,
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_provider_capacity_current WHERE provider_instance_id=${String(permit.providerInstanceId)}`,
+          earlyCapacity,
         );
         yield* mutateFixture(() => {
           fixture

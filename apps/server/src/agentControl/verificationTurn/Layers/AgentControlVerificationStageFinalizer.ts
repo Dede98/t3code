@@ -20,6 +20,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { isLegacyVerificationEvaluation } from "../legacyEvaluation.ts";
 
 import {
   canonicalJson,
@@ -184,7 +185,20 @@ const make = Effect.gen(function* () {
     handoffId: string,
     claim: AgentControlVerificationClaim,
     evaluation: AcceptedEvaluation | typeof noEvaluation,
+    invalidateLegacy = true,
   ) {
+    if (
+      invalidateLegacy &&
+      evaluation.evaluationAuthority === "accepted-evaluation" &&
+      (yield* isLegacyVerificationEvaluation(sql, claim.evidence.providerDeliveryId))
+    ) {
+      return {
+        ...evaluation,
+        evaluationDisposition: "invalid-output",
+        verificationVerdict: null,
+        invalidOutputCode: "verification-checks-missing",
+      } as const;
+    }
     if (evaluation.verificationVerdict !== "passed") return evaluation;
     const invalidations = yield* sql`
         SELECT invalidation.provider_delivery_id
@@ -512,9 +526,14 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error(handoffId, "decode-evaluation-numbers", "evaluation-conflict");
     }
-    const checks = yield* sealVerificationCheckAssessment(sql, claim).pipe(
-      Effect.mapError((cause) => error(handoffId, "load-check-assessment", "persistence", cause)),
-    );
+    const legacy = yield* isLegacyVerificationEvaluation(sql, claim.evidence.providerDeliveryId);
+    const checks = legacy
+      ? null
+      : yield* sealVerificationCheckAssessment(sql, claim).pipe(
+          Effect.mapError((cause) =>
+            error(handoffId, "load-check-assessment", "persistence", cause),
+          ),
+        );
     const expectedAuthorityJson = canonicalJson({
       admission: {
         evidenceId: claim.evidence.admissionEvidenceId,
@@ -582,7 +601,7 @@ const make = Effect.gen(function* () {
         streamVersion: row.terminalStreamVersion,
       },
       threadId: claim.evidence.threadId,
-      verificationChecksDigest: checks.digest,
+      ...(checks === null ? {} : { verificationChecksDigest: checks.digest }),
       verdict,
       worktree: {
         branch: claim.evidence.branch,
@@ -618,7 +637,8 @@ const make = Effect.gen(function* () {
       if (
         errorCode !== null ||
         semanticDigest === null ||
-        (checks.code !== null &&
+        (checks !== null &&
+          checks.code !== null &&
           !(checks.code === "verification-checks-failed" && verdict === "failed"))
       ) {
         return yield* error(handoffId, "evaluated-authority-shape", "evaluation-conflict");
@@ -1176,6 +1196,7 @@ const make = Effect.gen(function* () {
       handoffId,
       replayClaim,
       yield* loadEvaluationAuthority(handoffId, replayClaim, replayStart),
+      parsed.evaluation.invalidOutputCode === "verification-checks-missing",
     );
     if (
       canonicalJson(replayEvaluation as unknown as JsonValue) !==
@@ -1467,6 +1488,7 @@ const make = Effect.gen(function* () {
       return yield* error(handoffId, "validate-lease-history", "lease-history-corrupt");
     }
     let evaluation = yield* loadEvaluationAuthority(handoffId, claim, start);
+    evaluation = yield* applyCheckInvalidation(handoffId, claim, evaluation);
     yield* hooks.afterAuthoritativeRead(handoffId);
     if (
       evaluation.evaluationAuthority === "accepted-evaluation" &&
