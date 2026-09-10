@@ -3009,6 +3009,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
     readonly coordinator: VerificationTurnConsumerDependencies;
     readonly executorCalls: Ref.Ref<number>;
     readonly listSessions?: ProviderService["Service"]["listSessions"];
+    readonly readStoppedTurn?: ProviderService["Service"]["readStoppedTurn"];
     readonly responseLossDefect?: unknown;
     readonly responseLossCause?: Cause.Cause<never>;
     readonly prepareFailures?: Ref.Ref<number>;
@@ -3038,6 +3039,7 @@ const buildVerificationTurnConsumer = Effect.fn("buildVerificationTurnConsumerHa
         respondToUserInput: () => Effect.die("unused"),
         stopSession: () => Effect.die("unused"),
         listSessions: input.listSessions ?? (() => Ref.get(activeSessions)),
+        ...(input.readStoppedTurn ? { readStoppedTurn: input.readStoppedTurn } : {}),
         getCapabilities: () => Effect.die("unused"),
         getInstanceInfo: () => Effect.die("unused"),
         rollbackConversation: () => Effect.die("unused"),
@@ -30155,4 +30157,280 @@ it.effect.each([
         }),
       ),
     ),
+);
+
+it.effect.each(["interrupted", "failed"] as const)(
+  "Verification recovers durable native %s evidence once after losing the runtime",
+  (state) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(`native-stop-${state}`);
+          const executorCalls = yield* Ref.make(0);
+          const first = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* first.processHandoff(prepared.handoffId);
+          const started = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(`provider:native-recovery-start-${state}`),
+            threadId: started.evidence.threadId,
+            session: {
+              threadId: started.evidence.threadId,
+              providerName: "codex",
+              providerInstanceId: started.evidence.providerInstanceId,
+              runtimeMode: "approval-required",
+              status: "running",
+              activeTurnId: TurnId.make(started.delivery.providerTurnId!),
+              lastError: null,
+              updatedAt: started.delivery.providerAcceptedAt!,
+            },
+            providerRuntimeLifecycle: {
+              runtimeEventId: EventId.make(`native-recovery-start-${state}`),
+              runtimeEventType: "turn.started",
+              providerInstanceId: started.evidence.providerInstanceId,
+              providerTurnId: TurnId.make(started.delivery.providerTurnId!),
+            },
+            createdAt: started.delivery.providerAcceptedAt!,
+          });
+          const starter = yield* buildVerificationStageStarter({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            planningFinalizer: prepared.planningFinalizer,
+          });
+          yield* starter.processHandoff(prepared.handoffId);
+          const terminalAt = DateTime.formatIso(yield* DateTime.now);
+          const probeCalls = yield* Ref.make(0);
+          const recover = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: prepared.database.scopeB,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            listSessions: () => Effect.succeed([]),
+            hooks: {
+              ...noopVerificationConsumerHooks,
+              beforeProviderTerminalCas: () =>
+                Effect.die("simulated crash after canonical terminal receipt"),
+            },
+            readStoppedTurn: (input) =>
+              Ref.update(probeCalls, (n) => n + 1).pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    assert.equal(input.threadId, started.evidence.threadId);
+                    assert.equal(input.providerInstanceId, started.evidence.providerInstanceId);
+                    assert.equal(input.cwd, started.evidence.worktreePath);
+                    assert.equal(input.providerTurnId, started.delivery.providerTurnId);
+                    return {
+                      provider: ProviderDriverKind.make("codex"),
+                      providerTurnId: input.providerTurnId,
+                      state,
+                      terminalAt,
+                    };
+                  }),
+                ),
+              ),
+          });
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(recover.processHandoff(prepared.handoffId))),
+          );
+          assert.equal(
+            Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            ).delivery.state,
+            "provider-started",
+          );
+          const replay = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlB,
+            scope: prepared.database.scopeB,
+            coordinator: prepared.coordinator,
+            executorCalls,
+            listSessions: () => Effect.succeed([]),
+            readStoppedTurn: () =>
+              Effect.die("persisted terminal must recover without another native probe"),
+          });
+          yield* replay.processHandoff(prepared.handoffId);
+          assert.equal(yield* Ref.get(probeCalls), 1);
+          const terminal = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          assert.equal(terminal.delivery.state, state);
+          assert.equal(terminal.delivery.terminalAt, terminalAt);
+          yield* replay.processHandoff(prepared.handoffId);
+          assert.deepStrictEqual(
+            Option.getOrThrow(
+              yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+            ).delivery,
+            terminal.delivery,
+          );
+          assert.equal(yield* Ref.get(executorCalls), 1);
+          const evaluator = yield* buildVerificationEvaluator({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            handoffStore: prepared.coordinator.handoffStore,
+          });
+          const finalizer = yield* buildVerificationStageFinalizer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            planningFinalizer: prepared.planningFinalizer,
+            evaluator,
+          });
+          assert.equal((yield* finalizer.processHandoff(prepared.handoffId))._tag, "Finalized");
+          assert.equal((yield* finalizer.processHandoff(prepared.handoffId))._tag, "Replayed");
+          assert.deepStrictEqual(
+            yield* prepared.database.sqlB`
+      SELECT stage.status AS "stageStatus", lease.status AS "leaseStatus",
+        (SELECT count(*) FROM agent_control_verification_finalization_evidence WHERE handoff_id=${prepared.handoffId}) AS finalizations,
+        (SELECT count(*) FROM orchestration_events WHERE stream_id=${started.evidence.threadId}
+          AND json_extract(metadata_json,'$.providerRuntimeLifecycle.runtimeEventId')=${terminal.delivery.terminalEventId}) AS receipts
+      FROM agent_control_stage_run_states stage JOIN agent_control_stage_run_lease_states lease ON lease.lease_id=${started.evidence.leaseId}
+      WHERE stage.stage_run_id=${started.evidence.stageRunId}
+    `,
+            [
+              {
+                stageStatus: state === "interrupted" ? "cancelled" : "failed",
+                leaseStatus: "released",
+                finalizations: 1,
+                receipts: 1,
+              },
+            ],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect("Verification rejects native recovery evidence for another turn", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const prepared = yield* prepareVerificationTurnDelivery("native-stop-divergent");
+        const executorCalls = yield* Ref.make(0);
+        const first = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlA,
+          scope: prepared.database.scopeA,
+          coordinator: prepared.coordinator,
+          executorCalls,
+        });
+        yield* first.processHandoff(prepared.handoffId);
+        const before = Option.getOrThrow(
+          yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+        );
+        const terminalAt = DateTime.formatIso(yield* DateTime.now);
+        const recover = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlB,
+          scope: prepared.database.scopeB,
+          coordinator: prepared.coordinator,
+          executorCalls,
+          listSessions: () => Effect.succeed([]),
+          readStoppedTurn: () =>
+            Effect.succeed({
+              provider: ProviderDriverKind.make("codex"),
+              providerTurnId: TurnId.make("foreign-turn"),
+              state: "interrupted",
+              terminalAt,
+            }),
+        });
+        assert.isTrue(
+          Exit.isFailure(yield* Effect.exit(recover.processHandoff(prepared.handoffId))),
+        );
+        assert.deepStrictEqual(
+          Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          ).delivery,
+          before.delivery,
+        );
+        assert.equal(yield* Ref.get(executorCalls), 1);
+      }),
+    ),
+  ),
+);
+
+it.effect("Verification native probe cannot overwrite a concurrent takeover turn", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const prepared = yield* prepareVerificationTurnDelivery("native-stop-takeover-race");
+        const executorCalls = yield* Ref.make(0);
+        const first = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlA,
+          scope: prepared.database.scopeA,
+          coordinator: prepared.coordinator,
+          executorCalls,
+        });
+        yield* first.processHandoff(prepared.handoffId);
+        const before = Option.getOrThrow(
+          yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+        );
+        const probeStarted = yield* Deferred.make<void>();
+        const releaseProbe = yield* Deferred.make<void>();
+        const terminalAt = DateTime.formatIso(yield* DateTime.now);
+        const recover = yield* buildVerificationTurnConsumer({
+          sql: prepared.database.sqlB,
+          scope: prepared.database.scopeB,
+          coordinator: prepared.coordinator,
+          executorCalls,
+          listSessions: () => Effect.succeed([]),
+          readStoppedTurn: (input) =>
+            Deferred.succeed(probeStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseProbe)),
+              Effect.as({
+                provider: ProviderDriverKind.make("codex"),
+                providerTurnId: input.providerTurnId,
+                state: "interrupted" as const,
+                terminalAt,
+              }),
+            ),
+        });
+        const recovery = yield* recover
+          .processHandoff(prepared.handoffId)
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(probeStarted);
+        yield* prepared.coordinator.orchestration.dispatchAgentControl({
+          type: "thread.agent-control.state.set",
+          commandId: CommandId.make("native-stop-takeover"),
+          threadId: before.evidence.threadId,
+          controlState: "taken-over",
+          createdAt: terminalAt,
+        });
+        const newerSession = {
+          threadId: before.evidence.threadId,
+          providerName: "codex" as const,
+          providerInstanceId: before.evidence.providerInstanceId,
+          runtimeMode: "approval-required" as const,
+          status: "running" as const,
+          activeTurnId: TurnId.make("new-takeover-turn"),
+          lastError: null,
+          updatedAt: terminalAt,
+        };
+        yield* prepared.coordinator.orchestration.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("provider:takeover-new-turn"),
+          threadId: before.evidence.threadId,
+          session: newerSession,
+          createdAt: terminalAt,
+        });
+        yield* Deferred.succeed(releaseProbe, undefined);
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(recovery)));
+        const thread = Option.getOrThrow(
+          yield* prepared.coordinator.snapshots.getThreadShellById(before.evidence.threadId),
+        );
+        assert.deepStrictEqual(thread.session, newerSession);
+        assert.deepStrictEqual(
+          Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          ).delivery,
+          before.delivery,
+        );
+        assert.equal(yield* Ref.get(executorCalls), 1);
+      }),
+    ),
+  ),
 );

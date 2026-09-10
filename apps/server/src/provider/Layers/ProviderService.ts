@@ -79,6 +79,7 @@ import { withProviderAdmissionEffectFence } from "../../agentControl/providerAdm
 import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
 import { ProviderAdmissionGuard } from "../../agentControl/providerAdmission/Services/ProviderAdmissionGuard.ts";
 import { AGENT_CONTROL_VERIFICATION_PROMPT_MAX_BYTES } from "../../agentControl/verificationTurn/prompt.ts";
+import { AgentControlVerificationExecution } from "../../agentControl/verificationTurn/executionContext.ts";
 import { ProjectId } from "@t3tools/contracts";
 import {
   type ProviderAdapterError,
@@ -2071,7 +2072,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
           ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
         })
-        .pipe(Effect.onError(() => clearMcpSession(threadId)));
+        .pipe(
+          Effect.provideService(
+            AgentControlVerificationExecution,
+            providerAdmissionPermit?.stage === "verification" &&
+              input.runtimeMode === "approval-required" &&
+              effectiveCwd !== undefined
+              ? { threadId, cwd: effectiveCwd }
+              : null,
+          ),
+          Effect.onError(() => clearMcpSession(threadId)),
+        );
       const persistedSessionCreatedAt = canReusePersistedContinuation
         ? readPersistedSessionCreatedAt(persistedBinding?.runtimePayload)
         : undefined;
@@ -2473,23 +2484,33 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             yield* restore(boundary.afterDeliveryCas());
             yield* restore(enterProviderAdmission(permit, "turn-start"));
             const turn = yield* restore(
-              preparedTurn.invoke({
-                adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
-                nativeInvocationStarted: () =>
-                  Effect.sync(() => boundary.onNativeInvocationStarted?.()),
-                startExternal: (operation) =>
-                  Effect.gen(function* () {
-                    const externalOperation = yield* Effect.sync(operation);
-                    boundary.onExternalOperationStarted?.();
-                    const fiber = yield* externalOperation.pipe(
-                      Effect.forkChild({
-                        startImmediately: true,
-                        uninterruptible: false,
-                      }),
-                    );
-                    return yield* Fiber.join(fiber);
-                  }),
-              }),
+              preparedTurn
+                .invoke({
+                  adapterEntered: () => Effect.sync(() => boundary.onAdapterEntered?.()),
+                  nativeInvocationStarted: () =>
+                    Effect.sync(() => boundary.onNativeInvocationStarted?.()),
+                  startExternal: (operation) =>
+                    Effect.gen(function* () {
+                      const externalOperation = yield* Effect.sync(operation);
+                      boundary.onExternalOperationStarted?.();
+                      const fiber = yield* externalOperation.pipe(
+                        Effect.forkChild({
+                          startImmediately: true,
+                          uninterruptible: false,
+                        }),
+                      );
+                      return yield* Fiber.join(fiber);
+                    }),
+                })
+                .pipe(
+                  Effect.provideService(
+                    AgentControlVerificationExecution,
+                    permit.stage === "verification" &&
+                      boundary.expected.runtimeMode === "approval-required"
+                      ? { threadId: input.threadId, cwd: boundary.expected.cwd }
+                      : null,
+                  ),
+                ),
             );
             yield* restore(persistTurn(turn));
             return turn;
@@ -3149,6 +3170,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     ),
   );
 
+  const readStoppedTurn: NonNullable<ProviderServiceMethod<"readStoppedTurn">> = (input) =>
+    Effect.gen(function* () {
+      const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+      if (
+        binding === undefined ||
+        binding.providerInstanceId !== input.providerInstanceId ||
+        binding.runtimeMode !== "approval-required" ||
+        encodePromptJson(binding.resumeCursor) !== encodePromptJson(input.resumeCursor)
+      )
+        return;
+      const adapter = yield* registry.getByInstance(input.providerInstanceId);
+      if (adapter.readStoppedTurn === undefined || (yield* adapter.hasSession(input.threadId)))
+        return;
+      return yield* adapter.readStoppedTurn(input);
+    });
+
   return {
     startSession: (threadId, input, authority) =>
       rebuildBarrier.withOperation(startSession(threadId, input, authority)),
@@ -3157,6 +3194,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       rebuildBarrier.withOperation(sendTurnAtPreInvokeBoundary(input, boundary)),
     quarantineAdmissionIfEntered: (permit) =>
       rebuildBarrier.withOperation(quarantineAdmissionIfEntered(permit)),
+    readStoppedTurn: (input) => rebuildBarrier.withOperation(readStoppedTurn(input)),
     getSessionAttestation,
     compactThread: (threadId, modelSelection, requestId) =>
       rebuildBarrier.withOperation(compactThread(threadId, modelSelection, requestId)),

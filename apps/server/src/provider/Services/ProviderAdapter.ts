@@ -69,6 +69,19 @@ export interface ProviderThreadSnapshot {
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
 
+export interface ProviderStoppedTurnInput {
+  readonly cwd: string;
+  readonly resumeCursor: unknown;
+  readonly providerTurnId: TurnId;
+}
+
+export interface ProviderStoppedTurn {
+  readonly provider: ProviderDriverKind;
+  readonly providerTurnId: TurnId;
+  readonly state: "failed" | "interrupted";
+  readonly terminalAt: string;
+}
+
 export interface ProviderSessionAttestation {
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
@@ -277,6 +290,11 @@ export interface ProviderAdapterShape<TError> {
    * Check whether this adapter owns an active session id.
    */
   readonly hasSession: (threadId: ThreadId) => Effect.Effect<boolean>;
+
+  /** Read durable native terminal evidence without starting or resuming a thread. */
+  readonly readStoppedTurn?: (
+    input: ProviderStoppedTurnInput,
+  ) => Effect.Effect<ProviderStoppedTurn | undefined, TError>;
 
   /**
    * Read a provider thread snapshot.

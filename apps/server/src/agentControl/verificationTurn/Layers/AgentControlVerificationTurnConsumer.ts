@@ -1,5 +1,13 @@
+import { makeProviderTerminalSessionCommand } from "../../../orchestration/providerTerminalSessionCommand.ts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
-import { TurnId, type ProviderRuntimeEvent } from "@t3tools/contracts";
+import {
+  AgentControlTaskId,
+  AgentControlStageRunId,
+  AgentControlAttemptId,
+  EventId,
+  TurnId,
+  type ProviderRuntimeEvent,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -53,10 +61,13 @@ import { ProviderAdmissionRuntime } from "../../providerAdmission/Services/Provi
 import type { ProviderAdmissionPermit } from "../../providerAdmission/model.ts";
 import {
   normalizeVerificationTerminal,
+  normalizeVerificationTerminalSource,
   type VerificationTerminalObservation,
 } from "../terminalObservation.ts";
 import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "../prompt.ts";
 import { loadSealableVerificationResultSource } from "../orchestrationResultSource.ts";
+
+const decodeResumeCursor = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 
 const CLAIM_DURATION = Duration.minutes(2);
 const RETRY_DELAY = Duration.seconds(30);
@@ -282,6 +293,96 @@ const make = Effect.gen(function* () {
         )
       )
         return;
+      const cursor = decodeResumeCursor(claim.delivery.providerResumeCursorJson);
+      if (
+        provider.readStoppedTurn !== undefined &&
+        Option.isSome(cursor) &&
+        claim.delivery.providerTurnId !== null
+      ) {
+        const identity = {
+          threadId: claim.evidence.threadId,
+          providerInstanceId: claim.evidence.providerInstanceId,
+          providerTurnId: TurnId.make(claim.delivery.providerTurnId),
+          providerDeliveryId: claim.evidence.providerDeliveryId,
+        };
+        const native = yield* provider
+          .readStoppedTurn({
+            ...identity,
+            resumeCursor: cursor.value,
+            cwd: claim.evidence.worktreePath,
+          })
+          .pipe(Effect.catch(() => Effect.succeed(undefined)));
+        if (native !== undefined) {
+          const observation = yield* normalizeVerificationTerminalSource(
+            {
+              ...identity,
+              providerTurnId: native.providerTurnId,
+              runtimeEventId: EventId.make(
+                `native-recovery:${claim.evidence.providerDeliveryId}:${native.providerTurnId}`,
+              ),
+              runtimeEventType: "turn.completed",
+              providerState: native.state,
+              terminalAt: native.terminalAt,
+            },
+            identity,
+          ).pipe(
+            Effect.mapError((cause) =>
+              makeAgentControlVerificationCandidateEvidenceError({
+                handoffId: claim.evidence.handoffId,
+                candidateReason: "terminal-identity-divergent",
+                operation: "recover-native-terminal-evidence",
+                cause,
+              }),
+            ),
+          );
+          // Persist native provenance before finalizing. Admission release requires
+          // this canonical lifecycle receipt, and a crash can replay it by command ID.
+          const command = yield* makeProviderTerminalSessionCommand(
+            {
+              type: "turn.completed",
+              eventId: observation.runtimeEventId,
+              provider: native.provider,
+              providerInstanceId: identity.providerInstanceId,
+              threadId: identity.threadId,
+              turnId: native.providerTurnId,
+              createdAt: native.terminalAt,
+              payload: { state: native.state },
+            },
+            claim.evidence.runtimeMode,
+          ).pipe(
+            Effect.mapError((cause) =>
+              makeAgentControlVerificationCandidateEvidenceError({
+                handoffId: claim.evidence.handoffId,
+                candidateReason: "terminal-identity-divergent",
+                operation: "recover-native-terminal-command",
+                cause,
+              }),
+            ),
+          );
+          yield* orchestration
+            .dispatch({
+              ...command,
+              agentControlRecovery: {
+                taskId: AgentControlTaskId.make(claim.evidence.taskId),
+                stageRunId: AgentControlStageRunId.make(claim.evidence.stageRunId),
+                attemptId: AgentControlAttemptId.make(claim.evidence.attemptId),
+              },
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new AgentControlVerificationStoreError({
+                    handoffId: claim.evidence.handoffId,
+                    operation: "persist-native-terminal-command",
+                    reason: "persistence",
+                    cause,
+                  }),
+              ),
+            );
+          yield* observeTerminal(claim, observation);
+          return;
+        }
+      }
       // An accepted turn cannot become the pre-acceptance ambiguous state without
       // losing its durable identity. Report the missing evidence and retain capacity.
       return yield* makeAgentControlVerificationCandidateEvidenceError({

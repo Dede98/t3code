@@ -28,6 +28,19 @@ rl.on("line", (line) => {
     return;
   }
   const { id, method } = message;
+  if (method && script.recordAllRequests) {
+    NodeFS.appendFileSync(
+      `${process.env.T3_CODEX_COLLAB_SCRIPT}.requests`,
+      `${JSON.stringify({ method, params: message.params })}\n`,
+    );
+  }
+  if (method === "command/exec") {
+    write({
+      id,
+      result: script.commandResult ?? { exitCode: 0, stdout: "check passed", stderr: "" },
+    });
+    return;
+  }
   if (method === undefined && script.serverRequests?.some((request) => request.id === id)) {
     NodeFS.appendFileSync(
       `${process.env.T3_CODEX_COLLAB_SCRIPT}.responses`,

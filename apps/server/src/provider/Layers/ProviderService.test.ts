@@ -87,6 +87,7 @@ import {
   providerAdmissionUsageEvidence,
   type ProviderAdmissionRequest,
 } from "../../agentControl/providerAdmission/model.ts";
+import { AgentControlVerificationExecution } from "../../agentControl/verificationTurn/executionContext.ts";
 import { ProviderAdmissionGuard } from "../../agentControl/providerAdmission/Services/ProviderAdmissionGuard.ts";
 import { ProviderAdmissionGuardLive } from "../../agentControl/providerAdmission/Layers/ProviderAdmissionGuard.ts";
 import { ProviderAdmissionStoreLive } from "../../agentControl/providerAdmission/Layers/ProviderAdmissionStore.ts";
@@ -3191,6 +3192,62 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.instanceOf(oversized, ProviderValidationError);
       assert.isFalse(marked);
       assert.equal(routing.codex.sendTurn.mock.calls.length, callsAfter);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
+  it.effect("scopes sandboxed execution to the admitted verification invocation", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-verification-execution");
+      const modelSelection = createModelSelection(codexInstanceId, "gpt-5.4");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("verification-execution"),
+        modelSelection,
+        runtimeMode: "approval-required",
+      });
+      const attestation = yield* provider.getSessionAttestation!(threadId);
+      assert.isDefined(attestation);
+      if (attestation === undefined) return;
+      const observed: Array<typeof AgentControlVerificationExecution.Service> = [];
+      routing.codex.setPrepareTurn(() =>
+        Effect.gen(function* () {
+          assert.isNull(yield* AgentControlVerificationExecution);
+          return {
+            attestation: attestProviderNativeTurnConfiguration(modelSelection),
+            invoke: (entry) =>
+              entry.adapterEntered().pipe(
+                Effect.andThen(
+                  entry.startExternal(() =>
+                    Effect.gen(function* () {
+                      observed.push(yield* AgentControlVerificationExecution);
+                      return { threadId, turnId: TurnId.make(`turn-${threadId}`) };
+                    }),
+                  ),
+                ),
+              ),
+          };
+        }),
+      );
+      yield* Effect.gen(function* () {
+        for (const stage of ["initial-planning", "implementation", "verification"] as const) {
+          yield* provider.sendTurnAtPreInvokeBoundary!(
+            { threadId, input: "verify", modelSelection },
+            {
+              expected: attestation,
+              providerAdmissionPermit: { ...makeTestProviderAdmissionPermit(attestation), stage },
+              beforeDeliveryCas: () => Effect.void,
+              persistDeliveryAttempted: () => Effect.void,
+              afterDeliveryCas: () => Effect.void,
+            },
+          );
+          assert.isNull(yield* AgentControlVerificationExecution);
+        }
+        assert.deepStrictEqual(observed, [null, null, { threadId, cwd: attestation.cwd }]);
+      }).pipe(Effect.ensuring(Effect.sync(() => routing.codex.resetPrepareTurn())));
       yield* provider.stopSession({ threadId });
     }),
   );

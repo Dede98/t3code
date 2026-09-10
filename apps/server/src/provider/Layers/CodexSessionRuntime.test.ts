@@ -993,8 +993,10 @@ describe("openCodexThread", () => {
       const client = {
         raw: {
           request: (
-            method: "thread/resume",
-            payload: CodexRpc.ClientRequestParamsByMethod["thread/resume"],
+            method: "thread/resume" | "thread/start",
+            payload:
+              | CodexRpc.ClientRequestParamsByMethod["thread/resume"]
+              | CodexRpc.ClientRequestParamsByMethod["thread/start"],
           ) => {
             calls.push({ method, payload });
             return Effect.fail(

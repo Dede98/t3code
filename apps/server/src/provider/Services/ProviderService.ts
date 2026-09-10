@@ -37,7 +37,11 @@ import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
-import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
+import type {
+  ProviderStoppedTurnInput,
+  ProviderStoppedTurn,
+  ProviderAdapterCapabilities,
+} from "./ProviderAdapter.ts";
 import type { ProviderSessionAttestation, ProviderTurnAttestation } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
@@ -123,6 +127,14 @@ export interface ProviderServiceShape {
   readonly getSessionAttestation?: (
     threadId: ThreadId,
   ) => Effect.Effect<ProviderSessionAttestation | undefined>;
+
+  /** Recovery-only read. Unsupported providers and absent native evidence return undefined. */
+  readonly readStoppedTurn?: (
+    input: ProviderStoppedTurnInput & {
+      readonly threadId: ThreadId;
+      readonly providerInstanceId: ProviderInstanceId;
+    },
+  ) => Effect.Effect<ProviderStoppedTurn | undefined, ProviderServiceError>;
 
   readonly compactThread: (
     threadId: ThreadId,

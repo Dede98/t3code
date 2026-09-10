@@ -1880,6 +1880,25 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         threadId: command.threadId,
       });
       const providerRuntimeLifecycle = command.providerRuntimeLifecycle;
+      const recovery = command.agentControlRecovery;
+      if (
+        recovery !== undefined &&
+        (thread.agentControl?.controlState !== "controlled" ||
+          thread.agentControl.taskId !== recovery.taskId ||
+          thread.agentControl.stageRunId !== recovery.stageRunId ||
+          thread.agentControl.attemptId !== recovery.attemptId ||
+          providerRuntimeLifecycle?.runtimeEventType !== "turn.completed" ||
+          (providerRuntimeLifecycle.providerState !== "interrupted" &&
+            providerRuntimeLifecycle.providerState !== "failed") ||
+          thread.session?.providerInstanceId !== providerRuntimeLifecycle.providerInstanceId ||
+          (thread.session.activeTurnId !== null &&
+            thread.session.activeTurnId !== providerRuntimeLifecycle.providerTurnId))
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Native terminal recovery no longer owns this controlled turn.",
+        });
+      }
       const verificationResultSource = command.verificationResultSource;
       if (
         verificationResultSource !== undefined &&

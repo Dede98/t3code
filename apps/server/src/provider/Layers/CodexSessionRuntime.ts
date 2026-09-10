@@ -40,6 +40,12 @@ import { buildCodexInitializeParams } from "./CodexProvider.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import { buildCodexDeveloperInstructions } from "../CodexDeveloperInstructions.ts";
+import { AgentControlVerificationExecution } from "../../agentControl/verificationTurn/executionContext.ts";
+import {
+  CODEX_VERIFICATION_TOOL,
+  verificationCheckParams,
+  verificationToolFailure,
+} from "../CodexVerificationChecks.ts";
 const decodeV2TurnStartResponse = Schema.decodeUnknownEffect(EffectCodexSchema.V2TurnStartResponse);
 
 const PROVIDER = ProviderDriverKind.make("codex");
@@ -681,8 +687,11 @@ const decodeCodexThreadResumeMetadata = Schema.decodeUnknownEffect(CodexThreadRe
 interface CodexThreadOpenClient {
   readonly raw: {
     readonly request: (
-      method: "thread/resume",
-      payload: CodexRpc.ClientRequestParamsByMethod["thread/resume"] & {
+      method: "thread/resume" | "thread/start",
+      payload: (
+        | CodexRpc.ClientRequestParamsByMethod["thread/resume"]
+        | CodexRpc.ClientRequestParamsByMethod["thread/start"]
+      ) & {
         readonly excludeTurns?: boolean;
       },
     ) => Effect.Effect<unknown, CodexErrors.CodexAppServerError>;
@@ -704,6 +713,7 @@ export const openCodexThread = (input: {
   readonly requestedModel: string | undefined;
   readonly serviceTier: CodexServiceTier | undefined;
   readonly resumeThreadId: string | undefined;
+  readonly verificationChecksAvailable?: boolean;
 }): Effect.Effect<typeof CodexThreadResumeMetadata.Type, CodexErrors.CodexAppServerError> => {
   const resumeThreadId = input.resumeThreadId;
   const startParams = buildThreadStartParams({
@@ -712,10 +722,31 @@ export const openCodexThread = (input: {
     model: input.requestedModel,
     serviceTier: input.serviceTier,
   });
+  const params = input.verificationChecksAvailable
+    ? { ...startParams, dynamicTools: [CODEX_VERIFICATION_TOOL] }
+    : startParams;
 
-  if (resumeThreadId === undefined) {
-    return input.client.request("thread/start", startParams);
-  }
+  // The generated stable request codec omits experimental dynamicTools.
+  const startThread = Effect.suspend(() =>
+    input.verificationChecksAvailable
+      ? input.client.raw
+          .request("thread/start", params)
+          .pipe(
+            Effect.flatMap((response) =>
+              decodeCodexThreadResumeMetadata(response).pipe(
+                Effect.mapError((error) =>
+                  CodexErrors.CodexAppServerRequestError.invalidPayload(
+                    "thread/start",
+                    "decode-payload",
+                    error,
+                  ),
+                ),
+              ),
+            ),
+          )
+      : input.client.request("thread/start", params),
+  );
+  if (resumeThreadId === undefined) return startThread;
 
   // Older providers may still return history despite excludeTurns. Only the
   // session metadata is needed here, so unrelated historical items cannot
@@ -723,7 +754,7 @@ export const openCodexThread = (input: {
   return input.client.raw
     .request("thread/resume", {
       threadId: resumeThreadId,
-      ...startParams,
+      ...params,
       excludeTurns: true,
     })
     .pipe(
@@ -745,7 +776,7 @@ export const openCodexThread = (input: {
           resumeThreadId,
           recoverable: true,
           cause: error,
-        }).pipe(Effect.andThen(input.client.request("thread/start", startParams))),
+        }).pipe(Effect.andThen(startThread)),
       ),
     );
 };
@@ -1181,6 +1212,19 @@ export const makeCodexSessionRuntime = (
 > =>
   Effect.gen(function* () {
     const runtimeMode = resolveRuntimeMode(options.runtimeMode);
+    const sessionExecution = yield* AgentControlVerificationExecution;
+    const verificationChecksAvailable =
+      runtimeMode === "approval-required" &&
+      sessionExecution?.threadId === options.threadId &&
+      sessionExecution.cwd === options.cwd;
+    const verificationTurn = yield* Ref.make<{
+      readonly providerThreadId: string;
+      readonly turnId: Deferred.Deferred<string | null>;
+    } | null>(null);
+    const revokeVerification = Effect.gen(function* () {
+      const authorization = yield* Ref.getAndSet(verificationTurn, null);
+      if (authorization !== null) yield* Deferred.succeed(authorization.turnId, null);
+    });
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const runtimeScope = yield* Scope.Scope;
     const crypto = yield* Crypto.Crypto;
@@ -1907,20 +1951,31 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerNotification("turn/completed", (payload) =>
       currentSessionProviderThreadId.pipe(
-        Effect.flatMap((providerThreadId) => {
-          if (providerThreadId && payload.threadId !== providerThreadId) {
-            return Effect.void;
-          }
-          const lastError =
-            payload.turn.status === "failed" && "error" in payload.turn && payload.turn.error
-              ? payload.turn.error.message
-              : undefined;
-          return updateSession(sessionRef, {
-            status: payload.turn.status === "failed" ? "error" : "ready",
-            activeTurnId: undefined,
-            ...(lastError ? { lastError } : {}),
-          });
-        }),
+        Effect.flatMap(
+          Effect.fnUntraced(function* (providerThreadId) {
+            if (providerThreadId && payload.threadId !== providerThreadId) {
+              return;
+            }
+            const authorization = yield* Ref.get(verificationTurn);
+            if (
+              authorization !== null &&
+              (yield* Deferred.await(authorization.turnId)) === payload.turn.id
+            ) {
+              yield* Ref.update(verificationTurn, (current) =>
+                current === authorization ? null : current,
+              );
+            }
+            const lastError =
+              payload.turn.status === "failed" && "error" in payload.turn && payload.turn.error
+                ? payload.turn.error.message
+                : undefined;
+            yield* updateSession(sessionRef, {
+              status: payload.turn.status === "failed" ? "error" : "ready",
+              activeTurnId: undefined,
+              ...(lastError ? { lastError } : {}),
+            });
+          }),
+        ),
       ),
     );
 
@@ -1941,8 +1996,52 @@ export const makeCodexSessionRuntime = (
       ),
     );
 
+    yield* client.handleServerRequest("item/tool/call", (payload) =>
+      Effect.gen(function* () {
+        const authorization = yield* Ref.get(verificationTurn);
+        if (
+          authorization === null ||
+          payload.threadId !== authorization.providerThreadId ||
+          payload.tool !== CODEX_VERIFICATION_TOOL.name ||
+          payload.namespace != null
+        ) {
+          return verificationToolFailure("No authorization for this verification tool call.");
+        }
+        const turnId = yield* Deferred.await(authorization.turnId);
+        if (
+          turnId !== payload.turnId ||
+          (yield* Ref.get(verificationTurn)) !== authorization ||
+          (yield* Ref.get(sessionRef)).activeTurnId !== payload.turnId
+        ) {
+          return verificationToolFailure("Verification turn is no longer authorized.");
+        }
+        const params = yield* verificationCheckParams(payload.arguments, options.cwd);
+        // command/exec performs one sandboxed invocation. Unlike a shell approval,
+        // it cannot fall back to an unsandboxed retry after a sandbox denial.
+        const result = yield* client.request("command/exec", params);
+        return {
+          success: result.exitCode === 0,
+          contentItems: [
+            {
+              type: "inputText" as const,
+              text: `Exit code: ${result.exitCode}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+            },
+          ],
+        };
+      }).pipe(
+        Effect.catch(() =>
+          Effect.succeed(
+            verificationToolFailure(
+              "Verification check was rejected or could not execute. No sandbox escalation is permitted.",
+            ),
+          ),
+        ),
+      ),
+    );
+
     yield* client.handleServerRequest("item/commandExecution/requestApproval", (payload) =>
       Effect.gen(function* () {
+        if (yield* Ref.get(verificationTurn)) return { decision: "decline" };
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4("command-approval-request"));
         const turnId = TurnId.make(payload.turnId);
         const itemId = ProviderItemId.make(payload.itemId);
@@ -1999,6 +2098,7 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("item/fileChange/requestApproval", (payload) =>
       Effect.gen(function* () {
+        if (yield* Ref.get(verificationTurn)) return { decision: "decline" };
         const requestId = ApprovalRequestId.make(
           yield* randomUUIDv4("file-change-approval-request"),
         );
@@ -2057,6 +2157,7 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("mcpServer/elicitation/request", (payload) =>
       Effect.gen(function* () {
+        if (yield* Ref.get(verificationTurn)) return { action: "decline" };
         if (toMcpElicitationResponse(payload, "accept").action !== "accept") {
           yield* Effect.logWarning("Declined an unsupported MCP elicitation.", {
             serverName: payload.serverName,
@@ -2122,6 +2223,7 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("item/tool/requestUserInput", (payload) =>
       Effect.gen(function* () {
+        if (yield* Ref.get(verificationTurn)) return { answers: {} };
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4("user-input-request"));
         const turnId = TurnId.make(payload.turnId);
         const itemId = ProviderItemId.make(payload.itemId);
@@ -2269,6 +2371,7 @@ export const makeCodexSessionRuntime = (
         requestedModel,
         serviceTier: options.serviceTier,
         resumeThreadId: readResumeCursorThreadId(options.resumeCursor),
+        verificationChecksAvailable,
       });
 
       const providerThreadId = opened.thread.id;
@@ -2300,6 +2403,7 @@ export const makeCodexSessionRuntime = (
       if (alreadyClosed) {
         return;
       }
+      yield* revokeVerification;
       yield* settlePendingApprovals("cancel");
       yield* settlePendingUserInputs({});
       yield* updateSession(sessionRef, {
@@ -2352,7 +2456,17 @@ export const makeCodexSessionRuntime = (
             // has even if the setting changed after the session started.
             browserToolsAvailable: hasConfiguredMcpServer(options.appServerArgs),
           });
-          const rawResponse = yield* client.raw.request("turn/start", params);
+          const execution = yield* AgentControlVerificationExecution;
+          const authorization =
+            verificationChecksAvailable &&
+            execution?.threadId === options.threadId &&
+            execution.cwd === options.cwd
+              ? { providerThreadId, turnId: yield* Deferred.make<string | null>() }
+              : null;
+          yield* Ref.set(verificationTurn, authorization);
+          const rawResponse = yield* client.raw
+            .request("turn/start", params)
+            .pipe(Effect.onError(() => revokeVerification));
           const response = yield* decodeV2TurnStartResponse(rawResponse).pipe(
             Effect.mapError((error) =>
               CodexErrors.CodexAppServerProtocolParseError.fromSchemaError(
@@ -2361,6 +2475,7 @@ export const makeCodexSessionRuntime = (
                 { method: "turn/start" },
               ),
             ),
+            Effect.onError(() => revokeVerification),
           );
           const turnId = TurnId.make(response.turn.id);
           yield* updateSession(sessionRef, (session) => ({
@@ -2371,6 +2486,7 @@ export const makeCodexSessionRuntime = (
             activeTurnId: session.activeTurnId ?? turnId,
             ...(normalizedModel ? { model: normalizedModel } : {}),
           }));
+          if (authorization !== null) yield* Deferred.succeed(authorization.turnId, turnId);
           const resumedProviderThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
           return {
             threadId: options.threadId,
@@ -2382,6 +2498,7 @@ export const makeCodexSessionRuntime = (
         }),
       interruptTurn: (turnId) =>
         Effect.gen(function* () {
+          yield* revokeVerification;
           const providerThreadId = yield* readProviderThreadId;
           const session = yield* Ref.get(sessionRef);
           // Stop-everything: children are full threads with their own turns;

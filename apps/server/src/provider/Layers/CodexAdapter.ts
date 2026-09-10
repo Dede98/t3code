@@ -38,6 +38,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -49,6 +50,8 @@ import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import type { ExternalMcpServer } from "../ExternalMcpServers.ts";
+import { codexStoppedTurnThreadId, readCodexStoppedTurnEvidence } from "../CodexStoppedTurn.ts";
+import { withCodexAppServerClient } from "./CodexProvider.ts";
 
 import {
   ProviderAdapterRequestError,
@@ -2722,6 +2725,30 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
   });
 
+  const readStoppedTurn: NonNullable<CodexAdapterShape["readStoppedTurn"]> = (input) =>
+    Effect.gen(function* () {
+      const nativeThreadId = codexStoppedTurnThreadId(input.resumeCursor);
+      if (Option.isNone(nativeThreadId)) return;
+      const { client } = yield* withCodexAppServerClient({
+        cwd: input.cwd,
+        binaryPath: codexConfig.binaryPath,
+        launchArgs: resolveCodexLaunchArgs(codexConfig.launchArgs, options?.environment),
+        ...(codexConfig.homePath ? { homePath: codexConfig.homePath } : {}),
+        ...(options?.environment ? { environment: options.environment } : {}),
+      });
+      const snapshot = yield* client.raw.request("thread/read", {
+        threadId: nativeThreadId.value,
+        includeTurns: true,
+      });
+      return readCodexStoppedTurnEvidence(input, snapshot);
+    }).pipe(
+      Effect.scoped,
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+      Effect.timeoutOption("10 seconds"),
+      Effect.map(Option.getOrUndefined),
+      Effect.catch(() => Effect.succeed(undefined)),
+    );
+
   const readThread: CodexAdapterShape["readThread"] = (threadId) =>
     requireSession(threadId).pipe(
       Effect.flatMap((session) => session.runtime.readThread),
@@ -2881,6 +2908,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     compaction: { type: "native", start: compactThread },
     interruptTurn,
     readThread,
+    readStoppedTurn,
     rollbackThread,
     uploadFeedback,
     respondToRequest,

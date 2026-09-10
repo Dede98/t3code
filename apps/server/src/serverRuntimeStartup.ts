@@ -475,6 +475,7 @@ export const markRunningProviderSessionsForContinuation = Effect.gen(function* (
     (thread) =>
       thread.archivedAt === null &&
       thread.deletedAt === null &&
+      (thread.agentControl === undefined || thread.agentControl.controlState === "taken-over") &&
       thread.session?.status === "running" &&
       thread.session.activeTurnId !== null,
   );
@@ -622,7 +623,11 @@ export const reconcileProviderSessions = Effect.gen(function* () {
     const continuationTurnId = Option.isSome(binding)
       ? readServerUpdateContinuationTurnId(binding.value.runtimePayload)
       : null;
+    // Controlled turns belong to their durable stage delivery, including recovery.
+    const allowGenericContinuation =
+      thread.agentControl === undefined || thread.agentControl.controlState === "taken-over";
     const continuationMarked =
+      allowGenericContinuation &&
       continuationTurnId !== null &&
       (session.activeTurnId === null || continuationTurnId === session.activeTurnId) &&
       Option.isSome(binding) &&
@@ -639,6 +644,7 @@ export const reconcileProviderSessions = Effect.gen(function* () {
     // Runtime events advance the projection's turn, but not the directory's
     // last admitted turn. Use the projection to identify interrupted work.
     const interruptedByRestart =
+      allowGenericContinuation &&
       continueAfterRestart &&
       session.status === "running" &&
       session.activeTurnId !== null &&

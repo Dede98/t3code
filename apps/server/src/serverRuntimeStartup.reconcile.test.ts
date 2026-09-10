@@ -137,7 +137,17 @@ it.effect("marks active running sessions that have persisted resume state", () =
   return ServerRuntimeStartup.markRunningProviderSessionsForContinuation.pipe(
     Effect.provideService(
       ProjectionSnapshotQuery.ProjectionSnapshotQuery,
-      queryWithThreads([active, archived, ready, missingResumeState]),
+      queryWithThreads([
+        active,
+        archived,
+        ready,
+        missingResumeState,
+        {
+          ...active,
+          id: ThreadId.make("controlled"),
+          agentControl: { controlState: "controlled" },
+        } as ReturnType<typeof makeThread>,
+      ]),
     ),
     Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, {
       getBinding: (threadId) =>
@@ -1002,4 +1012,57 @@ it.effect("settles failed opt-in recovery without retrying the provider turn", (
       continueAfterServerUpdatePrepared: null,
     });
   }),
+);
+
+it.effect.each(["controlled", "closed"] as const)(
+  "does not generically restart an Agent Control %s turn",
+  (controlState) =>
+    Effect.gen(function* () {
+      const thread = {
+        ...makeThread("controlled-restart", "running", TurnId.make("native-turn")),
+        agentControl: { controlState },
+      };
+      const upserts: ProviderSessionDirectory.ProviderRuntimeBinding[] = [];
+      const commands: OrchestrationCommand[] = [];
+      yield* runReconciliation({
+        threads: [thread],
+        continueAfterRestart: true,
+        directory: {
+          getBinding: () =>
+            Effect.succeed(
+              Option.some({
+                threadId: thread.id,
+                provider: ProviderDriverKind.make("codex"),
+                providerInstanceId,
+                runtimeMode: "approval-required",
+                status: "running",
+                resumeCursor: { threadId: "native-thread" },
+                runtimePayload: {
+                  activeTurnId: "native-turn",
+                  continueAfterServerUpdate: "native-turn",
+                },
+              }),
+            ),
+          listBindings: () => Effect.succeed([]),
+          upsert: (binding) =>
+            Effect.sync(() => {
+              upserts.push(binding);
+            }),
+          getProvider: () => Effect.die("unused"),
+          listThreadIds: () => Effect.die("unused"),
+          recordImportedTranscript: () => Effect.die("unused"),
+        },
+        dispatch: (command) =>
+          Effect.sync(() => {
+            commands.push(command);
+            return { sequence: 1 };
+          }),
+      });
+      assert.equal(upserts.length, 1);
+      assert.equal(upserts[0]?.status, "stopped");
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0]?.type, "thread.session.set");
+      if (commands[0]?.type === "thread.session.set")
+        assert.equal(commands[0].session.status, "error");
+    }),
 );

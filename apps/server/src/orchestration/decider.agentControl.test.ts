@@ -547,3 +547,61 @@ it.layer(NodeServices.layer)("Agent Control decider rules", (it) => {
     }),
   );
 });
+
+it.layer(NodeServices.layer)("native terminal recovery ownership", (it) => {
+  it.effect.each(
+    [
+      ["controlled", "old-turn", true],
+      ["controlled", null, true],
+      ["controlled", "new-turn", false],
+      ["taken-over", "new-turn", false],
+      ["taken-over", null, false],
+      ["closed", null, false],
+    ].map(([controlState, activeTurnId, accepted]) => ({
+      controlState,
+      activeTurnId,
+      accepted,
+    })) as ReadonlyArray<{
+      controlState: AgentControlThreadControlState;
+      activeTurnId: string | null;
+      accepted: boolean;
+    }>,
+  )(
+    "checks current control=$controlState activeTurn=$activeTurnId atomically",
+    ({ controlState, activeTurnId, accepted }) =>
+      Effect.gen(function* () {
+        const model = readModel(controlState);
+        const session = {
+          threadId: THREAD_ID,
+          providerName: "codex" as const,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required" as const,
+          status: "running" as const,
+          activeTurnId: activeTurnId === null ? null : TurnId.make(activeTurnId),
+          lastError: null,
+          updatedAt: NOW,
+        };
+        const result = yield* decideOrchestrationCommand({
+          authority: "system",
+          readModel: { ...model, threads: model.threads.map((thread) => ({ ...thread, session })) },
+          command: {
+            type: "thread.session.set",
+            commandId: CommandId.make("provider:recovery:terminal"),
+            threadId: THREAD_ID,
+            session: { ...session, status: "ready", activeTurnId: null },
+            createdAt: NOW,
+            agentControlRecovery: binding("controlled"),
+            providerRuntimeLifecycle: {
+              runtimeEventId: EventId.make("recovered-terminal"),
+              runtimeEventType: "turn.completed",
+              providerInstanceId: session.providerInstanceId,
+              providerTurnId: TurnId.make("old-turn"),
+              providerState: "interrupted",
+            },
+          },
+        }).pipe(Effect.result);
+        expect(result._tag).toBe(accepted ? "Success" : "Failure");
+        expect(session.activeTurnId).toBe(activeTurnId);
+      }),
+  );
+});

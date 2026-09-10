@@ -1337,6 +1337,14 @@ const ThreadSessionSetCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   session: OrchestrationSession,
+  /** Atomic ownership precondition for replaying a controlled native terminal. */
+  agentControlRecovery: Schema.optional(
+    Schema.Struct({
+      taskId: AgentControlTaskId,
+      stageRunId: AgentControlStageRunId,
+      attemptId: AgentControlAttemptId,
+    }),
+  ),
   providerRuntimeLifecycle: Schema.optional(
     Schema.Union([
       Schema.Struct({
