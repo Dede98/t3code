@@ -456,7 +456,19 @@ const seedVerificationFinalization = (
 };
 
 const guardScenario =
-  (matchingNativeTerminal: boolean, recoverPreInvoke = false) =>
+  (
+    matchingNativeTerminal: boolean,
+    recoverPreInvoke = false,
+    preparedSession: boolean | "retry-wait" = false,
+    archiveObstacle?:
+      | "unarchived"
+      | "foreign-model"
+      | "newer-delivery"
+      | "accepted"
+      | "attempted"
+      | "attested"
+      | "session-rebound",
+  ) =>
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -514,7 +526,10 @@ const guardScenario =
           'agent_control_stage_run_lease_states',
           'agent_control_initial_planning_deliveries',
           'agent_control_implementation_deliveries',
-          'agent_control_verification_deliveries'
+          'agent_control_verification_deliveries',
+          'agent_control_initial_planning_session_evidence',
+          'agent_control_implementation_session_evidence',
+          'agent_control_verification_session_evidence'
         ) AND sql IS NOT NULL
         ORDER BY name
       `;
@@ -655,6 +670,57 @@ const guardScenario =
           yield* sql.unsafe(trigger.source).unprepared;
         }
 
+        if (preparedSession) {
+          // Seed the pre-070 persisted preparation through the historical schema,
+          // then restore its exact guards before executing the real upgrade.
+          for (const trigger of deliveryTriggers) {
+            if (trigger.name.includes("_session_evidence_"))
+              yield* sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+          }
+          for (const value of values) {
+            if (archiveObstacle === "unarchived") continue;
+            const sessions = `agent_control_${value.stage.replaceAll("-", "_")}_session_evidence`;
+            yield* Effect.sync(() =>
+              fixtureDatabase
+                .prepare(`INSERT INTO ${sessions}
+              (provider_delivery_id,thread_id,provider_instance_id,runtime_mode,cwd,
+               model_selection_json,model_selection_fingerprint,session_created_at,resume_cursor_json,recorded_at)
+              VALUES (?,?,?,?,?,?,?,?,?,?)`)
+                .run(
+                  value.providerDeliveryId,
+                  value.threadId,
+                  value.providerInstanceId,
+                  value.stage === "verification" ? "approval-required" : "full-access",
+                  "/isolated/worktree",
+                  value.modelSelectionJson,
+                  archiveObstacle === "foreign-model"
+                    ? "0".repeat(64)
+                    : value.modelSelectionFingerprint,
+                  at,
+                  "{}",
+                  at,
+                ),
+            );
+          }
+          for (const trigger of deliveryTriggers) {
+            if (trigger.name.includes("_session_evidence_"))
+              yield* sql.unsafe(trigger.source).unprepared;
+          }
+          if (preparedSession === "retry-wait" || archiveObstacle === "unarchived") {
+            for (const value of values) {
+              const table = `agent_control_${value.stage.replaceAll("-", "_")}_deliveries`;
+              yield* sql.withTransaction(
+                sql.unsafe(
+                  `UPDATE ${table} SET state='retry-wait',revision=revision+1,
+                claim_owner_id=NULL,claim_expires_at=NULL,next_attempt_at=?,last_error_code='transient-not-accepted'
+                WHERE provider_delivery_id=?`,
+                  [at, value.providerDeliveryId],
+                ),
+              );
+            }
+          }
+        }
+
         const wrongProvider = yield* Effect.exit(
           guard.enter(
             { ...permits[0]!, providerInstanceId: ProviderInstanceId.make("foreign-provider") },
@@ -678,7 +744,120 @@ const guardScenario =
         if (recoverPreInvoke) {
           // The fixture above reproduces the old pre-CAS guard: entry evidence
           // exists, but no delivery attestation or session correlation was committed.
-          yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, secondSql));
+          if (preparedSession) {
+            yield* runMigrations({ toMigrationInclusive: 70 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, secondSql),
+            );
+            assert.equal(
+              (yield* secondSql`SELECT * FROM agent_control_prepared_session_archive`).length,
+              archiveObstacle === "unarchived" ? 0 : 3,
+            );
+            for (const value of values) {
+              const table = `agent_control_${value.stage.replaceAll("-", "_")}_deliveries`;
+              assert.equal(
+                (yield* secondSql.unsafe<{ state: string }>(`SELECT state FROM ${table}`))[0]
+                  ?.state,
+                "retry-wait",
+              );
+            }
+          }
+          if (
+            archiveObstacle !== undefined &&
+            !["unarchived", "foreign-model"].includes(archiveObstacle)
+          ) {
+            // Deliberately divergent post-upgrade snapshots exercise the runtime proof;
+            // restore every exact DDL guard before opening the restarted store.
+            const fixtureTriggers = yield* secondSql<{
+              name: string;
+              source: string;
+            }>`SELECT name,sql AS source FROM sqlite_schema
+              WHERE type='trigger' AND (tbl_name LIKE 'agent_control_%_deliveries'
+                OR tbl_name LIKE 'agent_control_%_session_evidence' OR tbl_name LIKE 'agent_control_%_delivery_attestations')`;
+            for (const trigger of fixtureTriggers)
+              yield* secondSql.unsafe(`DROP TRIGGER "${trigger.name}"`).unprepared;
+            yield* Effect.sync(() => {
+              for (const value of values) {
+                const prefix = `agent_control_${value.stage.replaceAll("-", "_")}`;
+                if (archiveObstacle === "attested")
+                  fixtureDatabase
+                    .prepare(`INSERT INTO ${prefix}_delivery_attestations
+                  (provider_delivery_id,provider_instance_id,model_selection_json,model_selection_fingerprint,recorded_at)
+                  VALUES (?,?,?,?,?)`)
+                    .run(
+                      value.providerDeliveryId,
+                      value.providerInstanceId,
+                      value.modelSelectionJson,
+                      value.modelSelectionFingerprint,
+                      at,
+                    );
+                else if (archiveObstacle === "session-rebound")
+                  fixtureDatabase
+                    .prepare(`INSERT INTO ${prefix}_session_evidence
+                  (provider_delivery_id,thread_id,provider_instance_id,runtime_mode,cwd,model_selection_json,model_selection_fingerprint,session_created_at,resume_cursor_json,recorded_at)
+                  VALUES (?,?,?,?,?,?,?,?,?,?)`)
+                    .run(
+                      value.providerDeliveryId,
+                      value.threadId,
+                      value.providerInstanceId,
+                      value.stage === "verification" ? "approval-required" : "full-access",
+                      "/isolated/worktree",
+                      value.modelSelectionJson,
+                      value.modelSelectionFingerprint,
+                      at,
+                      "{}",
+                      at,
+                    );
+                else
+                  fixtureDatabase
+                    .prepare(
+                      `UPDATE ${prefix}_deliveries SET ${
+                        archiveObstacle === "newer-delivery"
+                          ? "revision=revision+2,claim_generation=claim_generation+1"
+                          : archiveObstacle === "accepted"
+                            ? "state='provider-started',next_attempt_at=NULL,last_error_code=NULL,provider_turn_id='accepted-native-turn',provider_accepted_at='2099-09-06T07:59:00.000Z',provider_session_created_at='2099-09-06T07:59:00.000Z',provider_resume_cursor_json='{}'"
+                            : "state='delivery-attempted',next_attempt_at=NULL,claim_owner_id='new-attempted-owner',claim_expires_at='2099-09-06T07:59:00.000Z',provider_session_created_at='2099-09-06T07:59:00.000Z',provider_resume_cursor_json='{}'"
+                      } WHERE provider_delivery_id=?`,
+                    )
+                    .run(value.providerDeliveryId);
+              }
+            });
+            for (const trigger of fixtureTriggers)
+              yield* secondSql.unsafe(trigger.source).unprepared;
+          }
+          if (preparedSession === true && archiveObstacle === undefined) {
+            const name = "agent_control_provider_admission_current_validate_update";
+            const source = (yield* secondSql<{
+              source: string;
+            }>`SELECT sql AS source FROM sqlite_schema WHERE name=${name}`)[0]!.source;
+            const divergent = source.replace("BEFORE UPDATE", "BEFORE /* divergent */ UPDATE");
+            yield* secondSql.unsafe(`DROP TRIGGER ${name}`).unprepared;
+            yield* secondSql.unsafe(divergent).unprepared;
+            const refused = yield* Effect.exit(
+              runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, secondSql)),
+            );
+            assert.isTrue(Exit.isFailure(refused));
+            assert.equal(
+              (yield* secondSql`SELECT * FROM effect_sql_agent_control_migrations WHERE migration_id=72`)
+                .length,
+              0,
+            );
+            assert.equal(
+              (yield* secondSql`SELECT * FROM sqlite_schema WHERE name='agent_control_prepared_session_archive_no_insert'`)
+                .length,
+              0,
+            );
+            assert.equal(
+              (yield* secondSql<{
+                source: string;
+              }>`SELECT sql AS source FROM sqlite_schema WHERE name=${name}`)[0]!.source,
+              divergent,
+            );
+            yield* secondSql.unsafe(`DROP TRIGGER ${name}`).unprepared;
+            yield* secondSql.unsafe(source).unprepared;
+          }
+          yield* runMigrations(preparedSession ? {} : { toMigrationInclusive: 68 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, secondSql),
+          );
         }
         const secondStoreLayer = Layer.fresh(ProviderAdmissionStoreLive).pipe(
           Layer.provide(Layer.succeed(SqlClient.SqlClient, secondSql)),
@@ -709,6 +888,31 @@ const guardScenario =
         );
         if (recoverPreInvoke) {
           const recoveryAt = "2099-09-06T07:59:01.000Z";
+          if (archiveObstacle !== undefined) {
+            assert.equal(yield* secondStore.minimumDeadline, null);
+            assert.deepStrictEqual(yield* secondStore.listDueDeadlines(recoveryAt), []);
+            for (const value of values) {
+              const denied = yield* secondStore.request({
+                request: value,
+                usage: providerAdmissionUsageEvidence({
+                  providerInstanceId: value.providerInstanceId,
+                  status: "allowed",
+                  observedAt: at,
+                  source: "refresh",
+                  nextRelevantAt: null,
+                }),
+                ownerId: "unsafe-recovery",
+                now: recoveryAt,
+                leaseExpiresAt: leaseExpiry,
+              });
+              assert.equal(denied?._tag, "Waiting");
+            }
+            assert.deepStrictEqual(
+              yield* secondSql`SELECT provider_fence_token AS fence FROM agent_control_provider_admission_current ORDER BY provider_instance_id`,
+              [{ fence: 1 }, { fence: 1 }, { fence: 1 }],
+            );
+            return;
+          }
           assert.equal(yield* secondStore.minimumDeadline, "2099-09-06T07:59:00.000Z");
           assert.equal((yield* secondStore.listDueDeadlines(recoveryAt)).length, 3);
           for (const [index, value] of values.entries()) {
@@ -765,6 +969,17 @@ const guardScenario =
               ),
               [],
             );
+          }
+          // Upgrade an already persisted 068 recovery as well as a 070 archive;
+          // startup must continue validating both immutable authority shapes.
+          yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, secondSql));
+          if (preparedSession) {
+            for (const statement of [
+              "DELETE FROM agent_control_prepared_session_archive",
+              "UPDATE agent_control_prepared_session_archive SET reason=reason",
+              "INSERT INTO agent_control_prepared_session_archive SELECT * FROM agent_control_prepared_session_archive",
+            ])
+              assert.isTrue(Exit.isFailure(yield* Effect.exit(secondSql.unsafe(statement))));
           }
           const revalidated = yield* Layer.buildWithScope(
             Layer.fresh(secondStoreLayer),
@@ -1610,3 +1825,28 @@ it.live(
   "recovers legacy pre-invoke quarantine with a new fence and invalidates late old delivery CAS",
   guardScenario(true, true),
 );
+
+it.live(
+  "recovers capacity after migration070 retires a persisted prepared session claim in all three stages",
+  guardScenario(true, true, true),
+);
+
+it.live(
+  "recovers capacity after migration070 archives an already retry-wait prepared session in all three stages",
+  guardScenario(true, true, "retry-wait"),
+);
+
+for (const obstacle of [
+  "unarchived",
+  "foreign-model",
+  "newer-delivery",
+  "accepted",
+  "attempted",
+  "attested",
+  "session-rebound",
+] as const) {
+  it.live(
+    `refuses archived preparation recovery without exact uninvoked proof: ${obstacle}`,
+    guardScenario(true, true, true, obstacle),
+  );
+}

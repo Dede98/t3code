@@ -1,6 +1,14 @@
 import { ProviderInstanceId } from "@t3tools/contracts";
+import {
+  ARCHIVED_PREPARATION_ADMISSION_TRIGGER,
+  ARCHIVED_PREPARATION_ADMISSION_FINGERPRINT,
+  PREPARED_SESSION_ARCHIVE_INSERT_GUARD,
+} from "../../../persistence/Migrations/072_AgentControlArchivedPreparationCapacityRecovery.ts";
 import { PROVIDER_PRE_INVOKE_DDL_FINGERPRINTS } from "../../../persistence/Migrations/068_AgentControlProviderPreInvokeRecovery.ts";
 import {
+  archivedPreInvokeDeliveryPredicate,
+  preparedSessionArchiveBindingPredicate,
+  PREPARED_SESSION_RECOVERY_DEADLINES_SQL,
   decodePreInvokeRecovery,
   ProviderAdmissionPreInvokeRecovery,
   preInvokeDeliveryPredicate,
@@ -336,6 +344,26 @@ const authorityDocument = (input: {
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const preparedRecoveryMigration = yield* sql<{ count: number }>`SELECT count(*) AS count
+    FROM main.effect_sql_agent_control_migrations
+    WHERE migration_id=72 AND name='AgentControlArchivedPreparationCapacityRecovery'`;
+  const hasPreparedRecovery = preparedRecoveryMigration[0]?.count === 1;
+  const loadPreparationArchive = (admissionId: string) =>
+    sql.unsafe<{
+      evidenceJson: string;
+      deliveryJson: string;
+      deliveryRevision: number;
+    }>(
+      `SELECT archive.evidence_json AS evidenceJson, archive.delivery_json AS deliveryJson,
+      json_extract(archive.delivery_json,'$.revision')
+        + CASE json_extract(archive.delivery_json,'$.state') WHEN 'claimed' THEN 1 ELSE 0 END AS deliveryRevision
+    FROM main.agent_control_prepared_session_archive archive
+    JOIN main.agent_control_provider_admission_intents intent ON intent.admission_id=?
+    WHERE ${preparedSessionArchiveBindingPredicate("intent", "archive")}`,
+      [admissionId],
+    );
+  const archiveFingerprint = (row: { evidenceJson: string; deliveryJson: string }) =>
+    sha256Utf8(canonicalJson({ evidenceJson: row.evidenceJson, deliveryJson: row.deliveryJson }));
 
   const readCurrent = (admissionId: string) =>
     sql<CurrentRow>`
@@ -667,7 +695,26 @@ const make = Effect.gen(function* () {
         WHERE (${preInvokeDeliveryPredicate("intent", "?")})`,
       [current.admissionId, now, now, now],
     );
-    if (rows.length !== 1) return undefined;
+    if (rows.length !== 1) {
+      if (!hasPreparedRecovery) return undefined;
+      const eligible = yield* sql.unsafe(
+        `SELECT 1 FROM main.agent_control_provider_admission_intents intent
+        WHERE intent.admission_id=? AND (${archivedPreInvokeDeliveryPredicate("intent")})`,
+        [current.admissionId],
+      );
+      if (eligible.length !== 1) return undefined;
+      const archive = (yield* loadPreparationArchive(current.admissionId))[0];
+      if (archive === undefined) return undefined;
+      return yield* decodeRecoverySnapshot({
+        previousOwnerId: current.ownerId,
+        previousFenceToken: current.providerFenceToken,
+        previousLeaseExpiresAt: current.leaseExpiresAt,
+        deliveryRevision: archive.deliveryRevision,
+        deliveryState: "retry-wait",
+        deliveryAttestationAbsent: true,
+        preparedSessionArchiveFingerprint: archiveFingerprint(archive),
+      });
+    }
     return yield* decodeRecoverySnapshot({
       previousOwnerId: current.ownerId,
       previousFenceToken: current.providerFenceToken,
@@ -890,7 +937,7 @@ const make = Effect.gen(function* () {
             updated_at=${input.now}
           WHERE provider_instance_id=${String(input.request.providerInstanceId)}
         `;
-          if (recovery !== undefined) {
+          if (recovery?.deliveryState === "claimed") {
             const table = providerAdmissionDeliveryTables.find(
               ([stage]) => stage === current.stage,
             )![1];
@@ -1463,7 +1510,9 @@ const make = Effect.gen(function* () {
   `.pipe(Effect.mapError((cause) => fail("list-waiting", "persistence", undefined, cause)));
 
   const preInvokeRecoveryDeadlines = sql.unsafe<ProviderAdmissionDeadlineWakeup>(
-    PROVIDER_PRE_INVOKE_DEADLINES_SQL,
+    hasPreparedRecovery
+      ? `${PROVIDER_PRE_INVOKE_DEADLINES_SQL} UNION ALL ${PREPARED_SESSION_RECOVERY_DEADLINES_SQL}`
+      : PROVIDER_PRE_INVOKE_DEADLINES_SQL,
     [],
   );
 
@@ -2001,6 +2050,12 @@ const make = Effect.gen(function* () {
           ? {
               ...EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS,
               ...PROVIDER_PRE_INVOKE_DDL_FINGERPRINTS,
+              ...(hasPreparedRecovery
+                ? {
+                    [ARCHIVED_PREPARATION_ADMISSION_TRIGGER]:
+                      ARCHIVED_PREPARATION_ADMISSION_FINGERPRINT,
+                  }
+                : {}),
             }
           : EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS;
       if (
@@ -2008,6 +2063,24 @@ const make = Effect.gen(function* () {
         objects.some((object) => expectedFingerprints[object.name] !== sha256Utf8(object.source))
       ) {
         return yield* fail("startup-ddl-audit", "authority-divergent");
+      }
+      if (hasPreparedRecovery) {
+        const archiveGuards = yield* sql<{
+          name: string;
+          source: string;
+        }>`SELECT name,sql AS source FROM main.sqlite_schema
+          WHERE type='trigger' AND name IN ('agent_control_prepared_session_archive_no_insert',
+            'agent_control_prepared_session_archive_no_update','agent_control_prepared_session_archive_no_delete')`;
+        if (
+          archiveGuards.length !== 3 ||
+          archiveGuards.some((guard) =>
+            guard.name.endsWith("_no_insert")
+              ? sha256Utf8(guard.source) !== sha256Utf8(PREPARED_SESSION_ARCHIVE_INSERT_GUARD)
+              : guard.source.replace(/\s+/g, " ").trim() !==
+                `CREATE TRIGGER ${guard.name} BEFORE ${guard.name.endsWith("_no_update") ? "UPDATE" : "DELETE"} ON agent_control_prepared_session_archive BEGIN SELECT RAISE(ABORT, 'prepared session archive is immutable'); END`,
+          )
+        )
+          return yield* fail("startup-prepared-archive-ddl", "authority-divergent");
       }
       const authorityCounts = yield* sql<{
         readonly evidenceCount: number;
@@ -2264,6 +2337,18 @@ const make = Effect.gen(function* () {
             catch: () => fail("startup-pre-invoke-recovery", "authority-divergent", admissionId),
           });
           if (recovery === undefined) continue;
+          if (recovery.deliveryState === "retry-wait") {
+            if (!hasPreparedRecovery)
+              return yield* fail("startup-prepared-archive", "authority-divergent", admissionId);
+            const archive = (yield* loadPreparationArchive(admissionId))[0];
+            if (
+              archive === undefined ||
+              archive.deliveryRevision !== recovery.deliveryRevision ||
+              archiveFingerprint(archive) !== recovery.preparedSessionArchiveFingerprint
+            ) {
+              return yield* fail("startup-prepared-archive", "authority-divergent", admissionId);
+            }
+          }
           const prior = admissionClaims.filter(
             (claim) =>
               claim.providerFenceToken === recovery.previousFenceToken &&
@@ -2274,7 +2359,7 @@ const make = Effect.gen(function* () {
             prior.length !== 1 ||
             chain.providerFenceToken !== recovery.previousFenceToken + 1 ||
             recovery.previousLeaseExpiresAt > chain.occurredAt ||
-            recovery.claimExpiresAt > chain.occurredAt ||
+            (recovery.deliveryState === "claimed" && recovery.claimExpiresAt > chain.occurredAt) ||
             !entryChains.some(
               (entry) => entry.providerFenceToken === recovery.previousFenceToken,
             ) ||
