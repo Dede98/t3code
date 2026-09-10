@@ -151,7 +151,7 @@ it.layer(
         yield* sql`SELECT name, sql FROM sqlite_schema WHERE type='trigger' ORDER BY name`,
         before,
       );
-      yield* runMigrations();
+      yield* runMigrations({ toMigrationInclusive: 70 });
       for (const stage of stages) {
         const rows = yield* sql.unsafe<{ provider_delivery_id: string }>(
           `SELECT provider_delivery_id FROM agent_control_${stage}_session_evidence ORDER BY provider_delivery_id`,
