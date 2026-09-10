@@ -222,6 +222,9 @@ const make = Effect.gen(function* () {
   const resolveRuntime = Effect.fn("AgentControlImplementationTurnCoordinator.resolveRuntime")(
     function* (evidence: AgentControlImplementationAdmissionEvidence) {
       const projectId = ProjectId.make(evidence.projectId);
+      const repair = yield* loadRunOnceRepair(sql, evidence.handoffId);
+      // Repair keeps the implementer stage identity but has its own policy route.
+      const routeRole = Option.isSome(repair) ? "repair" : "implementer";
       const before = yield* loadPolicyBinding(evidence.handoffId, projectId);
       const preflight = yield* policy
         .preflightRuntime({ projectId })
@@ -230,10 +233,8 @@ const make = Effect.gen(function* () {
             error(evidence.handoffId, "runtime-preflight", "runtime-policy-unavailable", cause),
           ),
         );
-      const runtimeRole = preflight.roles.find((role) => role.role === "implementer");
-      const staticRole = preflight.staticPreflight.roles.find(
-        (role) => role.role === "implementer",
-      );
+      const runtimeRole = preflight.roles.find((role) => role.role === routeRole);
+      const staticRole = preflight.staticPreflight.roles.find((role) => role.role === routeRole);
       const selection =
         runtimeRole?.selectedCandidateIndex === null || runtimeRole === undefined
           ? undefined

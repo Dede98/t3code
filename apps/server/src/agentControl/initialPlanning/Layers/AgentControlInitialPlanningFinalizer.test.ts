@@ -2078,6 +2078,10 @@ const buildImplementationCoordinator = Effect.fn("buildImplementationCoordinator
     readonly worktree: AgentControlWorktreeReservationState;
     readonly hooks?: AgentControlImplementationTurnCoordinatorHooksShape;
     readonly liveReservationReplay?: boolean;
+    readonly repairRoute?: {
+      readonly candidates: ReadonlyArray<ModelSelection>;
+      readonly selectedCandidateIndex: number;
+    };
   }) {
     const sqlLayer = Layer.succeed(SqlClient.SqlClient, input.sql);
     const build = <I, E>(layer: Layer.Layer<I, E, never>) =>
@@ -2130,6 +2134,14 @@ const buildImplementationCoordinator = Effect.fn("buildImplementationCoordinator
       model: "gpt-5.6",
       options: [{ id: "reasoning-effort", value: "high" }],
     } as const;
+    const routes = [
+      { role: "implementer", candidates: [modelSelection], selectedCandidateIndex: 0 },
+      {
+        role: "repair",
+        candidates: input.repairRoute?.candidates ?? [modelSelection],
+        selectedCandidateIndex: input.repairRoute?.selectedCandidateIndex ?? 0,
+      },
+    ] as const;
     const policy = AgentControlPolicyService.of({
       getPolicy: () => Effect.die("unused"),
       setProjectPolicy: () => Effect.die("unused"),
@@ -2140,40 +2152,38 @@ const buildImplementationCoordinator = Effect.fn("buildImplementationCoordinator
           ok: true,
           staticPreflight: {
             ok: true,
-            roles: [
-              {
-                role: "implementer",
-                accessMode: "full-access",
-                strict: true,
-                validCandidates: [
-                  { selection: modelSelection, source: "role-route", driverKind: null },
-                ],
-              },
-            ],
-          },
-          roles: [
-            {
-              role: "implementer",
-              accessMode: "full-access",
+            roles: routes.map(({ role, candidates }) => ({
+              role,
+              accessMode: "full-access" as const,
               strict: true,
-              candidates: [
-                {
-                  candidateIndex: 0,
-                  source: "role-route",
-                  providerInstanceId: modelSelection.instanceId,
-                  model: modelSelection.model,
-                  driverKind: null,
-                  providerStatus: "ready",
-                  authStatus: "authenticated",
-                  checkedAt: createdAt,
-                  runtimeReady: true,
-                  errorCode: null,
-                },
-              ],
-              selectedCandidateIndex: 0,
+              validCandidates: candidates.map((selection, candidateIndex) => ({
+                selection,
+                source:
+                  candidateIndex === 0 ? ("role-route" as const) : ("default-fallback" as const),
+                driverKind: null,
+              })),
+            })),
+          },
+          roles: routes.map(({ role, candidates, selectedCandidateIndex }) => ({
+            role,
+            accessMode: "full-access" as const,
+            strict: true,
+            candidates: candidates.map((selection, candidateIndex) => ({
+              candidateIndex,
+              source:
+                candidateIndex === 0 ? ("role-route" as const) : ("default-fallback" as const),
+              providerInstanceId: selection.instanceId,
+              model: selection.model,
+              driverKind: null,
+              providerStatus: "ready" as const,
+              authStatus: "authenticated" as const,
+              checkedAt: createdAt,
+              runtimeReady: candidateIndex === selectedCandidateIndex,
               errorCode: null,
-            },
-          ],
+            })),
+            selectedCandidateIndex,
+            errorCode: null,
+          })),
         }),
     });
     const taskGuard = AgentControlTaskConsumerGuard.of({
@@ -30698,6 +30708,8 @@ it.effect.each([
   "repair-failed",
   "repair-interrupted",
   "large-passed",
+  "repair-route",
+  "repair-fallback",
 ] as const)(
   "Run-once repair re-verifies to %s and keeps the durable limit after restart",
   (scenario) =>
@@ -30705,7 +30717,11 @@ it.effect.each([
       Effect.scoped(
         Effect.gen(function* () {
           const verdict =
-            scenario === "passed" || scenario === "large-passed" ? "passed" : "failed";
+            scenario === "failed" ||
+            scenario === "repair-failed" ||
+            scenario === "repair-interrupted"
+              ? "failed"
+              : "passed";
           const suffix = `repair-once-${scenario}`;
           const initialDatabase = yield* makeSharedDatabase(59);
           const initialPlanning = yield* buildFinalizer(
@@ -30772,6 +30788,22 @@ it.effect.each([
             yield* database.sqlA`SELECT count(*) AS count FROM agent_control_implementation_admission_evidence`,
             [{ count: 2 }],
           );
+          const repairRoute =
+            scenario === "repair-route" || scenario === "repair-fallback"
+              ? {
+                  candidates: [
+                    {
+                      instanceId: ProviderInstanceId.make("repair-primary-provider"),
+                      model: "gpt-5.4",
+                    },
+                    {
+                      instanceId: ProviderInstanceId.make("repair-fallback-provider"),
+                      model: "gpt-5.4-mini",
+                    },
+                  ],
+                  selectedCandidateIndex: scenario === "repair-fallback" ? 1 : 0,
+                }
+              : undefined;
           const coordinator = yield* buildImplementationCoordinator({
             sql: database.sqlA,
             scope: database.scopeA,
@@ -30782,6 +30814,7 @@ it.effect.each([
             task,
             worktree: setup.candidate.worktree,
             liveReservationReplay: true,
+            ...(repairRoute === undefined ? {} : { repairRoute }),
           });
           assert.equal(
             (yield* coordinator.coordinator.processHandoff(prepared.handoffId))._tag,
@@ -30833,6 +30866,21 @@ it.effect.each([
             yield* restarted.drain;
           }
           const claim = repaired.claim;
+          if (repairRoute !== undefined) {
+            const selected = repairRoute.candidates[repairRoute.selectedCandidateIndex]!;
+            assert.deepStrictEqual(claim.evidence.modelSelection, selected);
+            assert.equal(claim.evidence.providerInstanceId, selected.instanceId);
+            // Session evidence comes from the executor's actual prepared provider request.
+            assert.deepStrictEqual(
+              yield* database.sqlA`SELECT provider_instance_id AS provider,
+                json_extract(model_selection_json, '$.model') AS model
+                FROM agent_control_implementation_session_evidence ORDER BY rowid`,
+              [
+                { provider: "implementation-test-provider", model: "gpt-5.6" },
+                { provider: selected.instanceId, model: selected.model },
+              ],
+            );
+          }
           assert.include(claim.evidence.promptText, "only repair attempt");
           assert.include(claim.evidence.promptText, "sum(7,3) returned 4");
           if (scenario === "large-passed") {
