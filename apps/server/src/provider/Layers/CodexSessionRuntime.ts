@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import {
   ApprovalRequestId,
   DEFAULT_MODEL,
@@ -43,9 +47,14 @@ import { buildCodexDeveloperInstructions } from "../CodexDeveloperInstructions.t
 import { AgentControlVerificationExecution } from "../../agentControl/verificationTurn/executionContext.ts";
 import {
   CODEX_VERIFICATION_TOOL,
+  createCodexVerificationTool,
   verificationCheckParams,
   verificationToolFailure,
 } from "../CodexVerificationChecks.ts";
+const decodeVerificationToolInput = Schema.decodeUnknownEffect(
+  Schema.Struct({ check: Schema.String }),
+  { onExcessProperty: "error" },
+);
 const decodeV2TurnStartResponse = Schema.decodeUnknownEffect(EffectCodexSchema.V2TurnStartResponse);
 
 const PROVIDER = ProviderDriverKind.make("codex");
@@ -714,6 +723,7 @@ export const openCodexThread = (input: {
   readonly serviceTier: CodexServiceTier | undefined;
   readonly resumeThreadId: string | undefined;
   readonly verificationChecksAvailable?: boolean;
+  readonly verificationChecks?: Parameters<typeof createCodexVerificationTool>[0];
 }): Effect.Effect<typeof CodexThreadResumeMetadata.Type, CodexErrors.CodexAppServerError> => {
   const resumeThreadId = input.resumeThreadId;
   const startParams = buildThreadStartParams({
@@ -723,7 +733,7 @@ export const openCodexThread = (input: {
     serviceTier: input.serviceTier,
   });
   const params = input.verificationChecksAvailable
-    ? { ...startParams, dynamicTools: [CODEX_VERIFICATION_TOOL] }
+    ? { ...startParams, dynamicTools: [createCodexVerificationTool(input.verificationChecks)] }
     : startParams;
 
   // The generated stable request codec omits experimental dynamicTools.
@@ -1220,6 +1230,7 @@ export const makeCodexSessionRuntime = (
     const verificationTurn = yield* Ref.make<{
       readonly providerThreadId: string;
       readonly turnId: Deferred.Deferred<string | null>;
+      readonly execution: NonNullable<typeof sessionExecution>;
     } | null>(null);
     const revokeVerification = Effect.gen(function* () {
       const authorization = yield* Ref.getAndSet(verificationTurn, null);
@@ -2015,10 +2026,53 @@ export const makeCodexSessionRuntime = (
         ) {
           return verificationToolFailure("Verification turn is no longer authorized.");
         }
-        const params = yield* verificationCheckParams(payload.arguments, options.cwd);
-        // command/exec performs one sandboxed invocation. Unlike a shell approval,
-        // it cannot fall back to an unsandboxed retry after a sandbox denial.
-        const result = yield* client.request("command/exec", params);
+        const args = yield* decodeVerificationToolInput(payload.arguments);
+        const check = authorization.execution.checks.find(
+          (candidate) => candidate.id === args.check,
+        );
+        const execute = Effect.scoped(
+          Effect.gen(function* () {
+            const temporaryDirectory = check?.allowTemporaryFiles
+              ? yield* Effect.acquireRelease(
+                  Effect.tryPromise(() =>
+                    NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-verification-")),
+                  ),
+                  (path) =>
+                    Effect.promise(() => NodeFSP.rm(path, { recursive: true, force: true })),
+                )
+              : undefined;
+            const params = yield* verificationCheckParams(
+              payload.arguments,
+              options.cwd,
+              authorization.execution.checks,
+              temporaryDirectory,
+            );
+            if (temporaryDirectory === undefined)
+              return yield* client.request("command/exec", params);
+            // Codex includes its process cwd in workspaceWrite. A command-only
+            // worker rooted in the private temp directory keeps source read-only.
+            // It never creates a provider thread or starts a model turn.
+            const checkChild = yield* spawner.spawn(
+              ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+                cwd: temporaryDirectory,
+                env,
+                extendEnv,
+                forceKillAfter: CODEX_APP_SERVER_FORCE_KILL_AFTER,
+                shell: spawnCommand.shell,
+              }),
+            );
+            const checkContext = yield* Layer.build(CodexClient.layerChildProcess(checkChild));
+            const checkClient = yield* CodexClient.CodexAppServerClient.pipe(
+              Effect.provide(checkContext),
+            );
+            yield* checkClient.request("initialize", buildCodexInitializeParams());
+            yield* checkClient.notify("initialized", undefined);
+            return yield* checkClient.request("command/exec", params);
+          }),
+        );
+        const result = check
+          ? yield* authorization.execution.runCheck(args.check, payload.turnId, execute)
+          : yield* execute;
         return {
           success: result.exitCode === 0,
           contentItems: [
@@ -2372,6 +2426,7 @@ export const makeCodexSessionRuntime = (
         serviceTier: options.serviceTier,
         resumeThreadId: readResumeCursorThreadId(options.resumeCursor),
         verificationChecksAvailable,
+        verificationChecks: sessionExecution?.checks,
       });
 
       const providerThreadId = opened.thread.id;
@@ -2461,7 +2516,7 @@ export const makeCodexSessionRuntime = (
             verificationChecksAvailable &&
             execution?.threadId === options.threadId &&
             execution.cwd === options.cwd
-              ? { providerThreadId, turnId: yield* Deferred.make<string | null>() }
+              ? { providerThreadId, turnId: yield* Deferred.make<string | null>(), execution }
               : null;
           yield* Ref.set(verificationTurn, authorization);
           const rawResponse = yield* client.raw

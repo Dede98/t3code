@@ -224,3 +224,38 @@ describe("Agent Control policy contracts", () => {
     ).toEqual({ appPolicy: null, projectPolicy: null, preflight });
   });
 });
+
+describe("controller verification manifest", () => {
+  const check = {
+    id: "semver-tests",
+    command: "vp",
+    args: ["test", "run", "packages/shared/src/semver.test.ts", "--reporter=json"],
+    cwd: ".",
+    required: true,
+    timeoutMs: 60_000,
+    allowTemporaryFiles: true,
+    resultFormat: "vitest-json",
+  };
+  it("preserves a scoped executable and its required status through the project policy", () => {
+    expect(decodeProjectPolicy({ verificationChecks: [check] })).toEqual({
+      verificationChecks: [check],
+    });
+  });
+  it.each([
+    { cwd: "../outside" },
+    { cwd: "/absolute" },
+    { cwd: "package/../../outside" },
+    { cwd: "C:\\outside" },
+    { timeoutMs: 300_001 },
+    { timeoutMs: 0 },
+    { id: "git-diff" },
+    { resultFormat: "shell" },
+  ])("rejects unbounded or escaping check definitions: %j", (override) => {
+    expect(() =>
+      decodeProjectPolicy({ verificationChecks: [{ ...check, ...override }] }),
+    ).toThrow();
+  });
+  it("rejects duplicate IDs", () => {
+    expect(() => decodeProjectPolicy({ verificationChecks: [check, check] })).toThrow();
+  });
+});

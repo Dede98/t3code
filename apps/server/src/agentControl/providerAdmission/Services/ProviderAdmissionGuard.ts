@@ -7,7 +7,7 @@ import type { ProviderAdmissionError } from "./ProviderAdmissionStore.ts";
 export interface ProviderAdmissionGuardShape {
   readonly enter: (
     permit: ProviderAdmissionPermit,
-    boundary: "session-start" | "turn-start",
+    boundary: "session-start" | "turn-start" | "verification-check",
   ) => Effect.Effect<void, ProviderAdmissionError>;
   readonly quarantineIfEntered: (
     permit: ProviderAdmissionPermit,

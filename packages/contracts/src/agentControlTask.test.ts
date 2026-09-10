@@ -260,6 +260,30 @@ describe("Agent Control task contracts", () => {
       expect(decoded.type).toBe("agentControl.task.finalizedAfterVerification");
       expect(decoded.authority).toBe("system");
     }
+    for (const invalidOutputCode of [
+      "verification-checks-missing",
+      "verification-checks-unavailable",
+      "verification-checks-stale",
+      "verification-checks-failed",
+    ]) {
+      const mapping = {
+        ...finalizationSource,
+        ...cases[2],
+        evaluation: { ...cases[2].evaluation, invalidOutputCode },
+      };
+      expect(decodeEventDraft(eventDraft(mapping))).toMatchObject({
+        payload: { status: "failed" },
+      });
+      expect(() => decodeEventDraft(eventDraft({ ...mapping, status: "succeeded" }))).toThrow();
+      expect(() =>
+        decodeEventDraft(
+          eventDraft({
+            ...mapping,
+            evaluation: { ...mapping.evaluation, invalidOutputCode: "arbitrary-provider-error" },
+          }),
+        ),
+      ).toThrow();
+    }
     expect(() =>
       decodeEventDraft(
         eventDraft({

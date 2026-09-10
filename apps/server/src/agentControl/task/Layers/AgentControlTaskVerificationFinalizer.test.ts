@@ -142,7 +142,7 @@ const capturePopulatedProduction061 = (
           try {
             const authority = database
               .prepare(`SELECT
-                (SELECT count(*) FROM main.effect_sql_migrations WHERE migration_id = 61)
+                (SELECT count(*) FROM main.effect_sql_agent_control_migrations WHERE migration_id = 61)
                   AS migration,
                 (SELECT count(*) FROM main.agent_control_verification_finalization_markers)
                   AS markers`)
@@ -730,6 +730,40 @@ const seedCommittedVerificationFinalization = (
           finalizedAt,
         );
     });
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS agent_control_verification_check_manifests (
+        provider_delivery_id TEXT PRIMARY KEY, handoff_id TEXT NOT NULL,
+        fence_token INTEGER NOT NULL, worktree_path TEXT NOT NULL, code_digest TEXT NOT NULL,
+        checks_json TEXT NOT NULL, manifest_digest TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS agent_control_verification_check_assessments (
+        provider_delivery_id TEXT PRIMARY KEY, provider_turn_id TEXT NOT NULL,
+        code TEXT, digest TEXT NOT NULL, sealed_at TEXT NOT NULL
+      );
+    `);
+    database
+      .prepare(
+        "INSERT INTO agent_control_verification_check_manifests VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        common.providerDeliveryId,
+        handoffId,
+        common.fenceToken,
+        "/fixture/worktree",
+        "code-digest",
+        "[]",
+        "manifest-digest",
+        finalizedAt,
+      );
+    database
+      .prepare("INSERT INTO agent_control_verification_check_assessments VALUES (?, ?, ?, ?, ?)")
+      .run(
+        common.providerDeliveryId,
+        common.providerTurnId,
+        null,
+        "check-assessment-digest",
+        finalizedAt,
+      );
     const leaseEvent = {
       eventId: leaseEventId,
       type: "agentControl.stageRunLease.releasedAfterVerification",
@@ -1279,6 +1313,30 @@ it.live(
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   30_000,
+);
+
+it.live.each(["missing", "earlier-turn", "unavailable"] as const)(
+  "does not complete a passed stage with %s required-check authority",
+  (problem) =>
+    withDatabase("task-verification-checks-", (filename, runtime) =>
+      Effect.gen(function* () {
+        yield* seedTask(runtime, problem);
+        const source = seedCommittedVerificationFinalization(filename, problem, "passed");
+        if (problem === "missing")
+          yield* runtime.sql`DELETE FROM main.agent_control_verification_check_assessments`;
+        else if (problem === "earlier-turn")
+          yield* runtime.sql`UPDATE main.agent_control_verification_check_assessments SET provider_turn_id = 'previous-verification-turn'`;
+        else
+          yield* runtime.sql`UPDATE main.agent_control_verification_check_assessments SET code = 'verification-checks-unavailable'`;
+        const result = yield* Effect.exit(runtime.finalizer.processHandoff(source.handoffId));
+        assert.isTrue(Exit.isFailure(result));
+        const state = Option.getOrThrow(yield* runtime.states.get(source.taskId));
+        assert.notEqual(state.status, "succeeded");
+        assert.deepStrictEqual(yield* finalizationCounts(runtime.sql), [
+          { evidence: 0, events: 0, markers: 0, publications: 0, receipts: 0 },
+        ]);
+      }),
+    ),
 );
 
 it.live("maps every committed Verification disposition and publishes once after commit", () =>

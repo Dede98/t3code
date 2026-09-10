@@ -70,6 +70,11 @@ import { AgentControlVerificationStageFinalizerHooks } from "../Services/AgentCo
 import { ProviderAdmissionReleaseAuthority } from "../../providerAdmission/Services/ProviderAdmissionReleaseAuthority.ts";
 import { AgentControlVerificationTurnWakeup } from "../Services/AgentControlVerificationTurnWakeup.ts";
 import type { AgentControlVerificationClaim } from "../model.ts";
+import {
+  assessVerificationChecks,
+  sealVerificationCheckAssessment,
+  snapshotVerificationCode,
+} from "../checkEvidence.ts";
 
 const isFinalizerError = Schema.is(AgentControlVerificationStageFinalizerError);
 const INVALID_OUTPUT_CODES = new Set<AgentControlVerificationInvalidOutputCode>([
@@ -79,6 +84,10 @@ const INVALID_OUTPUT_CODES = new Set<AgentControlVerificationInvalidOutputCode>(
   "malformed-json",
   "unsupported-schema-version",
   "schema-violation",
+  "verification-checks-missing",
+  "verification-checks-unavailable",
+  "verification-checks-stale",
+  "verification-checks-failed",
 ]);
 
 interface StartAuthority {
@@ -168,6 +177,41 @@ const make = Effect.gen(function* () {
       try: () => decodeCanonicalUtf8Bytes(value),
       catch: (cause) => error(handoffId, operation, "identity-mismatch", cause),
     });
+
+  const applyCheckInvalidation = Effect.fn(
+    "AgentControlVerificationStageFinalizer.applyCheckInvalidation",
+  )(function* (
+    handoffId: string,
+    claim: AgentControlVerificationClaim,
+    evaluation: AcceptedEvaluation | typeof noEvaluation,
+  ) {
+    if (evaluation.verificationVerdict !== "passed") return evaluation;
+    const invalidations = yield* sql`
+        SELECT invalidation.provider_delivery_id
+        FROM main.agent_control_verification_check_invalidations invalidation
+        JOIN main.agent_control_verification_check_assessments assessment
+          ON assessment.provider_delivery_id = invalidation.provider_delivery_id
+        JOIN main.agent_control_verification_check_manifests manifest
+          ON manifest.provider_delivery_id = invalidation.provider_delivery_id
+        WHERE invalidation.provider_delivery_id = ${claim.evidence.providerDeliveryId}
+          AND invalidation.provider_turn_id = ${claim.delivery.providerTurnId}
+          AND invalidation.handoff_id = ${handoffId}
+          AND invalidation.assessment_digest = assessment.digest AND assessment.code IS NULL
+          AND invalidation.provider_turn_id = assessment.provider_turn_id
+          AND manifest.handoff_id = ${handoffId}
+          AND manifest.fence_token = ${claim.evidence.fenceToken}
+          AND invalidation.observed_code_digest <> manifest.code_digest
+      `.pipe(
+      Effect.mapError((cause) => error(handoffId, "load-check-invalidation", "persistence", cause)),
+    );
+    if (invalidations.length === 0) return evaluation;
+    return {
+      ...evaluation,
+      evaluationDisposition: "invalid-output",
+      verificationVerdict: null,
+      invalidOutputCode: "verification-checks-stale",
+    } as const;
+  });
 
   const loadStartAuthority = Effect.fn("AgentControlVerificationStageFinalizer.loadStartAuthority")(
     function* (handoffId: string, claim: AgentControlVerificationClaim) {
@@ -468,6 +512,9 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error(handoffId, "decode-evaluation-numbers", "evaluation-conflict");
     }
+    const checks = yield* sealVerificationCheckAssessment(sql, claim).pipe(
+      Effect.mapError((cause) => error(handoffId, "load-check-assessment", "persistence", cause)),
+    );
     const expectedAuthorityJson = canonicalJson({
       admission: {
         evidenceId: claim.evidence.admissionEvidenceId,
@@ -535,6 +582,7 @@ const make = Effect.gen(function* () {
         streamVersion: row.terminalStreamVersion,
       },
       threadId: claim.evidence.threadId,
+      verificationChecksDigest: checks.digest,
       verdict,
       worktree: {
         branch: claim.evidence.branch,
@@ -567,7 +615,12 @@ const make = Effect.gen(function* () {
       return yield* error(handoffId, "compare-evaluation-authority", "evaluation-conflict");
     }
     if (disposition === "evaluated" && (verdict === "passed" || verdict === "failed")) {
-      if (errorCode !== null || semanticDigest === null) {
+      if (
+        errorCode !== null ||
+        semanticDigest === null ||
+        (checks.code !== null &&
+          !(checks.code === "verification-checks-failed" && verdict === "failed"))
+      ) {
         return yield* error(handoffId, "evaluated-authority-shape", "evaluation-conflict");
       }
       return {
@@ -1119,6 +1172,17 @@ const make = Effect.gen(function* () {
     }
     const replayClaim = replayClaimOption.value;
     const replayStart = yield* loadStartAuthority(handoffId, replayClaim);
+    const replayEvaluation = yield* applyCheckInvalidation(
+      handoffId,
+      replayClaim,
+      yield* loadEvaluationAuthority(handoffId, replayClaim, replayStart),
+    );
+    if (
+      canonicalJson(replayEvaluation as unknown as JsonValue) !==
+      canonicalJson(parsed.evaluation as unknown as JsonValue)
+    ) {
+      return yield* error(handoffId, "replay-check-authority", "evaluation-conflict");
+    }
     const sourcePayloads = [parsed.stagePayload, parsed.leasePayload] as const;
     if (
       replayClaim.delivery.providerTurnId === null ||
@@ -1402,8 +1466,32 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error(handoffId, "validate-lease-history", "lease-history-corrupt");
     }
-    const evaluation = yield* loadEvaluationAuthority(handoffId, claim, start);
+    let evaluation = yield* loadEvaluationAuthority(handoffId, claim, start);
     yield* hooks.afterAuthoritativeRead(handoffId);
+    if (
+      evaluation.evaluationAuthority === "accepted-evaluation" &&
+      evaluation.verificationVerdict === "passed"
+    ) {
+      const currentChecks = yield* assessVerificationChecks(sql, claim).pipe(
+        Effect.mapError((cause) => error(handoffId, "check-current-code", "persistence", cause)),
+      );
+      if (currentChecks.code !== null) {
+        if (currentChecks.code !== "verification-checks-stale") {
+          return yield* error(handoffId, "check-current-code", "evaluation-conflict");
+        }
+        const observedCodeDigest = yield* snapshotVerificationCode(
+          claim.evidence.worktreePath,
+        ).pipe(Effect.catch(() => Effect.succeed("unavailable")));
+        yield* sql`INSERT INTO main.agent_control_verification_check_invalidations
+          (provider_delivery_id, provider_turn_id, handoff_id, assessment_digest, observed_code_digest, invalidated_at)
+          VALUES (${claim.evidence.providerDeliveryId}, ${claim.delivery.providerTurnId}, ${handoffId},
+            ${currentChecks.digest}, ${observedCodeDigest}, ${claim.delivery.terminalAt})
+        `.pipe(
+          Effect.mapError((cause) => error(handoffId, "invalidate-checks", "persistence", cause)),
+        );
+      }
+      evaluation = yield* applyCheckInvalidation(handoffId, claim, evaluation);
+    }
 
     const mapping =
       claim.delivery.state === "completed"

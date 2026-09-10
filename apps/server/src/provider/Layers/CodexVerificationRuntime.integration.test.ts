@@ -5,20 +5,48 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  ProviderInstanceId,
+  ThreadId,
+  type AgentControlVerificationCheck,
+} from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 import { describe, expect } from "vite-plus/test";
+import { VerificationCheckError } from "../../agentControl/verificationTurn/checkEvidence.ts";
 import { AgentControlVerificationExecution } from "../../agentControl/verificationTurn/executionContext.ts";
-import { CODEX_VERIFICATION_TOOL } from "../CodexVerificationChecks.ts";
+import {
+  CODEX_VERIFICATION_TOOL,
+  createCodexVerificationTool,
+} from "../CodexVerificationChecks.ts";
 import wireFixture from "../testFixtures/codexMultiAgentWire.json" with { type: "json" };
 import { makeCodexSessionRuntime } from "./CodexSessionRuntime.ts";
 
 const threadId = ThreadId.make("controlled-verification");
-const cwd = NodeOS.tmpdir();
-const authorization = { threadId, cwd };
+const cwd = NodeFS.realpathSync(NodeOS.tmpdir());
+const check: AgentControlVerificationCheck = {
+  id: "scoped-tests",
+  command: "vp",
+  args: ["test", "run", "packages/shared/src/semver.test.ts", "--reporter=json"],
+  cwd: ".",
+  required: true,
+  timeoutMs: 60_000,
+  allowTemporaryFiles: false,
+  resultFormat: "vitest-json",
+};
+const runCheck: NonNullable<typeof AgentControlVerificationExecution.Service>["runCheck"] = (
+  checkId,
+  providerTurnId,
+  execute,
+) =>
+  Effect.gen(function* () {
+    expect(checkId).toBe(check.id);
+    expect(providerTurnId).toBe(nativeTurnId);
+    return yield* execute.pipe(Effect.mapError((cause) => new VerificationCheckError({ cause })));
+  });
+const authorization = { threadId, cwd, checks: [check], runCheck };
 const nativeTurnId = "verification-native-turn";
 const toolCall = {
   id: 51,
@@ -28,7 +56,7 @@ const toolCall = {
     turnId: nativeTurnId,
     callId: "check-call",
     tool: CODEX_VERIFICATION_TOOL.name,
-    arguments: { check: "node-test" },
+    arguments: { check: "scoped-tests" },
   },
 };
 const peerPath = NodePath.join(
@@ -114,7 +142,7 @@ describe("Codex controlled Verification checks", () => {
       Effect.gen(function* () {
         const result = yield* exercise({});
         expect(result.requests.find((r) => r.method === "thread/start")?.params).toMatchObject({
-          dynamicTools: [CODEX_VERIFICATION_TOOL],
+          dynamicTools: [createCodexVerificationTool([check])],
           approvalPolicy: "untrusted",
           sandbox: "read-only",
         });
@@ -126,7 +154,7 @@ describe("Codex controlled Verification checks", () => {
           {
             method: "command/exec",
             params: {
-              command: ["node", "--test"],
+              command: [check.command, ...check.args],
               cwd,
               sandboxPolicy: { type: "readOnly", networkAccess: false },
               timeoutMs: 60_000,
@@ -144,9 +172,9 @@ describe("Codex controlled Verification checks", () => {
     { turnId: "stale-native-turn" },
     { tool: "exec" },
     { namespace: "other" },
-    { arguments: { check: "node-test", command: ["python3", "-c", "print(1)"] } },
-    { arguments: { check: "node-test", cwd: "/" } },
-    { arguments: { check: "node-test; touch changed" } },
+    { arguments: { check: "scoped-tests", command: ["python3", "-c", "print(1)"] } },
+    { arguments: { check: "scoped-tests", cwd: "/" } },
+    { arguments: { check: "scoped-tests; touch changed" } },
   ])("rejects calls outside the exact tool contract: %j", (params) =>
     Effect.gen(function* () {
       const result = yield* exercise({
@@ -167,6 +195,19 @@ describe("Codex controlled Verification checks", () => {
     Effect.gen(function* () {
       const result = yield* exercise(input);
       expect(result.requests.filter((r) => r.method === "command/exec")).toEqual([]);
+      expect(result.responses[0]?.result).toMatchObject({ success: false });
+    }),
+  );
+
+  it.effect("cannot execute a registered check when its evidence authority rejects the claim", () =>
+    Effect.gen(function* () {
+      const result = yield* exercise({
+        turnAuthorization: {
+          ...authorization,
+          runCheck: () => new VerificationCheckError({ cause: "stale verification fence" }),
+        },
+      });
+      expect(result.requests.filter((request) => request.method === "command/exec")).toEqual([]);
       expect(result.responses[0]?.result).toMatchObject({ success: false });
     }),
   );

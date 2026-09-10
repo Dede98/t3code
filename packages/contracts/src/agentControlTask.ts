@@ -440,6 +440,10 @@ const VerificationInvalidOutputEvaluation = Schema.Struct({
     "malformed-json",
     "unsupported-schema-version",
     "schema-violation",
+    "verification-checks-missing",
+    "verification-checks-unavailable",
+    "verification-checks-stale",
+    "verification-checks-failed",
   ]),
 });
 

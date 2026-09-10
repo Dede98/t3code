@@ -1102,6 +1102,26 @@ const make = Effect.gen(function* () {
     ) {
       return yield* error(handoffId, "compare-source-authority", "authority-conflict");
     }
+    if (document.outcome === "succeeded") {
+      const checks = yield* sql`
+        SELECT assessment.digest
+        FROM main.agent_control_verification_check_assessments assessment
+        JOIN main.agent_control_verification_check_manifests manifest
+          ON manifest.provider_delivery_id = assessment.provider_delivery_id
+        WHERE assessment.provider_delivery_id = ${document.stagePayload.providerDeliveryId}
+          AND assessment.provider_turn_id = ${document.stagePayload.providerTurnId}
+          AND assessment.code IS NULL
+          AND manifest.handoff_id = ${handoffId}
+          AND manifest.fence_token = ${document.stagePayload.fenceToken}
+      `.pipe(
+        Effect.mapError((cause) =>
+          error(handoffId, "load-verification-checks", "persistence", cause),
+        ),
+      );
+      if (checks.length !== 1) {
+        return yield* error(handoffId, "load-verification-checks", "authority-conflict");
+      }
+    }
     return { row, document };
   });
 

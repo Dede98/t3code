@@ -833,7 +833,9 @@ const guardScenario =
             yield* secondSql.unsafe(`DROP TRIGGER ${name}`).unprepared;
             yield* secondSql.unsafe(divergent).unprepared;
             const refused = yield* Effect.exit(
-              runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, secondSql)),
+              runMigrations({ toMigrationInclusive: 72 }).pipe(
+                Effect.provideService(SqlClient.SqlClient, secondSql),
+              ),
             );
             assert.isTrue(Exit.isFailure(refused));
             assert.equal(
@@ -855,7 +857,10 @@ const guardScenario =
             yield* secondSql.unsafe(`DROP TRIGGER ${name}`).unprepared;
             yield* secondSql.unsafe(source).unprepared;
           }
-          yield* runMigrations(preparedSession ? {} : { toMigrationInclusive: 68 }).pipe(
+          // These admission/archive fixtures intentionally omit parent orchestration
+          // rows. Stop at the archive-hardening migration under test, before 073
+          // rebuilds unrelated Repair tables and validates their foreign keys.
+          yield* runMigrations({ toMigrationInclusive: preparedSession ? 72 : 68 }).pipe(
             Effect.provideService(SqlClient.SqlClient, secondSql),
           );
         }
@@ -972,7 +977,9 @@ const guardScenario =
           }
           // Upgrade an already persisted 068 recovery as well as a 070 archive;
           // startup must continue validating both immutable authority shapes.
-          yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, secondSql));
+          yield* runMigrations({ toMigrationInclusive: 72 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, secondSql),
+          );
           if (preparedSession) {
             for (const statement of [
               "DELETE FROM agent_control_prepared_session_archive",
@@ -1850,3 +1857,137 @@ for (const obstacle of [
     guardScenario(true, true, true, obstacle),
   );
 }
+
+it.live(
+  "admits verification checks only for the live started delivery without creating another turn entry",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-verification-check-guard-",
+        });
+        const filename = path.join(directory, "guard.sqlite");
+        const context = yield* Layer.build(NodeSqliteClient.layer({ filename }));
+        const sql = Context.get(context, SqlClient.SqlClient);
+        yield* runMigrations({ toMigrationInclusive: 65 }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        );
+        const storeContext = yield* Layer.build(
+          Layer.fresh(ProviderAdmissionStoreLive).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+          ),
+        );
+        const store = Context.get(storeContext, ProviderAdmissionStore);
+        const value = request("verification", ProviderInstanceId.make("verification-check-guard"));
+        const decision = yield* store.request({
+          request: value,
+          usage: providerAdmissionUsageEvidence({
+            providerInstanceId: value.providerInstanceId,
+            status: "allowed",
+            observedAt: at,
+            source: "refresh",
+            nextRelevantAt: null,
+          }),
+          ownerId: "check-owner",
+          leaseExpiresAt: leaseExpiry,
+          now: at,
+        });
+        assert.equal(decision._tag, "Admitted");
+        if (decision._tag !== "Admitted") return;
+        const permit = decision.permit;
+        const triggers = yield* sql<{ name: string; source: string }>`
+      SELECT name,sql AS source FROM main.sqlite_schema WHERE type='trigger' AND tbl_name IN (
+        'agent_control_stage_run_states', 'agent_control_stage_run_lease_states', 'agent_control_verification_deliveries'
+      ) AND sql IS NOT NULL ORDER BY name`;
+        const fixture = yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            const db = new NodeSqlite.DatabaseSync(filename);
+            db.exec("PRAGMA foreign_keys=OFF");
+            return db;
+          }),
+          (db) => Effect.sync(() => db.close()),
+        );
+        const mutateFixture = (use: () => void) =>
+          Effect.gen(function* () {
+            for (const trigger of triggers)
+              yield* sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+            yield* Effect.sync(use);
+            for (const trigger of triggers) yield* sql.unsafe(trigger.source).unprepared;
+          });
+        for (const trigger of triggers)
+          yield* sql.unsafe(`DROP TRIGGER main."${trigger.name}"`).unprepared;
+        yield* sql`PRAGMA foreign_keys=OFF`;
+        yield* seedStageAndDelivery(sql, value, false);
+        yield* Effect.sync(() => seedNonInitialDelivery(fixture, value));
+        for (const trigger of triggers) yield* sql.unsafe(trigger.source).unprepared;
+        yield* sql`PRAGMA foreign_keys=ON`;
+        const guardContext = yield* Layer.build(
+          Layer.fresh(ProviderAdmissionGuardLive).pipe(
+            Layer.provide(Layer.mock(AgentControlStageRunLeaseEngine)({})),
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+            Layer.provide(Layer.succeed(ProviderAdmissionStore, store)),
+            Layer.provide(Layer.succeed(AgentControlTaskConsumerGuard, taskGuardShape)),
+          ),
+        );
+        const guard = Context.get(guardContext, ProviderAdmissionGuard);
+        assert.isTrue(
+          Exit.isFailure(yield* Effect.exit(guard.enter(permit, "verification-check"))),
+        );
+        yield* guard.enter(permit, "session-start");
+        yield* mutateFixture(() => {
+          fixture
+            .prepare(`UPDATE agent_control_verification_deliveries SET state='delivery-attempted',
+        revision=revision+1,attempt_count=1,provider_session_created_at=?,provider_resume_cursor_json='{}'
+        WHERE provider_delivery_id=?`)
+            .run(at, value.providerDeliveryId);
+        });
+        yield* guard.enter(permit, "turn-start");
+        assert.isTrue(
+          Exit.isFailure(yield* Effect.exit(guard.enter(permit, "verification-check"))),
+        );
+        yield* mutateFixture(() => {
+          fixture
+            .prepare(`UPDATE agent_control_verification_deliveries SET state='provider-started',
+        revision=revision+1,provider_turn_id='native-check-turn',provider_accepted_at=?,claim_owner_id=NULL,claim_expires_at=NULL
+        WHERE provider_delivery_id=?`)
+            .run(at, value.providerDeliveryId);
+        });
+        const markers =
+          yield* sql`SELECT * FROM agent_control_provider_authority_markers WHERE admission_id=${permit.admissionId} ORDER BY marker_id`;
+        const capacity =
+          yield* sql`SELECT * FROM agent_control_provider_capacity_current WHERE provider_instance_id=${String(permit.providerInstanceId)}`;
+        yield* guard.enter(permit, "verification-check");
+        yield* guard.enter(permit, "verification-check");
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_provider_authority_markers WHERE admission_id=${permit.admissionId} ORDER BY marker_id`,
+          markers,
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_provider_capacity_current WHERE provider_instance_id=${String(permit.providerInstanceId)}`,
+          capacity,
+        );
+        for (const invalid of [
+          { ...permit, providerFenceToken: permit.providerFenceToken + 1 },
+          { ...permit, stageFenceToken: permit.stageFenceToken + 1 },
+          { ...permit, admissionOwnerId: "other-owner" },
+          { ...permit, stageLeaseHolderId: "other-holder" },
+          { ...permit, providerDeliveryId: "old-verification-delivery" },
+        ])
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(guard.enter(invalid, "verification-check"))),
+          );
+        yield* mutateFixture(() => {
+          fixture
+            .prepare(
+              "UPDATE agent_control_stage_run_lease_states SET expires_at=? WHERE lease_id=?",
+            )
+            .run("2000-01-01T00:00:00.000Z", permit.stageLeaseId);
+        });
+        assert.isTrue(
+          Exit.isFailure(yield* Effect.exit(guard.enter(permit, "verification-check"))),
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);

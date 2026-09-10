@@ -59,6 +59,14 @@ import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as TxRef from "effect/TxRef";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { AgentControlVerificationChecks } from "@t3tools/contracts";
+import {
+  prepareVerificationCheckManifest,
+  executeVerificationCheck,
+  VerificationCheckError,
+  type VerificationCheckCommandResult,
+} from "../../agentControl/verificationTurn/checkEvidence.ts";
 
 import { appendUserInputAttachmentPaths } from "../userInputAttachments.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -578,6 +586,10 @@ export const correlateRuntimeEventWithInstance = (
   return { ...event, providerInstanceId: event.providerInstanceId };
 };
 
+const decodeVerificationChecksJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(AgentControlVerificationChecks),
+);
+
 const makeProviderService = Effect.fn("makeProviderService")(function* (
   options?: ProviderServiceLiveOptions,
 ) {
@@ -595,6 +607,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
   const threadOperationLock = yield* ProviderThreadOperationLock;
   const admissionGuard = Option.getOrUndefined(yield* Effect.serviceOption(ProviderAdmissionGuard));
+  const verificationSql = Option.getOrUndefined(yield* Effect.serviceOption(SqlClient.SqlClient));
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const runtimeEventPublicationPubSub =
     yield* PubSub.unbounded<ProviderService.ProviderRuntimeEventPublication>();
@@ -603,7 +616,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const sessionAttestations = new Map<ThreadId, ProviderSessionAttestation>();
   const enterProviderAdmission = (
     permit: ProviderAdmissionPermit,
-    boundary: "session-start" | "turn-start",
+    boundary: "session-start" | "turn-start" | "verification-check",
   ): Effect.Effect<void, ProviderValidationError> =>
     admissionGuard === undefined
       ? Effect.fail(
@@ -623,6 +636,55 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               ),
             ),
           );
+  const verificationExecution = Effect.fn("ProviderService.verificationExecution")(function* (
+    permit: ProviderAdmissionPermit,
+    cwd: string,
+  ) {
+    if (verificationSql === undefined)
+      return yield* toValidationError(
+        "ProviderService.verificationExecution",
+        "Verification evidence persistence is unavailable.",
+      );
+    const sql = verificationSql;
+    const manifest = yield* prepareVerificationCheckManifest(sql, { permit, cwd }).pipe(
+      Effect.mapError((cause) =>
+        toValidationError(
+          "ProviderService.verificationExecution",
+          "Cannot prepare verification check manifest.",
+          cause,
+        ),
+      ),
+    );
+    const checks = yield* decodeVerificationChecksJson(manifest.checksJson).pipe(
+      Effect.mapError((cause) =>
+        toValidationError(
+          "ProviderService.verificationExecution",
+          "Invalid verification check manifest.",
+          cause,
+        ),
+      ),
+    );
+    return {
+      threadId: ThreadId.make(permit.threadId),
+      cwd,
+      checks,
+      runCheck: <E>(
+        checkId: string,
+        providerTurnId: string,
+        execute: Effect.Effect<VerificationCheckCommandResult, E>,
+      ) =>
+        withProviderAdmissionEffectFence(
+          permit.providerInstanceId,
+          executeVerificationCheck(sql, {
+            manifest,
+            checkId,
+            providerTurnId,
+            execute,
+            authorize: enterProviderAdmission(permit, "verification-check"),
+          }),
+        ).pipe(Effect.mapError((cause) => new VerificationCheckError({ cause }))),
+    };
+  });
   const quarantineAdmissionIfEntered = (permit: ProviderAdmissionPermit) =>
     admissionGuard === undefined
       ? Effect.fail(
@@ -2079,7 +2141,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             providerAdmissionPermit?.stage === "verification" &&
               input.runtimeMode === "approval-required" &&
               effectiveCwd !== undefined
-              ? { threadId, cwd: effectiveCwd }
+              ? yield* verificationExecution(providerAdmissionPermit, effectiveCwd)
               : null,
           ),
           Effect.onError(() => clearMcpSession(threadId)),
@@ -2508,7 +2570,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                     AgentControlVerificationExecution,
                     permit.stage === "verification" &&
                       boundary.expected.runtimeMode === "approval-required"
-                      ? { threadId: input.threadId, cwd: boundary.expected.cwd }
+                      ? yield* verificationExecution(permit, boundary.expected.cwd)
                       : null,
                   ),
                 ),

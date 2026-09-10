@@ -1121,7 +1121,7 @@ const make = Effect.gen(function* () {
     "ProviderAdmissionStore.validateAndEnterInTransaction",
   )(function* (input: {
     readonly permit: ProviderAdmissionPermit;
-    readonly boundary: "session-start" | "turn-start";
+    readonly boundary: "session-start" | "turn-start" | "verification-check";
     readonly enteredAt: string;
   }) {
     const [current, intent, capacity] = yield* Effect.all([
@@ -1231,12 +1231,13 @@ const make = Effect.gen(function* () {
                 AND fence_token=${input.permit.stageFenceToken} AND typeof(fence_token)='integer'
                 AND provider_instance_id=${String(input.permit.providerInstanceId)}
                 AND model_selection_fingerprint=${input.permit.modelSelectionFingerprint}
-                AND (state='claimed' OR (${input.boundary === "turn-start" ? 1 : 0} AND state='delivery-attempted'))
+                AND (( ${input.boundary === "verification-check" ? 1 : 0} AND state='provider-started') OR ( ${input.boundary !== "verification-check" ? 1 : 0} AND (state='claimed' OR (${input.boundary === "turn-start" ? 1 : 0} AND state='delivery-attempted'))))
               AND typeof(state)='text'
             `;
     if (deliveryRows[0]?.count !== 1) {
       return yield* fail("pre-effect-delivery", "authority-divergent", input.permit.admissionId);
     }
+    if (input.boundary === "verification-check") return;
     // The first turn guard only authorizes adapter preparation. The immutable
     // turn-entry marker belongs after the consumer commits delivery-attempted.
     if (input.boundary === "turn-start" && deliveryRows[0]?.attempted !== 1) return;

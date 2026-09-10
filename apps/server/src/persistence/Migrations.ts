@@ -117,6 +117,10 @@ import AgentMigration0071 from "./Migrations/071_AgentControlNativeTerminalRecei
 import AgentMigration0073 from "./Migrations/073_AgentControlRunOnceRepair.ts";
 import AgentMigration0072 from "./Migrations/072_AgentControlArchivedPreparationCapacityRecovery.ts";
 import AgentMigration0074 from "./Migrations/074_AgentControlRepairPromptBudget.ts";
+import AgentMigration0075 from "./Migrations/075_AgentControlVerificationCheckErrors.ts";
+
+import AgentMigration0076 from "./Migrations/076_AgentControlVerificationChecks.ts";
+import AgentMigration0077 from "./Migrations/077_AgentControlVerificationCheckInvalidations.ts";
 
 const agentMigrationEntries = [
   [34, "OrchestrationCommandAuthority", AgentMigration0034],
@@ -160,6 +164,9 @@ const agentMigrationEntries = [
   [72, "AgentControlArchivedPreparationCapacityRecovery", AgentMigration0072],
   [73, "AgentControlRunOnceRepair", AgentMigration0073],
   [74, "AgentControlRepairPromptBudget", AgentMigration0074],
+  [75, "AgentControlVerificationCheckErrors", AgentMigration0075],
+  [76, "AgentControlVerificationChecks", AgentMigration0076],
+  [77, "AgentControlVerificationCheckInvalidations", AgentMigration0077],
 ] as const;
 
 const migrationEntries = [

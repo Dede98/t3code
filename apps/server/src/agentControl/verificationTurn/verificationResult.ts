@@ -34,6 +34,10 @@ export const VerificationResultDecodeErrorCode = Schema.Literals([
   "malformed-json",
   "unsupported-schema-version",
   "schema-violation",
+  "verification-checks-missing",
+  "verification-checks-unavailable",
+  "verification-checks-stale",
+  "verification-checks-failed",
 ]);
 export type VerificationResultDecodeErrorCode = typeof VerificationResultDecodeErrorCode.Type;
 

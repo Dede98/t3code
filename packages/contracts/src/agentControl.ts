@@ -71,6 +71,39 @@ export const AgentControlAppPolicy = Schema.Struct({
 });
 export type AgentControlAppPolicy = typeof AgentControlAppPolicy.Type;
 
+/** Executable checks are supplied by the controller policy, never by a provider turn. */
+export const AgentControlVerificationCheck = Schema.Struct({
+  id: Schema.String.check(Schema.isPattern(/^(?!git-)[a-z][a-z0-9-]{0,63}$/)),
+  command: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(4_096),
+    Schema.isPattern(/^[^\0\r\n]+$/),
+  ),
+  args: Schema.Array(
+    Schema.String.check(Schema.isMaxLength(8_192), Schema.isPattern(/^[^\0]*$/)),
+  ).check(Schema.isMaxLength(128)),
+  cwd: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(4_096),
+    Schema.isPattern(/^(?![\\/]|[a-zA-Z]:)(?!.*(?:^|[\\/])\.\.(?:[\\/]|$))[^\0\r\n]+$/),
+  ),
+  required: Schema.Boolean,
+  timeoutMs: PositiveInt.check(Schema.isLessThanOrEqualTo(300_000)),
+  allowTemporaryFiles: Schema.Boolean,
+  resultFormat: Schema.Literals(["exit-code", "node-test", "vitest-json"]),
+});
+export type AgentControlVerificationCheck = typeof AgentControlVerificationCheck.Type;
+
+export const AgentControlVerificationChecks = Schema.Array(AgentControlVerificationCheck).check(
+  Schema.isMaxLength(32),
+  Schema.makeFilter(
+    (checks) =>
+      new Set(checks.map((check) => check.id)).size === checks.length ||
+      "Verification check IDs must be unique",
+  ),
+);
+export type AgentControlVerificationChecks = typeof AgentControlVerificationChecks.Type;
+
 /**
  * Project-local overrides. Missing values inherit from the app policy.
  *
@@ -83,6 +116,7 @@ export const AgentControlProjectPolicy = Schema.Struct({
   roleRoutes: Schema.optionalKey(AgentControlRoleRoutes),
   defaultFallbacks: Schema.optionalKey(Schema.Array(ModelSelection)),
   fullAccess: Schema.optionalKey(Schema.Boolean),
+  verificationChecks: Schema.optionalKey(AgentControlVerificationChecks),
 });
 export type AgentControlProjectPolicy = typeof AgentControlProjectPolicy.Type;
 

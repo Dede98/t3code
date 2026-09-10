@@ -276,6 +276,10 @@ export const AgentControlVerificationInvalidOutputCode = Schema.Literals([
   "malformed-json",
   "unsupported-schema-version",
   "schema-violation",
+  "verification-checks-missing",
+  "verification-checks-unavailable",
+  "verification-checks-stale",
+  "verification-checks-failed",
 ]);
 export type AgentControlVerificationInvalidOutputCode =
   typeof AgentControlVerificationInvalidOutputCode.Type;

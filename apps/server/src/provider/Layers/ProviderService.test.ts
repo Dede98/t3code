@@ -3196,7 +3196,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
-  it.effect("scopes sandboxed execution to the admitted verification invocation", () =>
+  it.effect("requires evidence persistence before an admitted verification invocation", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const threadId = asThreadId("thread-verification-execution");
@@ -3233,7 +3233,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         }),
       );
       yield* Effect.gen(function* () {
-        for (const stage of ["initial-planning", "implementation", "verification"] as const) {
+        for (const stage of ["initial-planning", "implementation"] as const) {
           yield* provider.sendTurnAtPreInvokeBoundary!(
             { threadId, input: "verify", modelSelection },
             {
@@ -3246,7 +3246,21 @@ routing.layer("ProviderServiceLive routing", (it) => {
           );
           assert.isNull(yield* AgentControlVerificationExecution);
         }
-        assert.deepStrictEqual(observed, [null, null, { threadId, cwd: attestation.cwd }]);
+        const failure = yield* provider.sendTurnAtPreInvokeBoundary!(
+          { threadId, input: "verify", modelSelection },
+          {
+            expected: attestation,
+            providerAdmissionPermit: {
+              ...makeTestProviderAdmissionPermit(attestation),
+              stage: "verification",
+            },
+            beforeDeliveryCas: () => Effect.void,
+            persistDeliveryAttempted: () => Effect.void,
+            afterDeliveryCas: () => Effect.void,
+          },
+        ).pipe(Effect.flip);
+        assert.instanceOf(failure, ProviderValidationError);
+        assert.deepStrictEqual(observed, [null, null]);
       }).pipe(Effect.ensuring(Effect.sync(() => routing.codex.resetPrepareTurn())));
       yield* provider.stopSession({ threadId });
     }),

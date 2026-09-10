@@ -3,7 +3,6 @@ import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
-import * as Result from "effect/Result";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
@@ -32,11 +31,11 @@ import {
 } from "../Services/AgentControlVerificationEvaluator.ts";
 import { AgentControlVerificationEvaluatorHooks } from "../Services/AgentControlVerificationEvaluatorHooks.ts";
 import { AgentControlVerificationHandoffStore } from "../Services/AgentControlVerificationHandoffStore.ts";
-import { decodeVerificationResult, VerificationResultDecodeError } from "../verificationResult.ts";
+import { evaluateCheckedVerificationResult } from "../checkedResult.ts";
+import { sealVerificationCheckAssessment } from "../checkEvidence.ts";
 
 const RECOVERY_INTERVAL = Duration.seconds(5);
 const isEvaluationError = Schema.is(AgentControlVerificationEvaluationError);
-const isDecodeError = Schema.is(VerificationResultDecodeError);
 
 const evaluationError = (
   operation: string,
@@ -226,25 +225,16 @@ const make = Effect.gen(function* () {
       if (sourceResult._tag === "Waiting") return sourceResult;
       yield* hooks.afterSourceLoad(handoffId);
 
-      const decoded =
-        sourceResult.source.sourceDisposition === "oversize"
-          ? Result.fail(new VerificationResultDecodeError({ code: "output-too-large" }))
-          : yield* Effect.result(decodeVerificationResult(sourceResult.source.bytes));
-      const evaluation = Result.isSuccess(decoded)
-        ? {
-            disposition: "evaluated" as const,
-            verdict: decoded.success.verdict,
-            errorCode: null,
-            semanticResultDigest: decoded.success.semanticDigest,
-          }
-        : isDecodeError(decoded.failure)
-          ? {
-              disposition: "invalid-output" as const,
-              verdict: null,
-              errorCode: decoded.failure.code,
-              semanticResultDigest: null,
-            }
-          : yield* evaluationError("decode-verification-result", "history-corrupt", handoffId);
+      const checks = yield* sealVerificationCheckAssessment(sql, claim).pipe(
+        Effect.mapError((cause) =>
+          evaluationError("assess-verification-checks", "persistence", handoffId, cause),
+        ),
+      );
+      const evaluation = yield* evaluateCheckedVerificationResult(
+        sourceResult.source.bytes,
+        checks.code,
+        sourceResult.source.sourceDisposition === "oversize",
+      );
 
       const evaluationId = deriveVerificationEvaluationId({
         providerDeliveryId: claim.evidence.providerDeliveryId,
@@ -335,6 +325,7 @@ const make = Effect.gen(function* () {
           streamVersion: sourceResult.source.terminalEventStreamVersion,
         },
         threadId: claim.evidence.threadId,
+        verificationChecksDigest: checks.digest,
         verdict: evaluation.verdict,
         worktree: {
           branch: claim.evidence.branch,

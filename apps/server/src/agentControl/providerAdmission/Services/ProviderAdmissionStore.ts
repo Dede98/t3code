@@ -56,7 +56,7 @@ export interface ProviderAdmissionStoreShape {
   }) => Effect.Effect<ProviderAdmissionDecision, ProviderAdmissionError>;
   readonly validateAndEnterInTransaction: (input: {
     readonly permit: ProviderAdmissionPermit;
-    readonly boundary: "session-start" | "turn-start";
+    readonly boundary: "session-start" | "turn-start" | "verification-check";
     readonly enteredAt: string;
   }) => Effect.Effect<void, ProviderAdmissionError>;
   readonly admitOldest: (input: {

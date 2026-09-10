@@ -27,7 +27,9 @@ it.effect("upgrades an applied repair migration atomically and preserves its evi
       yield* sql`SELECT type, name, sql FROM sqlite_schema ORDER BY type, name`,
       before,
     );
-    assert.deepStrictEqual(yield* runMigrations(), [[74, "AgentControlRepairPromptBudget"]]);
+    assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 74 }), [
+      [74, "AgentControlRepairPromptBudget"],
+    ]);
     const after = yield* sql<{ type: string; name: string; sql: string | null }>`
       SELECT type, name, sql FROM sqlite_schema ORDER BY type, name
     `;
@@ -57,6 +59,6 @@ it.effect("upgrades an applied repair migration atomically and preserves its evi
       );
     }
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
-    assert.deepStrictEqual(yield* runMigrations(), []);
+    assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 74 }), []);
   }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
 );

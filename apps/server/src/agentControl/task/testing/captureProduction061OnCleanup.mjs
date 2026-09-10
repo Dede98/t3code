@@ -37,14 +37,13 @@ const captureBeforeCleanup = async (directory) => {
   try {
     const authority = database
       .prepare(`SELECT
-        (SELECT count(*) FROM main.effect_sql_migrations WHERE migration_id = 61) AS migration,
+        (SELECT count(*) FROM main.effect_sql_agent_control_migrations WHERE migration_id = 61) AS migration,
         (SELECT count(*) FROM main.agent_control_verification_finalization_markers) AS markers`)
       .get();
     if (authority.migration !== 1 || authority.markers !== 1) {
-      throw new Error(
-        `production 061 authority is incomplete: migration=${authority.migration}, markers=${authority.markers}`,
-      );
+      return;
     }
+    captured = true;
     await NodeSqlite.backup(database, snapshotFilename);
   } finally {
     database.close();
@@ -58,7 +57,6 @@ if (snapshotFilename !== undefined && acknowledgementSocket !== undefined) {
     if (captured || !NodePath.basename(directory).startsWith("t3-initial-planning-finalizer-")) {
       return originalRemove.call(NodeFS, path, options, callback);
     }
-    captured = true;
     void captureBeforeCleanup(directory).then(
       () => originalRemove.call(NodeFS, path, options, callback),
       (cause) => callback(cause),
