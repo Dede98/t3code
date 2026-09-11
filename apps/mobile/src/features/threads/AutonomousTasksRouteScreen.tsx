@@ -8,6 +8,9 @@ import {
   type ProjectId,
 } from "@t3tools/contracts";
 import {
+  agentControlEndPausedInput,
+  agentControlEndPausedExplanation,
+  agentControlCommandErrorMessage,
   agentControlRunStatus,
   agentControlEndBlockedRunInput,
   agentControlCanEndBlockedRun,
@@ -289,6 +292,7 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
   };
   const endBlockedRunInput = agentControlEndBlockedRunInput(modeChangeReadiness);
   const disarmInput = agentControlDisarmInput(modeChangeReadiness);
+  const endPausedInput = agentControlEndPausedInput(modeChangeReadiness);
 
   async function changeMode(input: AgentControlSetProjectModeInput) {
     if (pendingRef.current || pending || modeChangeBlocker !== null || !snapshotReady) return;
@@ -299,11 +303,7 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
       const result = await setMode({ environmentId, input });
       if (mountedRef.current && result._tag === "Failure") {
         const cause = Cause.squash(result.cause);
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "The request failed. Reload the current state before retrying.",
-        );
+        setError(agentControlCommandErrorMessage(cause));
       }
       if (mountedRef.current) {
         refreshSnapshot();
@@ -444,8 +444,7 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
         {!policy.data?.projectPolicy?.policy.verificationChecks?.length ? (
           <Text className="text-sm text-foreground-muted">No verification checks configured.</Text>
         ) : null}
-        {snapshot.data?.projectState.mode === "manual" ||
-        snapshot.data?.projectState.mode === "paused" ? (
+        {snapshot.data?.projectState.mode === "manual" ? (
           <Action
             disabled={!snapshotReady || pending || modeChangeBlocker !== null}
             onPress={() => {
@@ -460,6 +459,21 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
           >
             Enable task observation
           </Action>
+        ) : null}
+        {snapshot.data?.projectState.mode === "paused" ? (
+          <View className="gap-2">
+            <Action
+              disabled={endPausedInput === null}
+              onPress={() => {
+                if (endPausedInput) void changeMode(endPausedInput);
+              }}
+            >
+              End paused mode
+            </Action>
+            <Text className="text-sm text-foreground-muted">
+              {agentControlEndPausedExplanation}
+            </Text>
+          </View>
         ) : null}
         {snapshot.data?.projectState.mode === "observe" &&
         !snapshot.data.runs.some((run) => run.state.status === "active") ? (

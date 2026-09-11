@@ -1,6 +1,9 @@
 import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
+  agentControlEndPausedInput,
+  agentControlEndPausedExplanation,
+  agentControlCommandErrorMessage,
   agentControlRunStatus,
   agentControlArmedStatus,
   agentControlArmBlockers,
@@ -208,6 +211,12 @@ function AgentControlProjectPanelContent({
     pending,
     modeChangeBlocker,
   });
+  const endPausedInput = agentControlEndPausedInput({
+    snapshot,
+    connected: agentControlSnapshotReady(snapshotResult, connected),
+    pending,
+    modeChangeBlocker,
+  });
   const endBlockedRunInput = agentControlEndBlockedRunInput({
     snapshot,
     connected: agentControlSnapshotReady(snapshotResult, connected),
@@ -217,45 +226,45 @@ function AgentControlProjectPanelContent({
 
   const changeMode = async (
     mode: "manual" | "observe" | "run-once" | "armed",
-    action?: "end-blocked" | "disarm",
+    action?: "end-blocked" | "disarm" | "end-paused",
   ) => {
     if (!snapshot || pending || requestPending.current || modeChangeBlocker !== null) return;
     if (mode === "run-once" && (blockers.length > 0 || !selectedTaskId)) return;
     if (mode === "armed" && armedBlockers.length > 0) return;
     if (action === "end-blocked" && endBlockedRunInput === null) return;
     if (action === "disarm" && disarmInput === null) return;
+    if (action === "end-paused" && endPausedInput === null) return;
     if (!action && mode !== "run-once" && mode !== "armed" && !canChangeIntake) return;
-    if (mode === "manual" && snapshot.projectState.mode !== "observe") return;
+    if (mode === "manual" && action !== "end-paused" && snapshot.projectState.mode !== "observe")
+      return;
     requestPending.current = true;
     setPending(true);
     setError(null);
     try {
       const input =
-        action === "disarm" && disarmInput
-          ? disarmInput
-          : action === "end-blocked" && endBlockedRunInput
-            ? endBlockedRunInput
-            : mode === "armed"
-              ? agentControlArmInput(snapshot)
-              : mode === "run-once" && selectedTaskId
-                ? agentControlStartInput(snapshot, selectedTaskId)
-                : {
-                    projectId,
-                    commandId: CommandId.make(
-                      `t3auto-${mode}:${JSON.stringify([projectId, snapshot.projectState.revision])}`,
-                    ),
-                    expectedRevision: snapshot.projectState.revision,
-                    mode,
-                  };
+        action === "end-paused" && endPausedInput
+          ? endPausedInput
+          : action === "disarm" && disarmInput
+            ? disarmInput
+            : action === "end-blocked" && endBlockedRunInput
+              ? endBlockedRunInput
+              : mode === "armed"
+                ? agentControlArmInput(snapshot)
+                : mode === "run-once" && selectedTaskId
+                  ? agentControlStartInput(snapshot, selectedTaskId)
+                  : {
+                      projectId,
+                      commandId: CommandId.make(
+                        `t3auto-${mode}:${JSON.stringify([projectId, snapshot.projectState.revision])}`,
+                      ),
+                      expectedRevision: snapshot.projectState.revision,
+                      mode,
+                    };
       const result = await setMode({ environmentId, input });
       if (!mounted.current) return;
       if (result._tag === "Failure") {
         const failure = squashAtomCommandFailure(result);
-        setError(
-          failure instanceof Error
-            ? failure.message
-            : "The request failed. Reconnect and check the saved run before trying again.",
-        );
+        setError(agentControlCommandErrorMessage(failure));
       }
     } finally {
       requestPending.current = false;
@@ -372,8 +381,7 @@ function AgentControlProjectPanelContent({
               >
                 Run once
               </Button>
-              {snapshot.projectState.mode === "manual" ||
-              snapshot.projectState.mode === "paused" ? (
+              {snapshot.projectState.mode === "manual" ? (
                 <Button
                   size="sm"
                   variant="outline"
@@ -382,6 +390,21 @@ function AgentControlProjectPanelContent({
                 >
                   Enable task intake
                 </Button>
+              ) : null}
+              {snapshot.projectState.mode === "paused" ? (
+                <div className="space-y-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={endPausedInput === null}
+                    onClick={() => void changeMode("manual", "end-paused")}
+                  >
+                    End paused mode
+                  </Button>
+                  <p className="text-sm text-muted-foreground">
+                    {agentControlEndPausedExplanation}
+                  </p>
+                </div>
               ) : null}
               {snapshot.projectState.mode === "observe" ? (
                 <Button

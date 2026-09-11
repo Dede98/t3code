@@ -45,6 +45,8 @@ verification evidence remain available.
 After any active run releases its resources and blockers are resolved, you can turn automation on
 again. Previously attempted tasks cannot be restarted as fresh runs; remove their ready label or
 pause them in GitHub before offering new eligible tasks.
+If the project was paused, choose **End paused mode** to return to manual control, then enable
+intake again. This does not resume the previous autonomous run.
 
 The latest saved run shows Planning, Implementation, Verification, and any Repair with its own
 subsequent Verification. Expand check results to inspect their exit codes and captured output.

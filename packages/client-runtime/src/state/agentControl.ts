@@ -107,6 +107,19 @@ export function agentControlModeChangeBlocker<E>(
   return null;
 }
 
+/** Schema-tagged RPC errors may be Error instances with an empty message. */
+export function agentControlCommandErrorMessage(error: unknown): string {
+  const code = typeof error === "object" && error !== null && "code" in error ? error.code : null;
+  if (code === "revision-conflict") {
+    return "The project changed before this request was accepted. Review the refreshed state and try again.";
+  }
+  if (code === "command-previously-rejected") {
+    return "The server previously rejected this request. Review the refreshed state and resolve any reported blocker before trying again.";
+  }
+  if (error instanceof Error && error.message.trim()) return error.message;
+  return `The request failed${typeof code === "string" ? ` (${code})` : ""}. Check the refreshed state and your permissions in this environment before trying again.`;
+}
+
 /** Retries of the same displayed selection retain both command identity and revision. */
 export function agentControlStartInput(
   snapshot: AgentControlRunOnceSnapshot,
@@ -345,7 +358,13 @@ export function agentControlRunStatus(run: AgentControlRunOnceView): AgentContro
     };
   if (run.state.status === "no-eligible-task")
     return { label: "Blocked: no eligible task", tone: "warning" };
-  if (run.task === null) return { label: "Waiting for task data", tone: "warning" };
+  if (run.task === null) {
+    return run.state.status === "active" &&
+      run.state.lastStep === "activation-admitted" &&
+      run.state.taskId === null
+      ? { label: "Starting", tone: "running" }
+      : { label: "Waiting for task data", tone: "warning" };
+  }
   if (run.task.status === "failed") return { label: "Failed", tone: "danger" };
   if (["waiting", "needs-attention", "cancelled"].includes(run.task.status)) {
     return { label: "Blocked: action required", tone: "warning" };
@@ -390,7 +409,14 @@ export function agentControlArmedStatus(
 ): AgentControlStatusView & { enabled: boolean | null } {
   if (!snapshot?.armed) return { enabled: null, label: "Automatic mode unknown", tone: "warning" };
   if (!snapshot.armed.enabled)
-    return { enabled: false, label: "Automatic mode off", tone: "neutral" };
+    return {
+      enabled: false,
+      label:
+        snapshot.projectState.mode === "paused"
+          ? "Automatic mode off · project paused"
+          : "Automatic mode off",
+      tone: "neutral",
+    };
   const active = snapshot.runs.find((run) => run.state.status === "active");
   const status = active ? agentControlRunStatus(active) : null;
   if (snapshot.blockers.length > 0 || status?.tone === "warning" || status?.tone === "danger") {
@@ -438,3 +464,32 @@ export function agentControlDisarmInput(input: {
     mode: "observe",
   };
 }
+
+/** Leaving a paused project requires Manual; Observe could resume the wrong operation. */
+export function agentControlEndPausedInput(input: {
+  snapshot: AgentControlRunOnceSnapshot | null;
+  connected: boolean;
+  pending: boolean;
+  modeChangeBlocker: string | null;
+}): AgentControlSetProjectModeInput | null {
+  const snapshot = input.snapshot;
+  if (
+    !snapshot ||
+    snapshot.projectState.mode !== "paused" ||
+    !input.connected ||
+    input.pending ||
+    input.modeChangeBlocker !== null
+  )
+    return null;
+  return {
+    commandId: CommandId.make(
+      `t3auto-end-paused:${JSON.stringify([snapshot.projectId, snapshot.projectState.revision])}`,
+    ),
+    projectId: snapshot.projectId,
+    expectedRevision: snapshot.projectState.revision,
+    mode: "manual",
+  };
+}
+
+export const agentControlEndPausedExplanation =
+  "End paused mode to return this project to manual control. Then enable task intake before starting fresh autonomous work. This does not interrupt a provider turn already running.";

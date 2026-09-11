@@ -1,5 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
+  AgentControlProjectRevisionConflictError,
+  AgentControlCommandPreviouslyRejectedError,
   AgentControlRunOnceSnapshot,
   AgentControlTaskId,
   type AgentControlRunOnceView,
@@ -16,6 +18,8 @@ import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
 
 import {
+  agentControlEndPausedInput,
+  agentControlCommandErrorMessage,
   agentControlSnapshotFresh,
   agentControlArmedStatus,
   agentControlArmBlockers,
@@ -736,4 +740,103 @@ it("explains why Run once is unavailable while automation is waiting", () => {
       },
     }),
   ).toContain("Turn off automation before starting a single task.");
+});
+
+describe("autonomous command error presentation", () => {
+  it("explains typed revision conflicts even though their Error message is empty", () => {
+    const error = new AgentControlProjectRevisionConflictError({
+      code: "revision-conflict",
+      projectId: snapshot.projectId,
+      expectedRevision: 4,
+      actualRevision: 5,
+    });
+    expect(error.message).toBe("");
+    expect(agentControlCommandErrorMessage(error)).toBe(
+      "The project changed before this request was accepted. Review the refreshed state and try again.",
+    );
+    const replay = new AgentControlCommandPreviouslyRejectedError({
+      code: "command-previously-rejected",
+      commandId: agentControlArmInput(snapshot).commandId,
+      originalErrorCode: "revision-conflict",
+    });
+    expect(agentControlCommandErrorMessage(replay)).toContain("previously rejected");
+  });
+  it("preserves useful error messages and never hides an unknown failure", () => {
+    expect(agentControlCommandErrorMessage(new Error("Connection lost"))).toBe("Connection lost");
+    for (const error of [
+      null,
+      undefined,
+      new Error(""),
+      new Error("  "),
+      { code: "internal-persistence-error" },
+    ]) {
+      expect(agentControlCommandErrorMessage(error)).toContain("The request failed");
+    }
+    expect(agentControlCommandErrorMessage({ code: "internal-persistence-error" })).toContain(
+      "internal-persistence-error",
+    );
+  });
+});
+
+describe("Armed start and paused states", () => {
+  it("reports a preselection activation as starting and still prioritizes real blockers", () => {
+    const starting = {
+      ...run,
+      task: null,
+      state: {
+        ...run.state,
+        status: "active" as const,
+        lastStep: "activation-admitted" as const,
+        taskId: null,
+      },
+      stages: [],
+    };
+    const active = {
+      ...snapshot,
+      armed: { enabled: true },
+      projectState: { ...snapshot.projectState, mode: "run-once" as const },
+      runs: [starting],
+    };
+    expect(agentControlRunStatus(starting)).toEqual({ label: "Starting", tone: "running" });
+    expect(agentControlArmedStatus(active)).toMatchObject({ enabled: true, tone: "running" });
+    expect(agentControlArmedStatus({ ...active, blockers: ["source-watermark-stale"] }).tone).toBe(
+      "warning",
+    );
+    expect(agentControlRunStatus({ ...starting, errorCode: "source-watermark-stale" }).tone).toBe(
+      "warning",
+    );
+    expect(
+      agentControlRunStatus({ ...starting, state: { ...starting.state, taskId: task.taskId } }),
+    ).toEqual({ label: "Waiting for task data", tone: "warning" });
+  });
+  it.each(["observe", "armed", "run-once"] as const)(
+    "leaves paused %s through Manual without reviving the old operation",
+    (pausedFromMode) => {
+      const paused = {
+        ...snapshot,
+        armed: { enabled: false },
+        projectState: { ...snapshot.projectState, mode: "paused" as const, pausedFromMode },
+        runs: [{ ...run, state: { ...run.state, status: "active" as const } }],
+      };
+      const input = { snapshot: paused, connected: true, pending: false, modeChangeBlocker: null };
+      expect(agentControlArmedStatus(paused).label).toContain("project paused");
+      const command = agentControlEndPausedInput(input);
+      expect(command).toMatchObject({
+        mode: "manual",
+        projectId: snapshot.projectId,
+        expectedRevision: snapshot.projectState.revision,
+      });
+      expect(command).not.toHaveProperty("runOnceTaskId");
+      expect(agentControlEndPausedInput(input)).toEqual(command);
+      for (const unavailable of [
+        { connected: false },
+        { pending: true },
+        { snapshot: null },
+        { snapshot },
+        { modeChangeBlocker: "Checking permissions" },
+      ]) {
+        expect(agentControlEndPausedInput({ ...input, ...unavailable })).toBeNull();
+      }
+    },
+  );
 });
