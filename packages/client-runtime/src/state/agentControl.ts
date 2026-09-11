@@ -95,6 +95,15 @@ export function agentControlStartInput(
   };
 }
 
+/** This pre-turn worktree rejection retains immutable failure evidence after human takeover. */
+export function agentControlCanEndBlockedRun(run: AgentControlRunOnceView): boolean {
+  return (
+    run.state.status === "active" &&
+    run.state.lastStep === "lease-reserved" &&
+    run.errorCode === "downstream-rejected: default-remote-ref-unavailable"
+  );
+}
+
 /** Human takeover ends the blocked activation; it never retries its rejected commands. */
 export function agentControlEndBlockedRunInput(input: {
   snapshot: AgentControlRunOnceSnapshot | null;
@@ -109,7 +118,7 @@ export function agentControlEndBlockedRunInput(input: {
     input.pending ||
     input.modeChangeBlocker !== null ||
     snapshot.projectState.mode !== "run-once" ||
-    !snapshot.runs.some((run) => run.state.status === "active" && run.errorCode !== null)
+    !snapshot.runs.some(agentControlCanEndBlockedRun)
   )
     return null;
   return {
@@ -174,6 +183,10 @@ export function agentControlStartBlockers(input: {
       );
     } else if (task.status !== "candidate" || task.sourceGate !== "eligible") {
       blockers.push(`This task cannot start: ${task.status}, source ${task.sourceGate}.`);
+    } else if (snapshot.nextTaskId === null) {
+      blockers.push(
+        "Task readiness changed or the next task already has execution history. Refresh intake; if the old issue was already attempted, remove its ready label or pause it in GitHub, then choose a new eligible task.",
+      );
     } else if (snapshot.nextTaskId !== task.taskId) {
       blockers.push(
         "Run Once currently accepts the next eligible task in issue-number order. Select that task.",

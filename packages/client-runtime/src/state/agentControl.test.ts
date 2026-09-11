@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   AgentControlRunOnceSnapshot,
   AgentControlTaskId,
+  type AgentControlRunOnceView,
   AuthStandardClientScopes,
   AuthAdministrativeScopes,
   type AuthSessionState,
@@ -17,6 +18,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import {
   agentControlRunStatus,
   agentControlEndBlockedRunInput,
+  agentControlCanEndBlockedRun,
   agentControlModeChangeBlocker,
   agentControlSnapshotReady,
   agentControlStageLabel,
@@ -196,8 +198,8 @@ describe("Run Once client state", () => {
       runs: [
         {
           ...run,
-          state: { ...run.state, status: "active" as const },
-          errorCode: "default-remote-ref-unavailable",
+          state: { ...run.state, status: "active" as const, lastStep: "lease-reserved" as const },
+          errorCode: "downstream-rejected: default-remote-ref-unavailable",
         },
       ],
     };
@@ -244,6 +246,55 @@ describe("Run Once client state", () => {
         modeChangeBlocker: agentControlModeChangeBlocker(AsyncResult.success(adminSession)),
       }),
     ).toEqual(command);
+  });
+
+  it("only offers ending for the persisted pre-turn default-reference rejection", () => {
+    const blocked = {
+      ...run,
+      state: { ...run.state, status: "active" as const, lastStep: "lease-reserved" as const },
+    };
+    const endInput = (value: AgentControlRunOnceView) =>
+      agentControlEndBlockedRunInput({
+        snapshot: {
+          ...snapshot,
+          projectState: { ...snapshot.projectState, mode: "run-once" },
+          runs: [value],
+        },
+        connected: true,
+        pending: false,
+        modeChangeBlocker: null,
+      });
+    const supported = {
+      ...blocked,
+      errorCode: "downstream-rejected: default-remote-ref-unavailable",
+    };
+    expect(agentControlCanEndBlockedRun(supported)).toBe(true);
+    expect(endInput(supported)?.mode).toBe("observe");
+    for (const lastStep of [
+      "task-selected",
+      "stage-prepared",
+      "worktree-ready",
+      "thread-activated",
+    ] as const) {
+      const unsupported = { ...supported, state: { ...supported.state, lastStep } };
+      expect(agentControlCanEndBlockedRun(unsupported)).toBe(false);
+      expect(endInput(unsupported)).toBeNull();
+    }
+    for (const errorCode of [
+      null,
+      "persistence",
+      "downstream-rejected: internal-persistence-error",
+      "downstream-rejected: stage-not-prepared",
+      "downstream-rejected: lease-recovery-required",
+      "downstream-rejected: controlled-thread-unavailable",
+      "downstream-rejected: repository-unavailable",
+      "downstream-rejected: repository-lock-unavailable",
+      "downstream-rejected: repository-unavailable-extra",
+    ]) {
+      const unsupported = { ...blocked, errorCode };
+      expect(agentControlCanEndBlockedRun(unsupported)).toBe(false);
+      expect(endInput(unsupported)).toBeNull();
+    }
   });
 
   it("blocks start and intake changes for a standard session but permits an admin session", () => {
@@ -366,7 +417,7 @@ describe("Run Once client state", () => {
     expect(
       agentControlStartBlockers({ ...start, snapshot: { ...snapshot, nextTaskId: null } }),
     ).toContain(
-      "Run Once currently accepts the next eligible task in issue-number order. Select that task.",
+      "Task readiness changed or the next task already has execution history. Refresh intake; if the old issue was already attempted, remove its ready label or pause it in GitHub, then choose a new eligible task.",
     );
     for (const status of [
       "succeeded",

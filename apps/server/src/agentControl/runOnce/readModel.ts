@@ -19,7 +19,10 @@ import { AgentControlStageRunEngine } from "../stageRun/Services/AgentControlSta
 import { AgentControlWorktreeEngine } from "../worktree/Services/AgentControlWorktreeEngine.ts";
 import { AgentControlRunOnceController } from "./Services/AgentControlRunOnceController.ts";
 import { AgentControlRunOnceReadNotifications } from "./readNotifications.ts";
-import { selectAgentControlRunOnceCandidate } from "./selection.ts";
+import {
+  isAgentControlRunOnceCandidateVacant,
+  selectAgentControlRunOnceCandidate,
+} from "./selection.ts";
 import { deriveRunOnceCommandId } from "./identity.ts";
 
 const decodeSnapshot = Schema.decodeUnknownEffect(AgentControlRunOnceSnapshot);
@@ -62,10 +65,15 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
             0,
             ...listed.tasks.map((task) => task.githubIntakeSequence),
           );
-          const nextTaskId =
+          const candidateTaskId =
             intakeSequence === 0
               ? null
               : yield* selectAgentControlRunOnceCandidate(sql, input.projectId, intakeSequence);
+          const nextTaskId =
+            candidateTaskId !== null &&
+            (yield* isAgentControlRunOnceCandidateVacant(sql, input.projectId, candidateTaskId))
+              ? candidateTaskId
+              : null;
           const rows = yield* sql`
         SELECT 1 AS "schemaVersion", run_id AS "runId", project_id AS "projectId", status,
           next_ordinal AS "nextOrdinal", last_step AS "lastStep", task_id AS "taskId",

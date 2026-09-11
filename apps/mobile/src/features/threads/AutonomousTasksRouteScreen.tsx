@@ -10,6 +10,7 @@ import {
 import {
   agentControlRunStatus,
   agentControlEndBlockedRunInput,
+  agentControlCanEndBlockedRun,
   agentControlModeChangeBlocker,
   agentControlSnapshotReady,
   agentControlStageHeading,
@@ -352,9 +353,7 @@ export function AutonomousTasksRouteScreen({
           </Action>
         ) : null}
         {snapshot.data?.projectState.mode === "run-once" &&
-        snapshot.data.runs.some(
-          (run) => run.state.status === "active" && run.errorCode !== null,
-        ) ? (
+        snapshot.data.runs.some(agentControlCanEndBlockedRun) ? (
           <View className="gap-2">
             <Action
               disabled={endBlockedRunInput === null}

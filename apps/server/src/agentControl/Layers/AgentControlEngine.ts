@@ -5,6 +5,7 @@ import {
   AgentControlEventDecodeFailedError,
   AgentControlGetProjectStateInput,
   AgentControlInternalPersistenceError,
+  AgentControlModeNotAvailableError,
   AgentControlProjectDeletedError,
   AgentControlProjectMissingError,
   AgentControlProjectRevisionConflictError,
@@ -53,7 +54,10 @@ import { AgentControlCommandReceiptRepository } from "../../persistence/Services
 import { AgentControlEventStore } from "../../persistence/Services/AgentControlEventStore.ts";
 import { AgentControlProjectAvailability } from "../../persistence/Services/AgentControlProjectAvailability.ts";
 import { AgentControlProjectStateRepository } from "../../persistence/Services/AgentControlProjectStates.ts";
-import { selectAgentControlRunOnceCandidate } from "../runOnce/selection.ts";
+import {
+  isAgentControlRunOnceCandidateVacant,
+  selectAgentControlRunOnceCandidate,
+} from "../runOnce/selection.ts";
 import { withAgentControlRunOnceProjectFence } from "../runOnce/context.ts";
 
 interface CommandEnvelope {
@@ -333,13 +337,20 @@ const makeAgentControlEngine = Effect.gen(function* () {
             return { _tag: "Rejected" as const, error };
           }
 
-          if (envelope.command.runOnceTaskId !== undefined) {
-            if (envelope.command.mode !== "run-once" || currentState.mode !== "observe") {
-              return yield* new AgentControlRuntimeValidationError({
-                code: "validation",
-                operation: "set-project-mode",
-              });
-            }
+          if (
+            envelope.command.runOnceTaskId !== undefined &&
+            (envelope.command.mode !== "run-once" || currentState.mode !== "observe")
+          ) {
+            return yield* new AgentControlRuntimeValidationError({
+              code: "validation",
+              operation: "set-project-mode",
+            });
+          }
+          if (
+            envelope.command.mode === "run-once" &&
+            currentState.mode === "observe" &&
+            envelope.authority === "human"
+          ) {
             const intake = yield* sql<{ sequence: number | null }>`
               SELECT MAX(github_intake_sequence) AS sequence FROM main.agent_control_task_states
               WHERE project_id = ${envelope.command.projectId}
@@ -353,13 +364,48 @@ const makeAgentControlEngine = Effect.gen(function* () {
                     envelope.command.projectId,
                     sequence,
                   ).pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
-            if (candidate !== envelope.command.runOnceTaskId) {
+            if (
+              envelope.command.runOnceTaskId !== undefined &&
+              candidate !== envelope.command.runOnceTaskId
+            ) {
               return yield* new AgentControlRunOnceTaskChangedError({
                 code: "run-once-task-changed",
                 projectId: envelope.command.projectId,
                 expectedTaskId: envelope.command.runOnceTaskId,
                 actualTaskId: candidate,
               });
+            }
+            // A human-ended task retains its execution history. Reject a fresh
+            // activation here, before recovery could mistake it for corrupt authority.
+            if (
+              candidate !== null &&
+              !(yield* isAgentControlRunOnceCandidateVacant(
+                sql,
+                envelope.command.projectId,
+                candidate,
+              ))
+            ) {
+              const error = new AgentControlModeNotAvailableError({
+                code: "mode-not-available",
+                projectId: envelope.command.projectId,
+                mode: "run-once",
+              });
+              yield* receipts
+                .insert({
+                  commandId: envelope.command.commandId,
+                  commandFingerprint: fingerprint,
+                  authority: envelope.authority,
+                  aggregateKind: "project-controller",
+                  aggregateId: envelope.command.projectId,
+                  status: "rejected",
+                  resultSequence: currentState.sequence,
+                  resultStreamVersion: currentState.revision,
+                  eventCreated: false,
+                  acceptedAt: occurredAt,
+                  errorCode: error.code,
+                })
+                .pipe(Effect.mapError((cause) => mapInfrastructureError(cause, "persistence")));
+              return { _tag: "Rejected" as const, error };
             }
           }
 

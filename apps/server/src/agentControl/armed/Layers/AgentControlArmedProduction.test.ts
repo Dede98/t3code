@@ -1418,6 +1418,26 @@ it.live(
           },
         ).pipe(Effect.flip);
         assert.equal(revokedAuthority.code, "project-mode-inactive");
+        const revisionAfterEnd = (yield* engine.getProjectState({ projectId: blockedProjectId }))
+          .revision;
+        for (const selected of [false, true]) {
+          const retry = {
+            commandId: CommandId.make(`blocked-task-restart-${selected}`),
+            projectId: blockedProjectId,
+            expectedRevision: revisionAfterEnd,
+            mode: "run-once" as const,
+            ...(selected ? { runOnceTaskId: blockedTaskId } : {}),
+          };
+          const rejected = yield* engine.dispatchHuman(retry).pipe(Effect.flip);
+          assert.equal(rejected.code, "mode-not-available");
+          const replay = yield* engine.dispatchHuman(retry).pipe(Effect.flip);
+          assert.equal(replay.code, "command-previously-rejected");
+          assert.equal(
+            (yield* engine.getProjectState({ projectId: blockedProjectId })).revision,
+            revisionAfterEnd,
+          );
+          yield* restartRecovery();
+        }
         const refreshedAt = DateTime.formatIso(yield* DateTime.now);
         yield* publishSources(
           blockedProjectId,

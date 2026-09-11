@@ -3,6 +3,7 @@ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   agentControlRunStatus,
   agentControlEndBlockedRunInput,
+  agentControlCanEndBlockedRun,
   agentControlModeChangeBlocker,
   agentControlSnapshotReady,
   agentControlStartBlockers,
@@ -246,9 +247,7 @@ export function AgentControlProjectPanel({
                 </Button>
               ) : null}
               {snapshot.projectState.mode === "run-once" &&
-              snapshot.runs.some(
-                (run) => run.state.status === "active" && run.errorCode !== null,
-              ) ? (
+              snapshot.runs.some(agentControlCanEndBlockedRun) ? (
                 <Button
                   size="sm"
                   variant="outline"
@@ -273,7 +272,7 @@ export function AgentControlProjectPanel({
               </Button>
             </div>
             {snapshot.projectState.mode === "run-once" &&
-            snapshot.runs.some((run) => run.state.status === "active" && run.errorCode !== null) ? (
+            snapshot.runs.some(agentControlCanEndBlockedRun) ? (
               <p className="text-sm text-muted-foreground">
                 Ending the run prevents further automatic steps and keeps its failure history. After
                 fixing the cause, remove the old issue from ready intake in GitHub and start a new

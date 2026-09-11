@@ -401,6 +401,13 @@ layer("Run-Once client read model", (it) => {
         yield* sql`UPDATE agent_control_run_once_states SET run_id = ${nextRunId}
           WHERE run_id = ${runId}`;
         assert.isNull((yield* read.getSnapshot({ projectId })).runs[0]?.errorCode);
+        // The latest run no longer identifies the old blocked task. Its durable
+        // execution history must still prevent advertising a fresh activation.
+        yield* sql`UPDATE agent_control_task_states
+          SET status = 'candidate', stage = 'intake', source_gate = 'eligible',
+            state_json = json_set(state_json, '$.status', 'candidate', '$.stage', 'intake')
+          WHERE task_id = ${taskId}`;
+        assert.isNull((yield* read.getSnapshot({ projectId })).nextTaskId);
       }).pipe(Effect.scoped),
   );
 });

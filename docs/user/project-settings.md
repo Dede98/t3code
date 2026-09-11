@@ -38,7 +38,8 @@ subsequent Verification. Expand check results to inspect their exit codes and ca
 Missing evidence never counts as verified success. Reloading or reconnecting resumes the saved
 progress without starting work again.
 
-For a blocked run, **End blocked run** returns the project to task intake and prevents further
+For a run blocked before its first provider turn by an unavailable default remote reference,
+**End blocked run** returns the project to task intake and prevents further
 automatic steps in that run. This requires an admin session and does not mark the task successful or retry
 the rejected operation. Fix the reported cause, remove the old issue's ready label (or pause it)
 in GitHub, and wait for intake to show it as ineligible. Then start a new eligible issue with
