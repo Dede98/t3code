@@ -20,6 +20,7 @@ import { AgentControlWorktreeEngine } from "../worktree/Services/AgentControlWor
 import { AgentControlRunOnceController } from "./Services/AgentControlRunOnceController.ts";
 import { AgentControlRunOnceReadNotifications } from "./readNotifications.ts";
 import { selectAgentControlRunOnceCandidate } from "./selection.ts";
+import { deriveRunOnceCommandId } from "./identity.ts";
 
 const decodeSnapshot = Schema.decodeUnknownEffect(AgentControlRunOnceSnapshot);
 const encodeSnapshot = Schema.encodeSync(Schema.fromJsonString(AgentControlRunOnceSnapshot));
@@ -199,8 +200,37 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
                 verification,
               });
             }
+            let errorCode =
+              diagnostics.find((item) => item.runId === state.runId)?.errorCode ?? null;
+            if (
+              errorCode === null &&
+              state.status === "completed" &&
+              state.terminalTaskEventId === null &&
+              state.taskId !== null
+            ) {
+              // Human takeover clears the current blocker. Its immutable rejected
+              // worktree command still explains the ended run without blocking a new one.
+              const leaseSteps = yield* sql<{ ordinal: number }>`
+                SELECT ordinal FROM main.agent_control_run_once_step_evidence
+                WHERE run_id = ${state.runId} AND step = 'lease-reserved'
+              `;
+              if (leaseSteps[0]) {
+                const commandId = deriveRunOnceCommandId(
+                  state.runId,
+                  leaseSteps[0].ordinal + 1,
+                  "worktree-ready",
+                );
+                const rejected = yield* sql<{ code: string }>`
+                  SELECT rejection_code AS code FROM main.agent_control_worktree_controller_operations
+                  WHERE command_id = ${commandId} AND project_id = ${state.projectId}
+                    AND task_id = ${state.taskId} AND command_type = 'reserve-and-materialize'
+                    AND status = 'rejected'
+                `;
+                if (rejected[0]) errorCode = `downstream-rejected: ${rejected[0].code}`;
+              }
+            }
             runs.push({
-              errorCode: diagnostics.find((item) => item.runId === state.runId)?.errorCode ?? null,
+              errorCode,
               state,
               task: listed.tasks.find((task) => task.taskId === state.taskId) ?? null,
               stages,

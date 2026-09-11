@@ -9,6 +9,7 @@ import {
 } from "@t3tools/contracts";
 import {
   agentControlRunStatus,
+  agentControlEndBlockedRunInput,
   agentControlModeChangeBlocker,
   agentControlSnapshotReady,
   agentControlStageHeading,
@@ -211,6 +212,12 @@ export function AutonomousTasksRouteScreen({
     pending,
     modeChangeBlocker,
   });
+  const endBlockedRunInput = agentControlEndBlockedRunInput({
+    snapshot: snapshot.data,
+    connected: snapshotReady,
+    pending,
+    modeChangeBlocker,
+  });
 
   async function changeMode(input: AgentControlSetProjectModeInput) {
     if (pendingRef.current || modeChangeBlocker !== null) return;
@@ -343,6 +350,26 @@ export function AutonomousTasksRouteScreen({
           >
             Disable task observation
           </Action>
+        ) : null}
+        {snapshot.data?.projectState.mode === "run-once" &&
+        snapshot.data.runs.some(
+          (run) => run.state.status === "active" && run.errorCode !== null,
+        ) ? (
+          <View className="gap-2">
+            <Action
+              disabled={endBlockedRunInput === null}
+              onPress={() => {
+                if (endBlockedRunInput) void changeMode(endBlockedRunInput);
+              }}
+            >
+              End blocked run
+            </Action>
+            <Text className="text-sm text-foreground-muted">
+              Ending the run prevents further automatic steps and keeps its failure history. After
+              fixing the cause, remove the old issue from ready intake in GitHub and start a new
+              eligible task.
+            </Text>
+          </View>
         ) : null}
         <Text className="text-base font-t3-bold">Choose task</Text>
         {snapshot.data?.tasks.length === 0 ? (

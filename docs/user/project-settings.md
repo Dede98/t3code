@@ -38,6 +38,13 @@ subsequent Verification. Expand check results to inspect their exit codes and ca
 Missing evidence never counts as verified success. Reloading or reconnecting resumes the saved
 progress without starting work again.
 
+For a blocked run, **End blocked run** returns the project to task intake and prevents further
+automatic steps in that run. This requires an admin session and does not mark the task successful or retry
+the rejected operation. Fix the reported cause, remove the old issue's ready label (or pause it)
+in GitHub, and wait for intake to show it as ineligible. Then start a new eligible issue with
+**Run once**. A task with saved execution history cannot be started again as a fresh run; its
+original failure and evidence remain available.
+
 Open a stage's thread or changes to review the result. Web and desktop offer the available editor
 or file-manager actions for its worktree. Mobile can copy the worktree path; its files remain on
 the connected environment.

@@ -2,6 +2,7 @@ import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   agentControlRunStatus,
+  agentControlEndBlockedRunInput,
   agentControlModeChangeBlocker,
   agentControlSnapshotReady,
   agentControlStartBlockers,
@@ -117,27 +118,35 @@ export function AgentControlProjectPanel({
     pending,
     modeChangeBlocker,
   });
+  const endBlockedRunInput = agentControlEndBlockedRunInput({
+    snapshot,
+    connected: agentControlSnapshotReady(snapshotResult, connected),
+    pending,
+    modeChangeBlocker,
+  });
 
-  const changeMode = async (mode: "manual" | "observe" | "run-once") => {
+  const changeMode = async (mode: "manual" | "observe" | "run-once", endBlocked = false) => {
     if (!snapshot || requestPending.current || modeChangeBlocker !== null) return;
     if (mode === "run-once" && (blockers.length > 0 || !selectedTaskId)) return;
-    if (mode !== "run-once" && !canChangeIntake) return;
+    if (endBlocked ? endBlockedRunInput === null : mode !== "run-once" && !canChangeIntake) return;
     if (mode === "manual" && snapshot.projectState.mode !== "observe") return;
     requestPending.current = true;
     setPending(true);
     setError(null);
     try {
       const input =
-        mode === "run-once" && selectedTaskId
-          ? agentControlStartInput(snapshot, selectedTaskId)
-          : {
-              projectId,
-              commandId: CommandId.make(
-                `t3auto-${mode}:${JSON.stringify([projectId, snapshot.projectState.revision])}`,
-              ),
-              expectedRevision: snapshot.projectState.revision,
-              mode,
-            };
+        endBlocked && endBlockedRunInput
+          ? endBlockedRunInput
+          : mode === "run-once" && selectedTaskId
+            ? agentControlStartInput(snapshot, selectedTaskId)
+            : {
+                projectId,
+                commandId: CommandId.make(
+                  `t3auto-${mode}:${JSON.stringify([projectId, snapshot.projectState.revision])}`,
+                ),
+                expectedRevision: snapshot.projectState.revision,
+                mode,
+              };
       const result = await setMode({ environmentId, input });
       if (result._tag === "Failure") {
         const failure = squashAtomCommandFailure(result);
@@ -236,6 +245,19 @@ export function AgentControlProjectPanel({
                   Disable task intake
                 </Button>
               ) : null}
+              {snapshot.projectState.mode === "run-once" &&
+              snapshot.runs.some(
+                (run) => run.state.status === "active" && run.errorCode !== null,
+              ) ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={endBlockedRunInput === null}
+                  onClick={() => void changeMode("observe", true)}
+                >
+                  End blocked run
+                </Button>
+              ) : null}
               <Button
                 size="sm"
                 variant="outline"
@@ -250,6 +272,14 @@ export function AgentControlProjectPanel({
                 Check readiness again
               </Button>
             </div>
+            {snapshot.projectState.mode === "run-once" &&
+            snapshot.runs.some((run) => run.state.status === "active" && run.errorCode !== null) ? (
+              <p className="text-sm text-muted-foreground">
+                Ending the run prevents further automatic steps and keeps its failure history. After
+                fixing the cause, remove the old issue from ready intake in GitHub and start a new
+                eligible task.
+              </p>
+            ) : null}
             {snapshot.tasks.length === 0 ? (
               <p className="text-sm text-muted-foreground">
                 No tasks have been imported. Check the project’s GitHub intake configuration and

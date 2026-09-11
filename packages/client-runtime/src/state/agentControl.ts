@@ -95,6 +95,33 @@ export function agentControlStartInput(
   };
 }
 
+/** Human takeover ends the blocked activation; it never retries its rejected commands. */
+export function agentControlEndBlockedRunInput(input: {
+  snapshot: AgentControlRunOnceSnapshot | null;
+  connected: boolean;
+  pending: boolean;
+  modeChangeBlocker: string | null;
+}): AgentControlSetProjectModeInput | null {
+  const snapshot = input.snapshot;
+  if (
+    !snapshot ||
+    !input.connected ||
+    input.pending ||
+    input.modeChangeBlocker !== null ||
+    snapshot.projectState.mode !== "run-once" ||
+    !snapshot.runs.some((run) => run.state.status === "active" && run.errorCode !== null)
+  )
+    return null;
+  return {
+    commandId: CommandId.make(
+      `t3auto-end-blocked:${JSON.stringify([snapshot.projectId, snapshot.projectState.revision])}`,
+    ),
+    projectId: snapshot.projectId,
+    expectedRevision: snapshot.projectState.revision,
+    mode: "observe",
+  };
+}
+
 export function agentControlStartBlockers(input: {
   snapshot: AgentControlRunOnceSnapshot | null;
   preflight: AgentControlPreflightRuntimeResult | null;
@@ -134,7 +161,18 @@ export function agentControlStartBlockers(input: {
     }
     const task = snapshot.tasks.find((candidate) => candidate.taskId === input.selectedTaskId);
     if (!task) blockers.push("Select an eligible task.");
-    else if (task.status !== "candidate" || task.sourceGate !== "eligible") {
+    else if (
+      snapshot.runs.some(
+        (run) =>
+          run.state.status === "completed" &&
+          run.errorCode !== null &&
+          run.state.taskId === task.taskId,
+      )
+    ) {
+      blockers.push(
+        "This task belongs to an ended blocked run and cannot start again. Fix the reported cause, remove the old issue's ready label or pause it in GitHub, and wait for intake to update. Then select a new eligible task.",
+      );
+    } else if (task.status !== "candidate" || task.sourceGate !== "eligible") {
       blockers.push(`This task cannot start: ${task.status}, source ${task.sourceGate}.`);
     } else if (snapshot.nextTaskId !== task.taskId) {
       blockers.push(
@@ -226,7 +264,10 @@ export function agentControlVerificationPassed(stage: AgentControlRunOnceStageVi
 
 export function agentControlRunStatus(run: AgentControlRunOnceView): AgentControlStatusView {
   if (run.errorCode !== null)
-    return { label: `Blocked · ${agentControlErrorMessage(run.errorCode)}`, tone: "warning" };
+    return {
+      label: `${run.state.status === "completed" && run.task?.status !== "succeeded" ? "Ended · blocked" : "Blocked"} · ${agentControlErrorMessage(run.errorCode)}`,
+      tone: "warning",
+    };
   if (run.state.status === "no-eligible-task")
     return { label: "Blocked: no eligible task", tone: "warning" };
   if (run.task === null) return { label: "Waiting for task data", tone: "warning" };

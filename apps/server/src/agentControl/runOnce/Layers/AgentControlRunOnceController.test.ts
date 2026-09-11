@@ -1,6 +1,8 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  AGENT_CONTROL_WORKTREE_REJECTED_COMMAND_CODES,
   AgentControlRunOnceId,
+  AgentControlWorktreeRpcError,
   AgentControlTaskId,
   CommandId,
   EventId,
@@ -60,6 +62,7 @@ import {
 } from "../Services/AgentControlRunOnceControllerHooks.ts";
 import {
   AgentControlRunOnceControllerLive,
+  isRunOnceRecoveryProjectBlocker,
   makeAgentControlRunOnceWorkScheduler,
   readFullRunOnceTaskHistory,
   superviseAgentControlRunOnceListener,
@@ -67,6 +70,47 @@ import {
 
 const at = "2026-08-31T12:00:00.000Z";
 const projectId = ProjectId.make("run-once-controller-race");
+
+it("isolates Git availability rejections but preserves persistence and authority failures", () => {
+  const blocker = (cause: unknown) =>
+    new AgentControlRunOnceError({
+      projectId,
+      runId: AgentControlRunOnceId.make("blocked-recovery-run"),
+      step: "worktree-ready",
+      reason: "downstream-rejected",
+      cause,
+    });
+  const worktreeError = (code: AgentControlWorktreeRpcError["code"]) =>
+    new AgentControlWorktreeRpcError({
+      code,
+      operation: "reserve",
+      projectId,
+      taskId: AgentControlTaskId.make("blocked-recovery-task"),
+      reservationId: null,
+    });
+  for (const code of AGENT_CONTROL_WORKTREE_REJECTED_COMMAND_CODES) {
+    assert.equal(
+      isRunOnceRecoveryProjectBlocker(blocker(worktreeError(code))),
+      [
+        "default-remote-ref-unavailable",
+        "repository-unavailable",
+        "repository-lock-unavailable",
+      ].includes(code),
+      code,
+    );
+  }
+  const localFailure = blocker(worktreeError("default-remote-ref-unavailable"));
+  assert.isFalse(isRunOnceRecoveryProjectBlocker({ ...localFailure, reason: "persistence" }));
+  assert.isFalse(isRunOnceRecoveryProjectBlocker({ ...localFailure, step: "thread-activated" }));
+  assert.isFalse(
+    isRunOnceRecoveryProjectBlocker({
+      ...localFailure,
+      projectId: ProjectId.make("other-project"),
+    }),
+  );
+  assert.isFalse(isRunOnceRecoveryProjectBlocker(blocker(new Error("unexpected defect"))));
+  assert.isFalse(isRunOnceRecoveryProjectBlocker(blocker({ code: "repository-unavailable" })));
+});
 
 it.effect("supervises post-start listener defects with backoff and scoped shutdown", () =>
   Effect.gen(function* () {

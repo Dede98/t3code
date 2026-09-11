@@ -33,6 +33,7 @@ const persistence = Layer.effectDiscard(runMigrations()).pipe(
 import { AgentControlRuntimeLayerLive } from "../runtimeLayer.ts";
 import { AgentControlRunOnceController } from "./Services/AgentControlRunOnceController.ts";
 import { persistRunOnceDiagnostic } from "./diagnostics.ts";
+import { deriveRunOnceCommandId } from "./identity.ts";
 import { AgentControlRunOnceError } from "./model.ts";
 import { makeAgentControlRunOnceReadModel } from "./readModel.ts";
 import {
@@ -370,6 +371,36 @@ layer("Run-Once client read model", (it) => {
           unavailable.runs[0]?.stages[4]?.verification?.errorCode,
           "verification-checks-missing",
         );
+
+        // A human-ended run keeps the immutable rejection visible after its
+        // current diagnostic is cleared, without blocking the next activation.
+        yield* sql`UPDATE agent_control_run_once_states SET terminal_task_event_id = NULL
+          WHERE run_id = ${runId}`;
+        yield* insertFixture("agent_control_run_once_step_evidence", {
+          run_id: runId,
+          project_id: projectId,
+          ordinal: 4,
+          step: "lease-reserved",
+        });
+        yield* insertFixture("agent_control_worktree_controller_operations", {
+          command_id: deriveRunOnceCommandId(runId, 5, "worktree-ready"),
+          command_type: "reserve-and-materialize",
+          project_id: projectId,
+          task_id: taskId,
+          status: "rejected",
+          rejection_code: "default-remote-ref-unavailable",
+        });
+        const ended = yield* read.getSnapshot({ projectId, runId });
+        assert.equal(ended.runs[0]?.state.status, "completed");
+        assert.equal(
+          ended.runs[0]?.errorCode,
+          "downstream-rejected: default-remote-ref-unavailable",
+        );
+        assert.deepStrictEqual(ended.blockers, []);
+        const nextRunId = AgentControlRunOnceId.make(`run-once-${"b".repeat(64)}`);
+        yield* sql`UPDATE agent_control_run_once_states SET run_id = ${nextRunId}
+          WHERE run_id = ${runId}`;
+        assert.isNull((yield* read.getSnapshot({ projectId })).runs[0]?.errorCode);
       }).pipe(Effect.scoped),
   );
 });

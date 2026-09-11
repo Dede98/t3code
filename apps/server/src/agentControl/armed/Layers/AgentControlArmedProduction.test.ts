@@ -27,6 +27,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { alreadyActivated } from "../../../reactorStartupActivation.ts";
 import { ServerConfig } from "../../../config.ts";
 import * as GitManager from "../../../git/GitManager.ts";
 import * as GitWorkflowService from "../../../git/GitWorkflowService.ts";
@@ -63,6 +64,7 @@ import { AgentControlInitialPlanningConsumerLive } from "../../initialPlanning/L
 import { AgentControlInitialPlanningFinalizerLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningFinalizer.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningWakeupLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningWakeup.ts";
+import { AgentControlInitialPlanningHandoffStore } from "../../initialPlanning/Services/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningConsumer } from "../../initialPlanning/Services/AgentControlInitialPlanningConsumer.ts";
 import { AgentControlInitialPlanningWakeup } from "../../initialPlanning/Services/AgentControlInitialPlanningWakeup.ts";
 import { AgentControlInitialPlanningFinalizer } from "../../initialPlanning/Services/AgentControlInitialPlanningFinalizer.ts";
@@ -92,6 +94,8 @@ import { AgentControlTaskIntakeReactor } from "../../task/Services/AgentControlT
 import { AgentControlTaskReconcileStateRepository } from "../../task/Services/AgentControlTaskReconcileState.ts";
 import { AgentControlTaskVerificationFinalizerLive } from "../../task/Layers/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlTaskVerificationFinalizer } from "../../task/Services/AgentControlTaskVerificationFinalizer.ts";
+import { normalizedTaskSourceGate } from "../../task/decider.ts";
+import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
 import { deriveAgentControlTaskId } from "../../task/identity.ts";
 import { AgentControlVerificationAdmissionLive } from "../../verificationAdmission/Layers/AgentControlVerificationAdmission.ts";
 import { AgentControlVerificationAdmission } from "../../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
@@ -119,7 +123,6 @@ const modelSelection: ModelSelection = {
   options: [{ id: "reasoning", value: "high" }],
 };
 const policyRoles = ["planner", "implementer", "verifier"] as const;
-const encodeModelSelectionJson = Schema.encodeUnknownSync(Schema.fromJsonString(ModelSelection));
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const git = (cwd: string, args: ReadonlyArray<string>) =>
@@ -257,6 +260,7 @@ const makeProvider = Effect.fn("makeArmedProductionProvider")(function* () {
   return {
     service,
     sessions,
+    turnCount: () => turnOrdinal,
     publish: (event: ProviderRuntimeEvent) => PubSub.publish(events, event),
   };
 });
@@ -306,7 +310,7 @@ const makePolicyLayer = () =>
   });
 
 it.live(
-  "runs two initially eligible tasks serially through terminal re-arming on production guards",
+  "isolates a persisted project blocker across recovery while independent tasks run and fresh authority resolves it",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -320,9 +324,7 @@ it.live(
         const sql = Context.get(sqlContext, SqlClient.SqlClient);
         yield* sql`PRAGMA journal_mode = WAL`;
         yield* sql`PRAGMA foreign_keys = ON`;
-        yield* runMigrations({ toMigrationInclusive: 64 }).pipe(
-          Effect.provideService(SqlClient.SqlClient, sql),
-        );
+        yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, sql));
         const fakeProvider = yield* makeProvider();
         const sqlLayer = Layer.succeed(SqlClient.SqlClient, sql);
         const configLayer = ServerConfig.layerTest(directory, {
@@ -442,122 +444,206 @@ it.live(
         assert.isDefined(ProjectionTurnRepositoryLive);
         assert.isDefined(ProviderSessionRuntime.layer);
 
-        const at = DateTime.formatIso(yield* DateTime.now);
-        yield* sql`
-          INSERT INTO main.projection_projects (
-            project_id, title, workspace_root, default_model_selection_json,
-            scripts_json, created_at, updated_at, deleted_at
-          ) VALUES (
-            ${projectId}, 'Armed production serial', ${repository.cwd},
-            ${encodeModelSelectionJson(modelSelection)}, '[]', ${at}, ${at}, NULL
-          )
-        `;
-        yield* engine.dispatchHuman({
-          commandId: CommandId.make("armed-production-observe"),
-          projectId,
-          expectedRevision: 0,
-          mode: "observe",
-        });
-        yield* engine.dispatchHuman({
-          commandId: CommandId.make("armed-production-arm"),
-          projectId,
-          expectedRevision: 1,
-          mode: "armed",
-        });
-        const configured = yield* githubEvents.append({
-          projectId,
-          expectedStreamVersion: 0,
-          events: [
-            {
-              eventId: EventId.make("armed-production-config-event"),
-              type: "agentControl.github.config.set",
-              aggregateKind: "github-intake",
-              aggregateId: projectId,
-              occurredAt: at,
-              commandId: CommandId.make("armed-production-config-command"),
-              causationEventId: null,
-              correlationId: CommandId.make("armed-production-config-command"),
-              authority: "human",
-              payload: {
-                projectId,
-                settings: {
-                  trackerKind: "github",
-                  readyLabel: "agent:ready",
-                  pausedLabel: "agent:paused",
-                  trustedLogins: [],
-                  pollIntervalSeconds: 60,
-                },
-                repository: {
-                  repositoryNodeId: "armed-production-repository",
-                  nameWithOwner: "owner/repository",
-                },
-                configuredAt: at,
-              },
-              metadata: { schemaVersion: 1 },
-            },
-          ],
-        });
-        yield* githubProjection.projectEvent(configured[0]!);
-        const issues = [issue(1, at), issue(2, at)];
-        const polled = yield* githubEvents.append({
-          projectId,
-          expectedStreamVersion: 1,
-          events: [
-            {
-              eventId: EventId.make("armed-production-poll-event"),
-              type: "agentControl.github.poll.succeeded",
-              aggregateKind: "github-intake",
-              aggregateId: projectId,
-              occurredAt: at,
-              commandId: CommandId.make("armed-production-poll-command"),
-              causationEventId: null,
-              correlationId: CommandId.make("armed-production-poll-command"),
-              authority: "controller",
-              payload: {
-                projectId,
-                repository: {
-                  repositoryNodeId: "armed-production-repository",
-                  nameWithOwner: "owner/repository",
-                },
-                attemptedAt: at,
-                completedAt: at,
-                cursor: { lastSuccessfulPollAt: at, overlapSeconds: 60 },
-                issues,
-              },
-              metadata: { schemaVersion: 1 },
-            },
-          ],
-        });
-        yield* githubProjection.projectEvent(polled[0]!);
-        const snapshot = Option.getOrThrow(yield* githubStates.getCompletedSnapshot(projectId));
-        for (const source of issues.toReversed()) {
-          const taskId = yield* deriveAgentControlTaskId({
+        const publishSources = Effect.fn("publishArmedProductionSources")(function* (
+          projectId: ProjectId,
+          issues: ReadonlyArray<AgentControlGithubIssueSnapshot>,
+          streamVersion: number,
+        ) {
+          const at = DateTime.formatIso(yield* DateTime.now);
+          const polled = yield* githubEvents.append({
             projectId,
-            repositoryNodeId: source.repositoryNodeId,
-            issueNodeId: source.issueNodeId,
+            expectedStreamVersion: streamVersion,
+            events: [
+              {
+                eventId: EventId.make(`${projectId}-${streamVersion}-poll-event`),
+                type: "agentControl.github.poll.succeeded",
+                aggregateKind: "github-intake",
+                aggregateId: projectId,
+                occurredAt: at,
+                commandId: CommandId.make(`${projectId}-${streamVersion}-poll-command`),
+                causationEventId: null,
+                correlationId: CommandId.make(`${projectId}-${streamVersion}-poll-command`),
+                authority: "controller",
+                payload: {
+                  projectId,
+                  repository: {
+                    repositoryNodeId: "armed-production-repository",
+                    nameWithOwner: "owner/repository",
+                  },
+                  attemptedAt: at,
+                  completedAt: at,
+                  cursor: { lastSuccessfulPollAt: at, overlapSeconds: 60 },
+                  issues,
+                },
+                metadata: { schemaVersion: 1 },
+              },
+            ],
           });
-          yield* taskEngine.dispatchObservedController({
-            type: "agentControl.task.createFromGithubIssue",
-            commandId: CommandId.make(`armed-production-task-${source.number}`),
-            taskId,
-            projectId,
-            expectedRevision: 0,
-            sourcePrecondition: snapshot.sourcePrecondition,
-            source: {
+          yield* githubProjection.projectEvent(polled[0]!);
+          const snapshot = Option.getOrThrow(yield* githubStates.getCompletedSnapshot(projectId));
+          for (const source of issues.toReversed()) {
+            const taskId = yield* deriveAgentControlTaskId({
               projectId,
               repositoryNodeId: source.repositoryNodeId,
               issueNodeId: source.issueNodeId,
-              issueNumber: source.number,
-              issueUrl: source.url,
-            },
-            sourceGate: "eligible",
-            sourceUpdatedAt: source.updatedAt,
-            githubIntakeSequence: polled[0]!.sequence,
-            sourceSnapshot: source,
+            });
+            const existing = yield* taskEngine.get(taskId);
+            yield* taskEngine.dispatchObservedController({
+              type: Option.isSome(existing)
+                ? "agentControl.task.sourceGate.refresh"
+                : "agentControl.task.createFromGithubIssue",
+              commandId: CommandId.make(`${projectId}-${streamVersion}-task-${source.number}`),
+              taskId,
+              projectId,
+              expectedRevision: Option.isSome(existing) ? existing.value.revision : 0,
+              sourcePrecondition: snapshot.sourcePrecondition,
+              source: {
+                projectId,
+                repositoryNodeId: source.repositoryNodeId,
+                issueNodeId: source.issueNodeId,
+                issueNumber: source.number,
+                issueUrl: source.url,
+              },
+              sourceGate: normalizedTaskSourceGate(source),
+              sourceUpdatedAt: source.updatedAt,
+              githubIntakeSequence: polled[0]!.sequence,
+              sourceSnapshot: source,
+            });
+          }
+          const reconciling = yield* reconciles.begin(projectId, polled[0]!.sequence, at);
+          yield* reconciles.complete(projectId, polled[0]!.sequence, reconciling.revision, at);
+        });
+        const seedProject = Effect.fn("seedArmedProductionProject")(function* (
+          projectId: ProjectId,
+          repository: { readonly cwd: string },
+          issues: ReadonlyArray<AgentControlGithubIssueSnapshot>,
+          mode: "armed" | "run-once",
+        ) {
+          const at = DateTime.formatIso(yield* DateTime.now);
+          yield* Context.get(context, OrchestrationEngineService).dispatch({
+            type: "project.create",
+            commandId: CommandId.make(`${projectId}-create`),
+            projectId,
+            title: "Armed production project",
+            workspaceRoot: repository.cwd,
+            defaultModelSelection: modelSelection,
+            createdAt: at,
           });
-        }
-        const reconciling = yield* reconciles.begin(projectId, polled[0]!.sequence, at);
-        yield* reconciles.complete(projectId, polled[0]!.sequence, reconciling.revision, at);
+          yield* engine.dispatchHuman({
+            commandId: CommandId.make(`${projectId}-observe`),
+            projectId,
+            expectedRevision: 0,
+            mode: "observe",
+          });
+          const configured = yield* githubEvents.append({
+            projectId,
+            expectedStreamVersion: 0,
+            events: [
+              {
+                eventId: EventId.make(`${projectId}-config-event`),
+                type: "agentControl.github.config.set",
+                aggregateKind: "github-intake",
+                aggregateId: projectId,
+                occurredAt: at,
+                commandId: CommandId.make(`${projectId}-config-command`),
+                causationEventId: null,
+                correlationId: CommandId.make(`${projectId}-config-command`),
+                authority: "human",
+                payload: {
+                  projectId,
+                  settings: {
+                    trackerKind: "github",
+                    readyLabel: "agent:ready",
+                    pausedLabel: "agent:paused",
+                    trustedLogins: [],
+                    pollIntervalSeconds: 60,
+                  },
+                  repository: {
+                    repositoryNodeId: "armed-production-repository",
+                    nameWithOwner: "owner/repository",
+                  },
+                  configuredAt: at,
+                },
+                metadata: { schemaVersion: 1 },
+              },
+            ],
+          });
+          yield* githubProjection.projectEvent(configured[0]!);
+
+          yield* publishSources(projectId, issues, 1);
+          yield* engine.dispatchHuman({
+            commandId: CommandId.make(`${projectId}-arm`),
+            projectId,
+            expectedRevision: 1,
+            mode,
+          });
+        });
+        const at = DateTime.formatIso(yield* DateTime.now);
+        const issues = [issue(1, at), issue(2, at)];
+        yield* seedProject(projectId, repository, issues, "armed");
+        const blockedProjectId = ProjectId.make("a-blocked-recovery-project");
+        const blockedRepository = yield* makeRepository().pipe(Effect.provide(gitLayer));
+        yield* git(blockedRepository.cwd, [
+          "symbolic-ref",
+          "--delete",
+          "refs/remotes/origin/HEAD",
+        ]).pipe(Effect.provide(gitLayer));
+        yield* seedProject(blockedProjectId, blockedRepository, [issue(101, at)], "run-once");
+        const controller = Context.get(context, AgentControlRunOnceController);
+        const blocked = yield* controller.processProject(blockedProjectId).pipe(Effect.flip);
+        assert.equal(blocked.reason, "downstream-rejected");
+        assert.deepStrictEqual(
+          yield* sql`SELECT status, rejection_code AS code
+            FROM agent_control_worktree_controller_operations WHERE project_id=${blockedProjectId}`,
+          [{ status: "rejected", code: "default-remote-ref-unavailable" }],
+        );
+        yield* git(blockedRepository.cwd, [
+          "symbolic-ref",
+          "refs/remotes/origin/HEAD",
+          "refs/remotes/origin/main",
+        ]).pipe(Effect.provide(gitLayer));
+        const rejectedOperations = yield* sql`SELECT *
+          FROM agent_control_worktree_controller_operations WHERE project_id=${blockedProjectId}`;
+        const blockedState = yield* sql`SELECT * FROM agent_control_run_once_states
+          WHERE project_id=${blockedProjectId}`;
+        const restartRecovery = Effect.fn("restartArmedProductionRecovery")(function* () {
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const restarted = yield* Layer.build(
+                Layer.fresh(AgentControlRunOnceControllerLive).pipe(
+                  Layer.provide(Layer.succeedContext(context)),
+                ),
+              );
+              yield* Context.get(restarted, AgentControlRunOnceController).prepare(
+                alreadyActivated,
+              );
+            }),
+          );
+        });
+        yield* restartRecovery();
+        yield* restartRecovery();
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_worktree_controller_operations
+          WHERE project_id=${blockedProjectId}`,
+          rejectedOperations,
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_run_once_states
+          WHERE project_id=${blockedProjectId}`,
+          blockedState,
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT error_code AS code
+          FROM agent_control_run_once_diagnostics WHERE project_id=${blockedProjectId}`,
+          [{ code: "downstream-rejected: default-remote-ref-unavailable" }],
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT count(*) AS count
+          FROM agent_control_initial_planning_handoff_intents intent
+          JOIN agent_control_initial_planning_handoff_accepted accepted USING (handoff_id)
+          WHERE intent.project_id=${blockedProjectId}`,
+          [{ count: 0 }],
+        );
 
         yield* scheduler.processProject(projectId);
         const firstTaskId = yield* deriveAgentControlTaskId({
@@ -968,6 +1054,20 @@ it.live(
           return event;
         });
 
+        const startedEvent = (threadId: ThreadId): ProviderRuntimeEvent => {
+          const session = fakeProvider.sessions.get(threadId)!;
+          assert.isDefined(session.activeTurnId);
+          return {
+            type: "turn.started",
+            eventId: EventId.make(`started:${session.activeTurnId}`),
+            provider,
+            providerInstanceId,
+            threadId,
+            turnId: session.activeTurnId!,
+            createdAt: session.updatedAt,
+            payload: {},
+          };
+        };
         yield* planningConsumerService.start().pipe(Scope.provide(scope));
         const completeActiveTask = Effect.fn("completeArmedProductionActiveTask")(function* (
           runOrdinal: number,
@@ -982,6 +1082,17 @@ it.live(
           assert.isDefined(accepted);
           yield* planningWakeupService.wake(accepted!.handoffId);
           yield* planningConsumerService.drain;
+          const [pendingPlanning] = yield* sql<{ threadId: string }>`SELECT thread_id AS "threadId"
+            FROM agent_control_initial_planning_handoff_accepted WHERE handoff_id=${accepted!.handoffId}`;
+          const planningStarted = startedEvent(ThreadId.make(pendingPlanning!.threadId));
+          yield* Context.get(
+            pipelineContext,
+            AgentControlInitialPlanningHandoffStore,
+          ).observeProviderStarted({
+            threadId: planningStarted.threadId,
+            providerTurnId: String(planningStarted.turnId),
+            acceptedAt: planningStarted.createdAt,
+          });
           const [planningDelivery] = yield* sql<{
             readonly handoffId: string;
             readonly threadId: string;
@@ -1076,6 +1187,13 @@ it.live(
           const implementationHandoffId =
             implementationMaterialized.publication.implementationHandoffId;
           yield* implementationConsumerService.processHandoff(implementationHandoffId);
+          const [pendingImplementation] = yield* sql<{
+            threadId: string;
+          }>`SELECT thread_id AS "threadId"
+            FROM agent_control_implementation_deliveries WHERE handoff_id=${implementationHandoffId}`;
+          yield* implementationConsumerService.processRuntimeEvent(
+            startedEvent(ThreadId.make(pendingImplementation!.threadId)),
+          );
           const [implementationDelivery] = yield* sql<{
             readonly threadId: string;
             readonly providerTurnId: string;
@@ -1133,6 +1251,13 @@ it.live(
           }
           const verificationHandoffId = verificationMaterialized.publication.verificationHandoffId;
           yield* verificationConsumerService.processHandoff(verificationHandoffId);
+          const [pendingVerification] = yield* sql<{
+            threadId: string;
+          }>`SELECT thread_id AS "threadId"
+            FROM agent_control_verification_deliveries WHERE handoff_id=${verificationHandoffId}`;
+          yield* verificationConsumerService.processRuntimeEvent(
+            startedEvent(ThreadId.make(pendingVerification!.threadId)),
+          );
           const [verificationDelivery] = yield* sql<{
             readonly threadId: string;
             readonly providerTurnId: string;
@@ -1200,7 +1325,8 @@ it.live(
                WHERE selected_task_id=${firstTaskId}) AS firstDispatches,
               (SELECT count(*) FROM agent_control_armed_dispatch_evidence
                WHERE selected_task_id=${secondTaskId}) AS secondDispatches,
-              (SELECT count(*) FROM agent_control_run_once_activations) AS activations,
+              (SELECT count(*) FROM agent_control_run_once_activations
+               WHERE project_id=${projectId}) AS activations,
               (SELECT count(*) FROM agent_control_task_states
                WHERE task_id=${firstTaskId} AND status='failed'
                  AND stage='verification') AS firstFinalized,
@@ -1219,6 +1345,129 @@ it.live(
             },
           ],
         );
+        const completedEvidence = yield* sql`SELECT * FROM agent_control_run_once_step_evidence
+          WHERE project_id=${projectId} ORDER BY run_id, ordinal`;
+        const turnsBefore = fakeProvider.turnCount();
+        const checkEvidence = yield* sql`SELECT * FROM agent_control_verification_check_results`;
+        yield* restartRecovery();
+        assert.equal(fakeProvider.turnCount(), turnsBefore);
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_run_once_step_evidence
+          WHERE project_id=${projectId} ORDER BY run_id, ordinal`,
+          completedEvidence,
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_verification_check_results`,
+          checkEvidence,
+        );
+
+        yield* sql`CREATE TRIGGER recovery_diagnostic_write_failure
+          BEFORE UPDATE ON agent_control_run_once_diagnostics
+          WHEN NEW.project_id = 'a-blocked-recovery-project'
+          BEGIN SELECT RAISE(ABORT, 'diagnostic storage unavailable'); END`;
+        const diagnosticFailure = yield* restartRecovery().pipe(Effect.flip);
+        assert.equal(diagnosticFailure.reason, "persistence");
+        yield* sql`DROP TRIGGER recovery_diagnostic_write_failure`;
+
+        const blockedTaskId = yield* deriveAgentControlTaskId({
+          projectId: blockedProjectId,
+          repositoryNodeId: "armed-production-repository",
+          issueNodeId: "armed-production-issue-101",
+        });
+        const oldRunId = blocked.runId!;
+        const [oldCommand] = yield* sql<{ commandId: string }>`SELECT command_id AS "commandId"
+          FROM agent_control_worktree_controller_operations WHERE project_id=${blockedProjectId}`;
+        const worktreeController = Context.get(context, AgentControlWorktreeController);
+        const replayOldCommand = worktreeController.reserveAndMaterializeForRunOnce!(oldRunId, {
+          projectId: blockedProjectId,
+          taskId: blockedTaskId,
+          commandId: CommandId.make(oldCommand!.commandId),
+        });
+        assert.equal(
+          (yield* replayOldCommand.pipe(Effect.flip)).code,
+          "default-remote-ref-unavailable",
+        );
+        yield* engine.dispatchHuman({
+          commandId: CommandId.make("blocked-project-end-run"),
+          projectId: blockedProjectId,
+          expectedRevision: (yield* engine.getProjectState({ projectId: blockedProjectId }))
+            .revision,
+          mode: "observe",
+        });
+        yield* controller.processProject(blockedProjectId);
+        assert.deepStrictEqual(
+          yield* sql`SELECT status, last_step AS step
+          FROM agent_control_run_once_states WHERE run_id=${oldRunId}`,
+          [{ status: "completed", step: "completed" }],
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT step FROM agent_control_run_once_step_evidence
+          WHERE run_id=${oldRunId} AND step IN ('mode-reset-superseded', 'task-terminal-observed')`,
+          [{ step: "mode-reset-superseded" }],
+        );
+        assert.equal(
+          (yield* replayOldCommand.pipe(Effect.flip)).code,
+          "default-remote-ref-unavailable",
+        );
+        const revokedAuthority = yield* worktreeController.reserveAndMaterializeForRunOnce!(
+          oldRunId,
+          {
+            projectId: blockedProjectId,
+            taskId: blockedTaskId,
+            commandId: CommandId.make("revoked-run-new-worktree-command"),
+          },
+        ).pipe(Effect.flip);
+        assert.equal(revokedAuthority.code, "project-mode-inactive");
+        const refreshedAt = DateTime.formatIso(yield* DateTime.now);
+        yield* publishSources(
+          blockedProjectId,
+          [
+            {
+              ...issue(101, refreshedAt),
+              paused: true,
+              eligible: false,
+              eligibilityReason: "paused",
+            },
+            issue(102, refreshedAt),
+          ],
+          2,
+        );
+        yield* engine.dispatchHuman({
+          commandId: CommandId.make("blocked-project-new-run"),
+          projectId: blockedProjectId,
+          expectedRevision: (yield* engine.getProjectState({ projectId: blockedProjectId }))
+            .revision,
+          mode: "run-once",
+        });
+        yield* controller.processProject(blockedProjectId);
+        const replacementTaskId = yield* deriveAgentControlTaskId({
+          projectId: blockedProjectId,
+          repositoryNodeId: "armed-production-repository",
+          issueNodeId: "armed-production-issue-102",
+        });
+        assert.deepStrictEqual(
+          yield* sql`SELECT task_id AS taskId
+          FROM agent_control_initial_planning_handoff_intents intent
+          JOIN agent_control_initial_planning_handoff_accepted accepted USING (handoff_id)
+          WHERE intent.project_id=${blockedProjectId}`,
+          [{ taskId: replacementTaskId }],
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_worktree_controller_operations
+          WHERE command_id=${oldCommand!.commandId}`,
+          rejectedOperations,
+        );
+        const [replacementHandoff] = yield* sql<{
+          handoffId: string;
+        }>`SELECT handoff_id AS "handoffId"
+          FROM agent_control_initial_planning_handoff_intents WHERE project_id=${blockedProjectId}`;
+        yield* planningWakeupService.wake(replacementHandoff!.handoffId);
+        yield* planningConsumerService.drain;
+        const replacementTurns = fakeProvider.turnCount();
+        assert.equal(replacementTurns, turnsBefore + 1);
+        yield* restartRecovery();
+        yield* planningConsumerService.drain;
+        assert.equal(fakeProvider.turnCount(), replacementTurns);
         assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
         assert.deepStrictEqual(yield* sql`PRAGMA integrity_check`, [{ integrity_check: "ok" }]);
       }),

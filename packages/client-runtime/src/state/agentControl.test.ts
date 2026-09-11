@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
   AgentControlRunOnceSnapshot,
+  AgentControlTaskId,
   AuthStandardClientScopes,
   AuthAdministrativeScopes,
   type AuthSessionState,
@@ -15,6 +16,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 
 import {
   agentControlRunStatus,
+  agentControlEndBlockedRunInput,
   agentControlModeChangeBlocker,
   agentControlSnapshotReady,
   agentControlStageLabel,
@@ -187,6 +189,63 @@ const start = {
 };
 
 describe("Run Once client state", () => {
+  it("ends a blocked activation with fresh human mode authority, preserving command identity on replay", () => {
+    const blocked = {
+      ...snapshot,
+      projectState: { ...snapshot.projectState, mode: "run-once" as const },
+      runs: [
+        {
+          ...run,
+          state: { ...run.state, status: "active" as const },
+          errorCode: "default-remote-ref-unavailable",
+        },
+      ],
+    };
+    const input = { snapshot: blocked, connected: true, pending: false, modeChangeBlocker: null };
+    const command = agentControlEndBlockedRunInput(input);
+    expect(command).toMatchObject({
+      projectId: snapshot.projectId,
+      expectedRevision: 4,
+      mode: "observe",
+    });
+    expect(agentControlEndBlockedRunInput(input)).toEqual(command);
+    expect(
+      agentControlEndBlockedRunInput({
+        ...input,
+        snapshot: { ...blocked, projectState: { ...blocked.projectState, revision: 6 } },
+      })?.commandId,
+    ).not.toBe(command?.commandId);
+    for (const unavailable of [
+      { ...input, connected: false },
+      { ...input, pending: true },
+      { ...input, snapshot: null },
+      { ...input, snapshot },
+      { ...input, snapshot: { ...blocked, runs: [{ ...blocked.runs[0]!, errorCode: null }] } },
+      { ...input, snapshot: { ...blocked, runs: [{ ...blocked.runs[0]!, state: run.state }] } },
+    ])
+      expect(agentControlEndBlockedRunInput(unavailable)).toBeNull();
+    for (const session of [
+      AsyncResult.success({ ...adminSession, scopes: AuthStandardClientScopes }),
+      AsyncResult.initial<AuthSessionState>(),
+      AsyncResult.waiting(AsyncResult.success(adminSession)),
+      AsyncResult.fail(new Error("Session unavailable")),
+      AsyncResult.success({ ...adminSession, authenticated: false }),
+    ]) {
+      expect(
+        agentControlEndBlockedRunInput({
+          ...input,
+          modeChangeBlocker: agentControlModeChangeBlocker(session),
+        }),
+      ).toBeNull();
+    }
+    expect(
+      agentControlEndBlockedRunInput({
+        ...input,
+        modeChangeBlocker: agentControlModeChangeBlocker(AsyncResult.success(adminSession)),
+      }),
+    ).toEqual(command);
+  });
+
   it("blocks start and intake changes for a standard session but permits an admin session", () => {
     const standardSession = { ...adminSession, scopes: AuthStandardClientScopes };
     const blocked = agentControlModeChangeBlocker(AsyncResult.success(standardSession));
@@ -251,7 +310,11 @@ describe("Run Once client state", () => {
   });
 
   it("restores pre-stage failures from durable server diagnostics", () => {
-    const blocked = { ...snapshot.runs[0]!, errorCode: "source-watermark-stale" };
+    const blocked = {
+      ...snapshot.runs[0]!,
+      state: { ...snapshot.runs[0]!.state, status: "active" as const },
+      errorCode: "source-watermark-stale",
+    };
     expect(agentControlRunStatus(blocked).label).toContain("Blocked · source-watermark-stale");
     expect(
       agentControlStartBlockers({
@@ -259,6 +322,37 @@ describe("Run Once client state", () => {
         snapshot: { ...snapshot, blockers: ["source-watermark-stale"] },
       }).join(" "),
     ).toContain("review the selected task's eligibility");
+  });
+
+  it("keeps an ended run's rejection visible without reporting success or blocking a fresh task", () => {
+    const ended = {
+      ...snapshot.runs[0]!,
+      task,
+      errorCode: "default-remote-ref-unavailable",
+    };
+    const status = agentControlRunStatus(ended);
+    expect(status.label).toContain("Ended · blocked · default-remote-ref-unavailable");
+    expect(status.tone).toBe("warning");
+    const endedSnapshot = { ...snapshot, runs: [ended] };
+    expect(agentControlStartBlockers({ ...start, snapshot: endedSnapshot })).toEqual([
+      "This task belongs to an ended blocked run and cannot start again. Fix the reported cause, remove the old issue's ready label or pause it in GitHub, and wait for intake to update. Then select a new eligible task.",
+    ]);
+    const newTask = { ...task, taskId: AgentControlTaskId.make("new-task") };
+    expect(
+      agentControlStartBlockers({
+        ...start,
+        selectedTaskId: newTask.taskId,
+        snapshot: {
+          ...endedSnapshot,
+          tasks: [{ ...task, sourceGate: "not-ready" }, newTask],
+          nextTaskId: newTask.taskId,
+        },
+      }),
+    ).toEqual([]);
+    expect(agentControlRunStatus({ ...ended, task: null }).label).toContain("Ended · blocked");
+    expect(agentControlRunStatus({ ...ended, task: { ...task, status: "succeeded" } }).tone).toBe(
+      "warning",
+    );
   });
 
   it("only admits the server-selected eligible task with a ready connection and preflight", () => {

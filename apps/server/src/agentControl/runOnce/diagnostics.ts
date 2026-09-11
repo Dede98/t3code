@@ -32,5 +32,4 @@ export const persistRunOnceDiagnostic = Effect.fn("AgentControlRunOnce.persistDi
     const notifications = yield* AgentControlRunOnceReadNotifications;
     yield* notifications.publishProject(projectId);
   },
-  Effect.catchCause((cause) => Effect.logWarning("Run-Once diagnostic write failed", { cause })),
 );

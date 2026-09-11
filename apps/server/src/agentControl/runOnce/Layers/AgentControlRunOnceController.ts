@@ -1,6 +1,7 @@
 import { persistRunOnceDiagnostic } from "../diagnostics.ts";
 import {
   AgentControlRunOnceId,
+  AgentControlWorktreeRpcError,
   EventId,
   type AgentControlEvent,
   type AgentControlGithubEvent,
@@ -80,6 +81,18 @@ const PROJECT_WORKERS = 2;
 const RETRY_BASE_DELAY_MS = 25;
 const RETRY_MAX_DELAY_MS = 1_000;
 const isRunOnceError = Schema.is(AgentControlRunOnceError);
+const isWorktreeError = Schema.is(AgentControlWorktreeRpcError);
+
+/** Only local Git availability failures may leave a run blocked during startup. */
+export const isRunOnceRecoveryProjectBlocker = (failure: AgentControlRunOnceError) =>
+  failure.reason === "downstream-rejected" &&
+  failure.step === "worktree-ready" &&
+  isWorktreeError(failure.cause) &&
+  failure.cause.projectId === failure.projectId &&
+  (failure.cause.code === "default-remote-ref-unavailable" ||
+    failure.cause.code === "repository-unavailable" ||
+    failure.cause.code === "repository-lock-unavailable");
+
 interface PersistedRunState extends RunOnceStateBinding {
   readonly runId: AgentControlRunOnceId;
   readonly nextOrdinal: number;
@@ -1880,8 +1893,8 @@ const make = Effect.gen(function* () {
       .withPermit(
         projectId,
         processSerialized(projectId).pipe(
-          Effect.tap(() => persistRunOnceDiagnostic(sql, projectId, null)),
           Effect.tapError((failure) => persistRunOnceDiagnostic(sql, projectId, failure)),
+          Effect.tap(() => persistRunOnceDiagnostic(sql, projectId, null)),
         ),
       )
       .pipe(
@@ -1948,10 +1961,21 @@ const make = Effect.gen(function* () {
     );
     yield* recoverPublications();
     const projectIds = yield* loadCatchUpProjectIds();
-    yield* Effect.forEach(projectIds, processProject, {
-      concurrency: PROJECT_WORKERS,
-      discard: true,
-    });
+    yield* Effect.forEach(
+      projectIds,
+      (projectId) =>
+        processProject(projectId).pipe(
+          Effect.catchTag("AgentControlRunOnceError", (failure) =>
+            // processProject has persisted the diagnostic and released its permit.
+            // Keep the rejected command intact; existing event-driven scheduling
+            // handles subsequent project changes without a recovery retry loop.
+            isRunOnceRecoveryProjectBlocker(failure)
+              ? Effect.logWarning("Run-Once recovery left project blocked", { projectId, failure })
+              : Effect.fail(failure),
+          ),
+        ),
+      { concurrency: PROJECT_WORKERS, discard: true },
+    );
   });
 
   const prepare: AgentControlRunOnceControllerShape["prepare"] = (activation) =>
