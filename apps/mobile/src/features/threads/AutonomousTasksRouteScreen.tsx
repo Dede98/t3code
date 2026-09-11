@@ -371,11 +371,14 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
   const disarmInput = agentControlDisarmInput(modeChangeReadiness);
   const endPausedInput = agentControlEndPausedInput(modeChangeReadiness);
 
-  async function changeMode(input: AgentControlSetProjectModeInput) {
+  async function changeMode(
+    input: AgentControlSetProjectModeInput,
+    action?: "end-blocked" | "disarm" | "end-paused",
+  ) {
     if (
       pendingRef.current ||
       pending ||
-      setupController.getSnapshot().pending ||
+      (setupController.getSnapshot().pending && action === undefined) ||
       modeChangeBlocker !== null ||
       !snapshotReady
     )
@@ -481,7 +484,7 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
               <Action
                 disabled={disarmInput === null}
                 onPress={() => {
-                  if (disarmInput) void changeMode(disarmInput);
+                  if (disarmInput) void changeMode(disarmInput, "disarm");
                 }}
               >
                 {pending ? "Submitting…" : "Turn off automation"}
@@ -559,7 +562,7 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
         ) : null}
         {snapshot.data?.projectState.mode === "manual" ? (
           <Action
-            disabled={!snapshotReady || pending || modeChangeBlocker !== null}
+            disabled={!snapshotReady || pending || setupState.pending || modeChangeBlocker !== null}
             onPress={() => {
               if (!snapshotReady || !snapshot.data) return;
               void changeMode({
@@ -578,7 +581,7 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
             <Action
               disabled={endPausedInput === null}
               onPress={() => {
-                if (endPausedInput) void changeMode(endPausedInput);
+                if (endPausedInput) void changeMode(endPausedInput, "end-paused");
               }}
             >
               End paused mode
@@ -591,7 +594,7 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
         {snapshot.data?.projectState.mode === "observe" &&
         !snapshot.data.runs.some((run) => run.state.status === "active") ? (
           <Action
-            disabled={!snapshotReady || pending || modeChangeBlocker !== null}
+            disabled={!snapshotReady || pending || setupState.pending || modeChangeBlocker !== null}
             onPress={() => {
               if (!snapshotReady || !snapshot.data) return;
               void changeMode({
@@ -612,7 +615,7 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
             <Action
               disabled={endBlockedRunInput === null}
               onPress={() => {
-                if (endBlockedRunInput) void changeMode(endBlockedRunInput);
+                if (endBlockedRunInput) void changeMode(endBlockedRunInput, "end-blocked");
               }}
             >
               End blocked run
