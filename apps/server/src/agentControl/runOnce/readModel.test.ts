@@ -96,7 +96,7 @@ const insertFixture = Effect.fn("insertFixture")(function* (
   );
 });
 
-const seed = Effect.gen(function* () {
+const allowReadFixtures = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const triggers = yield* sql<{
     name: string;
@@ -104,6 +104,10 @@ const seed = Effect.gen(function* () {
   for (const trigger of triggers) yield* sql.unsafe(`DROP TRIGGER "${trigger.name}"`).unprepared;
   yield* sql`PRAGMA foreign_keys = OFF`;
   yield* sql`PRAGMA ignore_check_constraints = ON`;
+});
+
+const seed = Effect.gen(function* () {
+  yield* allowReadFixtures;
   yield* insertFixture("projection_projects", {
     project_id: projectId,
     title: "Read project",
@@ -224,6 +228,8 @@ const seed = Effect.gen(function* () {
       worktree_path: "/isolated/worktree",
       provider_delivery_id: `delivery-${ordinal}`,
       worktree_reservation_id: "worktree",
+      provider_instance_id: "codex-production",
+      model_selection_json: encodeUnknownJson({ instanceId: "codex-production", model: "gpt-5" }),
     });
     if (stageKind !== "verification") continue;
     yield* insertFixture("agent_control_verification_check_manifests", {
@@ -308,6 +314,9 @@ layer("Run-Once client read model", (it) => {
           "final success",
         );
         assert.equal(snapshot.runs[0]?.stages[4]?.verification?.verdict, "passed");
+        assert.equal(snapshot.runs[0]?.stages[4]?.providerInstanceId, "codex-production");
+        assert.equal(snapshot.runs[0]?.stages[4]?.model, "gpt-5");
+        assert.deepStrictEqual(snapshot.armed, { enabled: false });
         assert.isFalse(encodeUnknownJson(snapshot).includes("Must never appear"));
         assert.deepStrictEqual(
           (yield* read.getSnapshot({ projectId, runId: AgentControlRunOnceId.make("another-run") }))
@@ -409,5 +418,145 @@ layer("Run-Once client read model", (it) => {
           WHERE task_id = ${taskId}`;
         assert.isNull((yield* read.getSnapshot({ projectId })).nextTaskId);
       }).pipe(Effect.scoped),
+  );
+  it.effect("reads Armed authority before run publication, across resume and after takeover", () =>
+    Effect.gen(function* () {
+      yield* allowReadFixtures;
+      const sql = yield* SqlClient.SqlClient;
+      const read = yield* makeAgentControlRunOnceReadModel;
+      const id = ProjectId.make("armed-authority-read");
+      yield* insertFixture("projection_projects", {
+        project_id: id,
+        title: "Armed authority",
+        workspace_root: "/isolated/armed-authority",
+        default_model_selection_json: null,
+        scripts_json: "[]",
+        created_at: at,
+        updated_at: at,
+        deleted_at: null,
+      });
+      yield* insertFixture("agent_control_project_states", {
+        project_id: id,
+        mode: "armed",
+        paused_from_mode: null,
+        revision: 1,
+        last_event_sequence: 100,
+        updated_at: at,
+      });
+      assert.deepStrictEqual((yield* read.getSnapshot({ projectId: id })).armed, { enabled: true });
+      yield* insertFixture("agent_control_events", {
+        event_id: "armed-origin-event",
+        command_id: "armed-origin-command",
+        aggregate_kind: "project-controller",
+        stream_id: id,
+        stream_version: 2,
+        sequence: 101,
+        actor_authority: "system",
+        event_type: "agentControl.project.mode.changed",
+        payload_json: encodeUnknownJson({ previousMode: "armed", mode: "run-once" }),
+      });
+      yield* insertFixture("agent_control_command_receipts", {
+        command_id: "armed-origin-command",
+        status: "accepted",
+        authority: "system",
+        aggregate_kind: "project-controller",
+        aggregate_id: id,
+        event_created: 1,
+        result_sequence: 101,
+        result_stream_version: 2,
+      });
+      yield* sql`UPDATE agent_control_project_states
+        SET mode = 'run-once', revision = 2, last_event_sequence = 101 WHERE project_id = ${id}`;
+      const activating = yield* read.getSnapshot({ projectId: id });
+      assert.deepStrictEqual(activating.armed, { enabled: true });
+      assert.deepStrictEqual(activating.runs, []);
+      const activeRunId = AgentControlRunOnceId.make("armed-read-active-run");
+      yield* insertFixture("agent_control_run_once_states", {
+        run_id: activeRunId,
+        project_id: id,
+        status: "active",
+        next_ordinal: 2,
+        last_step: "activation-admitted",
+        task_id: null,
+        stage_run_id: null,
+        lease_id: null,
+        worktree_reservation_id: null,
+        controlled_thread_reservation_id: null,
+        terminal_task_event_id: null,
+        activation_project_revision: 2,
+        reset_project_revision: null,
+        updated_at: at,
+      });
+      yield* insertFixture("agent_control_run_once_activations", {
+        run_id: activeRunId,
+        project_id: id,
+        origin_mode: "armed",
+      });
+      const running = yield* read.getSnapshot({ projectId: id });
+      assert.equal(running.projectState.mode, "run-once");
+      assert.equal(running.runs[0]?.originMode, "armed");
+      assert.equal(running.runs[0]?.state.status, "active");
+      assert.deepStrictEqual(running.armed, { enabled: true });
+      yield* sql`UPDATE agent_control_project_states
+        SET mode = 'paused', paused_from_mode = 'run-once', revision = 3 WHERE project_id = ${id}`;
+      assert.deepStrictEqual((yield* read.getSnapshot({ projectId: id })).armed, {
+        enabled: false,
+      });
+      yield* sql`UPDATE agent_control_project_states
+        SET mode = 'run-once', paused_from_mode = NULL, revision = 4 WHERE project_id = ${id}`;
+      assert.deepStrictEqual((yield* read.getSnapshot({ projectId: id })).armed, { enabled: true });
+      yield* persistRunOnceDiagnostic(
+        sql,
+        id,
+        new AgentControlRunOnceError({
+          projectId: id,
+          runId: null,
+          step: null,
+          reason: "downstream-rejected",
+          cause: { code: "default-remote-ref-unavailable" },
+        }),
+      );
+      const blocked = yield* read.getSnapshot({ projectId: id });
+      assert.deepStrictEqual(blocked.armed, { enabled: true });
+      assert.equal(blocked.blockers.length, 1);
+      yield* sql`UPDATE agent_control_project_states
+        SET mode = 'observe', revision = 5 WHERE project_id = ${id}`;
+      const stopped = yield* read.getSnapshot({ projectId: id });
+      assert.deepStrictEqual(stopped.armed, { enabled: false });
+      assert.equal(stopped.runs[0]?.originMode, "armed");
+      assert.equal(stopped.runs[0]?.state.status, "active");
+      const reconnected = yield* Stream.runHead(yield* read.subscribe({ projectId: id }));
+      assert.deepStrictEqual(Option.getOrThrow(reconnected).armed, { enabled: false });
+      yield* sql`UPDATE agent_control_project_states
+        SET mode = 'armed', revision = 6 WHERE project_id = ${id}`;
+      assert.deepStrictEqual((yield* read.getSnapshot({ projectId: id })).armed, { enabled: true });
+      // A later manual Run Once must not inherit an earlier Armed activation.
+      yield* insertFixture("agent_control_events", {
+        event_id: "observe-origin-event",
+        command_id: "observe-origin-command",
+        aggregate_kind: "project-controller",
+        stream_id: id,
+        stream_version: 7,
+        sequence: 102,
+        actor_authority: "human",
+        event_type: "agentControl.project.mode.changed",
+        payload_json: encodeUnknownJson({ previousMode: "observe", mode: "run-once" }),
+      });
+      yield* insertFixture("agent_control_command_receipts", {
+        command_id: "observe-origin-command",
+        status: "accepted",
+        authority: "human",
+        aggregate_kind: "project-controller",
+        aggregate_id: id,
+        event_created: 1,
+        result_sequence: 102,
+        result_stream_version: 7,
+      });
+      yield* sql`UPDATE agent_control_project_states
+        SET mode = 'run-once', revision = 7, last_event_sequence = 102 WHERE project_id = ${id}`;
+      assert.deepStrictEqual((yield* read.getSnapshot({ projectId: id })).armed, {
+        enabled: false,
+      });
+    }).pipe(Effect.scoped),
   );
 });

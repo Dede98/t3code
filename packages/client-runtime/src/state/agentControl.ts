@@ -12,8 +12,10 @@ import {
   type AgentControlRunOnceView,
   type AgentControlSetProjectModeInput,
   type AgentControlTaskId,
+  type EnvironmentId,
+  type ProjectId,
 } from "@t3tools/contracts";
-import { AsyncResult, type Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import {
@@ -27,6 +29,18 @@ import {
 export function createAgentControlEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
+  const commandKey = (target: { environmentId: EnvironmentId; input: { projectId: ProjectId } }) =>
+    JSON.stringify([target.environmentId, target.input.projectId]);
+  const pending = Atom.family((_key: string) => Atom.make(false).pipe(Atom.keepAlive));
+  const setMode = createEnvironmentRpcCommand(runtime, {
+    label: "environment-data:agent-control:set-mode",
+    tag: AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode,
+    scheduler: createAtomCommandScheduler(),
+    concurrency: {
+      mode: "singleFlight",
+      key: ({ environmentId, input }) => JSON.stringify([environmentId, input.projectId]),
+    },
+  });
   return {
     snapshot: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:agent-control:run-once",
@@ -43,15 +57,20 @@ export function createAgentControlEnvironmentAtoms<R, E>(
       tag: AGENT_CONTROL_RPC_METHODS.getPolicy,
       staleTimeMs: 0,
     }),
-    setMode: createEnvironmentRpcCommand(runtime, {
-      label: "environment-data:agent-control:set-mode",
-      tag: AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode,
-      scheduler: createAtomCommandScheduler(),
-      concurrency: {
-        mode: "singleFlight",
-        key: ({ environmentId, input }) => JSON.stringify([environmentId, input.projectId]),
+    pending: (target: { environmentId: EnvironmentId; input: { projectId: ProjectId } }) =>
+      pending(commandKey(target)),
+    setMode: {
+      ...setMode,
+      run: async (registry, target) => {
+        const atom = pending(commandKey(target));
+        registry.set(atom, true);
+        try {
+          return await setMode.run(registry, target);
+        } finally {
+          registry.set(atom, false);
+        }
       },
-    }),
+    } satisfies typeof setMode,
   };
 }
 
@@ -61,6 +80,15 @@ export function agentControlSnapshotReady<E>(
   connected: boolean,
 ): boolean {
   return connected && AsyncResult.isSuccess(result);
+}
+
+/** A refresh may retain the previous value while the subscription reconnects. */
+export function agentControlSnapshotFresh<E>(
+  result: AsyncResult.AsyncResult<AgentControlRunOnceSnapshot, E>,
+  previousSnapshot: AgentControlRunOnceSnapshot | null,
+  connected: boolean,
+): boolean {
+  return connected && AsyncResult.isSuccess(result) && result.value !== previousSnapshot;
 }
 
 /** Start and intake changes share the server's administrative mode-change permission. */
@@ -131,7 +159,7 @@ export function agentControlEndBlockedRunInput(input: {
   };
 }
 
-export function agentControlStartBlockers(input: {
+type AgentControlStartContext = {
   snapshot: AgentControlRunOnceSnapshot | null;
   preflight: AgentControlPreflightRuntimeResult | null;
   policy: AgentControlPolicyStateResult | null;
@@ -139,7 +167,37 @@ export function agentControlStartBlockers(input: {
   connected: boolean;
   pending: boolean;
   modeChangeBlocker: string | null;
-}): string[] {
+};
+
+export function agentControlStartBlockers(input: AgentControlStartContext): string[] {
+  return agentControlActivationBlockers(input, "run-once");
+}
+
+export function agentControlArmBlockers(
+  input: Omit<AgentControlStartContext, "selectedTaskId">,
+): string[] {
+  const blockers = agentControlActivationBlockers({ ...input, selectedTaskId: null }, "armed");
+  if (input.snapshot?.armed === undefined)
+    blockers.push(
+      "This environment has not supplied automatic mode authority. Reconnect to an updated server before enabling automatic mode.",
+    );
+  if (
+    input.snapshot?.nextTaskId === null &&
+    input.snapshot.tasks.some(
+      (task) => task.status === "candidate" && task.sourceGate === "eligible",
+    )
+  ) {
+    blockers.push(
+      "An eligible task has unresolved readiness or execution history. Refresh intake; remove an already attempted issue's ready label or pause it in GitHub before enabling automatic mode.",
+    );
+  }
+  return blockers;
+}
+
+function agentControlActivationBlockers(
+  input: AgentControlStartContext,
+  mode: "run-once" | "armed",
+): string[] {
   const blockers: string[] = [];
   if (input.modeChangeBlocker !== null) blockers.push(input.modeChangeBlocker);
   if (input.policy === null) {
@@ -162,35 +220,39 @@ export function agentControlStartBlockers(input: {
       blockers.push(
         snapshot.projectState.mode === "run-once"
           ? "A run is already active. Open its progress below."
-          : "Enable Observe mode to prepare a single autonomous run.",
+          : snapshot.projectState.mode === "armed"
+            ? "Turn off automation before starting a single task."
+            : "Enable task intake before starting autonomous work.",
       );
     }
     if (snapshot.runs.some((run) => run.state.status === "active")) {
       blockers.push("The previous run has not finished releasing its resources.");
     }
-    const task = snapshot.tasks.find((candidate) => candidate.taskId === input.selectedTaskId);
-    if (!task) blockers.push("Select an eligible task.");
-    else if (
-      snapshot.runs.some(
-        (run) =>
-          run.state.status === "completed" &&
-          run.errorCode !== null &&
-          run.state.taskId === task.taskId,
-      )
-    ) {
-      blockers.push(
-        "This task belongs to an ended blocked run and cannot start again. Fix the reported cause, remove the old issue's ready label or pause it in GitHub, and wait for intake to update. Then select a new eligible task.",
-      );
-    } else if (task.status !== "candidate" || task.sourceGate !== "eligible") {
-      blockers.push(`This task cannot start: ${task.status}, source ${task.sourceGate}.`);
-    } else if (snapshot.nextTaskId === null) {
-      blockers.push(
-        "Task readiness changed or the next task already has execution history. Refresh intake; if the old issue was already attempted, remove its ready label or pause it in GitHub, then choose a new eligible task.",
-      );
-    } else if (snapshot.nextTaskId !== task.taskId) {
-      blockers.push(
-        "Run Once currently accepts the next eligible task in issue-number order. Select that task.",
-      );
+    if (mode === "run-once") {
+      const task = snapshot.tasks.find((candidate) => candidate.taskId === input.selectedTaskId);
+      if (!task) blockers.push("Select an eligible task.");
+      else if (
+        snapshot.runs.some(
+          (run) =>
+            run.state.status === "completed" &&
+            run.errorCode !== null &&
+            run.state.taskId === task.taskId,
+        )
+      ) {
+        blockers.push(
+          "This task belongs to an ended blocked run and cannot start again. Fix the reported cause, remove the old issue's ready label or pause it in GitHub, and wait for intake to update. Then select a new eligible task.",
+        );
+      } else if (task.status !== "candidate" || task.sourceGate !== "eligible") {
+        blockers.push(`This task cannot start: ${task.status}, source ${task.sourceGate}.`);
+      } else if (snapshot.nextTaskId === null) {
+        blockers.push(
+          "Task readiness changed or the next task already has execution history. Refresh intake; if the old issue was already attempted, remove its ready label or pause it in GitHub, then choose a new eligible task.",
+        );
+      } else if (snapshot.nextTaskId !== task.taskId) {
+        blockers.push(
+          "Run Once currently accepts the next eligible task in issue-number order. Select that task.",
+        );
+      }
     }
   }
   if (input.preflight === null)
@@ -304,9 +366,75 @@ export function agentControlRunStatus(run: AgentControlRunOnceView): AgentContro
     };
   }
   if (run.state.status === "completed")
-    return { label: "Finished without verified success", tone: "warning" };
+    return {
+      label:
+        run.originMode === "armed" && run.state.terminalTaskEventId === null
+          ? "Automatic run ended · admitted work may continue"
+          : "Finished without verified success",
+      tone: "warning",
+    };
   return {
     label: latest ? `Running · ${agentControlStageLabel(latest)}` : "Starting",
     tone: "running",
+  };
+}
+
+export const agentControlArmedExplanation =
+  "Automatic mode (Armed) lets this environment start eligible tasks for this project one after another, including tasks that become eligible later. The server chooses their order and checks admission. It stays enabled until you turn it off.";
+export const agentControlDisarmExplanation =
+  "Turning off automatic mode prevents new tasks from starting automatically. Work already admitted can continue, including later stages of the current task. This does not interrupt provider turns or guarantee that the task will finish. Saved threads, changes and check evidence remain available. Task intake stays enabled.";
+
+/** The server reports current durable authority, independent of the latest run's history. */
+export function agentControlArmedStatus(
+  snapshot: AgentControlRunOnceSnapshot | null,
+): AgentControlStatusView & { enabled: boolean | null } {
+  if (!snapshot?.armed) return { enabled: null, label: "Automatic mode unknown", tone: "warning" };
+  if (!snapshot.armed.enabled)
+    return { enabled: false, label: "Automatic mode off", tone: "neutral" };
+  const active = snapshot.runs.find((run) => run.state.status === "active");
+  const status = active ? agentControlRunStatus(active) : null;
+  if (snapshot.blockers.length > 0 || status?.tone === "warning" || status?.tone === "danger") {
+    return { enabled: true, label: "Automatic mode on · blocked", tone: "warning" };
+  }
+  return active || snapshot.projectState.mode === "run-once"
+    ? { enabled: true, label: "Automatic mode on · task running", tone: "running" }
+    : { enabled: true, label: "Automatic mode on · waiting for eligible tasks", tone: "neutral" };
+}
+
+export function agentControlArmInput(
+  snapshot: AgentControlRunOnceSnapshot,
+): AgentControlSetProjectModeInput {
+  return {
+    commandId: CommandId.make(
+      `t3auto-armed:${JSON.stringify([snapshot.projectId, snapshot.projectState.revision])}`,
+    ),
+    projectId: snapshot.projectId,
+    expectedRevision: snapshot.projectState.revision,
+    mode: "armed",
+  };
+}
+
+export function agentControlDisarmInput(input: {
+  snapshot: AgentControlRunOnceSnapshot | null;
+  connected: boolean;
+  pending: boolean;
+  modeChangeBlocker: string | null;
+}): AgentControlSetProjectModeInput | null {
+  const snapshot = input.snapshot;
+  if (
+    !snapshot?.armed?.enabled ||
+    !input.connected ||
+    input.pending ||
+    input.modeChangeBlocker !== null ||
+    (snapshot.projectState.mode !== "armed" && snapshot.projectState.mode !== "run-once")
+  )
+    return null;
+  return {
+    commandId: CommandId.make(
+      `t3auto-disarm:${JSON.stringify([snapshot.projectId, snapshot.projectState.revision])}`,
+    ),
+    projectId: snapshot.projectId,
+    expectedRevision: snapshot.projectState.revision,
+    mode: "observe",
   };
 }

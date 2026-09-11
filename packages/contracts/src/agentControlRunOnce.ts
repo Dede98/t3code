@@ -143,6 +143,8 @@ export const AgentControlRunOnceVerificationView = Schema.Struct({
 });
 export const AgentControlRunOnceStageView = Schema.Struct({
   ...AgentControlStageRunState.fields,
+  providerInstanceId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  model: Schema.optionalKey(Schema.NullOr(Schema.String)),
   displayStage: Schema.Literals(["planning", "implementation", "verification", "repair"]),
   threadId: Schema.NullOr(ThreadId),
   worktreePath: Schema.NullOr(Schema.String),
@@ -152,6 +154,7 @@ export const AgentControlRunOnceStageView = Schema.Struct({
 });
 export type AgentControlRunOnceStageView = typeof AgentControlRunOnceStageView.Type;
 export const AgentControlRunOnceView = Schema.Struct({
+  originMode: Schema.optionalKey(Schema.NullOr(Schema.Literals(["observe", "armed"]))),
   errorCode: Schema.NullOr(Schema.String),
   state: AgentControlRunOnceState,
   task: Schema.NullOr(AgentControlTaskSummary),
@@ -159,6 +162,8 @@ export const AgentControlRunOnceView = Schema.Struct({
 });
 export type AgentControlRunOnceView = typeof AgentControlRunOnceView.Type;
 export const AgentControlRunOnceSnapshot = Schema.Struct({
+  /** Absent on older servers; clients must not interpret unknown authority as off. */
+  armed: Schema.optionalKey(Schema.Struct({ enabled: Schema.Boolean })),
   blockers: Schema.Array(Schema.String),
   projectId: ProjectId,
   projectState: AgentControlProjectState,

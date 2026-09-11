@@ -1,4 +1,4 @@
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import {
   CommandId,
   type AgentControlRunOnceView,
@@ -13,14 +13,21 @@ import {
   agentControlCanEndBlockedRun,
   agentControlModeChangeBlocker,
   agentControlSnapshotReady,
+  agentControlSnapshotFresh,
   agentControlStageHeading,
   agentControlVerificationPassed,
   agentControlStartBlockers,
   agentControlStartInput,
+  agentControlArmedStatus,
+  agentControlArmBlockers,
+  agentControlArmInput,
+  agentControlDisarmInput,
+  agentControlArmedExplanation,
+  agentControlDisarmExplanation,
 } from "@t3tools/client-runtime/state/agent-control";
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import * as Cause from "effect/Cause";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Platform, Pressable, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -64,6 +71,11 @@ function RunResult(props: {
   return (
     <View className="gap-3 rounded-2xl border border-border-subtle p-4">
       <Text className="text-base font-t3-bold">{props.run.task?.title ?? "Run"}</Text>
+      {props.run.originMode ? (
+        <Text className="text-xs text-foreground-muted">
+          {props.run.originMode === "armed" ? "Started automatically" : "Started with Run once"}
+        </Text>
+      ) : null}
       <Text className="text-sm font-t3-bold">{status.label}</Text>
       {status.tone === "warning" || status.tone === "danger" ? (
         <Text className="text-sm text-foreground-muted">
@@ -86,6 +98,10 @@ function RunResult(props: {
             !agentControlVerificationPassed(stage)
               ? "Evidence incomplete"
               : stage.status}
+          </Text>
+          <Text className="text-xs text-foreground-muted">
+            Provider: {stage.providerInstanceId ?? "Unavailable"} · Model:{" "}
+            {stage.model ?? "Unavailable"}
           </Text>
           {stage.errorCode ? (
             <Text selectable className="text-sm text-destructive">
@@ -183,7 +199,10 @@ type AutonomousTasksRouteParams = {
 export function AutonomousTasksRouteScreen({
   route,
 }: StaticScreenProps<AutonomousTasksRouteParams>) {
-  const { environmentId, projectId } = route.params;
+  return <AutonomousTasksProjectScreen key={JSON.stringify(route.params)} {...route.params} />;
+}
+
+function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTasksRouteParams) {
   const navigation = useNavigation();
   const project = useProject({ environmentId, projectId });
   const { presentation } = useEnvironmentPresentation(environmentId);
@@ -193,41 +212,92 @@ export function AutonomousTasksRouteScreen({
   const snapshotAtom = agentControlEnvironment.snapshot(target);
   const snapshot = useEnvironmentQuery(snapshotAtom);
   const snapshotResult = useAtomValue(snapshotAtom);
-  const sessionResult = useAtomValue(environmentSession.sessionStateAtom(environmentId));
-  const modeChangeBlocker = agentControlModeChangeBlocker(sessionResult);
-  const preflight = useEnvironmentQuery(agentControlEnvironment.preflight(target));
-  const policy = useEnvironmentQuery(agentControlEnvironment.policy(target));
+  const sessionAtom = environmentSession.sessionStateAtom(environmentId);
+  const sessionResult = useAtomValue(sessionAtom);
+  const refreshSession = useAtomRefresh(sessionAtom);
+  const preflightAtom = agentControlEnvironment.preflight(target);
+  const preflight = useEnvironmentQuery(preflightAtom);
+  const preflightResult = useAtomValue(preflightAtom);
+  const policyAtom = agentControlEnvironment.policy(target);
+  const policy = useEnvironmentQuery(policyAtom);
+  const policyResult = useAtomValue(policyAtom);
   const setMode = useAtomCommand(agentControlEnvironment.setMode);
   const [selectedTaskId, setSelectedTaskId] = useState<AgentControlTaskId | null>(null);
-  const [pending, setPending] = useState(false);
+  const [localPending, setPending] = useState(false);
+  const sharedPending = useAtomValue(agentControlEnvironment.pending(target));
+  const pending = localPending || sharedPending;
   const [error, setError] = useState<string | null>(null);
   const pendingRef = useRef(false);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const connected = presentation?.connection.phase === "connected";
   const snapshotReady = agentControlSnapshotReady(snapshotResult, connected);
-  const blockers = agentControlStartBlockers({
-    policy: policy.error === null && !policy.isPending ? policy.data : null,
+  const currentFreshness = {
+    connected,
+    snapshot: snapshot.data,
+    sessionResult,
+    preflightResult,
+    policyResult,
+  };
+  const [freshness, setFreshness] = useState(currentFreshness);
+  if (freshness.connected !== connected) setFreshness(currentFreshness);
+  const refreshSnapshot = snapshot.refresh;
+  const refreshPreflight = preflight.refresh;
+  const refreshPolicy = policy.refresh;
+  useEffect(() => {
+    if (!connected) return;
+    refreshSession();
+    refreshSnapshot();
+    refreshPreflight();
+    refreshPolicy();
+  }, [connected, refreshSession, refreshSnapshot, refreshPreflight, refreshPolicy]);
+  const fresh =
+    connected &&
+    freshness.connected === connected &&
+    agentControlSnapshotFresh(snapshotResult, freshness.snapshot ?? null, connected) &&
+    sessionResult !== freshness.sessionResult;
+  const modeChangeBlocker =
+    agentControlModeChangeBlocker(sessionResult) ??
+    (fresh ? null : "Checking current state and permissions in this environment.");
+  const readiness = {
+    policy:
+      policyResult !== freshness.policyResult && policy.error === null && !policy.isPending
+        ? policy.data
+        : null,
     snapshot: snapshotReady ? snapshot.data : null,
-    preflight: preflight.error || preflight.isPending ? null : preflight.data,
-    selectedTaskId,
+    preflight:
+      preflightResult === freshness.preflightResult || preflight.error || preflight.isPending
+        ? null
+        : preflight.data,
     connected,
     pending,
     modeChangeBlocker,
-  });
-  const endBlockedRunInput = agentControlEndBlockedRunInput({
+  };
+  const blockers = agentControlStartBlockers({ ...readiness, selectedTaskId });
+  const armedStatus = agentControlArmedStatus(readiness.snapshot);
+  const armBlockers = agentControlArmBlockers(readiness);
+  const modeChangeReadiness = {
     snapshot: snapshot.data,
     connected: snapshotReady,
     pending,
     modeChangeBlocker,
-  });
+  };
+  const endBlockedRunInput = agentControlEndBlockedRunInput(modeChangeReadiness);
+  const disarmInput = agentControlDisarmInput(modeChangeReadiness);
 
   async function changeMode(input: AgentControlSetProjectModeInput) {
-    if (pendingRef.current || modeChangeBlocker !== null) return;
+    if (pendingRef.current || pending || modeChangeBlocker !== null || !snapshotReady) return;
     pendingRef.current = true;
     setPending(true);
     setError(null);
     try {
       const result = await setMode({ environmentId, input });
-      if (result._tag === "Failure") {
+      if (mountedRef.current && result._tag === "Failure") {
         const cause = Cause.squash(result.cause);
         setError(
           cause instanceof Error
@@ -235,9 +305,15 @@ export function AutonomousTasksRouteScreen({
             : "The request failed. Reload the current state before retrying.",
         );
       }
+      if (mountedRef.current) {
+        refreshSnapshot();
+        refreshPreflight();
+        refreshPolicy();
+        refreshSession();
+      }
     } finally {
       pendingRef.current = false;
-      setPending(false);
+      if (mountedRef.current) setPending(false);
     }
   }
 
@@ -259,8 +335,8 @@ export function AutonomousTasksRouteScreen({
             {project?.workspaceRoot ?? projectId} · {connection?.environmentLabel ?? environmentId}
           </Text>
           <Text className="text-sm text-foreground-muted">
-            Start one eligible task and review its verified result. Worktree files remain on this
-            environment; mobile can copy the path and open changes.
+            Run one eligible task or enable automatic tasks for this project and environment.
+            Worktree files remain on this environment; mobile can copy the path and open changes.
           </Text>
         </View>
         {!connected ? (
@@ -276,15 +352,65 @@ export function AutonomousTasksRouteScreen({
         ) : null}
         <Action
           onPress={() => {
-            snapshot.refresh();
-            preflight.refresh();
-            policy.refresh();
+            setFreshness(currentFreshness);
+            refreshSnapshot();
+            refreshPreflight();
+            refreshPolicy();
+            refreshSession();
           }}
           disabled={!connected || pending}
         >
           Refresh status and preflight
         </Action>
-        <Text className="text-base font-t3-bold">Provider and model</Text>
+        <View className="gap-3 rounded-2xl border border-border-subtle p-4">
+          <Text className="text-base font-t3-bold">Automatic tasks</Text>
+          <Text accessibilityLiveRegion="polite" className="text-sm font-t3-bold">
+            {armedStatus.label}
+          </Text>
+          {snapshot.data?.runs
+            .filter((run) => run.state.status === "active")
+            .map((run) => (
+              <Text key={run.state.runId} className="text-sm text-foreground-muted">
+                Current task: {run.task?.title ?? "Waiting for task data"} ·{" "}
+                {agentControlRunStatus(run).label}
+              </Text>
+            ))}
+          {armedStatus.enabled ? (
+            <>
+              <Text className="text-sm text-foreground-muted">{agentControlDisarmExplanation}</Text>
+              {modeChangeBlocker ? (
+                <Text className="text-sm text-foreground-muted">{modeChangeBlocker}</Text>
+              ) : null}
+              <Action
+                disabled={disarmInput === null}
+                onPress={() => {
+                  if (disarmInput) void changeMode(disarmInput);
+                }}
+              >
+                {pending ? "Submitting…" : "Turn off automation"}
+              </Action>
+            </>
+          ) : (
+            <>
+              <Text className="text-sm text-foreground-muted">{agentControlArmedExplanation}</Text>
+              {armBlockers.map((blocker) => (
+                <Text key={blocker} className="text-sm text-foreground-muted">
+                  {blocker}
+                </Text>
+              ))}
+              <Action
+                disabled={armBlockers.length > 0}
+                onPress={() => {
+                  if (readiness.snapshot && armBlockers.length === 0)
+                    void changeMode(agentControlArmInput(readiness.snapshot));
+                }}
+              >
+                {pending ? "Submitting…" : "Turn on automation"}
+              </Action>
+            </>
+          )}
+        </View>
+        <Text className="text-base font-t3-bold">Configured provider and model readiness</Text>
         {preflight.data?.roles.map((role) => (
           <View key={role.role} className="gap-1">
             <Text className="text-sm font-t3-bold">
@@ -352,7 +478,8 @@ export function AutonomousTasksRouteScreen({
             Disable task observation
           </Action>
         ) : null}
-        {snapshot.data?.projectState.mode === "run-once" &&
+        {armedStatus.enabled !== true &&
+        snapshot.data?.projectState.mode === "run-once" &&
         snapshot.data.runs.some(agentControlCanEndBlockedRun) ? (
           <View className="gap-2">
             <Action
@@ -370,7 +497,7 @@ export function AutonomousTasksRouteScreen({
             </Text>
           </View>
         ) : null}
-        <Text className="text-base font-t3-bold">Choose task</Text>
+        <Text className="text-base font-t3-bold">Run once · Choose task</Text>
         {snapshot.data?.tasks.length === 0 ? (
           <Text className="text-sm text-foreground-muted">
             No tasks available. Check the project's GitHub intake configuration and observe mode.
@@ -388,7 +515,7 @@ export function AutonomousTasksRouteScreen({
             <Text className="text-sm font-t3-bold">{task.title}</Text>
             <Text className="text-xs text-foreground-muted">
               {task.status} · {task.sourceGate}
-              {snapshot.data?.nextTaskId === task.taskId ? " · Next eligible task" : ""}
+              {snapshot.data?.nextTaskId === task.taskId ? " · Eligible next by server order" : ""}
             </Text>
           </Pressable>
         ))}

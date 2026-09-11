@@ -19,7 +19,7 @@ Reset that list to use shared actions again. Existing project actions are preser
 Project names, icons, removal, and importing actions from a checkout remain project-specific.
 When there are several checkouts, the checkout picker selects which actions and grouping to edit.
 
-## Run one autonomous task
+## Run autonomous tasks
 
 For projects with GitHub task intake and provider routing already configured, open the project's
 **Autonomous task** section. Select the checkout on the environment where the work should run.
@@ -32,6 +32,19 @@ be disabled again when no run is active. This view does not configure GitHub int
 Starting runs and changing intake require an admin session on the selected environment. Standard
 pairing and relay sessions can review saved runs; ask the environment administrator for an admin
 pairing link to enable these actions.
+
+Choose **Turn on automation** to enable automatic mode (Armed) for this project and environment.
+The server starts eligible tasks one after another, including tasks that become eligible later.
+Automatic mode stays on while a task runs and while waiting for more work. Readiness and recorded
+blockers explain why work cannot start; **Run once** remains available when automatic mode is off.
+
+**Turn off automation** prevents new tasks from starting automatically and leaves intake enabled.
+Work already admitted can continue, including later stages of the current task. Turning automation
+off does not interrupt provider turns or guarantee that the task will finish. Threads, changes and
+verification evidence remain available.
+After any active run releases its resources and blockers are resolved, you can turn automation on
+again. Previously attempted tasks cannot be restarted as fresh runs; remove their ready label or
+pause them in GitHub before offering new eligible tasks.
 
 The latest saved run shows Planning, Implementation, Verification, and any Repair with its own
 subsequent Verification. Expand check results to inspect their exit codes and captured output.

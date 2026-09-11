@@ -60,6 +60,40 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
       .withTransaction(
         Effect.gen(function* () {
           const projectState = yield* engine.getProjectState(input);
+          // The committed system mode event carries Armed authority before the
+          // scheduler publishes its activation or Run-Once creates a run row.
+          // Pause/resume keeps the latest original activation's origin; takeover
+          // to Observe/Manual wins immediately, even before run cleanup.
+          const activationModes =
+            projectState.mode === "run-once"
+              ? yield* sql<{ originMode: string }>`
+                  SELECT json_extract(event.payload_json, '$.previousMode') AS "originMode"
+                  FROM main.agent_control_events event
+                  JOIN main.agent_control_command_receipts receipt
+                    ON receipt.command_id = event.command_id
+                  WHERE event.aggregate_kind = 'project-controller'
+                    AND event.stream_id = ${input.projectId}
+                    AND event.stream_version <= ${projectState.revision}
+                    AND event.event_type = 'agentControl.project.mode.changed'
+                    AND json_extract(event.payload_json, '$.mode') = 'run-once'
+                    AND ((event.actor_authority = 'system'
+                      AND json_extract(event.payload_json, '$.previousMode') = 'armed')
+                      OR (event.actor_authority = 'human'
+                      AND json_extract(event.payload_json, '$.previousMode') = 'observe'))
+                    AND receipt.status = 'accepted' AND receipt.event_created = 1
+                    AND receipt.authority = event.actor_authority
+                    AND receipt.aggregate_kind = event.aggregate_kind
+                    AND receipt.aggregate_id = event.stream_id
+                    AND receipt.result_sequence = event.sequence
+                    AND receipt.result_stream_version = event.stream_version
+                  ORDER BY event.stream_version DESC LIMIT 1
+                `
+              : [];
+          const armed = {
+            enabled:
+              projectState.mode === "armed" ||
+              (projectState.mode === "run-once" && activationModes[0]?.originMode === "armed"),
+          };
           const listed = yield* tasks.listTasks(input);
           const intakeSequence = Math.max(
             0,
@@ -93,6 +127,10 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
           const runs = [];
           for (const row of rows) {
             const state = yield* decodeRun(row);
+            const activations = yield* sql<{ originMode: string }>`
+              SELECT origin_mode AS "originMode" FROM main.agent_control_run_once_activations
+              WHERE project_id = ${input.projectId} AND run_id = ${state.runId}
+            `;
             const stageRows =
               state.taskId === null
                 ? []
@@ -122,10 +160,14 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
                 providerDeliveryId: string;
                 errorCode: string | null;
                 branch: string | null;
+                providerInstanceId: string;
+                model: string;
               }>(
                 `SELECT intent.handoff_id AS "handoffId", intent.thread_id AS "threadId",
             intent.worktree_path AS "worktreePath", intent.provider_delivery_id AS "providerDeliveryId",
-            delivery.last_error_code AS "errorCode", json_extract(worktree.state_json, '$.branchName') AS branch
+            delivery.last_error_code AS "errorCode", json_extract(worktree.state_json, '$.branchName') AS branch,
+            intent.provider_instance_id AS "providerInstanceId",
+            json_extract(intent.model_selection_json, '$.model') AS model
             FROM main.agent_control_${prefix}_handoff_intents intent
             LEFT JOIN main.agent_control_${prefix}_deliveries delivery ON delivery.handoff_id = intent.handoff_id
             LEFT JOIN main.agent_control_worktree_reservation_states worktree ON worktree.reservation_id = intent.worktree_reservation_id
@@ -204,6 +246,8 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
                 threadId: handoff ? ThreadId.make(handoff.threadId) : null,
                 worktreePath: handoff?.worktreePath ?? null,
                 branch: handoff?.branch ?? null,
+                providerInstanceId: handoff?.providerInstanceId ?? null,
+                model: handoff?.model ?? null,
                 errorCode: handoff?.errorCode ?? null,
                 verification,
               });
@@ -238,6 +282,7 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
               }
             }
             runs.push({
+              originMode: activations[0]?.originMode ?? null,
               errorCode,
               state,
               task: listed.tasks.find((task) => task.taskId === state.taskId) ?? null,
@@ -245,6 +290,7 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
             });
           }
           return yield* decodeSnapshot({
+            armed,
             blockers: diagnostics.map((item) => item.errorCode),
             projectId: input.projectId,
             projectState,

@@ -16,6 +16,11 @@ import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
 
 import {
+  agentControlSnapshotFresh,
+  agentControlArmedStatus,
+  agentControlArmBlockers,
+  agentControlArmInput,
+  agentControlDisarmInput,
   agentControlRunStatus,
   agentControlEndBlockedRunInput,
   agentControlCanEndBlockedRun,
@@ -585,4 +590,150 @@ describe("Run Once client state", () => {
       ).toBe("warning");
     }
   });
+});
+
+describe("Armed client state", () => {
+  const off = { ...snapshot, armed: { enabled: false } };
+  const on = {
+    ...snapshot,
+    armed: { enabled: true },
+    projectState: { ...snapshot.projectState, mode: "armed" as const },
+  };
+  it("keeps automatic authority visible during a run-once execution and before its run is published", () => {
+    const executing = {
+      ...on,
+      projectState: { ...on.projectState, mode: "run-once" as const },
+      runs: [],
+    };
+    expect(agentControlArmedStatus(executing)).toMatchObject({ enabled: true, tone: "running" });
+    expect(agentControlArmedStatus(on).label).toContain("waiting");
+    expect(
+      agentControlArmedStatus({
+        ...executing,
+        runs: [
+          {
+            ...run,
+            task: { ...task, status: "running" },
+            state: { ...run.state, status: "active" },
+          },
+        ],
+      }).label,
+    ).toContain("task running");
+  });
+  it("does not reactivate automatic mode from a historical armed run or an eligible follow-up", () => {
+    expect(off.nextTaskId).not.toBeNull();
+    expect(
+      agentControlArmedStatus({ ...off, runs: [{ ...run, originMode: "armed" }] }),
+    ).toMatchObject({ enabled: false, label: "Automatic mode off" });
+    expect(agentControlDisarmInput({ ...start, snapshot: off })).toBeNull();
+  });
+  it("shows project and run blockers without hiding the stop action", () => {
+    const blocked = { ...on, blockers: ["source-watermark-stale"] };
+    expect(agentControlArmedStatus(blocked).label).toContain("blocked");
+    expect(agentControlDisarmInput({ ...start, snapshot: blocked })?.mode).toBe("observe");
+    expect(
+      agentControlArmedStatus({
+        ...on,
+        runs: [
+          { ...run, errorCode: "provider-unavailable", state: { ...run.state, status: "active" } },
+        ],
+      }).tone,
+    ).toBe("warning");
+  });
+  it("can enable waiting without selecting tasks and delegates admission to the server", () => {
+    expect(
+      agentControlArmBlockers({
+        ...start,
+        snapshot: { ...off, tasks: [], runs: [], nextTaskId: null },
+      }),
+    ).toEqual([]);
+    expect(agentControlArmInput(off)).toMatchObject({
+      expectedRevision: 4,
+      projectId: "project",
+      mode: "armed",
+    });
+    expect(agentControlArmInput(off)).not.toHaveProperty("runOnceTaskId");
+    expect(agentControlArmBlockers({ ...start, snapshot: on }).length).toBeGreaterThan(0);
+  });
+  it("fails closed for old servers, unknown or refreshing permissions and reconnect gaps", () => {
+    expect(agentControlArmedStatus(snapshot).enabled).toBeNull();
+    expect(agentControlArmBlockers(start).join(" ")).toContain("authority");
+    for (const unavailable of [
+      { connected: false },
+      { pending: true },
+      { snapshot: null },
+      ...[
+        AsyncResult.initial<AuthSessionState>(),
+        AsyncResult.waiting(AsyncResult.success(adminSession)),
+        AsyncResult.success({ ...adminSession, scopes: AuthStandardClientScopes }),
+        AsyncResult.fail(new Error("reconnect")),
+      ].map((session) => ({ modeChangeBlocker: agentControlModeChangeBlocker(session) })),
+    ]) {
+      expect(
+        agentControlArmBlockers({ ...start, snapshot: off, ...unavailable }).length,
+      ).toBeGreaterThan(0);
+      expect(agentControlDisarmInput({ ...start, snapshot: on, ...unavailable })).toBeNull();
+    }
+    expect(agentControlArmBlockers({ ...start, snapshot: off })).toEqual([]);
+    expect(agentControlDisarmInput({ ...start, snapshot: on })).not.toBeNull();
+  });
+  it("retains command identity at one revision and issues new identities after stop and reactivation", () => {
+    const disarm = agentControlDisarmInput({ ...start, snapshot: on });
+    expect(agentControlDisarmInput({ ...start, snapshot: on })).toEqual(disarm);
+    const renewed = { ...off, projectState: { ...off.projectState, revision: 8 } };
+    expect(agentControlArmInput(renewed).commandId).not.toBe(agentControlArmInput(off).commandId);
+    expect(agentControlArmInput(renewed).expectedRevision).toBe(8);
+    expect(
+      agentControlDisarmInput({
+        ...start,
+        snapshot: { ...on, projectState: { ...on.projectState, revision: 9 } },
+      })?.commandId,
+    ).not.toBe(disarm?.commandId);
+  });
+});
+
+it("does not treat a cached streaming value as fresh after reconnect", () => {
+  expect(
+    agentControlSnapshotFresh(AsyncResult.waiting(AsyncResult.success(snapshot)), snapshot, true),
+  ).toBe(false);
+  expect(agentControlSnapshotFresh(AsyncResult.success({ ...snapshot }), snapshot, false)).toBe(
+    false,
+  );
+  expect(agentControlSnapshotFresh(AsyncResult.success({ ...snapshot }), snapshot, true)).toBe(
+    true,
+  );
+  expect(agentControlSnapshotFresh(AsyncResult.initial(), snapshot, true)).toBe(false);
+});
+it("requires history-blocked candidates to leave intake before rearming", () => {
+  expect(
+    agentControlArmBlockers({
+      ...start,
+      snapshot: { ...snapshot, armed: { enabled: false }, nextTaskId: null },
+    }).join(" "),
+  ).toContain("execution history");
+});
+
+it("keeps an ended Armed run honest while its admitted pipeline continues", () => {
+  expect(
+    agentControlRunStatus({
+      ...run,
+      originMode: "armed",
+      task,
+      state: { ...run.state, terminalTaskEventId: null },
+      stages: [{ ...stage, status: "running", verification: null }],
+    }),
+  ).toEqual({ label: "Automatic run ended · admitted work may continue", tone: "warning" });
+});
+
+it("explains why Run once is unavailable while automation is waiting", () => {
+  expect(
+    agentControlStartBlockers({
+      ...start,
+      snapshot: {
+        ...snapshot,
+        armed: { enabled: true },
+        projectState: { ...snapshot.projectState, mode: "armed" },
+      },
+    }),
+  ).toContain("Turn off automation before starting a single task.");
 });
