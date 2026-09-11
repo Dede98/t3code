@@ -1,5 +1,11 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { CommandId, EventId, ProjectId, type AgentControlEvent } from "@t3tools/contracts";
+import {
+  AgentControlWorktreeRpcError,
+  CommandId,
+  EventId,
+  ProjectId,
+  type AgentControlEvent,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -8,6 +14,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
+import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -26,6 +33,7 @@ import { deriveAgentControlRunOnceId, deriveRunOnceCommandId } from "../../runOn
 import { AgentControlTaskIntakeReactor } from "../../task/Services/AgentControlTaskIntakeReactor.ts";
 import { canonicalJson } from "../../initialPlanning/eventEvidence.ts";
 import { makeReactorStartupActivation } from "../../../reactorStartupActivation.ts";
+import { AgentControlRunOnceError } from "../../runOnce/model.ts";
 import { AgentControlArmedError } from "../model.ts";
 import { make, makeAgentControlArmedWorkScheduler } from "./AgentControlArmedScheduler.ts";
 
@@ -52,7 +60,9 @@ interface ActivatedDispatchRow {
 
 const runOnceCalls = Ref.makeUnsafe(new Map<ProjectId, number>());
 const runOnceEntered = Ref.makeUnsafe(new Map<ProjectId, Deferred.Deferred<void>>());
-const runOnceHandlers = Ref.makeUnsafe(new Map<ProjectId, Effect.Effect<void>>());
+const runOnceHandlers = Ref.makeUnsafe(
+  new Map<ProjectId, Effect.Effect<void, AgentControlRunOnceError>>(),
+);
 const resetRunOnce = (id: ProjectId, signal?: Deferred.Deferred<void>) =>
   Ref.update(runOnceCalls, (current) => {
     const next = new Map(current);
@@ -70,7 +80,10 @@ const resetRunOnce = (id: ProjectId, signal?: Deferred.Deferred<void>) =>
   );
 const getRunOnceCalls = (id: ProjectId) =>
   Ref.get(runOnceCalls).pipe(Effect.map((current) => current.get(id) ?? 0));
-const setRunOnceHandler = (id: ProjectId, handler?: Effect.Effect<void>) =>
+const setRunOnceHandler = (
+  id: ProjectId,
+  handler?: Effect.Effect<void, AgentControlRunOnceError>,
+) =>
   Ref.update(runOnceHandlers, (current) => {
     const next = new Map(current);
     if (handler === undefined) next.delete(id);
@@ -1188,4 +1201,131 @@ layer("AgentControlArmedScheduler", (it) => {
       assert.deepStrictEqual(yield* sql`PRAGMA main.foreign_key_check`, []);
     }).pipe(Effect.ensuring(setRunOnceHandler(id)));
   });
+});
+
+layer("Armed recovery failure boundary", (it) => {
+  it.effect("keeps a recovered project blocker isolated after Armed workers activate", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const engine = yield* AgentControlEngine;
+      const id = ProjectId.make("armed-recovery-local-blocker");
+      yield* addProject(sql, id);
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make(`${id}-observe`),
+        projectId: id,
+        expectedRevision: 0,
+        mode: "observe",
+      });
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make(`${id}-arm`),
+        projectId: id,
+        expectedRevision: 1,
+        mode: "armed",
+      });
+      yield* seedSourceAndCandidate(sql, id);
+      const blocker = new AgentControlRunOnceError({
+        projectId: id,
+        runId: null,
+        step: "worktree-ready",
+        reason: "downstream-rejected",
+        cause: new AgentControlWorktreeRpcError({
+          projectId: id,
+          taskId: null,
+          reservationId: null,
+          operation: "reserve",
+          code: "default-remote-ref-unavailable",
+        }),
+      });
+      yield* setRunOnceHandler(id, Effect.fail(blocker));
+      yield* Effect.addFinalizer(() => setRunOnceHandler(id));
+      const wakeups = yield* PubSub.unbounded<ProjectId>();
+      const intake = yield* AgentControlTaskIntakeReactor;
+      const scheduler = yield* make().pipe(
+        Effect.provideService(AgentControlTaskIntakeReactor, {
+          ...intake,
+          subscribeCompletions: PubSub.subscribe(wakeups).pipe(Effect.map(Stream.fromSubscription)),
+        }),
+      );
+      const activation = yield* makeReactorStartupActivation;
+      yield* scheduler.prepare(activation);
+      assert.equal(yield* getRunOnceCalls(id), 1);
+      const entered = yield* Deferred.make<void>();
+      yield* resetRunOnce(id, entered);
+      yield* activation.open;
+      yield* Deferred.await(entered);
+      yield* resetRunOnce(id);
+      const wakeupEntered = yield* Deferred.make<void>();
+      yield* resetRunOnce(id, wakeupEntered);
+      yield* PubSub.publish(wakeups, id);
+      yield* Deferred.await(wakeupEntered);
+      yield* TestClock.adjust(Duration.hours(1));
+      assert.equal(yield* getRunOnceCalls(id), 1);
+      const failure = yield* Effect.forkScoped(scheduler.awaitFailure);
+      yield* Effect.yieldNow;
+      assert.isUndefined(failure.pollUnsafe());
+      assert.deepStrictEqual(
+        yield* sql`SELECT status FROM agent_control_armed_dispatch_states WHERE project_id=${id}`,
+        [{ status: "activated" }],
+      );
+      assert.equal((yield* engine.getProjectState({ projectId: id })).mode, "run-once");
+    }),
+  );
+
+  it.effect.each(["persistence", "authority-conflict", "projection-corrupt", "defect"] as const)(
+    "keeps %s fatal during Armed recovery",
+    (reason) =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const engine = yield* AgentControlEngine;
+        const id = ProjectId.make(`armed-recovery-fatal-${reason}`);
+        yield* addProject(sql, id);
+        yield* engine.dispatchHuman({
+          commandId: CommandId.make(`${id}-observe`),
+          projectId: id,
+          expectedRevision: 0,
+          mode: "observe",
+        });
+        yield* engine.dispatchHuman({
+          commandId: CommandId.make(`${id}-arm`),
+          projectId: id,
+          expectedRevision: 1,
+          mode: "armed",
+        });
+        yield* seedSourceAndCandidate(sql, id);
+        const defect = new Error("unexpected Armed downstream defect");
+        yield* setRunOnceHandler(
+          id,
+          reason === "defect"
+            ? Effect.die(defect)
+            : Effect.fail(
+                new AgentControlRunOnceError({
+                  projectId: id,
+                  runId: null,
+                  step: "worktree-ready",
+                  reason,
+                }),
+              ),
+        );
+        yield* Effect.addFinalizer(() => setRunOnceHandler(id));
+        const scheduler = yield* make();
+        const activation = yield* makeReactorStartupActivation;
+        const result = yield* Effect.exit(scheduler.prepare(activation));
+        assert.isTrue(Exit.isFailure(result));
+        if (Exit.isFailure(result)) {
+          const failures = result.cause.reasons;
+          assert.lengthOf(failures, 1);
+          if (reason === "defect") {
+            assert.equal(failures[0]?._tag, "Die");
+            if (failures[0]?._tag === "Die") assert.equal(failures[0].defect, defect);
+          } else {
+            const failure = yield* scheduler.recover.pipe(Effect.flip);
+            assert.equal(
+              failure.reason,
+              reason === "persistence" ? "persistence" : "authority-conflict",
+            );
+            assert.equal(failure.projectId, id);
+          }
+        }
+      }),
+  );
 });

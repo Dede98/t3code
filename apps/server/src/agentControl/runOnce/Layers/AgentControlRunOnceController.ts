@@ -1077,6 +1077,8 @@ const make = Effect.gen(function* () {
       const integrity = yield* sql<{ readonly integrity_check: unknown }>`
         PRAGMA integrity_check
       `;
+      // Human takeover can supersede an Armed dispatch before Run-Once cleanup.
+      // Its historical activation remains valid; new admissions still require activated.
       const invalidActivations = yield* sql<{ readonly runId: unknown }>`
         SELECT activation.run_id AS "runId"
         FROM main.agent_control_run_once_activations activation
@@ -1124,7 +1126,35 @@ const make = Effect.gen(function* () {
                 WHERE armed.dispatch_id = activation.armed_dispatch_id
                   AND armed.claim_id = activation.armed_claim_id
                   AND armed.marker_id = activation.armed_marker_id
-                  AND dispatch.status IN ('activated', 'completed')
+                  AND armed.project_id = activation.project_id
+                  AND armed.mode_command_id = activation.activation_command_id
+                  AND dispatch.activation_event_id = activation.activation_event_id
+                  AND dispatch.activation_event_sequence = activation.activation_event_sequence
+                  AND dispatch.activation_event_stream_version = activation.activation_event_stream_version
+                  AND (
+                    dispatch.status IN ('activated', 'completed')
+                    OR (dispatch.status = 'superseded' AND EXISTS (
+                      SELECT 1 FROM main.agent_control_events takeover
+                      JOIN main.agent_control_command_receipts takeover_receipt
+                        ON takeover_receipt.command_id = takeover.command_id
+                      WHERE takeover.stream_id = activation.project_id
+                        AND takeover.aggregate_kind = 'project-controller'
+                        AND takeover.event_type = 'agentControl.project.mode.changed'
+                        AND takeover.stream_version > activation.activation_event_stream_version
+                        AND takeover.actor_authority = 'human'
+                        AND json_extract(takeover.payload_json, '$.mode') IN ('observe', 'manual')
+                        AND json_extract(takeover.payload_json, '$.pausedFromMode') IS NULL
+                        AND takeover_receipt.status = 'accepted'
+                        AND takeover_receipt.authority = 'human'
+                        AND takeover_receipt.aggregate_kind = 'project-controller'
+                        AND takeover_receipt.aggregate_id = activation.project_id
+                        AND takeover_receipt.event_created = 1
+                        AND takeover_receipt.result_sequence = takeover.sequence
+                        AND takeover_receipt.result_stream_version = takeover.stream_version
+                        AND takeover_receipt.accepted_at = takeover.occurred_at
+                        AND takeover_receipt.error_code IS NULL
+                    ))
+                  )
               ))
             )
         )

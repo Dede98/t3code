@@ -17,7 +17,10 @@ import { AgentControlRunOnceController } from "../../runOnce/Services/AgentContr
 import { withAgentControlRunOnceProjectFence } from "../../runOnce/context.ts";
 import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
 import { AgentControlTaskIntakeReactor } from "../../task/Services/AgentControlTaskIntakeReactor.ts";
-import { superviseAgentControlRunOnceListener } from "../../runOnce/Layers/AgentControlRunOnceController.ts";
+import {
+  isRunOnceRecoveryProjectBlocker,
+  superviseAgentControlRunOnceListener,
+} from "../../runOnce/Layers/AgentControlRunOnceController.ts";
 import {
   activateArmedDispatch,
   claimArmedDispatch,
@@ -430,19 +433,27 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
         yield* finishArmedDispatch(sql, dispatch, "superseded", preflight.updatedAt as string);
         return;
       }
-      yield* runOnce
-        .processProject(projectId)
-        .pipe(
-          Effect.mapError((cause) =>
-            fail(
-              projectId,
-              cause.reason === "persistence" || cause.reason === "source-unavailable"
-                ? "persistence"
-                : "authority-conflict",
-              cause,
-            ),
-          ),
-        );
+      const progressed = yield* runOnce.processProject(projectId).pipe(
+        Effect.as(true),
+        Effect.catch((cause) =>
+          // Run-Once has persisted the diagnostic. Keep this dispatch activated,
+          // without converting a local blocker into a fatal Armed authority error.
+          isRunOnceRecoveryProjectBlocker(cause)
+            ? Effect.logWarning("Armed left project blocked", { projectId, failure: cause }).pipe(
+                Effect.as(false),
+              )
+            : Effect.fail(
+                fail(
+                  projectId,
+                  cause.reason === "persistence" || cause.reason === "source-unavailable"
+                    ? "persistence"
+                    : "authority-conflict",
+                  cause,
+                ),
+              ),
+        ),
+      );
+      if (!progressed) return;
       if (options.hooks?.afterRunOnce !== undefined) yield* options.hooks.afterRunOnce(dispatch);
       const state = yield* loadState(projectId, dispatch.dispatchId);
       if (state.status !== "activated") return;

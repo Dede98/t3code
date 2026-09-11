@@ -27,7 +27,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { alreadyActivated } from "../../../reactorStartupActivation.ts";
+import { makeReactorStartupActivation } from "../../../reactorStartupActivation.ts";
 import { ServerConfig } from "../../../config.ts";
 import * as GitManager from "../../../git/GitManager.ts";
 import * as GitWorkflowService from "../../../git/GitWorkflowService.ts";
@@ -309,9 +309,9 @@ const makePolicyLayer = () =>
       }),
   });
 
-it.live(
-  "isolates a persisted project blocker across recovery while independent tasks run and fresh authority resolves it",
-  () =>
+it.live.each(["run-once", "armed"] as const)(
+  "isolates a persisted %s project blocker across recovery while independent tasks run and fresh authority resolves it",
+  (blockedMode) =>
     Effect.scoped(
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
@@ -588,7 +588,11 @@ it.live(
           "--delete",
           "refs/remotes/origin/HEAD",
         ]).pipe(Effect.provide(gitLayer));
-        yield* seedProject(blockedProjectId, blockedRepository, [issue(101, at)], "run-once");
+        yield* seedProject(blockedProjectId, blockedRepository, [issue(101, at)], blockedMode);
+        if (blockedMode === "armed") {
+          // Establish the automatic activation and its durable rejection before restart.
+          yield* scheduler.processProject(blockedProjectId).pipe(Effect.exit);
+        }
         const controller = Context.get(context, AgentControlRunOnceController);
         const blocked = yield* controller.processProject(blockedProjectId).pipe(Effect.flip);
         assert.equal(blocked.reason, "downstream-rejected");
@@ -614,9 +618,14 @@ it.live(
                   Layer.provide(Layer.succeedContext(context)),
                 ),
               );
-              yield* Context.get(restarted, AgentControlRunOnceController).prepare(
-                alreadyActivated,
+              const startup = yield* makeReactorStartupActivation;
+              yield* Context.get(restarted, AgentControlRunOnceController).prepare(startup);
+              const restartedArmed = yield* Layer.build(
+                Layer.fresh(AgentControlArmedSchedulerLive).pipe(
+                  Layer.provide(Layer.succeedContext(Context.merge(context, restarted))),
+                ),
               );
+              yield* Context.get(restartedArmed, AgentControlArmedScheduler).prepare(startup);
             }),
           );
         });
@@ -654,7 +663,8 @@ it.live(
         assert.deepStrictEqual(
           yield* sql`
             SELECT project.mode,
-              (SELECT selected_task_id FROM agent_control_armed_dispatch_evidence)
+              (SELECT selected_task_id FROM agent_control_armed_dispatch_evidence
+               WHERE project_id=${projectId})
                 AS selectedTask,
               (SELECT count(*) FROM agent_control_initial_planning_handoff_accepted)
                 AS planningHandoffs
@@ -1082,7 +1092,9 @@ it.live(
           assert.isDefined(accepted);
           yield* planningWakeupService.wake(accepted!.handoffId);
           yield* planningConsumerService.drain;
-          const [pendingPlanning] = yield* sql<{ threadId: string }>`SELECT thread_id AS "threadId"
+          const [pendingPlanning] = yield* sql<{
+            threadId: string;
+          }>`SELECT thread_id AS "threadId"
             FROM agent_control_initial_planning_handoff_accepted WHERE handoff_id=${accepted!.handoffId}`;
           const planningStarted = startedEvent(ThreadId.make(pendingPlanning!.threadId));
           yield* Context.get(
@@ -1394,7 +1406,23 @@ it.live(
             .revision,
           mode: "observe",
         });
-        yield* controller.processProject(blockedProjectId);
+        if (blockedMode === "armed") {
+          // Armed may observe Human takeover before Run-Once cleanup and then crash.
+          yield* scheduler.processProject(blockedProjectId);
+          assert.deepStrictEqual(
+            yield* sql`SELECT status FROM agent_control_armed_dispatch_states
+              WHERE project_id=${blockedProjectId}`,
+            [{ status: "superseded" }],
+          );
+          assert.deepStrictEqual(
+            yield* sql`SELECT status FROM agent_control_run_once_states
+              WHERE run_id=${oldRunId}`,
+            [{ status: "active" }],
+          );
+          yield* restartRecovery();
+        } else {
+          yield* controller.processProject(blockedProjectId);
+        }
         assert.deepStrictEqual(
           yield* sql`SELECT status, last_step AS step
           FROM agent_control_run_once_states WHERE run_id=${oldRunId}`,
