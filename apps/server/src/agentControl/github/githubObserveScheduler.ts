@@ -18,6 +18,7 @@ const RETRYABLE_CODES = new Set<AgentControlGithubPollErrorCode>([
   "github-authentication",
   "github-timeout",
   "github-command-failed",
+  "github-issues-disabled",
   "github-decode-failed",
 ]);
 

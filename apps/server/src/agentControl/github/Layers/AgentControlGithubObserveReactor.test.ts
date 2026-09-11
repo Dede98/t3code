@@ -133,6 +133,7 @@ const addProject = Effect.fn("test.addProject")(function* (input: {
   readonly withConfig?: boolean;
   readonly pollIntervalSeconds?: number;
   readonly corruptControllerProjection?: boolean;
+  readonly withControllerState?: boolean;
 }) {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`
@@ -147,7 +148,8 @@ const addProject = Effect.fn("test.addProject")(function* (input: {
   if (input.corruptControllerProjection === true) {
     yield* sql`PRAGMA ignore_check_constraints = ON`;
   }
-  yield* sql`
+  if (input.withControllerState !== false)
+    yield* sql`
       INSERT INTO agent_control_project_states (
         project_id, mode, paused_from_mode, revision, last_event_sequence, updated_at
       ) VALUES (
@@ -663,6 +665,66 @@ const waitForEffect = <E, R>(predicate: () => Effect.Effect<boolean, E, R>) =>
 
 const run = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.scoped(effect).pipe(Effect.provide(testLayer));
+
+it.effect("keeps fresh setup inactive until the first explicit intake mode change", () =>
+  run(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("fresh-setup-before-mode");
+      const sql = yield* SqlClient.SqlClient;
+      const projectStates = yield* AgentControlProjectStateRepository;
+      const schedulerStates = yield* AgentControlGithubSchedulerStateRepository;
+      yield* addProject({
+        projectId,
+        mode: "manual",
+        withControllerState: false,
+        withConfig: false,
+      });
+      let reconciled = yield* Deferred.make<void>();
+      const pollStarted = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        reactorOptions: {
+          testHooks: {
+            lifecycleEvent: (event) =>
+              event._tag === "project-reconciled" && event.projectId === projectId
+                ? Deferred.succeed(reconciled, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+          },
+        },
+      });
+      harness.setPoll(() =>
+        Deferred.succeed(pollStarted, undefined).pipe(Effect.andThen(Effect.never)),
+      );
+      yield* harness.reactor.start();
+      yield* setGithubState(projectId, 15);
+      yield* PubSub.publish(harness.githubEvents, githubConfigEvent(projectId, 15));
+      yield* Deferred.await(reconciled);
+
+      const inactive = yield* harness.reactor.getStatus({ projectId });
+      assert.equal(inactive.activity, "inactive");
+      assert.equal(inactive.health, "healthy");
+      assert.equal(inactive.workerStatus, "stopped");
+      assert.isNull(inactive.reasonCode);
+      assert.isNull(inactive.nextAttemptAt);
+      assert.equal(harness.pollInputs.length, 0);
+      assert.isTrue(Option.isNone(yield* projectStates.get(projectId)));
+      assert.isTrue(Option.isNone(yield* schedulerStates.get(projectId)));
+
+      // The first explicit mode change creates the projection; config saving did not.
+      yield* sql`
+        INSERT INTO agent_control_project_states (
+          project_id, mode, paused_from_mode, revision, last_event_sequence, updated_at
+        ) VALUES (${projectId}, 'observe', NULL, 1, 1, ${EPOCH})
+      `;
+      reconciled = yield* Deferred.make<void>();
+      yield* PubSub.publish(harness.projectEvents, projectEvent(projectId, "manual", "observe", 1));
+      yield* Deferred.await(reconciled);
+      yield* Deferred.await(pollStarted);
+      assert.equal(harness.pollInputs.length, 1);
+      assert.equal(harness.pollInputs[0]?.projectId, projectId);
+      assert.equal((yield* harness.reactor.getStatus({ projectId })).activity, "active");
+    }),
+  ),
+);
 
 it.effect(
   "starts exactly one worker for each healthy Observe or Armed project and skips manual, paused, missing, and corrupt projects",

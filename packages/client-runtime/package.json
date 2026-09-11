@@ -234,6 +234,10 @@
     "./state/agent-control": {
       "types": "./src/state/agentControl.ts",
       "default": "./src/state/agentControl.ts"
+    },
+    "./state/agent-control-setup": {
+      "types": "./src/state/agentControlSetup.ts",
+      "default": "./src/state/agentControlSetup.ts"
     }
   },
   "scripts": {

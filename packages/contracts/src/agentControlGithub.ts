@@ -80,6 +80,7 @@ export type AgentControlGithubPollCursor = typeof AgentControlGithubPollCursor.T
 export const AGENT_CONTROL_GITHUB_POLL_ERROR_CODES = [
   "github-unavailable",
   "github-authentication",
+  "github-issues-disabled",
   "github-timeout",
   "github-command-failed",
   "github-decode-failed",
@@ -260,6 +261,7 @@ export type AgentControlGithubCircuitState = typeof AgentControlGithubCircuitSta
 export const AGENT_CONTROL_GITHUB_REACTOR_REASON_CODES = [
   "github-unavailable",
   "github-authentication",
+  "github-issues-disabled",
   "github-timeout",
   "github-command-failed",
   "github-decode-failed",
@@ -306,6 +308,7 @@ export const AGENT_CONTROL_GITHUB_RPC_ERROR_CODES = [
   "poll-in-progress",
   "github-unavailable",
   "github-authentication",
+  "github-issues-disabled",
   "github-timeout",
   "github-command-failed",
   "github-decode-failed",

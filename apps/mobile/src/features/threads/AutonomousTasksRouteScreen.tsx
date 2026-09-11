@@ -1,4 +1,4 @@
-import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
+import { RegistryContext, useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import {
   CommandId,
   type AgentControlRunOnceView,
@@ -30,7 +30,21 @@ import {
 } from "@t3tools/client-runtime/state/agent-control";
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import * as Cause from "effect/Cause";
-import { useEffect, useRef, useState } from "react";
+import {
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import {
+  agentControlSetupPermissionBlocker,
+  agentControlPreflightErrorMessage,
+  bindAgentControlSetupApi,
+  createAgentControlSetupController,
+} from "@t3tools/client-runtime/state/agent-control-setup";
 import { Platform, Pressable, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -40,6 +54,9 @@ import { copyTextWithHaptic } from "../../lib/copyTextWithHaptic";
 import { uuidv4 } from "../../lib/uuid";
 import { NativeStackScreenOptions } from "../../native/StackHeader";
 import { agentControlEnvironment } from "../../state/agent-control";
+import { agentControlSetupEnvironment } from "../../state/agent-control-setup";
+import { serverEnvironment } from "../../state/server";
+import { AutonomousProjectSetupForm } from "./AutonomousProjectSetupForm";
 import { useProject } from "../../state/entities";
 import { useEnvironmentPresentation } from "../../state/presentation";
 import { useEnvironmentQuery } from "../../state/query";
@@ -264,6 +281,62 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
     freshness.connected === connected &&
     agentControlSnapshotFresh(snapshotResult, freshness.snapshot ?? null, connected) &&
     sessionResult !== freshness.sessionResult;
+  const registry = useContext(RegistryContext);
+  const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
+  const setupFreshBlocker = fresh
+    ? null
+    : "Checking current state and permissions in this environment.";
+  const activeRun = snapshot.data?.runs.some((run) => run.state.status === "active") ?? false;
+  const setupWriteBlocker =
+    setupFreshBlocker ??
+    (pending ? "Wait for the current project action to finish." : null) ??
+    agentControlSetupPermissionBlocker(sessionResult, "configure") ??
+    (activeRun
+      ? "Finish the active run before changing configuration. Later stages can read updated settings."
+      : null);
+  const setupImportBlocker =
+    setupFreshBlocker ?? agentControlSetupPermissionBlocker(sessionResult, "import");
+  const [setupGuards] = useState(() => ({
+    setupWriteBlocker,
+    setupImportBlocker,
+    connected,
+    mounted: true,
+  }));
+  useLayoutEffect(() => {
+    Object.assign(setupGuards, { setupWriteBlocker, setupImportBlocker, connected, mounted: true });
+    return () => {
+      setupGuards.mounted = false;
+    };
+  }, [setupGuards, setupWriteBlocker, setupImportBlocker, connected]);
+  const setupController = useMemo(
+    () =>
+      createAgentControlSetupController(
+        bindAgentControlSetupApi(
+          agentControlSetupEnvironment,
+          registry,
+          {
+            environmentId,
+            input: { projectId },
+          },
+          {
+            canWrite: () => setupGuards.setupWriteBlocker,
+            canImport: () => setupGuards.setupImportBlocker,
+            isCurrent: () => setupGuards.mounted && setupGuards.connected,
+          },
+        ),
+      ),
+    [environmentId, projectId, registry, setupGuards],
+  );
+  useEffect(() => {
+    if (connected) void setupController.load();
+    else setupController.invalidate();
+    return () => setupController.invalidate();
+  }, [connected, setupController]);
+  const setupState = useSyncExternalStore(
+    setupController.subscribe,
+    setupController.getSnapshot,
+    setupController.getSnapshot,
+  );
   const modeChangeBlocker =
     agentControlModeChangeBlocker(sessionResult) ??
     (fresh ? null : "Checking current state and permissions in this environment.");
@@ -278,8 +351,12 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
         ? null
         : preflight.data,
     connected,
-    pending,
-    modeChangeBlocker,
+    pending: pending || setupState.pending,
+    modeChangeBlocker:
+      modeChangeBlocker ??
+      (setupState.policyDirty || setupState.githubDirty
+        ? "Save or discard setup changes before starting autonomous work."
+        : null),
   };
   const blockers = agentControlStartBlockers({ ...readiness, selectedTaskId });
   const armedStatus = agentControlArmedStatus(readiness.snapshot);
@@ -295,7 +372,14 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
   const endPausedInput = agentControlEndPausedInput(modeChangeReadiness);
 
   async function changeMode(input: AgentControlSetProjectModeInput) {
-    if (pendingRef.current || pending || modeChangeBlocker !== null || !snapshotReady) return;
+    if (
+      pendingRef.current ||
+      pending ||
+      setupController.getSnapshot().pending ||
+      modeChangeBlocker !== null ||
+      !snapshotReady
+    )
+      return;
     pendingRef.current = true;
     setPending(true);
     setError(null);
@@ -362,6 +446,19 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
         >
           Refresh status and preflight
         </Action>
+        <AutonomousProjectSetupForm
+          controller={setupController}
+          providers={serverConfig?.providers ?? []}
+          repositoryIdentity={project?.repositoryIdentity ?? null}
+          writeBlocker={setupWriteBlocker}
+          importBlocker={setupImportBlocker}
+          connected={connected}
+          onSaved={() => {
+            refreshSnapshot();
+            refreshPreflight();
+            refreshPolicy();
+          }}
+        />
         <View className="gap-3 rounded-2xl border border-border-subtle p-4">
           <Text className="text-base font-t3-bold">Automatic tasks</Text>
           <Text accessibilityLiveRegion="polite" className="text-sm font-t3-bold">
@@ -422,14 +519,30 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
                   ? "Selected: "
                   : "Fallback: "}
                 {candidate.providerInstanceId} · {candidate.model} ·{" "}
-                {candidate.errorCode ?? (candidate.runtimeReady ? "Ready" : "Unavailable")}
+                {candidate.errorCode
+                  ? agentControlPreflightErrorMessage(candidate.errorCode)
+                  : candidate.runtimeReady
+                    ? "Ready"
+                    : "Unavailable"}
               </Text>
             ))}
             {role.errorCode ? (
-              <Text className="text-sm text-destructive">{role.errorCode}</Text>
+              <Text className="text-sm text-destructive">
+                {agentControlPreflightErrorMessage(role.errorCode)}
+              </Text>
             ) : null}
           </View>
         ))}
+        {preflight.data && !preflight.data.staticPreflight.ok
+          ? preflight.data.staticPreflight.errors.map((error) => (
+              <Text
+                key={`${error.role}:${error.code}:${"candidateIndex" in error ? `${error.source}:${error.candidateIndex}:${error.instanceId}` : ""}`}
+                className="text-sm text-destructive"
+              >
+                {error.role}: {agentControlPreflightErrorMessage(error.code)}
+              </Text>
+            ))
+          : null}
         <Text className="text-base font-t3-bold">Verification checks</Text>
         {policy.data?.projectPolicy?.policy.verificationChecks?.map((check) => (
           <View key={check.id} className="gap-1">

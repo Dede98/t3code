@@ -20,7 +20,7 @@ import {
 
 const REPOSITORY_QUERY = `
 query AgentControlRepository($owner: String!, $name: String!) {
-  repository(owner: $owner, name: $name) { id nameWithOwner }
+  repository(owner: $owner, name: $name) { id nameWithOwner hasIssuesEnabled }
 }`;
 
 const TIMELINE_QUERY = `
@@ -51,7 +51,11 @@ const RawRepository = Schema.Struct({
   nameWithOwner: TrimmedNonEmptyString,
 });
 const RawRepositoryResponse = Schema.Struct({
-  data: Schema.Struct({ repository: Schema.NullOr(RawRepository) }),
+  data: Schema.Struct({
+    repository: Schema.NullOr(
+      Schema.Struct({ ...RawRepository.fields, hasIssuesEnabled: Schema.Boolean }),
+    ),
+  }),
 });
 
 const RawRestIssue = Schema.Struct({
@@ -195,7 +199,14 @@ export const make = Effect.fn("GithubIssueTrackerClient.make")(function* (
       Effect.flatMap(({ data }) =>
         data.repository === null
           ? Effect.fail(decodeFailure("resolve-repository"))
-          : Effect.succeed(normalizeRepository(data.repository)),
+          : !data.repository.hasIssuesEnabled
+            ? Effect.fail(
+                new GithubIssueTrackerClientError({
+                  code: "github-issues-disabled",
+                  operation: "resolve-repository",
+                }),
+              )
+            : Effect.succeed(normalizeRepository(data.repository)),
       ),
     );
 

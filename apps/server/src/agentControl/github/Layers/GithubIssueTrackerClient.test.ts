@@ -31,7 +31,9 @@ const repository: AgentControlGithubRepositoryBinding = {
 };
 
 const rawRepository = { id: repository.repositoryNodeId, nameWithOwner: repository.nameWithOwner };
-const repositoryResponse = { data: { repository: rawRepository } };
+const repositoryResponse = {
+  data: { repository: { ...rawRepository, hasIssuesEnabled: true } },
+};
 const timelineResponse = (input: {
   readonly nodes: ReadonlyArray<unknown>;
   readonly hasNextPage: boolean;
@@ -107,6 +109,35 @@ const knownIssue: AgentControlGithubIssueSnapshot = {
 };
 
 describe("GithubIssueTrackerClient", () => {
+  it.effect("rejects disabled Issues before configuration or issue polling", () =>
+    Effect.gen(function* () {
+      const execute = vi
+        .fn<GitHubCli.GitHubCli["Service"]["execute"]>()
+        .mockReturnValue(
+          Effect.succeed(
+            output({ data: { repository: { ...rawRepository, hasIssuesEnabled: false } } }),
+          ),
+        );
+      const clientLayer = makeLayer(execute);
+      const resolveError = yield* Effect.gen(function* () {
+        const client = yield* GithubIssueTrackerClient;
+        return yield* Effect.flip(
+          client.resolveRepository({
+            cwd: "/server/selected/repo",
+            locator: { owner: "owner", name: "repo" },
+          }),
+        );
+      }).pipe(Effect.provide(clientLayer));
+      const pollError = yield* poll().pipe(Effect.flip, Effect.provide(clientLayer));
+      for (const error of [resolveError, pollError]) {
+        assert.equal(error.code, "github-issues-disabled");
+        assert.equal(error.operation, "resolve-repository");
+      }
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(execute.mock.calls.every(([input]) => input.args[1] === "graphql")).toBe(true);
+    }),
+  );
+
   it.effect("paginates issues and timelines, filters PRs, and deduplicates external events", () =>
     Effect.gen(function* () {
       const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>();

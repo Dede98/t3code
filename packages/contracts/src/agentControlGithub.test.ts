@@ -51,21 +51,24 @@ describe("Agent Control GitHub contracts", () => {
     ).toThrow();
   });
 
-  it("keeps wire errors closed and free of process or GitHub details", () => {
-    const error = new AgentControlGithubRpcError({
-      code: "github-timeout",
-      operation: "poll-once",
-      projectId: ProjectId.make("project-1"),
-    });
-    const encoded = encodeRpcError(error);
-    expect(encoded).toEqual({
-      _tag: "AgentControlGithubRpcError",
-      code: "github-timeout",
-      operation: "poll-once",
-      projectId: "project-1",
-    });
-    expect(JSON.stringify(encoded)).not.toMatch(/argv|cwd|stderr|token|exception|body|title/i);
-  });
+  it.each(["github-timeout", "github-issues-disabled"] as const)(
+    "keeps %s wire errors closed and free of process or GitHub details",
+    (code) => {
+      const error = new AgentControlGithubRpcError({
+        code,
+        operation: "poll-once",
+        projectId: ProjectId.make("project-1"),
+      });
+      const encoded = encodeRpcError(error);
+      expect(encoded).toEqual({
+        _tag: "AgentControlGithubRpcError",
+        code,
+        operation: "poll-once",
+        projectId: "project-1",
+      });
+      expect(JSON.stringify(encoded)).not.toMatch(/argv|cwd|stderr|token|exception|body|title/i);
+    },
+  );
 
   it("keeps reactor status transport-safe and rejects diagnostic payloads", () => {
     const status = decodeReactorStatus({

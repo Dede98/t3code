@@ -1246,6 +1246,7 @@ function ProjectDetail({
           environmentId={selectedCheckout.environmentId}
           projectId={selectedCheckout.id}
           workspaceRoot={selectedCheckout.workspaceRoot}
+          repositoryIdentity={selectedCheckout.repositoryIdentity ?? null}
         />
 
         <SettingsSection title="Checkout">

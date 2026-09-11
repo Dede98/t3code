@@ -21,17 +21,37 @@ When there are several checkouts, the checkout picker selects which actions and 
 
 ## Run autonomous tasks
 
-For projects with GitHub task intake and provider routing already configured, open the project's
-**Autonomous task** section. Select the checkout on the environment where the work should run.
+Open the project's **Autonomous task** section. Select the checkout on the environment where the work should run.
 On mobile, open **New Task**, choose the project's **Autonomous tasks** entry, and select its environment.
+
+Use **Project setup** to configure GitHub intake, provider routing, and verification checks. The
+checkout determines the GitHub repository: the server prefers `upstream`, then `origin`, then the
+first other fetch remote by name. Review the detected repository and the saved intake binding;
+there is no separate repository picker. Set ready and pause labels, trusted GitHub accounts, and
+the poll interval, then save GitHub settings. The environment's existing GitHub login needs access
+to a repository with Issues enabled. Import or refresh issues to see the intake result.
+
+Choose existing provider instances and models from that environment. Project fallbacks and role
+routes can override inherited defaults; reset an override to inherit again. Full access, when
+explicitly enabled, applies only to Implementation and Repair. Add at least one required
+verification check: its program runs with a list of separate arguments and a directory relative
+to the task worktree on the selected environment. Choose its timeout and result format to match
+the command. Saving or passing provider preflight does not execute checks.
+
+GitHub and policy settings save separately. Each result reports which settings were saved; a
+failed second save does not undo the first. Save or discard local edits before starting work.
+After a revision conflict or reconnect with unsaved edits, reload saved settings before editing
+again. Setup changes are unavailable during an active run because they could affect later stages.
+Saving configuration never enables Run once or Armed.
 
 Enable task intake, select the next eligible task, review provider/model readiness and verification
 checks, then choose **Run once**. Tasks follow issue-number order; selecting a later task explains
 why it cannot start yet. Start blockers identify missing readiness or an existing run. Intake can
-be disabled again when no run is active. This view does not configure GitHub intake or provider routing.
-Starting runs and changing intake require an admin session on the selected environment. Standard
-pairing and relay sessions can review saved runs; ask the environment administrator for an admin
-pairing link to enable these actions.
+be disabled again when no run is active.
+Saving setup, starting runs, and changing intake require an admin session (`access:write`) on the
+selected environment. Importing issues requires `orchestration:operate`, which standard pairing
+sessions include. Standard pairing and relay sessions can review saved runs; ask the environment
+administrator for an admin pairing link to save setup or control runs.
 
 Choose **Turn on automation** to enable automatic mode (Armed) for this project and environment.
 The server starts eligible tasks one after another, including tasks that become eligible later.

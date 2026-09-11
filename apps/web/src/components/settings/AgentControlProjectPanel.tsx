@@ -23,11 +23,16 @@ import {
 } from "@t3tools/client-runtime/state/agent-control";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
+  agentControlPreflightErrorMessage,
+  agentControlSetupPermissionBlocker,
+} from "@t3tools/client-runtime/state/agent-control-setup";
+import {
   CommandId,
   type AgentControlPreflightRuntimeResult,
   type AgentControlTaskId,
   type EnvironmentId,
   type ProjectId,
+  type RepositoryIdentity,
   type ThreadId,
 } from "@t3tools/contracts";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
@@ -47,6 +52,7 @@ import { OpenInPicker } from "../chat/OpenInPicker";
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { SettingsSection } from "./settingsLayout";
+import { AgentControlProjectSetupPanel } from "./AgentControlProjectSetup";
 
 function PreflightDetails({ preflight }: { preflight: AgentControlPreflightRuntimeResult }) {
   return (
@@ -61,10 +67,16 @@ function PreflightDetails({ preflight }: { preflight: AgentControlPreflightRunti
               <div key={candidate.candidateIndex} className="break-words text-muted-foreground">
                 {candidate.providerInstanceId} / {candidate.model}
                 {candidate.candidateIndex === role.selectedCandidateIndex ? " · Selected" : ""}
-                {candidate.errorCode ? ` · ${candidate.errorCode}` : ""}
+                {candidate.errorCode
+                  ? ` · ${agentControlPreflightErrorMessage(candidate.errorCode)}`
+                  : ""}
               </div>
             ))}
-            {role.errorCode ? <p className="text-destructive">{role.errorCode}</p> : null}
+            {role.errorCode ? (
+              <p className="text-destructive">
+                {agentControlPreflightErrorMessage(role.errorCode)}
+              </p>
+            ) : null}
           </li>
         ))}
       </ul>
@@ -72,7 +84,7 @@ function PreflightDetails({ preflight }: { preflight: AgentControlPreflightRunti
         <ul className="mt-2 text-destructive">
           {preflight.staticPreflight.errors.map((error) => (
             <li key={JSON.stringify(error)}>
-              {error.role}: {error.code}
+              {error.role}: {agentControlPreflightErrorMessage(error.code)}
             </li>
           ))}
         </ul>
@@ -85,6 +97,7 @@ type AgentControlProjectPanelProps = {
   environmentId: EnvironmentId;
   projectId: ProjectId;
   workspaceRoot: string;
+  repositoryIdentity: RepositoryIdentity | null;
 };
 
 export function AgentControlProjectPanel(props: AgentControlProjectPanelProps) {
@@ -100,6 +113,7 @@ function AgentControlProjectPanelContent({
   environmentId,
   projectId,
   workspaceRoot,
+  repositoryIdentity,
 }: AgentControlProjectPanelProps) {
   const target = { environmentId, input: { projectId } };
   const snapshotResult = useAtomValue(agentControlEnvironment.snapshot(target));
@@ -155,7 +169,13 @@ function AgentControlProjectPanelContent({
   const navigate = useNavigate();
   const [taskId, setTaskId] = useState<AgentControlTaskId | null>(null);
   const [localPending, setPending] = useState(false);
+  const [setupStatus, setSetupStatus] = useState({ pending: true, dirty: false });
   const pending = localPending || commandPending;
+  const setupStartBlocker = setupStatus.pending
+    ? "Wait for project setup to finish before starting work."
+    : setupStatus.dirty
+      ? "Save or discard the project setup changes before starting work."
+      : null;
   const requestPending = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const selectedTaskId = taskId ?? snapshot?.nextTaskId ?? null;
@@ -185,7 +205,7 @@ function AgentControlProjectPanelContent({
     selectedTaskId,
     connected: agentControlSnapshotReady(snapshotResult, connected),
     pending,
-    modeChangeBlocker,
+    modeChangeBlocker: modeChangeBlocker ?? setupStartBlocker,
   });
   const armedBlockers = agentControlArmBlockers({
     policy:
@@ -203,7 +223,7 @@ function AgentControlProjectPanelContent({
         : null,
     connected: agentControlSnapshotReady(snapshotResult, connected),
     pending,
-    modeChangeBlocker,
+    modeChangeBlocker: modeChangeBlocker ?? setupStartBlocker,
   });
   const disarmInput = agentControlDisarmInput({
     snapshot,
@@ -302,6 +322,37 @@ function AgentControlProjectPanelContent({
             Could not load autonomous tasks from this environment.
           </p>
         ) : null}
+        <AgentControlProjectSetupPanel
+          environmentId={environmentId}
+          projectId={projectId}
+          connected={connected}
+          repositoryIdentity={repositoryIdentity}
+          providers={config?.providers ?? []}
+          activeRun={snapshot?.runs.some((run) => run.state.status === "active") ?? false}
+          onStatusChange={setSetupStatus}
+          writeBlocker={
+            agentControlSetupPermissionBlocker(sessionResult, "configure") ??
+            (pending ? "Wait for the current mode change before changing setup." : null) ??
+            (!fresh
+              ? "Checking the current environment and session before allowing setup changes."
+              : null) ??
+            (snapshot?.runs.some((run) => run.state.status === "active")
+              ? "Finish or end the active run before changing setup."
+              : null)
+          }
+          importBlocker={
+            agentControlSetupPermissionBlocker(sessionResult, "import") ??
+            (pending ? "Wait for the current mode change before importing issues." : null) ??
+            (!fresh
+              ? "Checking the current environment and session before importing issues."
+              : null)
+          }
+          onSaved={() => {
+            refreshPolicy();
+            refreshPreflight();
+            refreshSnapshot();
+          }}
+        />
         {!snapshot ? (
           <p className="text-sm text-muted-foreground">Loading saved tasks and runs…</p>
         ) : (

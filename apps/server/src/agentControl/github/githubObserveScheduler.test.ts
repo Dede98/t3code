@@ -107,6 +107,29 @@ it("counts every committed failure and opens the circuit on the fifth", () => {
   assert.equal(folded.state?.lastGithubEventSequence, 6);
 });
 
+it("keeps disabled Issues on the existing retry and circuit policy", () => {
+  const disabled = apply([
+    config(1),
+    failure(2, "github-issues-disabled"),
+    failure(3, "github-issues-disabled"),
+    failure(4, "github-issues-disabled"),
+    failure(5, "github-issues-disabled"),
+    failure(6, "github-issues-disabled"),
+  ]);
+  const previous = apply([
+    config(1),
+    failure(2, "github-command-failed"),
+    failure(3, "github-command-failed"),
+    failure(4, "github-command-failed"),
+    failure(5, "github-command-failed"),
+    failure(6, "github-command-failed"),
+  ]);
+  assert.deepStrictEqual(disabled.state, {
+    ...previous.state!,
+    reasonCode: "github-issues-disabled",
+  });
+});
+
 it("preserves hard suspension across manual timeout and authentication failures", () => {
   const suspended = apply([
     config(1),

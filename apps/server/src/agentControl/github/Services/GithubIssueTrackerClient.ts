@@ -10,6 +10,7 @@ import * as Schema from "effect/Schema";
 export const GithubIssueTrackerClientErrorCode = Schema.Literals([
   "github-unavailable",
   "github-authentication",
+  "github-issues-disabled",
   "github-timeout",
   "github-command-failed",
   "github-decode-failed",

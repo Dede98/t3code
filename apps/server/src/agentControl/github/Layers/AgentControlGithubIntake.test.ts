@@ -250,7 +250,7 @@ layer("AgentControlGithubIntake", (it) => {
       }),
   );
 
-  it.effect("does not advance the cursor on timeout, decode failure, or overflow", () =>
+  it.effect("preserves intake state when Issues are disabled or polling fails", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const intake = yield* AgentControlGithubIntake;
@@ -270,13 +270,31 @@ layer("AgentControlGithubIntake", (it) => {
           name: "repo",
         }),
       );
+      mockResolveRepository.mockReturnValueOnce(
+        Effect.fail(
+          new GithubIssueTrackerClientError({
+            code: "github-issues-disabled",
+            operation: "resolve-repository",
+          }),
+        ),
+      );
+      const disabled = yield* Effect.flip(setConfig(intake, projectId));
+      assert.equal(disabled.code, "github-issues-disabled");
+      const unconfigured = yield* intake.getObserveState({ projectId });
+      assert.equal(unconfigured.config, null);
+      assert.equal(unconfigured.revision, 0);
       mockResolveRepository.mockReturnValue(Effect.succeed(repository));
       mockPollIssues.mockReturnValueOnce(Effect.succeed({ repository, issues: [issue] }));
       yield* setConfig(intake, projectId);
       const success = yield* poll(intake, projectId, "poll-success", 1);
       const cursor = success.state.cursor;
 
-      const codes = ["github-timeout", "github-decode-failed", "pagination-overflow"] as const;
+      const codes = [
+        "github-issues-disabled",
+        "github-timeout",
+        "github-decode-failed",
+        "pagination-overflow",
+      ] as const;
       let revision = 2;
       for (const code of codes) {
         mockPollIssues.mockReturnValueOnce(

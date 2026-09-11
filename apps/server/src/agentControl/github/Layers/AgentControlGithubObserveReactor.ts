@@ -98,6 +98,7 @@ export interface AgentControlGithubObserveReactorOptions {
 }
 
 type ReactorLifecycleTestEvent =
+  | { readonly _tag: "project-reconciled"; readonly projectId: ProjectId }
   | { readonly _tag: "closing"; readonly attemptId: number }
   | { readonly _tag: "waiting-for-closing"; readonly attemptId: number }
   | { readonly _tag: "shutdown-completed"; readonly attemptId: number };
@@ -444,12 +445,10 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
       if (unavailable) return Option.none();
 
       const project = yield* projectStates.get(projectId);
-      if (Option.isNone(project)) {
-        return yield* new AgentControlGithubObserveRecoveryError({
-          projectId,
-          reason: "projection-unavailable",
-        });
-      }
+      // Before the first mode change, an available project has the same implicit
+      // manual state as AgentControlEngine.getProjectState; configuration alone
+      // must not start polling or persist a controller mode.
+      if (Option.isNone(project)) return Option.none();
       if (project.value.mode !== "observe" && project.value.mode !== "armed") {
         return Option.none();
       }
@@ -931,6 +930,7 @@ export const make = Effect.fn("AgentControlGithubObserveReactor.make")(function*
         recoveryAttempts.delete(projectId);
         recoveryScheduled.delete(projectId);
         recoveringProjects.delete(projectId);
+        yield* emitLifecycleTestEvent({ _tag: "project-reconciled", projectId });
       }
       if (
         message._tag === "FullReconcileBarrier" &&
