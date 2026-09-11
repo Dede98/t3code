@@ -528,7 +528,7 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
       const first = runtimeFactory.lastRuntime?.options;
       NodeAssert.ok(first);
       NodeAssert.equal(first.environment?.T3_EXTERNAL_MCP_BEARER_0, "token-1");
-      NodeAssert.equal(first.browserToolsAvailable, false);
+      NodeAssert.deepEqual(first.mcpCapabilities, new Set());
       NodeAssert.ok(
         first.appServerArgs?.includes(
           'mcp_servers.assets_1.bearer_token_env_var="T3_EXTERNAL_MCP_BEARER_0"',
@@ -549,8 +549,13 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
       NodeAssert.equal(second.environment?.T3_EXTERNAL_MCP_BEARER_0, "token-2");
       NodeAssert.ok(second.appServerArgs?.some((arg) => arg.includes("assets_2")));
 
-      for (const preview of [false, true]) {
-        const threadId = asThreadId(`external-mcp-preview-${preview}`);
+      for (const [preview, device] of [
+        [false, false],
+        [false, true],
+        [true, false],
+        [true, true],
+      ]) {
+        const threadId = asThreadId(`external-mcp-preview-${preview}-device-${device}`);
         yield* Effect.acquireRelease(
           Effect.sync(() =>
             McpProviderSession.setMcpProviderSession({
@@ -560,7 +565,11 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
               providerInstanceId: ProviderInstanceId.make("codex"),
               endpoint: "http://127.0.0.1:1234/mcp",
               authorizationHeader: "Bearer internal-token",
-              preview,
+              capabilities: new Set([
+                ...(preview ? ["preview"] : []),
+                ...(device ? ["device"] : []),
+              ]),
+              ...(device ? { agentDeviceEnvironment: { PATH: "/device/bin" } } : {}),
             }),
           ),
           () => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
@@ -573,7 +582,9 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
         const combined: CodexSessionRuntimeOptions | undefined =
           runtimeFactory.lastRuntime?.options;
         NodeAssert.ok(combined);
-        NodeAssert.equal(combined.browserToolsAvailable, preview);
+        NodeAssert.equal(combined.mcpCapabilities?.has("preview"), preview);
+        NodeAssert.equal(combined.mcpCapabilities?.has("device"), device);
+        NodeAssert.equal(combined.environment?.PATH, device ? "/device/bin:/usr/bin" : "/usr/bin");
         NodeAssert.equal(combined.environment?.T3_MCP_BEARER_TOKEN, "internal-token");
         NodeAssert.equal(combined.environment?.T3_EXTERNAL_MCP_BEARER_0, `token-${resolution}`);
         NodeAssert.ok(

@@ -2314,9 +2314,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(serviceTier ? { serviceTier } : {}),
           ...(appServerArgs.length > 0
             ? {
-                environment: mcpEnvironment,
+                environment: McpProviderSession.withAgentDeviceEnvironment(
+                  mcpEnvironment,
+                  mcpSession,
+                ),
                 appServerArgs,
-                browserToolsAvailable: mcpSession?.preview ?? false,
+                mcpCapabilities: mcpSession?.capabilities ?? new Set<string>(),
               }
             : {}),
         };
