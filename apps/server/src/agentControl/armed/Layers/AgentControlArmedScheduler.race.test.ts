@@ -151,9 +151,7 @@ const runClaimEpochRace = Effect.fn("runArmedClaimEpochRace")(function* (
     yield* sql`PRAGMA journal_mode = WAL`;
     yield* sql`PRAGMA foreign_keys = ON`;
   }
-  yield* runMigrations({ toMigrationInclusive: 64 }).pipe(
-    Effect.provideService(SqlClient.SqlClient, sqlA),
-  );
+  yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, sqlA));
   const claimReached = yield* Deferred.make<void>();
   const releaseClaim = yield* Deferred.make<void>();
   const contextA = yield* buildProductionScheduler(sqlA, scopeA, {
@@ -392,9 +390,7 @@ it.live(
           yield* sql`PRAGMA journal_mode = WAL`;
           yield* sql`PRAGMA foreign_keys = ON`;
         }
-        yield* runMigrations({ toMigrationInclusive: 64 }).pipe(
-          Effect.provideService(SqlClient.SqlClient, sqlA),
-        );
+        yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, sqlA));
         const contextA = yield* buildProductionScheduler(sqlA, scopeA);
         const contextB = yield* buildProductionScheduler(sqlB, scopeB);
         const engine = Context.get(contextA, AgentControlEngine);
