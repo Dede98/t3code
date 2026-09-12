@@ -78,3 +78,18 @@ export const loadRunOnceRepair = Effect.fn("loadRunOnceRepair")(function* (
   }
   return Option.some(repair);
 });
+
+/** Re-verification uses the immutable failure that authorized its implementation stage. */
+export const loadRunOnceRepairForImplementationStage = Effect.fn(
+  "loadRunOnceRepairForImplementationStage",
+)(function* (sql: SqlClient.SqlClient, implementationStageRunId: string) {
+  const available = yield* sql`SELECT 1 FROM main.sqlite_schema
+    WHERE type = 'table' AND name = 'agent_control_run_once_repairs'`;
+  if (available.length === 0) return Option.none<RunOnceRepair>();
+  const rows = yield* sql<{ verificationHandoffId: string }>`
+    SELECT verification_handoff_id AS "verificationHandoffId"
+    FROM agent_control_run_once_repairs WHERE repair_stage_run_id = ${implementationStageRunId}`;
+  if (rows.length === 0) return Option.none<RunOnceRepair>();
+  if (rows.length !== 1) return yield* new RunOnceRepairEvidenceError({});
+  return yield* loadRunOnceRepair(sql, rows[0]!.verificationHandoffId);
+});

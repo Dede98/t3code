@@ -1,3 +1,4 @@
+import { loadRunOnceRepairForImplementationStage } from "../../runOnce/repair.ts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import {
   AgentControlControlledThreadReservationId,
@@ -1320,7 +1321,16 @@ const make = Effect.gen(function* () {
       )
     `;
 
+    const repair = yield* loadRunOnceRepairForImplementationStage(
+      sql,
+      evidence.implementationStageRunId,
+    ).pipe(
+      Effect.mapError((cause) =>
+        error(evidence.handoffId, "load-repair-report", "admission-corrupt", cause),
+      ),
+    );
     const handoffAuthority = {
+      ...(Option.isSome(repair) ? { repairReportJson: repair.value.reportJson } : {}),
       materializationEvidenceId,
       materializationReceiptId,
       materializationMarkerId,

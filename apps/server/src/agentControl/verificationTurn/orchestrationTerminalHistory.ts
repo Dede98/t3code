@@ -22,7 +22,7 @@ import {
 } from "../../orchestration/orchestrationEventRaw.ts";
 import type { AgentControlVerificationClaim } from "./model.ts";
 import type { AgentControlVerificationTurnAcceptance } from "./Services/AgentControlVerificationHandoffStore.ts";
-import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "./prompt.ts";
+import { isStructuredAgentControlVerificationPromptVersion } from "./prompt.ts";
 import {
   normalizeVerificationTerminalSource,
   type VerificationTerminalObservation,
@@ -895,12 +895,13 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
     return yield* error("provider-terminal-selection", "corrupt-history");
   }
   const resultSourceSeal = terminal.entry.event.metadata.verificationResultSource;
-  const isPromptV2 =
-    claim.evidence.templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION;
-  if (resultSourceSeal !== undefined && !isPromptV2) {
+  const isStructuredPrompt = isStructuredAgentControlVerificationPromptVersion(
+    claim.evidence.templateVersion,
+  );
+  if (resultSourceSeal !== undefined && !isStructuredPrompt) {
     return yield* error("verification-result-source-on-legacy-turn", "terminal-conflict");
   }
-  if (isPromptV2 && terminalSelection.observation.deliveryState === "completed") {
+  if (isStructuredPrompt && terminalSelection.observation.deliveryState === "completed") {
     if (resultSourceSeal === undefined) {
       return { _tag: "Waiting", terminalObserved: true } as const;
     }

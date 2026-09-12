@@ -21,6 +21,7 @@ import {
   parseCanonicalJson,
   sha256Utf8,
 } from "../../initialPlanning/eventEvidence.ts";
+import { loadRunOnceRepairForImplementationStage } from "../../runOnce/repair.ts";
 import { fingerprintAgentControlSourceIdentity } from "../../stageRun/identity.ts";
 import {
   AgentControlVerificationHistoricalAuthorityError,
@@ -32,7 +33,11 @@ import {
   type AgentControlVerificationHandoffAuthority,
 } from "../handoffValidation.ts";
 import type { AgentControlVerificationClaim, AgentControlVerificationDelivery } from "../model.ts";
-import { canonicalAgentControlVerificationPromptSource } from "../prompt.ts";
+import {
+  canonicalAgentControlVerificationPromptSource,
+  isStructuredAgentControlVerificationPromptVersion,
+  AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION,
+} from "../prompt.ts";
 import {
   AgentControlVerificationHandoffStore,
   AgentControlVerificationStoreError,
@@ -110,6 +115,7 @@ const EvidenceRow = Schema.Struct({
   templateVersion: Schema.Literals([
     "agent-control-verification-prompt-v1",
     "agent-control-verification-prompt-v2",
+    "agent-control-verification-prompt-v3",
   ]),
   promptContractFingerprint: Schema.NullOr(Schema.String),
   promptText: Schema.String,
@@ -767,6 +773,7 @@ const make = Effect.gen(function* () {
           AS "authorityOrchestrationHistoryBytes",
         CAST(materialization.orchestration_history_digest AS BLOB)
           AS "authorityOrchestrationHistoryDigestBytes",
+        CAST(admission.implementation_stage_run_id AS BLOB) AS "admissionImplementationStageRunIdBytes",
         CAST(admission.task_history_json AS BLOB) AS "admissionTaskHistoryBytes",
         CAST(admission.task_history_digest AS BLOB) AS "admissionTaskHistoryDigestBytes",
         CAST(admission.worktree_history_json AS BLOB) AS "admissionWorktreeHistoryBytes",
@@ -1025,7 +1032,29 @@ const make = Effect.gen(function* () {
         candidateEvidenceError("event-template-json", cause, handoffId, "evidence-undecodable"),
     });
     const evidenceWithModel = { ...evidence, modelSelection };
-    const authority = yield* authorityFromRaw(raw, taskAuthority, worktreeAuthority, handoffId);
+    const baseAuthority = yield* authorityFromRaw(raw, taskAuthority, worktreeAuthority, handoffId);
+    const repair =
+      evidence.templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION
+        ? yield* Effect.gen(function* () {
+            const implementationStageRunId = yield* Effect.try({
+              try: () => decodeCanonicalUtf8Bytes(raw.admissionImplementationStageRunIdBytes),
+              catch: (cause) =>
+                candidateEvidenceError("repair-implementation-stage", cause, handoffId),
+            });
+            return yield* loadRunOnceRepairForImplementationStage(
+              sql,
+              implementationStageRunId,
+            ).pipe(
+              Effect.mapError((cause) =>
+                candidateEvidenceError("repair-report-authority", cause, handoffId),
+              ),
+            );
+          })
+        : Option.none();
+    const authority = {
+      ...baseAuthority,
+      ...(Option.isSome(repair) ? { repairReportJson: repair.value.reportJson } : {}),
+    };
     const authorityMismatch = yield* Effect.try({
       try: () => verificationHandoffAuthorityMismatch(authority, evidenceWithModel),
       catch: (cause) =>
@@ -1258,7 +1287,7 @@ const make = Effect.gen(function* () {
           ${evidence.planningThreadId}, ${evidence.planId},
           ${evidence.proposedPlanDigest}, ${evidence.providerInstanceId}, ${evidence.runtimeMode},
           ${evidence.modelSelectionJson}, ${evidence.modelSelectionFingerprint},
-          'agent-control-verification-prompt-v1', ${evidence.templateVersion === "agent-control-verification-prompt-v2" ? evidence.templateVersion : null},
+          'agent-control-verification-prompt-v1', ${isStructuredAgentControlVerificationPromptVersion(evidence.templateVersion) ? evidence.templateVersion : null},
           ${evidence.promptContractFingerprint},
           ${evidence.promptText}, ${evidence.promptDigest}, ${evidence.resultSchemaVersion},
           ${evidence.resultSchemaFingerprint},

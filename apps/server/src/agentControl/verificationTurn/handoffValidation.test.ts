@@ -27,7 +27,7 @@ const modelSelection = {
 const modelEvidence = canonicalProviderModelSelectionEvidence(modelSelection);
 const proposedPlanJson = canonicalJson({
   planId: "plan-1",
-  planText: "Implement the accepted change.",
+  planMarkdown: "Implement the accepted change.",
   schemaVersion: 1,
 });
 const implementationHandoffJson = canonicalJson({ handoffId: "implementation-handoff" });
@@ -113,7 +113,7 @@ it("binds every derived verification handoff field to one authoritative root", (
   const alternateModelEvidence = canonicalProviderModelSelectionEvidence(alternateModel);
   const alternatePlanJson = canonicalJson({
     planId: "plan-1",
-    planText: "Execute a different plan.",
+    planMarkdown: "Execute a different plan.",
     schemaVersion: 1,
   });
   const variants: ReadonlyArray<readonly [string, AgentControlVerificationHandoffAuthority]> = [
@@ -231,7 +231,7 @@ it("binds every derived verification handoff field to one authoritative root", (
 it("preserves canonical Unicode plan and task data byte-for-byte", () => {
   const unicodePlanJson = canonicalJson({
     planId: "plan-unicode",
-    planText: "Ändere Grüße 👩🏽‍💻 und 東京 ohne Datenverlust.",
+    planMarkdown: "Ändere Grüße 👩🏽‍💻 und 東京 ohne Datenverlust.",
     schemaVersion: 1,
   });
   const unicodeAuthority = {
@@ -248,4 +248,25 @@ it("preserves canonical Unicode plan and task data byte-for-byte", () => {
   assert.include(evidence.promptText, "東京");
   assert.include(evidence.promptText, "café");
   assert.include(evidence.promptText, "Ändere Grüße 👩🏽‍💻");
+});
+
+it("binds coherently altered excluded evidence to the compact handoff", () => {
+  const accepted = buildExpectedAgentControlVerificationHandoff(authority);
+  for (const [jsonField, digestField] of [
+    ["implementationHandoffJson", "implementationHandoffDigest"],
+    ["implementationProviderDeliveryJson", "implementationProviderDeliveryDigest"],
+    ["implementationResultJson", "implementationResultDigest"],
+    ["verificationAdmissionJson", "verificationAdmissionDigest"],
+    ["verificationIdentityJson", "verificationIdentityDigest"],
+    ["proposedPlanJson", "proposedPlanDigest"],
+  ] as const) {
+    const json = canonicalJson({
+      ...JSON.parse(authority[jsonField]),
+      excludedInternalMetadata: "coherently changed",
+    });
+    const altered = { ...authority, [jsonField]: json, [digestField]: sha256Utf8(json) };
+    const rendered = buildExpectedAgentControlVerificationHandoff(altered);
+    assert.notEqual(rendered.promptDigest, accepted.promptDigest);
+    assert.notEqual(verificationHandoffAuthorityMismatch(altered, accepted), null, jsonField);
+  }
 });

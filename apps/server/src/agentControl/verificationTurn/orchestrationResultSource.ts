@@ -17,7 +17,7 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import { loadOrchestrationEventStreamPage } from "../../orchestration/orchestrationEventRaw.ts";
 import { providerRuntimeEventMatchesVerificationResultFragment } from "../../orchestration/providerRuntimeMessageCorrelation.ts";
 import type { AgentControlVerificationClaim } from "./model.ts";
-import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "./prompt.ts";
+import { isStructuredAgentControlVerificationPromptVersion } from "./prompt.ts";
 import { loadVerificationTerminalFromOrchestrationHistory } from "./orchestrationTerminalHistory.ts";
 import type { AgentControlVerificationTurnAcceptance } from "./Services/AgentControlVerificationHandoffStore.ts";
 import {
@@ -698,7 +698,7 @@ export const loadVerificationResultSource = Effect.fn("loadVerificationResultSou
   claim: AgentControlVerificationClaim,
 ) {
   if (
-    claim.evidence.templateVersion !== AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION ||
+    !isStructuredAgentControlVerificationPromptVersion(claim.evidence.templateVersion) ||
     claim.evidence.resultSchemaVersion !== AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_VERSION ||
     claim.evidence.promptContractFingerprint === null ||
     claim.evidence.resultSchemaFingerprint === null ||

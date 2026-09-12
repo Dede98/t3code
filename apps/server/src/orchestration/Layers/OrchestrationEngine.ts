@@ -47,7 +47,10 @@ import {
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
 } from "../../agentControl/verificationTurn/runtimeEventAuthority.ts";
-import { AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT } from "../../agentControl/verificationTurn/prompt.ts";
+import {
+  AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT,
+  AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT_V2,
+} from "../../agentControl/verificationTurn/prompt.ts";
 import { AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT } from "../../agentControl/verificationTurn/verificationResult.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
@@ -1471,11 +1474,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         AND typeof(intent.attempt_id) = 'text'
         AND CAST(intent.attempt_id AS BLOB) = CAST(delivery.attempt_id AS BLOB)
         AND typeof(intent.prompt_template_version) = 'text'
-        AND CAST(intent.prompt_template_version AS BLOB) =
-          CAST('agent-control-verification-prompt-v2' AS BLOB)
         AND typeof(intent.prompt_contract_fingerprint) = 'text'
-        AND CAST(intent.prompt_contract_fingerprint AS BLOB) =
-          CAST(${AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT} AS BLOB)
+        AND ((CAST(intent.prompt_template_version AS BLOB) =
+          CAST('agent-control-verification-prompt-v2' AS BLOB)
+          AND CAST(intent.prompt_contract_fingerprint AS BLOB) =
+            CAST(${AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT_V2} AS BLOB))
+          OR (CAST(intent.prompt_template_version AS BLOB) =
+            CAST('agent-control-verification-prompt-v3' AS BLOB)
+            AND CAST(intent.prompt_contract_fingerprint AS BLOB) =
+              CAST(${AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT} AS BLOB)))
         AND typeof(intent.result_schema_version) = 'text'
         AND CAST(intent.result_schema_version AS BLOB) =
           CAST('agent-control-verification-result-v1' AS BLOB)

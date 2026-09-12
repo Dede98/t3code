@@ -7,7 +7,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT } from "../../agentControl/verificationTurn/prompt.ts";
+import { AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT_V2 } from "../../agentControl/verificationTurn/prompt.ts";
 import {
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_CONFLICT,
   VERIFICATION_RESULT_RUNTIME_EVENT_AUTHORITY_INDEX,
@@ -369,7 +369,7 @@ const resultContractPredicate = (row = "NEW") => `
     AND ${row}.prompt_template_version = 'agent-control-verification-prompt-v2'
     AND ${sha256(`${row}.prompt_contract_fingerprint`)}
     AND ${row}.prompt_contract_fingerprint =
-      '${AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT}'
+      '${AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT_V2}'
     AND ${row}.result_schema_version = 'agent-control-verification-result-v1'
     AND ${sha256(`${row}.result_schema_fingerprint`)}
     AND ${row}.result_schema_fingerprint =
@@ -2040,7 +2040,7 @@ export const makeMigration060 = (
                 'agent-control-verification-prompt-v2'
               AND ${sha256("intent.prompt_contract_fingerprint")}
               AND intent.prompt_contract_fingerprint =
-                '${AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT}'
+                '${AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT_V2}'
               AND intent.result_schema_version = 'agent-control-verification-result-v1'
               AND intent.result_schema_fingerprint =
                 '${AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT}'

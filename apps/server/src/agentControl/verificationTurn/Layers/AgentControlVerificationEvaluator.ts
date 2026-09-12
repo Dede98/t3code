@@ -24,7 +24,7 @@ import {
   fingerprintVerificationTurn,
 } from "../identity.ts";
 import { loadVerificationResultSource } from "../orchestrationResultSource.ts";
-import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "../prompt.ts";
+import { isStructuredAgentControlVerificationPromptVersion } from "../prompt.ts";
 import {
   AgentControlVerificationEvaluationError,
   AgentControlVerificationEvaluator,
@@ -206,7 +206,7 @@ const make = Effect.gen(function* () {
       if (Option.isNone(claimOption)) return { _tag: "Waiting" } as const;
       const claim = claimOption.value;
       if (
-        claim.evidence.templateVersion !== AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION ||
+        !isStructuredAgentControlVerificationPromptVersion(claim.evidence.templateVersion) ||
         claim.delivery.state !== "completed" ||
         claim.delivery.providerTurnId === null ||
         claim.evidence.promptContractFingerprint === null ||
@@ -567,7 +567,7 @@ const make = Effect.gen(function* () {
                   cause,
                 ),
             });
-            if (promptVersion !== AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION) {
+            if (!isStructuredAgentControlVerificationPromptVersion(promptVersion)) {
               return yield* evaluationError(
                 "decode-evaluation-candidate-version",
                 "history-corrupt",
@@ -578,8 +578,7 @@ const make = Effect.gen(function* () {
             if (Option.isNone(claimOption)) return;
             const claim = claimOption.value;
             if (
-              claim.evidence.templateVersion !==
-                AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION ||
+              !isStructuredAgentControlVerificationPromptVersion(claim.evidence.templateVersion) ||
               claim.delivery.state !== "completed" ||
               claim.delivery.providerTurnId === null
             ) {

@@ -128,6 +128,7 @@ import AgentMigration0079 from "./Migrations/079_AgentControlLegacyVerificationT
 import AgentMigration0080 from "./Migrations/080_AgentControlRunOnceDiagnostics.ts";
 
 import AgentMigration0081 from "./Migrations/081_AgentControlRunOnceSelectedTask.ts";
+import AgentMigration0082 from "./Migrations/082_AgentControlCompactVerificationPrompt.ts";
 
 const agentMigrationEntries = [
   [34, "OrchestrationCommandAuthority", AgentMigration0034],
@@ -178,6 +179,7 @@ const agentMigrationEntries = [
   [79, "AgentControlLegacyVerificationTasks", AgentMigration0079],
   [80, "AgentControlRunOnceDiagnostics", AgentMigration0080],
   [81, "AgentControlRunOnceSelectedTask", AgentMigration0081],
+  [82, "AgentControlCompactVerificationPrompt", AgentMigration0082],
 ] as const;
 
 const migrationEntries = [

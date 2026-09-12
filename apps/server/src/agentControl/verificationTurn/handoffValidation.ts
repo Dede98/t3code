@@ -17,6 +17,10 @@ import {
 import type { AgentControlVerificationHandoffEvidence } from "./model.ts";
 import {
   AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT,
+  AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT_V2,
+  AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V2,
+  isStructuredAgentControlVerificationPromptVersion,
+  type AgentControlVerificationPromptTemplateVersion,
   AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION,
   AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V1,
   buildAgentControlVerificationPrompt,
@@ -67,6 +71,7 @@ export interface AgentControlVerificationHandoffAuthority {
   readonly implementationProviderDeliveryDigest: string;
   readonly implementationResultJson: string;
   readonly implementationResultDigest: string;
+  readonly repairReportJson?: string;
   readonly verificationAdmissionJson: string;
   readonly verificationAdmissionDigest: string;
   readonly verificationIdentityJson: string;
@@ -85,9 +90,7 @@ export interface AgentControlVerificationHandoffAuthority {
 
 export const buildExpectedAgentControlVerificationHandoff = (
   authority: AgentControlVerificationHandoffAuthority,
-  templateVersion:
-    | typeof AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION
-    | typeof AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V1 = AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION,
+  templateVersion: AgentControlVerificationPromptTemplateVersion = AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION,
 ): AgentControlVerificationHandoffEvidence => {
   const handoffId = deriveVerificationHandoffId(authority.materializationEvidenceId);
   const turnRequestCommandId = deriveVerificationTurnRequestCommandId(handoffId);
@@ -112,6 +115,9 @@ export const buildExpectedAgentControlVerificationHandoff = (
       implementationProviderDeliveryDigest: authority.implementationProviderDeliveryDigest,
       implementationResultJson: authority.implementationResultJson,
       implementationResultDigest: authority.implementationResultDigest,
+      ...(authority.repairReportJson === undefined
+        ? {}
+        : { repairReportJson: authority.repairReportJson }),
       verificationAdmissionJson: authority.verificationAdmissionJson,
       verificationAdmissionDigest: authority.verificationAdmissionDigest,
       verificationIdentityJson: authority.verificationIdentityJson,
@@ -207,17 +213,17 @@ export const buildExpectedAgentControlVerificationHandoff = (
     promptContractFingerprint:
       templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION
         ? AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT
-        : null,
+        : templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V2
+          ? AGENT_CONTROL_VERIFICATION_PROMPT_CONTRACT_FINGERPRINT_V2
+          : null,
     promptText: prompt.promptText,
     promptDigest: prompt.promptDigest,
-    resultSchemaVersion:
-      templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION
-        ? AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_VERSION
-        : null,
-    resultSchemaFingerprint:
-      templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION
-        ? AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT
-        : null,
+    resultSchemaVersion: isStructuredAgentControlVerificationPromptVersion(templateVersion)
+      ? AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_VERSION
+      : null,
+    resultSchemaFingerprint: isStructuredAgentControlVerificationPromptVersion(templateVersion)
+      ? AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT
+      : null,
     turnRequestCommandId,
     messageId,
     messageEventId,
@@ -298,11 +304,14 @@ export const verificationHandoffAuthorityMismatch = (
   authority: AgentControlVerificationHandoffAuthority,
   evidence: AgentControlVerificationHandoffEvidence,
 ): string | null => {
+  if (
+    evidence.templateVersion !== AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V1 &&
+    !isStructuredAgentControlVerificationPromptVersion(evidence.templateVersion)
+  )
+    return "templateVersion";
   const expected = buildExpectedAgentControlVerificationHandoff(
     authority,
-    evidence.templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V1
-      ? AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION_V1
-      : AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION,
+    evidence.templateVersion,
   );
   for (const field of comparedFields) {
     if (evidence[field] !== expected[field]) return field;

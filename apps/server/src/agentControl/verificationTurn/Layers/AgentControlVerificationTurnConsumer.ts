@@ -64,7 +64,7 @@ import {
   normalizeVerificationTerminalSource,
   type VerificationTerminalObservation,
 } from "../terminalObservation.ts";
-import { AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION } from "../prompt.ts";
+import { isStructuredAgentControlVerificationPromptVersion } from "../prompt.ts";
 import { loadSealableVerificationResultSource } from "../orchestrationResultSource.ts";
 
 const decodeResumeCursor = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
@@ -440,7 +440,7 @@ const make = Effect.gen(function* () {
       });
     }
     if (
-      claim.evidence.templateVersion === AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION &&
+      isStructuredAgentControlVerificationPromptVersion(claim.evidence.templateVersion) &&
       recovered.observation.deliveryState === "completed"
     ) {
       const seal = recovered.resultSourceSeal;
@@ -861,8 +861,7 @@ const make = Effect.gen(function* () {
         ),
       );
       if (
-        claim.value.evidence.templateVersion ===
-          AGENT_CONTROL_VERIFICATION_PROMPT_TEMPLATE_VERSION &&
+        isStructuredAgentControlVerificationPromptVersion(claim.value.evidence.templateVersion) &&
         observation.deliveryState === "completed"
       ) {
         const previous = pendingResultSeals.get(claim.value.evidence.providerDeliveryId);

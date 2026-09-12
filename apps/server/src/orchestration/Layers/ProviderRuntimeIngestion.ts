@@ -1,3 +1,4 @@
+import { isStructuredAgentControlVerificationPromptVersion } from "../../agentControl/verificationTurn/prompt.ts";
 import {
   ApprovalRequestId,
   type AssistantDeliveryMode,
@@ -131,7 +132,9 @@ interface VerificationV2RuntimeAuthority {
   readonly providerDeliveryId: string;
   readonly providerInstanceId: string;
   readonly providerTurnId: string;
-  readonly promptTemplateVersion: "agent-control-verification-prompt-v2";
+  readonly promptTemplateVersion:
+    | "agent-control-verification-prompt-v2"
+    | "agent-control-verification-prompt-v3";
   readonly promptContractFingerprint: string;
   readonly resultSchemaVersion: "agent-control-verification-result-v1";
   readonly resultSchemaFingerprint: string;
@@ -1967,7 +1970,7 @@ const make = Effect.gen(function* () {
             ),
           ]);
           if (
-            promptVersion !== "agent-control-verification-prompt-v2" ||
+            !isStructuredAgentControlVerificationPromptVersion(promptVersion) ||
             resultSchemaVersion !== "agent-control-verification-result-v1" ||
             !/^[0-9a-f]{64}$/u.test(promptContractFingerprint) ||
             !/^[0-9a-f]{64}$/u.test(resultSchemaFingerprint)
