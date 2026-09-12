@@ -6,6 +6,9 @@ import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import { assert, it } from "@effect/vitest";
 import { ProviderInstanceId, type AgentControlVerificationChecks } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -17,6 +20,7 @@ import {
   assessVerificationChecks,
   executeVerificationCheck,
   VerificationCheckError,
+  VerificationCheckAssessmentError,
   prepareVerificationCheckManifest,
   sealVerificationCheckAssessment,
   type VerificationCheckClaim,
@@ -534,4 +538,96 @@ it.effect(
         );
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
     }).pipe(Effect.scoped),
+);
+
+it.effect.each(["matching", "foreign-turn", "foreign-fence"] as const)(
+  "handles a concurrent %s assessment seal without repeating checks or replacing the winner",
+  (identity) =>
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const sql = yield* SqlClient.SqlClient;
+        const manifest = yield* prepareVerificationCheckManifest(sql, {
+          permit: permit(),
+          cwd: repo.cwd,
+          checks,
+        });
+        yield* execute(sql, manifest);
+        const assessed = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const contenderClaim = claim(
+          identity === "foreign-fence"
+            ? { ...manifest, fenceToken: manifest.fenceToken + 1 }
+            : manifest,
+          identity === "foreign-turn" ? "foreign-turn" : "turn-1",
+        );
+        const contender = yield* sealVerificationCheckAssessment(
+          sql,
+          contenderClaim,
+          Deferred.succeed(assessed, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ).pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(assessed);
+        const winner = yield* sealVerificationCheckAssessment(sql, claim(manifest));
+        const rows = yield* sql`SELECT * FROM agent_control_verification_check_assessments`;
+        yield* Deferred.succeed(release, undefined);
+        const outcome = yield* Fiber.join(contender);
+        if (identity === "matching") assert.deepStrictEqual(outcome, Exit.succeed(winner));
+        else {
+          assert.isTrue(Exit.isFailure(outcome));
+          if (Exit.isFailure(outcome)) {
+            const failure = outcome.cause.reasons.find(Cause.isFailReason);
+            assert.isDefined(failure);
+            assert.instanceOf(failure!.error, VerificationCheckAssessmentError);
+            assert.equal(failure!.error.reason, "evidence-conflict");
+          }
+        }
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM agent_control_verification_check_assessments`,
+          rows,
+        );
+        assert.deepStrictEqual(
+          yield* sealVerificationCheckAssessment(sql, claim(manifest)),
+          winner,
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_starts`,
+          [{ count: 1 }],
+        );
+        assert.deepStrictEqual(
+          yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_results`,
+          [{ count: 1 }],
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: repo.database })));
+    }).pipe(Effect.scoped),
+);
+
+it.effect("keeps a genuine assessment persistence failure distinct from evidence conflict", () =>
+  Effect.gen(function* () {
+    const repo = yield* repository;
+    yield* Effect.gen(function* () {
+      yield* initialize;
+      const sql = yield* SqlClient.SqlClient;
+      const manifest = yield* prepareVerificationCheckManifest(sql, {
+        permit: permit(),
+        cwd: repo.cwd,
+        checks,
+      });
+      yield* execute(sql, manifest);
+      yield* sql`CREATE TRIGGER reject_assessment BEFORE INSERT ON agent_control_verification_check_assessments BEGIN SELECT RAISE(ABORT, 'PRIVATE_PAYLOAD_SENTINEL'); END`;
+      const error = yield* sealVerificationCheckAssessment(sql, claim(manifest)).pipe(Effect.flip);
+      assert.equal(error.reason, "persistence");
+      assert.equal(error.operation, "insert-seal");
+      assert.equal(error.sqlReason, "UnknownError");
+      assert.equal(error.sqliteCode, 1811);
+      assert.deepStrictEqual(
+        yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_assessments`,
+        [{ count: 0 }],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_results`,
+        [{ count: 1 }],
+      );
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
+  }).pipe(Effect.scoped),
 );

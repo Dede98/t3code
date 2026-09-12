@@ -531,7 +531,12 @@ const make = Effect.gen(function* () {
       ? null
       : yield* sealVerificationCheckAssessment(sql, claim).pipe(
           Effect.mapError((cause) =>
-            error(handoffId, "load-check-assessment", "persistence", cause),
+            error(
+              handoffId,
+              "load-check-assessment",
+              cause.reason === "persistence" ? "persistence" : "evaluation-conflict",
+              cause,
+            ),
           ),
         );
     const expectedAuthorityJson = canonicalJson({

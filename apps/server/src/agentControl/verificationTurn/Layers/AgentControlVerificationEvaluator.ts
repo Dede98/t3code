@@ -33,10 +33,14 @@ import {
 import { AgentControlVerificationEvaluatorHooks } from "../Services/AgentControlVerificationEvaluatorHooks.ts";
 import { AgentControlVerificationHandoffStore } from "../Services/AgentControlVerificationHandoffStore.ts";
 import { evaluateCheckedVerificationResult } from "../checkedResult.ts";
-import { sealVerificationCheckAssessment } from "../checkEvidence.ts";
+import {
+  sealVerificationCheckAssessment,
+  VerificationCheckAssessmentError,
+} from "../checkEvidence.ts";
 import { isLegacyVerificationEvaluation } from "../legacyEvaluation.ts";
 
 const RECOVERY_INTERVAL = Duration.seconds(5);
+const isCheckAssessmentError = Schema.is(VerificationCheckAssessmentError);
 const isEvaluationError = Schema.is(AgentControlVerificationEvaluationError);
 
 const evaluationError = (
@@ -232,7 +236,12 @@ const make = Effect.gen(function* () {
         ? null
         : yield* sealVerificationCheckAssessment(sql, claim).pipe(
             Effect.mapError((cause) =>
-              evaluationError("assess-verification-checks", "persistence", handoffId, cause),
+              evaluationError(
+                "assess-verification-checks",
+                cause.reason === "persistence" ? "persistence" : "history-corrupt",
+                handoffId,
+                cause,
+              ),
             ),
           );
       const evaluation = yield* evaluateCheckedVerificationResult(
@@ -625,6 +634,18 @@ const make = Effect.gen(function* () {
                 ...(cause.handoffId === undefined ? {} : { handoffId: cause.handoffId }),
                 operation: cause.operation,
                 reason: cause.reason,
+                ...(isCheckAssessmentError(cause.cause)
+                  ? {
+                      assessmentOperation: cause.cause.operation,
+                      assessmentReason: cause.cause.reason,
+                      ...(cause.cause.sqliteCode === undefined
+                        ? {}
+                        : { sqliteCode: cause.cause.sqliteCode }),
+                      ...(cause.cause.sqlReason === undefined
+                        ? {}
+                        : { sqlReason: cause.cause.sqlReason }),
+                    }
+                  : {}),
               }),
             ),
           );

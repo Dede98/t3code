@@ -9,6 +9,7 @@ import { AgentControlVerificationChecks, AgentControlProjectPolicy } from "@t3to
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { isSqlError } from "effect/unstable/sql/SqlError";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import { canonicalJson, sha256Utf8 } from "../initialPlanning/eventEvidence.ts";
 import type { ProviderAdmissionPermit } from "../providerAdmission/model.ts";
@@ -346,25 +347,75 @@ export const assessVerificationChecks = Effect.fn("assessVerificationChecks")(fu
   return { code, digest };
 });
 
+const hasSqliteCode = Schema.is(Schema.Struct({ errcode: Schema.Int }));
+
+export class VerificationCheckAssessmentError extends Schema.TaggedError<VerificationCheckAssessmentError>()(
+  "VerificationCheckAssessmentError",
+  {
+    operation: Schema.Literals(["load-seal", "assess-checks", "insert-seal", "compare-seal"]),
+    reason: Schema.Literals(["persistence", "invalid-evidence", "evidence-conflict"]),
+    sqlReason: Schema.optional(Schema.String),
+    sqliteCode: Schema.optional(Schema.Int),
+    cause: Schema.optional(Schema.Unknown),
+  },
+) {}
+
 export const sealVerificationCheckAssessment = Effect.fn("sealVerificationCheckAssessment")(
-  function* (sql: SqlClient.SqlClient, claim: VerificationCheckClaim) {
-    const existing = yield* sql<{
+  function* (
+    sql: SqlClient.SqlClient,
+    claim: VerificationCheckClaim,
+    beforeInsert: Effect.Effect<void> = Effect.void,
+  ) {
+    const mapFailure =
+      (operation: VerificationCheckAssessmentError["operation"]) => (cause: unknown) =>
+        new VerificationCheckAssessmentError({
+          operation,
+          reason: isSqlError(cause) ? "persistence" : "invalid-evidence",
+          ...(isSqlError(cause) ? { sqlReason: cause.reason._tag } : {}),
+          ...(isSqlError(cause) && hasSqliteCode(cause.reason.cause)
+            ? { sqliteCode: cause.reason.cause.errcode }
+            : {}),
+          cause,
+        });
+    const loadSeal = sql<{
       providerTurnId: string;
       code: VerificationChecksCode | null;
       digest: string;
-    }>`SELECT provider_turn_id AS "providerTurnId",code,digest FROM agent_control_verification_check_assessments WHERE provider_delivery_id=${claim.evidence.providerDeliveryId}`;
-    if (existing[0]) {
-      const historical = yield* assessVerificationChecks(sql, claim, { checkCurrentCode: false });
+    }>`SELECT provider_turn_id AS "providerTurnId",code,digest FROM agent_control_verification_check_assessments WHERE provider_delivery_id=${claim.evidence.providerDeliveryId}`.pipe(
+      Effect.mapError(mapFailure("load-seal")),
+    );
+    const replay = Effect.fn("replayVerificationCheckAssessment")(function* (
+      existing: Effect.Success<typeof loadSeal>,
+    ) {
+      const historical = yield* assessVerificationChecks(sql, claim, {
+        checkCurrentCode: false,
+      }).pipe(Effect.mapError(mapFailure("assess-checks")));
       if (
-        existing[0].providerTurnId !== claim.delivery.providerTurnId ||
-        existing[0].digest !== historical.digest
+        existing.length !== 1 ||
+        existing[0]!.providerTurnId !== claim.delivery.providerTurnId ||
+        existing[0]!.digest !== historical.digest
       )
-        return yield* Effect.fail(failure("Sealed verification check evidence changed"));
-      return { code: existing[0].code, digest: existing[0].digest };
-    }
-    const assessment = yield* assessVerificationChecks(sql, claim);
-    yield* sql`INSERT INTO agent_control_verification_check_assessments(provider_delivery_id,provider_turn_id,code,digest,sealed_at)
-    VALUES (${claim.evidence.providerDeliveryId},${claim.delivery.providerTurnId ?? ""},${assessment.code},${assessment.digest},${yield* now})`;
-    return assessment;
+        return yield* new VerificationCheckAssessmentError({
+          operation: "compare-seal",
+          reason: "evidence-conflict",
+        });
+      return { code: existing[0]!.code, digest: existing[0]!.digest };
+    });
+    const existing = yield* loadSeal;
+    if (existing.length !== 0) return yield* replay(existing);
+    const assessment = yield* assessVerificationChecks(sql, claim).pipe(
+      Effect.mapError(mapFailure("assess-checks")),
+    );
+    yield* beforeInsert;
+    // Evaluator recovery and stage finalization can assess the same delivery.
+    // Only the delivery key may lose the insert; every replay still proves the
+    // immutable check evidence and turn identity against the winning seal.
+    const inserted =
+      yield* sql`INSERT INTO agent_control_verification_check_assessments(provider_delivery_id,provider_turn_id,code,digest,sealed_at)
+    VALUES (${claim.evidence.providerDeliveryId},${claim.delivery.providerTurnId ?? ""},${assessment.code},${assessment.digest},${yield* now})
+    ON CONFLICT(provider_delivery_id) DO NOTHING RETURNING provider_delivery_id`.pipe(
+        Effect.mapError(mapFailure("insert-seal")),
+      );
+    return inserted.length === 1 ? assessment : yield* replay(yield* loadSeal);
   },
 );
