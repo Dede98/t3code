@@ -77,6 +77,11 @@ const isVerificationOrchestrationHistoryError = Schema.is(
   AgentControlVerificationOrchestrationHistoryError,
 );
 
+type TerminalRuntimeEvent = Extract<
+  ProviderRuntimeEvent,
+  { readonly type: "turn.completed" | "turn.aborted" }
+>;
+
 type ConsumerInput =
   | { readonly _tag: "handoff"; readonly handoffId: string }
   | { readonly _tag: "runtime"; readonly event: ProviderRuntimeEvent }
@@ -293,6 +298,40 @@ const make = Effect.gen(function* () {
         )
       )
         return;
+      const queuedTerminal = activeWorker?.queuedTerminals
+        .values()
+        .find(
+          (event) =>
+            event.threadId === claim.evidence.threadId &&
+            event.providerInstanceId === claim.evidence.providerInstanceId &&
+            event.turnId === claim.delivery.providerTurnId,
+        );
+      if (queuedTerminal !== undefined && claim.delivery.providerTurnId !== null) {
+        yield* normalizeVerificationTerminal(queuedTerminal, {
+          providerDeliveryId: claim.evidence.providerDeliveryId,
+          threadId: claim.evidence.threadId,
+          providerInstanceId: claim.evidence.providerInstanceId,
+          providerTurnId: TurnId.make(claim.delivery.providerTurnId),
+        }).pipe(
+          Effect.mapError((cause) =>
+            makeAgentControlVerificationCandidateEvidenceError({
+              handoffId: claim.evidence.handoffId,
+              candidateReason: "terminal-identity-divergent",
+              operation: "validate-queued-provider-terminal",
+              cause,
+            }),
+          ),
+        );
+        // Liveness can already be idle while this worker still has the terminal
+        // behind its recovery input. Let that input validate and persist it;
+        // queue presence alone never completes a delivery or releases capacity.
+        yield* Effect.logDebug("verification delivery waiting for queued terminal", {
+          handoffId: claim.evidence.handoffId,
+          providerDeliveryId: claim.evidence.providerDeliveryId,
+          runtimeEventId: queuedTerminal.eventId,
+        });
+        return;
+      }
       const cursor = decodeResumeCursor(claim.delivery.providerResumeCursorJson);
       if (
         provider.readStoppedTurn !== undefined &&
@@ -311,7 +350,16 @@ const make = Effect.gen(function* () {
             resumeCursor: cursor.value,
             cwd: claim.evidence.worktreePath,
           })
-          .pipe(Effect.catch(() => Effect.succeed(undefined)));
+          .pipe(
+            Effect.mapError((cause) =>
+              makeAgentControlVerificationCandidateEvidenceError({
+                handoffId: claim.evidence.handoffId,
+                candidateReason: "provider-runtime-unavailable",
+                operation: "recover-read-native-terminal",
+                cause,
+              }),
+            ),
+          );
         if (native !== undefined) {
           const observation = yield* normalizeVerificationTerminalSource(
             {
@@ -855,6 +903,9 @@ const make = Effect.gen(function* () {
                       handoffId,
                       operation: cause.operation,
                       candidateReason: cause.candidateReason,
+                      ...(cause.cause === undefined
+                        ? {}
+                        : { underlyingErrorTag: safeCauseTag(Cause.fail(cause.cause)) }),
                     }),
                   ),
                 ),
@@ -902,6 +953,9 @@ const make = Effect.gen(function* () {
               handoffId: cause.handoffId,
               operation: cause.operation,
               candidateReason: cause.candidateReason,
+              ...(cause.cause === undefined
+                ? {}
+                : { underlyingErrorTag: safeCauseTag(Cause.fail(cause.cause)) }),
             }),
           ),
         ),
@@ -932,6 +986,7 @@ const make = Effect.gen(function* () {
   let activeWorker:
     | {
         readonly attemptId: number;
+        readonly queuedTerminals: Set<TerminalRuntimeEvent>;
         readonly drain: Effect.Effect<void>;
       }
     | undefined;
@@ -941,8 +996,21 @@ const make = Effect.gen(function* () {
   )(function* (providerEvents, activation, abortSignal) {
     const ownerScope = yield* Scope.Scope;
     const prefixOutcome = yield* makeDurablePrefixOutcomeTracker;
+    const queuedTerminals = new Set<TerminalRuntimeEvent>();
     const worker = yield* makeDrainableWorker(
-      (input: ConsumerInput) => processSafely(input, prefixOutcome),
+      (input: ConsumerInput) =>
+        processSafely(input, prefixOutcome).pipe(
+          Effect.onExit((exit) =>
+            Effect.sync(() => {
+              if (Exit.isFailure(exit)) queuedTerminals.clear();
+              else if (
+                input._tag === "runtime" &&
+                (input.event.type === "turn.completed" || input.event.type === "turn.aborted")
+              )
+                queuedTerminals.delete(input.event);
+            }),
+          ),
+        ),
       { failureMode: "observable" },
     );
     const localActivation = activation === undefined ? yield* Deferred.make<void>() : undefined;
@@ -954,10 +1022,11 @@ const make = Effect.gen(function* () {
         : Effect.raceFirst(awaitActivation.pipe(Effect.andThen(effect)), abortSignal);
     nextAttemptId += 1;
     const attemptId = nextAttemptId;
-    activeWorker = { attemptId, drain: worker.drain };
+    activeWorker = { attemptId, drain: worker.drain, queuedTerminals };
     yield* Scope.addFinalizer(
       ownerScope,
       Effect.sync(() => {
+        queuedTerminals.clear();
         if (activeWorker?.attemptId === attemptId) activeWorker = undefined;
       }),
     );
@@ -973,6 +1042,21 @@ const make = Effect.gen(function* () {
       value: ProviderRuntimeEventPublication | ProviderRuntimeEvent,
     ): value is ProviderRuntimeEventPublication =>
       "_tag" in value && (value._tag === "Event" || value._tag === "Drain");
+    const enqueueRuntime = Effect.fn("enqueueVerificationRuntimeEvent")(function* (
+      event: ProviderRuntimeEvent,
+    ) {
+      if (event.type === "turn.completed" || event.type === "turn.aborted")
+        queuedTerminals.add(event);
+      yield* worker.enqueue({ _tag: "runtime", event }).pipe(
+        Effect.onError(() =>
+          Effect.sync(() => {
+            if (event.type === "turn.completed" || event.type === "turn.aborted")
+              queuedTerminals.delete(event);
+          }),
+        ),
+      );
+      yield* hooks.afterRuntimeEventEnqueued?.(event.eventId) ?? Effect.void;
+    });
     const runProviderPump = Stream.runForEach(
       providerEvents === undefined
         ? provider.streamEvents
@@ -981,9 +1065,9 @@ const make = Effect.gen(function* () {
         runAfterActivation(
           isLifecyclePublication(publication)
             ? publication._tag === "Event"
-              ? worker.enqueue({ _tag: "runtime", event: publication.event })
+              ? enqueueRuntime(publication.event)
               : worker.enqueue({ _tag: "provider-drain", token: publication.token })
-            : worker.enqueue({ _tag: "runtime", event: publication }),
+            : enqueueRuntime(publication),
         ),
     );
     const providerPump = yield* Effect.forkScoped(
