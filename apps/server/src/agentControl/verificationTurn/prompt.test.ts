@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { canonicalJson, sha256Utf8 } from "../initialPlanning/eventEvidence.ts";
+import { canonicalJson, sha256Utf8, type JsonValue } from "../initialPlanning/eventEvidence.ts";
 
 import {
   deriveVerificationHandoffId,
@@ -186,6 +186,54 @@ it("selects complete domain fields without recursive prompts, authority document
       implementationHandoffDigest: "0".repeat(64),
     }),
   );
+});
+
+it("ignores unbound and foreign assistant messages without losing the implementation summary", () => {
+  const message = (turnId: string | null, text: string, threadId = "implementation-thread") => ({
+    type: "thread.message-sent",
+    payload: {
+      role: "assistant",
+      messageId: `${threadId}-${turnId}-${text}`,
+      threadId,
+      turnId,
+      text,
+      streaming: false,
+    },
+  });
+  const summary = "Implemented the complete requested change.\nGrüße 🚀";
+  const matching = message("implementation-provider-turn", summary);
+  const deliveryJson = canonicalJson({
+    threadId: "implementation-thread",
+    providerTurnId: "implementation-provider-turn",
+  });
+  const render = (history: Array<JsonValue>) => {
+    const resultJson = canonicalJson({ outcome: "succeeded", orchestrationHistory: history });
+    return buildAgentControlVerificationPrompt({
+      ...input,
+      implementationProviderDeliveryJson: deliveryJson,
+      implementationProviderDeliveryDigest: sha256Utf8(deliveryJson),
+      implementationResultJson: resultJson,
+      implementationResultDigest: sha256Utf8(resultJson),
+    });
+  };
+  const prompt = render([
+    message(null, "Unbound initial commentary"),
+    matching,
+    message(null, "Unbound trailing commentary"),
+    message("foreign-turn", "Foreign turn"),
+    message("implementation-provider-turn", "Foreign thread", "foreign-thread"),
+  ]);
+  assert.deepStrictEqual(
+    contextOf(prompt.promptText).acceptedImplementation,
+    contextOf(render([matching]).promptText).acceptedImplementation,
+  );
+  assert.deepStrictEqual(contextOf(prompt.promptText).acceptedImplementation, {
+    outcome: "succeeded",
+    summary,
+  });
+  assert.notInclude(prompt.promptText, "Unbound");
+  assert.notInclude(prompt.promptText, "Foreign");
+  assert.throws(() => render([{ ...matching, payload: { ...matching.payload, text: null } }]));
 });
 
 it("retains the complete failure report for re-verification without including the repair handoff", () => {

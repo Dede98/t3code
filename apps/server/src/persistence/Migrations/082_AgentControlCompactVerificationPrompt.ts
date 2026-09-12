@@ -7,6 +7,10 @@ import {
 } from "../../agentControl/verificationTurn/prompt.ts";
 
 const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
+// sqlite_schema omits schema qualifiers. Restore MAIN explicitly so TEMP
+// objects cannot redirect the rebuild or the reinstalled guards.
+const createInMain = (source: string) =>
+  source.replace(/^(CREATE (?:UNIQUE )?(?:TABLE|INDEX|TRIGGER|VIEW) )/i, "$1main.");
 const versions = "('agent-control-verification-prompt-v2', 'agent-control-verification-prompt-v3')";
 const tables = [
   "agent_control_verification_handoff_intents",
@@ -80,13 +84,22 @@ export default Effect.gen(function* () {
   for (const entry of schema.filter((entry) => entry.type === "trigger" || entry.type === "view")) {
     yield* sql.unsafe(`DROP ${entry.type.toUpperCase()} main.${quote(entry.name)}`).unprepared;
   }
+  // RENAME validates other tables' indexes too; remove both rebuilt tables'
+  // indexes before either rename so a TEMP shadow cannot redirect that validation.
+  for (const entry of schema.filter(
+    (entry) => entry.type === "index" && tables.some((name) => name === entry.tbl_name),
+  )) {
+    yield* sql.unsafe(`DROP INDEX main.${quote(entry.name)}`).unprepared;
+  }
   for (const name of tables) {
     const temporaryName = `${name}_prompt_082`;
-    yield* sql.unsafe(replacements.get(name)!.replace(name, temporaryName)).unprepared;
-    yield* sql.unsafe(`INSERT INTO ${quote(temporaryName)} SELECT * FROM ${quote(name)}`)
+    yield* sql.unsafe(createInMain(replacements.get(name)!.replace(name, temporaryName)))
       .unprepared;
-    yield* sql.unsafe(`DROP TABLE ${quote(name)}`).unprepared;
-    yield* sql.unsafe(`ALTER TABLE ${quote(temporaryName)} RENAME TO ${quote(name)}`).unprepared;
+    yield* sql.unsafe(`INSERT INTO main.${quote(temporaryName)} SELECT * FROM main.${quote(name)}`)
+      .unprepared;
+    yield* sql.unsafe(`DROP TABLE main.${quote(name)}`).unprepared;
+    yield* sql.unsafe(`ALTER TABLE main.${quote(temporaryName)} RENAME TO ${quote(name)}`)
+      .unprepared;
   }
   for (const entry of schema) {
     if (
@@ -94,10 +107,10 @@ export default Effect.gen(function* () {
       entry.type === "view" ||
       (entry.type === "index" && tables.some((name) => name === entry.tbl_name))
     ) {
-      yield* sql.unsafe(replacements.get(entry.name) ?? entry.sql).unprepared;
+      yield* sql.unsafe(createInMain(replacements.get(entry.name) ?? entry.sql)).unprepared;
     }
   }
-  const violations = yield* sql`PRAGMA foreign_key_check`;
+  const violations = yield* sql`PRAGMA main.foreign_key_check`;
   if (violations.length !== 0) {
     return yield* Effect.die(
       new Error("Compact verification prompt introduced foreign-key violations."),

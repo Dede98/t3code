@@ -225,6 +225,14 @@ const isAssistantMessage = Schema.is(
     payload: Schema.Struct({ role: Schema.Literal("assistant") }),
   }),
 );
+const decodeAssistantMessageIdentity = Schema.decodeUnknownSync(
+  Schema.Struct({
+    payload: Schema.Struct({
+      threadId: Schema.String,
+      turnId: Schema.NullOr(Schema.String),
+    }),
+  }),
+);
 const decodeAssistantMessage = Schema.decodeUnknownSync(
   Schema.Struct({
     payload: Schema.Struct({
@@ -256,9 +264,14 @@ const implementationSummary = (input: Parameters<typeof renderV1>[0]) => {
   const messages = new Map<string, { text: string; streaming: boolean }>();
   for (const event of result.orchestrationHistory ?? []) {
     if (!isAssistantMessage(event)) continue;
-    const { payload } = decodeAssistantMessage(event);
-    if (payload.threadId !== delivery.threadId || payload.turnId !== delivery.providerTurnId)
+    const { payload: identity } = decodeAssistantMessageIdentity(event);
+    if (
+      identity.turnId === null ||
+      identity.threadId !== delivery.threadId ||
+      identity.turnId !== delivery.providerTurnId
+    )
       continue;
+    const { payload } = decodeAssistantMessage(event);
     const previous = messages.get(payload.messageId);
     messages.set(payload.messageId, {
       text: payload.streaming

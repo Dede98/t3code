@@ -7,6 +7,77 @@ import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 import Migration082 from "./082_AgentControlCompactVerificationPrompt.ts";
 
+it.effect("preserves TEMP and attached shadows through upgrade, rollback and replay", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 81 });
+    yield* sql`ATTACH DATABASE ':memory:' AS migration082_shadow`;
+    const tableNames = [
+      "agent_control_verification_handoff_intents",
+      "agent_control_verification_evaluation_evidence",
+    ].flatMap((name) => [name, `${name}_prompt_082`]);
+    const [view] = yield* sql<{ name: string }>`
+      SELECT name FROM main.sqlite_schema WHERE type = 'view' ORDER BY name LIMIT 1
+    `;
+    assert.isDefined(view);
+    for (const schema of ["temp", "migration082_shadow"] as const) {
+      for (const name of tableNames) {
+        yield* sql.unsafe(`CREATE TABLE ${schema}.${name} (shadow_value TEXT)`).unprepared;
+        yield* sql.unsafe(`INSERT INTO ${schema}.${name} VALUES ('preserve shadow')`).unprepared;
+      }
+      yield* sql.unsafe(`CREATE INDEX ${schema}.idx_agent_control_verification_evaluation_candidate
+        ON agent_control_verification_evaluation_evidence(shadow_value)`).unprepared;
+      yield* sql.unsafe(`CREATE TRIGGER ${schema}.agent_control_verification_handoff_intent_validate
+        BEFORE INSERT ON agent_control_verification_handoff_intents BEGIN SELECT 1; END`)
+        .unprepared;
+      yield* sql.unsafe(`CREATE VIEW ${schema}."${view!.name}"
+        AS SELECT shadow_value FROM agent_control_verification_handoff_intents`).unprepared;
+    }
+    const snapshotShadows = Effect.gen(function* () {
+      const snapshots = [];
+      for (const schema of ["temp", "migration082_shadow"] as const) {
+        snapshots.push(
+          yield* sql.unsafe(
+            `SELECT type, name, sql FROM ${schema}.sqlite_schema ORDER BY type, name`,
+          ),
+        );
+        for (const name of tableNames) {
+          snapshots.push(yield* sql.unsafe(`SELECT * FROM ${schema}.${name}`));
+        }
+      }
+      return snapshots;
+    });
+    const beforeShadows = yield* snapshotShadows;
+    const beforeMain =
+      yield* sql`SELECT type, name, sql FROM main.sqlite_schema ORDER BY type, name`;
+    const failed = yield* Effect.exit(
+      sql.withTransaction(
+        Effect.gen(function* () {
+          yield* Migration082;
+          return yield* Effect.fail("rollback upgrade");
+        }),
+      ),
+    );
+    assert.deepStrictEqual(failed, Exit.fail("rollback upgrade"));
+    assert.deepStrictEqual(yield* snapshotShadows, beforeShadows);
+    assert.deepStrictEqual(
+      yield* sql`SELECT type, name, sql FROM main.sqlite_schema ORDER BY type, name`,
+      beforeMain,
+    );
+    assert.deepStrictEqual(yield* runMigrations(), [[82, "AgentControlCompactVerificationPrompt"]]);
+    assert.deepStrictEqual(yield* snapshotShadows, beforeShadows);
+    assert.deepStrictEqual(yield* sql`PRAGMA main.foreign_key_check`, []);
+    const afterMain =
+      yield* sql`SELECT type, name, sql FROM main.sqlite_schema ORDER BY type, name`;
+    assert.deepStrictEqual(yield* runMigrations(), []);
+    assert.deepStrictEqual(yield* snapshotShadows, beforeShadows);
+    assert.deepStrictEqual(
+      yield* sql`SELECT type, name, sql FROM main.sqlite_schema ORDER BY type, name`,
+      afterMain,
+    );
+  }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+);
+
 it.effect(
   "upgrades prompt contracts atomically while retaining every unrelated evidence guard",
   () =>
