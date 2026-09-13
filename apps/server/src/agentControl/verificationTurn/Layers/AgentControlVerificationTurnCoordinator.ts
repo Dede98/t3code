@@ -1,4 +1,5 @@
 import { loadRunOnceRepairForImplementationStage } from "../../runOnce/repair.ts";
+import { persistVerificationRunOnceDiagnostic } from "../../runOnce/diagnostics.ts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import {
   AgentControlControlledThreadReservationId,
@@ -1569,6 +1570,12 @@ const make = Effect.gen(function* () {
         isCoordinatorError(cause)
           ? cause
           : error(handoffId, "process-handoff", "persistence", cause),
+      ),
+      Effect.tapError((cause) => persistVerificationRunOnceDiagnostic(sql, handoffId, cause)),
+      Effect.tap((result) =>
+        result._tag === "NotCandidate"
+          ? Effect.void
+          : persistVerificationRunOnceDiagnostic(sql, handoffId, null),
       ),
     );
 

@@ -1,14 +1,17 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
+  AgentControlTaskId,
   EventId,
   ModelSelection,
+  MessageId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   TurnId,
   type AgentControlGithubIssueSnapshot,
+  type AgentControlTaskEvent,
   type ProviderRuntimeEvent,
   type ProviderSession,
 } from "@t3tools/contracts";
@@ -57,7 +60,6 @@ import { AgentControlControlledThreadMaterializationCoordinatorHooksNoop } from 
 import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
 import { AgentControlGithubEventStore } from "../../github/Services/AgentControlGithubEventStore.ts";
 import { AgentControlGithubProjection } from "../../github/Services/AgentControlGithubProjection.ts";
-import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 import { AgentControlImplementationAdmissionLive } from "../../implementationAdmission/Layers/AgentControlImplementationAdmission.ts";
 import { AgentControlImplementationAdmission } from "../../implementationAdmission/Services/AgentControlImplementationAdmission.ts";
 import { AgentControlInitialPlanningConsumerLive } from "../../initialPlanning/Layers/AgentControlInitialPlanningConsumer.ts";
@@ -89,16 +91,30 @@ import { AgentControlRunOnceController } from "../../runOnce/Services/AgentContr
 import { providerAdmissionId } from "../../providerAdmission/model.ts";
 import { ProviderAdmissionRuntime } from "../../providerAdmission/Services/ProviderAdmissionRuntime.ts";
 import { ProviderAdmissionReleaseAuthority } from "../../providerAdmission/Services/ProviderAdmissionReleaseAuthority.ts";
+import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTaskEventStore.ts";
 import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
 import { AgentControlTaskIntakeReactor } from "../../task/Services/AgentControlTaskIntakeReactor.ts";
-import { AgentControlTaskReconcileStateRepository } from "../../task/Services/AgentControlTaskReconcileState.ts";
+import { AgentControlTaskIntake } from "../../task/Services/AgentControlTaskIntake.ts";
 import { AgentControlTaskVerificationFinalizerLive } from "../../task/Layers/AgentControlTaskVerificationFinalizer.ts";
 import { AgentControlTaskVerificationFinalizer } from "../../task/Services/AgentControlTaskVerificationFinalizer.ts";
-import { normalizedTaskSourceGate } from "../../task/decider.ts";
 import { AgentControlWorktreeController } from "../../worktree/Services/AgentControlWorktreeController.ts";
 import { deriveAgentControlTaskId } from "../../task/identity.ts";
 import { AgentControlVerificationAdmissionLive } from "../../verificationAdmission/Layers/AgentControlVerificationAdmission.ts";
 import { AgentControlVerificationAdmission } from "../../verificationAdmission/Services/AgentControlVerificationAdmission.ts";
+import { AgentControlVerificationAdmissionHooks } from "../../verificationAdmission/Services/AgentControlVerificationAdmissionHooks.ts";
+import {
+  executeVerificationCheck,
+  prepareVerificationCheckManifest,
+} from "../../verificationTurn/checkEvidence.ts";
+import {
+  makeBoundedVerificationResultCompletion,
+  loadSealableVerificationResultSource,
+} from "../../verificationTurn/orchestrationResultSource.ts";
+import {
+  AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT,
+  AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_VERSION,
+} from "../../verificationTurn/verificationResult.ts";
+import type { ProviderAdmissionPermit } from "../../providerAdmission/model.ts";
 import { AgentControlVerificationEvaluatorLive } from "../../verificationTurn/Layers/AgentControlVerificationEvaluator.ts";
 import { AgentControlVerificationHandoffStoreLive } from "../../verificationTurn/Layers/AgentControlVerificationHandoffStore.ts";
 import { AgentControlVerificationStageFinalizerLive } from "../../verificationTurn/Layers/AgentControlVerificationStageFinalizer.ts";
@@ -309,9 +325,17 @@ const makePolicyLayer = () =>
       }),
   });
 
-it.live.each(["run-once", "armed"] as const)(
-  "isolates a persisted %s project blocker across recovery while independent tasks run and fresh authority resolves it",
-  (blockedMode) =>
+it.live.each([
+  { blockedMode: "run-once", intakeRefreshes: 0, recoverMissing: false, sourceChange: "none" },
+  { blockedMode: "armed", intakeRefreshes: 0, recoverMissing: false, sourceChange: "none" },
+  { blockedMode: "armed", intakeRefreshes: 1, recoverMissing: false, sourceChange: "none" },
+  { blockedMode: "armed", intakeRefreshes: 3, recoverMissing: false, sourceChange: "none" },
+  { blockedMode: "armed", intakeRefreshes: 0, recoverMissing: true, sourceChange: "none" },
+  { blockedMode: "armed", intakeRefreshes: 3, recoverMissing: false, sourceChange: "paused" },
+  { blockedMode: "armed", intakeRefreshes: 3, recoverMissing: false, sourceChange: "replaced" },
+] as const)(
+  "isolates a persisted $blockedMode project blocker with $intakeRefreshes intake refreshes (recover missing: $recoverMissing, source change: $sourceChange) while independent tasks run and fresh authority resolves it",
+  ({ blockedMode, intakeRefreshes, recoverMissing, sourceChange }) =>
     Effect.scoped(
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
@@ -326,6 +350,7 @@ it.live.each(["run-once", "armed"] as const)(
         yield* sql`PRAGMA foreign_keys = ON`;
         yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, sql));
         const fakeProvider = yield* makeProvider();
+        const verificationPermits = new Map<string, ProviderAdmissionPermit>();
         const sqlLayer = Layer.succeed(SqlClient.SqlClient, sql);
         const configLayer = ServerConfig.layerTest(directory, {
           prefix: "armed-production-",
@@ -432,9 +457,8 @@ it.live.each(["run-once", "armed"] as const)(
         const engine = Context.get(context, AgentControlEngine);
         const githubEvents = Context.get(context, AgentControlGithubEventStore);
         const githubProjection = Context.get(context, AgentControlGithubProjection);
-        const githubStates = Context.get(context, AgentControlGithubStateRepository);
         const taskEngine = Context.get(context, AgentControlTaskEngine);
-        const reconciles = Context.get(context, AgentControlTaskReconcileStateRepository);
+        const taskIntake = Context.get(context, AgentControlTaskIntake);
         const scheduler = Context.get(context, AgentControlArmedScheduler);
         assert.isDefined(Context.get(context, AgentControlRunOnceController));
         assert.isDefined(Context.get(context, OrchestrationEngineService));
@@ -448,6 +472,7 @@ it.live.each(["run-once", "armed"] as const)(
           projectId: ProjectId,
           issues: ReadonlyArray<AgentControlGithubIssueSnapshot>,
           streamVersion: number,
+          reconcileTasks = true,
         ) {
           const at = DateTime.formatIso(yield* DateTime.now);
           const polled = yield* githubEvents.append({
@@ -480,38 +505,7 @@ it.live.each(["run-once", "armed"] as const)(
             ],
           });
           yield* githubProjection.projectEvent(polled[0]!);
-          const snapshot = Option.getOrThrow(yield* githubStates.getCompletedSnapshot(projectId));
-          for (const source of issues.toReversed()) {
-            const taskId = yield* deriveAgentControlTaskId({
-              projectId,
-              repositoryNodeId: source.repositoryNodeId,
-              issueNodeId: source.issueNodeId,
-            });
-            const existing = yield* taskEngine.get(taskId);
-            yield* taskEngine.dispatchObservedController({
-              type: Option.isSome(existing)
-                ? "agentControl.task.sourceGate.refresh"
-                : "agentControl.task.createFromGithubIssue",
-              commandId: CommandId.make(`${projectId}-${streamVersion}-task-${source.number}`),
-              taskId,
-              projectId,
-              expectedRevision: Option.isSome(existing) ? existing.value.revision : 0,
-              sourcePrecondition: snapshot.sourcePrecondition,
-              source: {
-                projectId,
-                repositoryNodeId: source.repositoryNodeId,
-                issueNodeId: source.issueNodeId,
-                issueNumber: source.number,
-                issueUrl: source.url,
-              },
-              sourceGate: normalizedTaskSourceGate(source),
-              sourceUpdatedAt: source.updatedAt,
-              githubIntakeSequence: polled[0]!.sequence,
-              sourceSnapshot: source,
-            });
-          }
-          const reconciling = yield* reconciles.begin(projectId, polled[0]!.sequence, at);
-          yield* reconciles.complete(projectId, polled[0]!.sequence, reconciling.revision, at);
+          if (reconcileTasks) yield* taskIntake.reconcileObservedProject({ projectId });
         });
         const seedProject = Effect.fn("seedArmedProductionProject")(function* (
           projectId: ProjectId,
@@ -581,6 +575,22 @@ it.live.each(["run-once", "armed"] as const)(
         const at = DateTime.formatIso(yield* DateTime.now);
         const issues = [issue(1, at), issue(2, at)];
         yield* seedProject(projectId, repository, issues, "armed");
+        for (let refresh = 0; refresh < intakeRefreshes; refresh++) {
+          yield* publishSources(projectId, issues, 2 + refresh);
+        }
+        if (recoverMissing) {
+          yield* publishSources(projectId, [], 2);
+          yield* publishSources(projectId, issues, 3);
+        }
+        const refreshedTaskId = yield* deriveAgentControlTaskId({
+          projectId,
+          repositoryNodeId: issues[0]!.repositoryNodeId,
+          issueNodeId: issues[0]!.issueNodeId,
+        });
+        const refreshedTask = Option.getOrThrow(yield* taskEngine.get(refreshedTaskId));
+        assert.equal(refreshedTask.revision, recoverMissing ? 3 : intakeRefreshes + 1);
+        assert.equal(refreshedTask.status, "candidate");
+        assert.equal(refreshedTask.sourceGate, "eligible");
         const blockedProjectId = ProjectId.make("a-blocked-recovery-project");
         const blockedRepository = yield* makeRepository().pipe(Effect.provide(gitLayer));
         yield* git(blockedRepository.cwd, [
@@ -714,9 +724,8 @@ it.live.each(["run-once", "armed"] as const)(
         const providerAdmissionRuntime = ProviderAdmissionRuntime.of({
           awaitFailure: Effect.never,
           request: (request) =>
-            Effect.succeed({
-              _tag: "Admitted" as const,
-              permit: {
+            Effect.sync(() => {
+              const permit: ProviderAdmissionPermit = {
                 ...request,
                 admissionId: providerAdmissionId(request),
                 admissionMarkerId: `marker-${request.handoffId}`,
@@ -725,7 +734,9 @@ it.live.each(["run-once", "armed"] as const)(
                 admissionLeaseExpiresAt: "2099-01-01T00:00:00.000Z",
                 providerFenceToken: 1,
                 usageEvidenceFingerprint: "b".repeat(64),
-              },
+              };
+              verificationPermits.set(request.handoffId, permit);
+              return { _tag: "Admitted" as const, permit };
             }),
           usageChanged: () => Effect.void,
           capacityReleased: () => Effect.void,
@@ -1002,9 +1013,44 @@ it.live.each(["run-once", "armed"] as const)(
             if (input.event.turnId === undefined) {
               return yield* Effect.die(new Error("terminal provider event is missing turnId"));
             }
+            const verificationPermit = [...verificationPermits.values()].find(
+              (permit) =>
+                permit.stage === "verification" && permit.threadId === input.event.threadId,
+            );
+            const resultSource =
+              verificationPermit === undefined
+                ? undefined
+                : yield* loadSealableVerificationResultSource(sql, {
+                    threadId: input.event.threadId,
+                    providerInstanceId,
+                    providerTurnId: input.event.turnId,
+                    afterStreamVersion: 4,
+                    handoffId: verificationPermit.handoffId,
+                    providerDeliveryId: verificationPermit.providerDeliveryId,
+                    resultSchemaFingerprint: AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT,
+                  });
             yield* orchestrationEngine.dispatch({
               type: "thread.session.set",
-              commandId: CommandId.make(`provider:${input.event.eventId}:thread-session-set`),
+              ...(verificationPermit === undefined || resultSource === undefined
+                ? {}
+                : {
+                    verificationResultSource: {
+                      schemaVersion: 1,
+                      handoffId: verificationPermit.handoffId,
+                      providerDeliveryId: verificationPermit.providerDeliveryId,
+                      providerInstanceId,
+                      providerTurnId: input.event.turnId,
+                      resultSchemaFingerprint: AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT,
+                      sourceDisposition: resultSource.sourceDisposition,
+                      finalMessageId: resultSource.finalMessageId,
+                      sourceEventId: resultSource.sourceEventId,
+                      outputDigest: resultSource.outputDigest,
+                      outputByteLength: resultSource.outputByteLength,
+                    },
+                  }),
+              commandId: CommandId.make(
+                `provider:${input.event.eventId}:thread-session-set:00000000-0000-4000-8000-000000000001`,
+              ),
               threadId: input.event.threadId,
               session: {
                 threadId: input.event.threadId,
@@ -1250,10 +1296,184 @@ it.live.each(["run-once", "armed"] as const)(
             return yield* Effect.die("implementation was not finalized");
           }
 
-          const verificationAdmitted = yield* verificationAdmissionService.processResultEvidence(
-            implementationFinalized.resultEvidenceId,
-          );
-          assert.equal(verificationAdmitted._tag, "Admitted");
+          const resultEvidenceId = implementationFinalized.resultEvidenceId;
+          if (sourceChange !== "none") {
+            const refreshedAt = DateTime.formatIso(yield* DateTime.now);
+            const changedSource: AgentControlGithubIssueSnapshot =
+              sourceChange === "paused"
+                ? {
+                    ...issue(1, refreshedAt),
+                    paused: true,
+                    eligible: false,
+                    eligibilityReason: "paused",
+                  }
+                : issue(3, refreshedAt);
+            yield* publishSources(
+              projectId,
+              [changedSource, issues[1]!],
+              2 + intakeRefreshes,
+              false,
+            );
+            assert.equal(
+              (yield* verificationAdmissionService.processResultEvidence(resultEvidenceId))._tag,
+              "Admitted",
+            );
+            const rejection = yield* verificationCoordinatorService
+              .processHandoff(resultEvidenceId)
+              .pipe(Effect.flip);
+            assert.equal(rejection.reason, "source-stale");
+            assert.equal(rejection.operation, "guard-worktree");
+            assert.equal(fakeProvider.turnCount(), 2);
+            assert.deepStrictEqual(
+              yield* sql`SELECT count(*) AS count FROM agent_control_verification_deliveries`,
+              [{ count: 0 }],
+            );
+            assert.deepStrictEqual(
+              yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_starts`,
+              [{ count: 0 }],
+            );
+            return;
+          }
+          if (intakeRefreshes === 3 && runOrdinal === 1) {
+            const beforeCrash = fakeProvider.turnCount();
+            const committedAdmission = yield* Effect.scoped(
+              Effect.gen(function* () {
+                const crashContext = yield* Layer.build(
+                  Layer.fresh(AgentControlVerificationAdmissionLive).pipe(
+                    Layer.provide(Layer.succeedContext(pipelineContext)),
+                    Layer.provide(
+                      Layer.succeed(AgentControlVerificationAdmissionHooks, {
+                        ...Context.get(Context.empty(), AgentControlVerificationAdmissionHooks),
+                        afterNativeCommit: () =>
+                          Effect.die("simulated process stop after admission commit"),
+                      }),
+                    ),
+                  ),
+                );
+                return yield* Context.get(crashContext, AgentControlVerificationAdmission)
+                  .processResultEvidence(resultEvidenceId)
+                  .pipe(Effect.exit);
+              }),
+            );
+            assert.isTrue(Exit.isFailure(committedAdmission));
+            yield* Effect.scoped(
+              Effect.gen(function* () {
+                const reopenedSql = yield* Layer.build(NodeSqliteClient.layer({ filename }));
+                const restarted = yield* Layer.build(
+                  Layer.fresh(AgentControlVerificationAdmissionLive).pipe(
+                    Layer.provide(
+                      Layer.succeedContext(Context.merge(pipelineContext, reopenedSql)),
+                    ),
+                  ),
+                );
+                const admission = Context.get(restarted, AgentControlVerificationAdmission);
+                yield* admission.recover;
+                assert.equal(
+                  (yield* admission.processResultEvidence(resultEvidenceId))._tag,
+                  "Replayed",
+                );
+              }),
+            );
+            assert.equal(fakeProvider.turnCount(), beforeCrash);
+          } else {
+            assert.equal(
+              (yield* verificationAdmissionService.processResultEvidence(resultEvidenceId))._tag,
+              "Admitted",
+            );
+          }
+          if (intakeRefreshes === 3 && runOrdinal === 1) {
+            const taskEvents = Context.get(context, AgentControlTaskEventStore);
+            const admission = Option.getOrThrow(
+              yield* verificationAdmissionService.loadAcceptedEvidence(resultEvidenceId),
+            );
+            const [createdTaskEvent] = yield* taskEvents.readStream(
+              AgentControlTaskId.make(admission.taskId),
+              0,
+              1,
+            );
+            const mutations: ReadonlyArray<
+              (event: AgentControlTaskEvent) => AgentControlTaskEvent
+            > = [
+              (event) => ({
+                ...createdTaskEvent!,
+                eventId: event.eventId,
+                sequence: event.sequence,
+                streamVersion: event.streamVersion,
+              }),
+              (event) => ({ ...event, eventId: EventId.make("foreign-source-event") }),
+              (event) => ({
+                ...event,
+                aggregateId: AgentControlTaskId.make("foreign-source-task"),
+              }),
+              (event) => ({ ...event, sequence: event.sequence + 1 }),
+              (event) => ({ ...event, streamVersion: event.streamVersion + 1 }),
+              (event) =>
+                event.type === "agentControl.task.sourceGate.changed"
+                  ? {
+                      ...event,
+                      payload: {
+                        ...event.payload,
+                        source: {
+                          ...event.payload.source,
+                          projectId: ProjectId.make("foreign-source-project"),
+                        },
+                      },
+                    }
+                  : event,
+              (event) =>
+                event.type === "agentControl.task.sourceGate.changed"
+                  ? { ...event, payload: { ...event.payload, sourceGate: "paused" } }
+                  : event,
+            ];
+            for (const mutate of mutations) {
+              yield* Effect.scoped(
+                Effect.gen(function* () {
+                  const corrupted = yield* Layer.build(
+                    Layer.fresh(AgentControlVerificationAdmissionLive).pipe(
+                      Layer.provide(
+                        Layer.succeedContext(
+                          Context.add(pipelineContext, AgentControlTaskEventStore, {
+                            ...taskEvents,
+                            readStream: (...args) =>
+                              taskEvents
+                                .readStream(...args)
+                                .pipe(
+                                  Effect.map((events) =>
+                                    events.map((event) =>
+                                      event.eventId === admission.taskSourceEventId
+                                        ? mutate(event)
+                                        : event,
+                                    ),
+                                  ),
+                                ),
+                          }),
+                        ),
+                      ),
+                    ),
+                  );
+                  const rejection = yield* Context.get(corrupted, AgentControlVerificationAdmission)
+                    .loadAcceptedEvidence(resultEvidenceId)
+                    .pipe(Effect.flip);
+                  assert.equal(rejection.reason, "identity-mismatch");
+                  assert.equal(rejection.operation, "replay-bound-histories");
+                }),
+              );
+            }
+            assert.isTrue(
+              Option.isSome(
+                yield* verificationAdmissionService.loadAcceptedEvidence(resultEvidenceId),
+              ),
+            );
+            assert.equal(fakeProvider.turnCount(), 2);
+            assert.deepStrictEqual(
+              yield* sql`SELECT count(*) AS count FROM agent_control_verification_deliveries`,
+              [{ count: 0 }],
+            );
+            assert.deepStrictEqual(
+              yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_starts`,
+              [{ count: 0 }],
+            );
+          }
           const verificationMaterialized = yield* verificationCoordinatorService.processHandoff(
             implementationFinalized.resultEvidenceId,
           );
@@ -1295,11 +1515,87 @@ it.live.each(["run-once", "armed"] as const)(
             (yield* verificationStarterService.processHandoff(verificationHandoffId))._tag,
             "Started",
           );
+          const permit = verificationPermits.get(verificationHandoffId)!;
+          assert.isDefined(permit);
+          const verificationCwd = fakeProvider.sessions.get(
+            ThreadId.make(verificationDelivery!.threadId),
+          )?.cwd;
+          if (verificationCwd === undefined) {
+            return yield* Effect.die("Verification session is missing its controlled worktree");
+          }
+          const manifest = yield* prepareVerificationCheckManifest(sql, {
+            permit,
+            cwd: verificationCwd,
+            checks: [
+              {
+                id: "clean-diff",
+                command: "git",
+                args: ["diff", "--check"],
+                cwd: ".",
+                required: true,
+                timeoutMs: 10_000,
+                allowTemporaryFiles: false,
+                resultFormat: "exit-code",
+              },
+            ],
+          });
+          let checkExecutions = 0;
+          const runCheck = executeVerificationCheck(sql, {
+            manifest,
+            checkId: "clean-diff",
+            providerTurnId: verificationDelivery!.providerTurnId,
+            authorize: Effect.void,
+            execute: Effect.gen(function* () {
+              checkExecutions++;
+              const result = yield* git(verificationCwd, ["diff", "--check"]).pipe(
+                Effect.provide(gitLayer),
+              );
+              return { exitCode: 0, stdout: result.stdout, stderr: result.stderr };
+            }),
+          });
+          assert.equal((yield* runCheck).exitCode, 0);
+          assert.equal((yield* runCheck).exitCode, 0);
+          assert.equal(checkExecutions, 1);
+          const outputAt = DateTime.formatIso(yield* DateTime.now);
+          const messageId = MessageId.make(`verification-output-${runOrdinal}`);
+          const outputEventId = EventId.make(`verification-output-event-${runOrdinal}`);
+          yield* orchestrationEngine.dispatch({
+            type: "thread.verification-result.capture",
+            commandId: CommandId.make(`provider:${outputEventId}:verification-result:${messageId}`),
+            threadId: ThreadId.make(verificationDelivery!.threadId),
+            messageId,
+            turnId: TurnId.make(verificationDelivery!.providerTurnId),
+            fragment: makeBoundedVerificationResultCompletion(
+              encodeUnknownJson({
+                schemaVersion: AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_VERSION,
+                verdict: "passed",
+                report: "Required clean-diff check passed.",
+              }),
+              null,
+            ),
+            providerRuntimeMessage: {
+              runtimeEventId: outputEventId,
+              eventType: "item.completed",
+              providerInstanceId,
+              providerTurnId: TurnId.make(verificationDelivery!.providerTurnId),
+              providerItemId: null,
+            },
+            verificationResultCapture: {
+              schemaVersion: 1,
+              disposition: "authority",
+              handoffId: verificationHandoffId,
+              providerDeliveryId: permit.providerDeliveryId,
+              providerInstanceId,
+              providerTurnId: TurnId.make(verificationDelivery!.providerTurnId),
+              resultSchemaFingerprint: AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT,
+            },
+            createdAt: outputAt,
+          });
           const verificationTerminal = yield* publishTerminal({
             prefix: `armed-production-verification-${runOrdinal}`,
             threadId: ThreadId.make(verificationDelivery!.threadId),
             turnId: TurnId.make(verificationDelivery!.providerTurnId),
-            state: "failed",
+            state: "completed",
           });
           yield* projectProviderTerminal({
             prefix: `armed-production-verification-${runOrdinal}`,
@@ -1315,9 +1611,41 @@ it.live.each(["run-once", "armed"] as const)(
             (yield* taskFinalizerService.processHandoff(verificationHandoffId))._tag,
             "Finalized",
           );
+          assert.equal(
+            (yield* verificationAdmissionService.processResultEvidence(resultEvidenceId))._tag,
+            "Replayed",
+          );
+          assert.equal(
+            (yield* verificationFinalizerService.processHandoff(verificationHandoffId))._tag,
+            "Replayed",
+          );
+          assert.equal(
+            (yield* taskFinalizerService.processHandoff(verificationHandoffId))._tag,
+            "Replayed",
+          );
+          assert.equal(checkExecutions, 1);
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const reopened = yield* Layer.build(NodeSqliteClient.layer({ filename }));
+              const replay = yield* executeVerificationCheck(
+                Context.get(reopened, SqlClient.SqlClient),
+                {
+                  manifest,
+                  checkId: "clean-diff",
+                  providerTurnId: verificationDelivery!.providerTurnId,
+                  authorize: Effect.void,
+                  execute: Effect.die(
+                    "persisted verification check must not execute after restart",
+                  ),
+                },
+              );
+              assert.equal(replay.exitCode, 0);
+            }),
+          );
         });
 
         yield* completeActiveTask(1);
+        if (sourceChange !== "none") return;
         yield* scheduler.processProject(projectId);
         assert.equal((yield* engine.getProjectState({ projectId })).mode, "armed");
         yield* scheduler.processProject(projectId);
@@ -1340,10 +1668,10 @@ it.live.each(["run-once", "armed"] as const)(
               (SELECT count(*) FROM agent_control_run_once_activations
                WHERE project_id=${projectId}) AS activations,
               (SELECT count(*) FROM agent_control_task_states
-               WHERE task_id=${firstTaskId} AND status='failed'
+               WHERE task_id=${firstTaskId} AND status='succeeded'
                  AND stage='verification') AS firstFinalized,
               (SELECT count(*) FROM agent_control_task_states
-               WHERE task_id=${secondTaskId} AND status='failed'
+               WHERE task_id=${secondTaskId} AND status='succeeded'
                  AND stage='verification') AS secondFinalized
           `,
           [
@@ -1360,7 +1688,13 @@ it.live.each(["run-once", "armed"] as const)(
         const completedEvidence = yield* sql`SELECT * FROM agent_control_run_once_step_evidence
           WHERE project_id=${projectId} ORDER BY run_id, ordinal`;
         const turnsBefore = fakeProvider.turnCount();
+        assert.equal(turnsBefore, 6);
         const checkEvidence = yield* sql`SELECT * FROM agent_control_verification_check_results`;
+        assert.lengthOf(checkEvidence, 2);
+        assert.deepStrictEqual(
+          checkEvidence.map((check) => check.status),
+          ["passed", "passed"],
+        );
         yield* restartRecovery();
         assert.equal(fakeProvider.turnCount(), turnsBefore);
         assert.deepStrictEqual(

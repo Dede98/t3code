@@ -32,7 +32,7 @@ const persistence = Layer.effectDiscard(runMigrations()).pipe(
 );
 import { AgentControlRuntimeLayerLive } from "../runtimeLayer.ts";
 import { AgentControlRunOnceController } from "./Services/AgentControlRunOnceController.ts";
-import { persistRunOnceDiagnostic } from "./diagnostics.ts";
+import { persistRunOnceDiagnostic, persistVerificationRunOnceDiagnostic } from "./diagnostics.ts";
 import { deriveRunOnceCommandId } from "./identity.ts";
 import { AgentControlRunOnceError } from "./model.ts";
 import { makeAgentControlRunOnceReadModel } from "./readModel.ts";
@@ -353,6 +353,89 @@ layer("Run-Once client read model", (it) => {
         const reconnect = yield* read.subscribe({ projectId });
         const reconnected = yield* Stream.runHead(reconnect);
         assert.deepStrictEqual(Option.getOrThrow(reconnected), received);
+
+        yield* sql`UPDATE agent_control_run_once_states
+          SET status = 'active', worktree_reservation_id = 'verification-diagnostic-worktree'
+          WHERE run_id = ${runId}`;
+        for (const [id, worktree] of [
+          ["blocked-result", "verification-diagnostic-worktree"],
+          ["other-result", "verification-diagnostic-worktree"],
+          ["foreign-result", "foreign-worktree"],
+        ] as const) {
+          yield* insertFixture("agent_control_implementation_result_evidence", {
+            result_evidence_id: id,
+            project_id: projectId,
+            task_id: taskId,
+            worktree_reservation_id: worktree,
+          });
+        }
+        yield* persistRunOnceDiagnostic(sql, projectId, null);
+        yield* persistVerificationRunOnceDiagnostic(sql, "foreign-result", {
+          operation: "verification-admission",
+          reason: "admission-corrupt",
+        });
+        assert.isNull((yield* read.getSnapshot({ projectId })).runs[0]?.errorCode);
+
+        const admissionBlocked = yield* Deferred.make<AgentControlRunOnceSnapshot>();
+        const diagnosticReady = yield* Deferred.make<void>();
+        const diagnosticStream = yield* read.subscribe({ projectId });
+        const diagnosticFiber = yield* diagnosticStream.pipe(
+          Stream.runForEach((value) =>
+            value.runs[0]?.errorCode === "verification-admission: admission-corrupt"
+              ? Deferred.succeed(admissionBlocked, value)
+              : Deferred.succeed(diagnosticReady, undefined),
+          ),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(diagnosticReady);
+        yield* persistVerificationRunOnceDiagnostic(sql, "blocked-result", {
+          operation: "verification-admission",
+          reason: "admission-corrupt",
+        });
+        const blockedVerification = yield* Deferred.await(admissionBlocked);
+        assert.deepStrictEqual(blockedVerification.blockers, [
+          "verification-admission: admission-corrupt",
+        ]);
+        yield* Fiber.interrupt(diagnosticFiber);
+        // A transient controller error followed by an ordinary wait cannot
+        // replace and erase the verification worker's still unresolved blocker.
+        yield* persistRunOnceDiagnostic(
+          sql,
+          projectId,
+          new AgentControlRunOnceError({
+            projectId,
+            runId,
+            step: "thread-activated",
+            reason: "persistence",
+          }),
+        );
+        assert.equal(
+          (yield* read.getSnapshot({ projectId })).runs[0]?.errorCode,
+          "verification-admission: admission-corrupt",
+        );
+        yield* persistRunOnceDiagnostic(sql, projectId, null);
+        // A different result's replay cannot resolve this transition either.
+        yield* persistVerificationRunOnceDiagnostic(sql, "other-result", null);
+        const diagnosticReconnect = yield* Stream.runHead(yield* read.subscribe({ projectId }));
+        assert.equal(
+          Option.getOrThrow(diagnosticReconnect).runs[0]?.errorCode,
+          "verification-admission: admission-corrupt",
+        );
+        yield* persistVerificationRunOnceDiagnostic(sql, "blocked-result", null);
+        assert.isNull((yield* read.getSnapshot({ projectId })).runs[0]?.errorCode);
+        yield* persistVerificationRunOnceDiagnostic(sql, "blocked-result", {
+          operation: "verification-admission",
+          reason: "admission-corrupt",
+        });
+        yield* sql`UPDATE agent_control_run_once_states SET status = 'completed'
+          WHERE run_id = ${runId}`;
+        yield* persistRunOnceDiagnostic(sql, projectId, null);
+        assert.deepStrictEqual((yield* read.getSnapshot({ projectId })).blockers, []);
+        yield* persistVerificationRunOnceDiagnostic(sql, "blocked-result", {
+          operation: "verification-admission",
+          reason: "admission-corrupt",
+        });
+        assert.deepStrictEqual((yield* read.getSnapshot({ projectId })).blockers, []);
 
         const checkInitial = yield* Deferred.make<void>();
         const checkChanged = yield* Deferred.make<AgentControlRunOnceSnapshot>();

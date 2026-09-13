@@ -47,7 +47,10 @@ import { loadAgentControlImplementationOrchestrationEvidence } from "../../imple
 import {
   deriveAgentControlAttemptId,
   deriveAgentControlStageRunId,
+  fingerprintAgentControlSourceIdentity,
 } from "../../stageRun/identity.ts";
+import { loadAgentControlVerificationTaskAuthorityInTransaction } from "../../verificationTurn/historicalAuthority.ts";
+import { persistVerificationRunOnceDiagnostic } from "../../runOnce/diagnostics.ts";
 import { AgentControlStageRunEngine } from "../../stageRun/Services/AgentControlStageRunEngine.ts";
 import { AgentControlStageRunEventStore } from "../../stageRun/Services/AgentControlStageRunEventStore.ts";
 import { AgentControlStageRunProjection } from "../../stageRun/Services/AgentControlStageRunProjection.ts";
@@ -1682,7 +1685,25 @@ const make = Effect.gen(function* () {
       candidate.taskId,
       reservationEvents,
     ).pipe(mapHistoryError("replay-reservation-history", "reservation-history-corrupt"));
+    // Intake refreshes and source recovery can establish the bound revision.
+    // Replay that revision with the same typed projector used by materialization;
+    // later task events must not replace the immutable source authority.
+    const taskAuthority = yield* loadAgentControlVerificationTaskAuthorityInTransaction(
+      sql,
+      candidate.taskId,
+      candidate.taskRevision,
+    ).pipe(mapHistoryError("replay-task-source", "task-history-corrupt"));
     if (
+      taskAuthority.state.source.projectId !== candidate.projectId ||
+      taskAuthority.state.status !== "candidate" ||
+      taskAuthority.state.stage !== "intake" ||
+      taskAuthority.state.sourceGate !== "eligible" ||
+      taskAuthority.state.githubIntakeSequence !== candidate.githubIntakeSequence ||
+      fingerprintAgentControlSourceIdentity(taskAuthority.state.source) !==
+        candidate.sourceIdentityFingerprint ||
+      taskAuthority.event.eventId !== claim.evidence.taskSourceEventId ||
+      taskAuthority.event.sequence !== claim.evidence.taskSourceEventSequence ||
+      taskAuthority.event.streamVersion !== claim.evidence.taskSourceEventStreamVersion ||
       verificationStageRunId !== text.stageRunId ||
       verificationAttemptId !== text.attemptId ||
       verificationControlledThreadReservationId !== text.reservationId ||
@@ -1708,7 +1729,7 @@ const make = Effect.gen(function* () {
         eventId: claim.evidence.taskSourceEventId,
         sequence: claim.evidence.taskSourceEventSequence,
         streamVersion: claim.evidence.taskSourceEventStreamVersion,
-        type: "agentControl.task.created",
+        type: taskAuthority.event.type,
       }) ||
       !hasBoundEvent(histories.worktree, {
         eventId: candidate.worktreeEventId,
@@ -2395,6 +2416,9 @@ const make = Effect.gen(function* () {
 
   const processSafely = (implementationResultEvidenceId: string) =>
     processResultEvidence(implementationResultEvidenceId).pipe(
+      Effect.tapError((cause) =>
+        persistVerificationRunOnceDiagnostic(sql, implementationResultEvidenceId, cause),
+      ),
       Effect.asVoid,
       Effect.catchIf(
         (cause) => candidateReasons.has(cause.reason),
