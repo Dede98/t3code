@@ -34,6 +34,9 @@ import {
   saveEpicRun,
 } from "../authority.ts";
 import { epicSourceChanges, selectEpicMember } from "../model.ts";
+import { makeEpicHandoff } from "../handoff.ts";
+import { EpicHandoffEvidence } from "../handoffAuthority.ts";
+import { EpicHandoffRemote } from "../remote.ts";
 
 const isEpicError = Schema.is(AgentControlEpicRpcError);
 const mapError = (cause: unknown) =>
@@ -738,10 +741,36 @@ export const makeAgentControlEpic = Effect.gen(function* () {
       )
       .pipe(Effect.mapError(mapError));
 
+  const handoffEvidence = yield* Effect.serviceOption(EpicHandoffEvidence);
+  const handoffRemote = yield* Effect.serviceOption(EpicHandoffRemote);
+  const unavailableHandoff = () =>
+    Effect.fail(
+      epicError("handoff-unavailable", "Epic publication is unavailable on this server."),
+    );
+  const handoff =
+    Option.isSome(handoffEvidence) && Option.isSome(handoffRemote)
+      ? yield* makeEpicHandoff({ onChange: publish, withProjectLock: locks.withPermit }).pipe(
+          Effect.provideService(EpicHandoffEvidence, handoffEvidence.value),
+          Effect.provideService(EpicHandoffRemote, handoffRemote.value),
+        )
+      : {
+          previewHandoff: unavailableHandoff,
+          publishHandoff: unavailableHandoff,
+          recoverPending: () => Effect.void,
+        };
+  yield* handoff.recoverPending().pipe(
+    Effect.catch(() =>
+      Effect.logWarning("Epic publication recovery could not load pending handoffs."),
+    ),
+    Effect.forkScoped,
+  );
+
   return AgentControlEpic.of({
     subscribeChanges: PubSub.subscribe(changes).pipe(Effect.map(Stream.fromSubscription)),
     get,
     preview,
+    previewHandoff: handoff.previewHandoff,
+    publishHandoff: handoff.publishHandoff,
     start,
     resume: (input) => control("resume", input),
     stop: (input) => control("stop", input),

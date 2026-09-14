@@ -516,6 +516,8 @@ const makeWsRpcLayer = (
         AgentControlEpic.of({
           get: unavailableEpic,
           preview: unavailableEpic,
+          previewHandoff: unavailableEpic,
+          publishHandoff: unavailableEpic,
           start: unavailableEpic,
           resume: unavailableEpic,
           stop: unavailableEpic,
@@ -1509,6 +1511,18 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             AGENT_CONTROL_EPIC_RPC_METHODS.preview,
             agentControlEpic.preview(input),
+            { "rpc.aggregate": "agent-control" },
+          ),
+        [AGENT_CONTROL_EPIC_RPC_METHODS.previewHandoff]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_EPIC_RPC_METHODS.previewHandoff,
+            agentControlEpic.previewHandoff(input),
+            { "rpc.aggregate": "agent-control" },
+          ),
+        [AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff,
+            agentControlEpic.publishHandoff(input),
             { "rpc.aggregate": "agent-control" },
           ),
         [AGENT_CONTROL_EPIC_RPC_METHODS.start]: (input) =>

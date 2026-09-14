@@ -35,6 +35,8 @@ type WsRpcMethod = RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"];
  */
 export const RPC_REQUIRED_SCOPES = {
   [AGENT_CONTROL_EPIC_RPC_METHODS.preview]: AuthOrchestrationReadScope,
+  [AGENT_CONTROL_EPIC_RPC_METHODS.previewHandoff]: AuthOrchestrationReadScope,
+  [AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff]: AuthAccessWriteScope,
   [AGENT_CONTROL_EPIC_RPC_METHODS.start]: AuthAccessWriteScope,
   [AGENT_CONTROL_EPIC_RPC_METHODS.resume]: AuthAccessWriteScope,
   [AGENT_CONTROL_EPIC_RPC_METHODS.stop]: AuthAccessWriteScope,

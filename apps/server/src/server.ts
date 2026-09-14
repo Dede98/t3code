@@ -2,6 +2,11 @@ import { AgentControlEpic } from "./agentControl/epic/Services/AgentControlEpic.
 import { AgentControlEpicProgress } from "./agentControl/epic/Services/AgentControlEpicProgress.ts";
 import { AgentControlEpicLive } from "./agentControl/epic/Layers/AgentControlEpic.ts";
 import { EpicResultsLive, EpicCheckExecutorLive } from "./agentControl/epic/results.ts";
+import {
+  EpicHandoffEvidence,
+  makeEpicHandoffEvidence,
+} from "./agentControl/epic/handoffAuthority.ts";
+import { EpicHandoffRemoteLive } from "./agentControl/epic/remote.ts";
 import { layer as EpicGithubClientLive } from "./agentControl/github/Layers/GithubIssueTrackerClient.ts";
 import { makeAgentControlRunOnceReadModel } from "./agentControl/runOnce/readModel.ts";
 import { AgentControlRunOnceReadModel } from "./agentControl/runOnce/Services/AgentControlRunOnceReadModel.ts";
@@ -814,6 +819,19 @@ const AgentControlRunOnceControllerServiceLayerLive = AgentControlRunOnceControl
 );
 
 const AgentControlEpicServiceLive = AgentControlEpicLive.pipe(
+  Layer.provide(
+    Layer.effect(EpicHandoffEvidence, makeEpicHandoffEvidence).pipe(
+      Layer.provide(AgentControlRuntimeServicesLayerLive),
+      Layer.provide(RuntimeCoreDependenciesBaseLive),
+    ),
+  ),
+  Layer.provide(
+    EpicHandoffRemoteLive.pipe(
+      Layer.provide(GitHubCli.layer),
+      Layer.provide(VcsProcess.layer),
+      Layer.provide(RuntimeCoreDependenciesBaseLive),
+    ),
+  ),
   Layer.provide(
     EpicResultsLive.pipe(
       Layer.provide(EpicCheckExecutorLive),

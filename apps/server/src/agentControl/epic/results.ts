@@ -538,6 +538,7 @@ export const makeEpicResults = Effect.gen(function* () {
                 ? ("failed" as const)
                 : ("blocked" as const),
           commitSha: input.commitSha,
+          manifestDigest: manifest.manifestDigest,
           evidenceId,
           detail: assessment.code ?? "All required checks passed on the common result.",
           checks,

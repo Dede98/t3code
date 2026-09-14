@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 import { AgentControlEpicSource } from "./agentControlEpic.ts";
 import { AgentControlVerificationChecks } from "./agentControl.ts";
+import { AgentControlGithubRepositoryBinding } from "./agentControlGithub.ts";
 
 import {
   AgentControlTaskId,
@@ -44,6 +45,7 @@ export const AgentControlEpicMemberView = Schema.Struct({
 });
 export type AgentControlEpicMemberView = typeof AgentControlEpicMemberView.Type;
 export const AgentControlEpicFinalVerification = Schema.Struct({
+  manifestDigest: Schema.optionalKey(Schema.String),
   status: Schema.Literals(["passed", "failed", "blocked"]),
   commitSha: Schema.String,
   evidenceId: Schema.String,
@@ -63,6 +65,31 @@ export const AgentControlEpicFinalVerification = Schema.Struct({
   ),
 });
 export type AgentControlEpicFinalVerification = typeof AgentControlEpicFinalVerification.Type;
+export const AgentControlEpicHandoffPullRequest = Schema.Struct({
+  number: PositiveInt,
+  url: Schema.String,
+  state: Schema.Literals(["open", "closed", "merged"]),
+  isDraft: Schema.Boolean,
+  headSha: Schema.String,
+  baseBranch: Schema.String,
+});
+export type AgentControlEpicHandoffPullRequest = typeof AgentControlEpicHandoffPullRequest.Type;
+export const AgentControlEpicHandoff = Schema.Struct({
+  intentId: Schema.String,
+  status: Schema.Literals(["publishing", "published", "blocked", "failed"]),
+  repository: AgentControlGithubRepositoryBinding,
+  targetBranch: Schema.String,
+  baseCommitSha: Schema.String,
+  commitSha: Schema.String,
+  branchName: Schema.String,
+  verificationEvidenceId: Schema.String,
+  branchCreationAttempted: Schema.optionalKey(Schema.Boolean),
+  requestedAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  pullRequest: Schema.NullOr(AgentControlEpicHandoffPullRequest),
+  error: Schema.NullOr(Schema.Struct({ code: Schema.String, message: Schema.String })),
+});
+export type AgentControlEpicHandoff = typeof AgentControlEpicHandoff.Type;
 export const AgentControlEpicRuntimeView = Schema.Struct({
   epicRunId: Schema.String,
   projectId: ProjectId,
@@ -92,6 +119,7 @@ export const AgentControlEpicRuntimeView = Schema.Struct({
   verificationAttempt: PositiveInt,
   finalVerification: Schema.NullOr(AgentControlEpicFinalVerification),
   finalVerificationHistory: Schema.Array(AgentControlEpicFinalVerification),
+  handoff: Schema.optionalKey(AgentControlEpicHandoff),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -115,12 +143,36 @@ export const AgentControlEpicControlInput = Schema.Struct({
   epicRunId: Schema.String,
 });
 export type AgentControlEpicControlInput = typeof AgentControlEpicControlInput.Type;
+export const AgentControlEpicHandoffPreviewInput = Schema.Struct({
+  projectId: ProjectId,
+  epicRunId: Schema.String,
+});
+export type AgentControlEpicHandoffPreviewInput = typeof AgentControlEpicHandoffPreviewInput.Type;
+export const AgentControlEpicHandoffPreview = Schema.Struct({
+  ...AgentControlEpicHandoffPreviewInput.fields,
+  repository: AgentControlGithubRepositoryBinding,
+  targetBranch: Schema.NullOr(Schema.String),
+  commitSha: Schema.NullOr(Schema.String),
+  branchName: Schema.NullOr(Schema.String),
+  canPublish: Schema.Boolean,
+  blockers: Schema.Array(AgentControlEpicBlocker),
+  handoff: Schema.NullOr(AgentControlEpicHandoff),
+});
+export type AgentControlEpicHandoffPreview = typeof AgentControlEpicHandoffPreview.Type;
+export const AgentControlEpicHandoffPublishInput = Schema.Struct({
+  ...AgentControlEpicControlInput.fields,
+  expectedCommitSha: Schema.String,
+  expectedTargetBranch: Schema.String,
+});
+export type AgentControlEpicHandoffPublishInput = typeof AgentControlEpicHandoffPublishInput.Type;
 export const AGENT_CONTROL_EPIC_RPC_METHODS = {
   preview: "agentControlEpic.preview",
   start: "agentControlEpic.start",
   resume: "agentControlEpic.resume",
   stop: "agentControlEpic.stop",
   clear: "agentControlEpic.clear",
+  previewHandoff: "agentControlEpic.previewHandoff",
+  publishHandoff: "agentControlEpic.publishHandoff",
 } as const;
 export class AgentControlEpicRpcError extends Schema.TaggedError<AgentControlEpicRpcError>()(
   "AgentControlEpicRpcError",

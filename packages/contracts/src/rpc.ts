@@ -6,6 +6,9 @@ import {
   AgentControlEpicPreview,
   AgentControlEpicRuntimeView,
   AgentControlEpicRpcError,
+  AgentControlEpicHandoffPreviewInput,
+  AgentControlEpicHandoffPreview,
+  AgentControlEpicHandoffPublishInput,
 } from "./agentControlEpicRuntime.ts";
 import {
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
@@ -486,6 +489,22 @@ export const WS_METHODS = {
   subscribeResourceTelemetry: "subscribeResourceTelemetry",
 } as const;
 
+export const WsAgentControlEpicHandoffPreviewRpc = Rpc.make(
+  AGENT_CONTROL_EPIC_RPC_METHODS.previewHandoff,
+  {
+    payload: AgentControlEpicHandoffPreviewInput,
+    success: AgentControlEpicHandoffPreview,
+    error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
+  },
+);
+export const WsAgentControlEpicHandoffPublishRpc = Rpc.make(
+  AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff,
+  {
+    payload: AgentControlEpicHandoffPublishInput,
+    success: AgentControlEpicRuntimeView,
+    error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
+  },
+);
 export const WsAgentControlEpicPreviewRpc = Rpc.make(AGENT_CONTROL_EPIC_RPC_METHODS.preview, {
   payload: AgentControlEpicPreviewInput,
   success: AgentControlEpicPreview,
@@ -1601,6 +1620,8 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
 
 export const WsRpcGroup = RpcGroup.make(
   WsAgentControlEpicPreviewRpc,
+  WsAgentControlEpicHandoffPreviewRpc,
+  WsAgentControlEpicHandoffPublishRpc,
   WsAgentControlEpicStartRpc,
   WsAgentControlEpicResumeRpc,
   WsAgentControlEpicStopRpc,

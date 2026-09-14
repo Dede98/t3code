@@ -8,6 +8,7 @@ import {
   AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS,
   AGENT_CONTROL_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
+  AGENT_CONTROL_EPIC_RPC_METHODS,
   AGENT_CONTROL_TASK_RPC_METHODS,
   AgentControlPolicyRevisionConflictError,
   AgentControlTaskId,
@@ -5408,6 +5409,39 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       }
 
       const writeWsUrl = yield* scopedWsUrl("access:write");
+      const handoffInput = {
+        projectId: defaultProjectId,
+        epicRunId: "epic-handoff-authorization",
+        commandId: CommandId.make("epic-handoff-authorization"),
+        expectedRevision: 0,
+        expectedCommitSha: "a".repeat(40),
+        expectedTargetBranch: "main",
+      };
+      for (const wsUrl of [readWsUrl, operateWsUrl]) {
+        const denied = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff](handoffInput),
+            ),
+          ),
+        );
+        assert.deepInclude(denied, {
+          _tag: "EnvironmentAuthorizationError",
+          requiredScope: "access:write",
+        });
+      }
+      // This test server omits the Epic runtime: only an authorized request can reach it.
+      const authorizedHandoff = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(writeWsUrl, (client) =>
+            client[AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff](handoffInput),
+          ),
+        ),
+      );
+      assert.deepInclude(authorizedHandoff, {
+        _tag: "AgentControlEpicRpcError",
+        code: "epic-runtime-unavailable",
+      });
       const writeResults = yield* Effect.scoped(
         withWsRpcClient(writeWsUrl, (client) =>
           Effect.all([

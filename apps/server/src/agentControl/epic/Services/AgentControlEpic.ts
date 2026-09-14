@@ -1,5 +1,8 @@
 import type {
   AgentControlEpicControlInput,
+  AgentControlEpicHandoffPreviewInput,
+  AgentControlEpicHandoffPreview,
+  AgentControlEpicHandoffPublishInput,
   AgentControlEpicPreview,
   AgentControlEpicPreviewInput,
   AgentControlEpicRpcError,
@@ -13,6 +16,12 @@ import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
 export interface AgentControlEpicShape {
+  readonly previewHandoff: (
+    input: AgentControlEpicHandoffPreviewInput,
+  ) => Effect.Effect<AgentControlEpicHandoffPreview, AgentControlEpicRpcError>;
+  readonly publishHandoff: (
+    input: AgentControlEpicHandoffPublishInput,
+  ) => Effect.Effect<AgentControlEpicRuntimeView, AgentControlEpicRpcError>;
   readonly subscribeChanges: Effect.Effect<Stream.Stream<ProjectId>, never, Scope.Scope>;
   readonly get: (
     projectId: ProjectId,

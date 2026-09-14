@@ -1,5 +1,6 @@
 import {
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
+  AGENT_CONTROL_EPIC_RPC_METHODS,
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
   AuthAccessWriteScope,
   AuthAdministrativeScopes,
@@ -16,6 +17,15 @@ import { describe, expect, it } from "@effect/vitest";
 import { RPC_REQUIRED_SCOPES, requiredScopeForRpcMethod } from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
+  it("requires explicit environment write access to publish an Epic result", () => {
+    const scope = requiredScopeForRpcMethod(AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff);
+    expect(scope).toBe(AuthAccessWriteScope);
+    expect(new Set<string>(AuthStandardClientScopes).has(scope)).toBe(false);
+    expect(new Set<string>(AuthAdministrativeScopes).has(scope)).toBe(true);
+    expect(requiredScopeForRpcMethod(AGENT_CONTROL_EPIC_RPC_METHODS.previewHandoff)).toBe(
+      AuthOrchestrationReadScope,
+    );
+  });
   it("keeps Run Once and intake changes administrative while standard clients can read runs", () => {
     const required = requiredScopeForRpcMethod(AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode);
     expect(required).toBe(AuthAccessWriteScope);
