@@ -415,4 +415,70 @@ describe("Epic handoff persistence and recovery", () => {
         assert.isFalse((yield* service.previewHandoff(request())).canPublish);
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
     );
+  it.effect("forgets a rejected branch attempt durably before retrying the same intent", () =>
+    Effect.gen(function* () {
+      yield* seed(initial());
+      let calls = 0;
+      let token: string | undefined;
+      const service = yield* build({
+        prepare: (input) => Effect.sync(() => assert.isFalse(input.branchCreationAttempted)),
+        publish: (input, hooks) =>
+          Effect.gen(function* () {
+            assert.isFalse(input.branchCreationAttempted);
+            if (token) assert.equal(input.ownershipToken, token);
+            token = input.ownershipToken;
+            calls++;
+            yield* hooks.beforeBranchCreate();
+            if (calls === 1)
+              return yield* new EpicHandoffRemoteError({
+                code: "remote-branch-rejected",
+                message: "Request rejected.",
+              });
+            return pr;
+          }),
+      });
+      const rejected = yield* service.publishHandoff(request());
+      assert.equal(rejected.handoff?.status, "failed");
+      assert.isFalse(rejected.handoff?.branchCreationAttempted);
+      assert.isTrue((yield* service.previewHandoff(request())).canPublish);
+      const saved = yield* loadEpicRun(yield* SqlClient.SqlClient, "run");
+      assert.isFalse(saved?.handoff?.branchCreationAttempted);
+      assert.equal((yield* service.publishHandoff(request())).handoff?.status, "published");
+      assert.equal(calls, 2);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+  it.effect("does not retain branch creation authority when saving the attempt fails", () =>
+    Effect.gen(function* () {
+      yield* seed(initial());
+      const sql = yield* SqlClient.SqlClient;
+      let writes = 0;
+      const withTransaction: SqlClient.SqlClient["withTransaction"] = (effect) =>
+        Effect.gen(function* () {
+          writes++;
+          if (writes === 2) yield* sql`SELECT missing_column FROM agent_control_epic_runs`;
+          return yield* sql.withTransaction(effect);
+        });
+      const controlledSql = new Proxy(sql, {
+        get: (target, key, receiver) =>
+          key === "withTransaction" ? withTransaction : Reflect.get(target, key, receiver),
+      });
+      let remoteCreates = 0;
+      const service = yield* build({
+        prepare: () => Effect.void,
+        publish: (input, hooks) =>
+          Effect.gen(function* () {
+            assert.isFalse(input.branchCreationAttempted);
+            yield* hooks.beforeBranchCreate();
+            remoteCreates++;
+            return pr;
+          }),
+      }).pipe(Effect.provideService(SqlClient.SqlClient, controlledSql));
+      const failed = yield* service.publishHandoff(request());
+      assert.equal(failed.handoff?.error?.code, "handoff-persistence-failed");
+      assert.isFalse(failed.handoff?.branchCreationAttempted);
+      assert.equal(remoteCreates, 0);
+      assert.equal((yield* service.publishHandoff(request())).handoff?.status, "published");
+      assert.equal(remoteCreates, 1);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
 });

@@ -131,6 +131,9 @@ const setup = Effect.gen(function* () {
     denyWrite: false,
     repositoryId: "repo-node",
     collisionOnCreate: false,
+    opaqueCollisionOnCreate: false,
+    transientRejectionOnCreate: false,
+    transientRejectionStatus: 422,
   };
   const failure = (command: string) =>
     new VcsProcessSpawnError({
@@ -147,7 +150,17 @@ const setup = Effect.gen(function* () {
           if (request.command === "gh") {
             state.branchCreates++;
             if (state.collisionOnCreate)
-              return output("HTTP/2.0 422 Unprocessable Entity\n\n{}", 1);
+              return output(
+                `HTTP/2.0 422 Unprocessable Entity\n\n${encodeJson({ message: "Reference already exists" })}`,
+                1,
+              );
+            if (state.transientRejectionOnCreate) {
+              state.transientRejectionOnCreate = false;
+              return output(
+                `HTTP/2.0 ${state.transientRejectionStatus} Rejected\n\n${encodeJson({ message: "Request rejected." })}`,
+                1,
+              );
+            }
             const body = decodeRefRequest(request.stdin!);
             await runGit(bare, [
               "update-ref",
@@ -155,6 +168,8 @@ const setup = Effect.gen(function* () {
               body.sha,
               "0000000000000000000000000000000000000000",
             ]);
+            if (state.opaqueCollisionOnCreate)
+              return output("HTTP/2.0 422 Unprocessable Entity\n\n{}", 1);
             if (state.loseBranchReply) {
               state.loseBranchReply = false;
               throw new Error("lost");
@@ -316,6 +331,43 @@ it.layer(NodeServices.layer)("Epic handoff remote", (it) => {
       f.state.collisionOnCreate = true;
       expect((yield* Effect.flip(f.publish())).code).toBe("remote-branch-collision");
       expect(f.state.prCreates).toBe(0);
+    }),
+  );
+  it.effect("reconciles an opaque create-ref rejection as a collision when the branch exists", () =>
+    Effect.gen(function* () {
+      const f = yield* setup;
+      f.state.opaqueCollisionOnCreate = true;
+      expect((yield* Effect.flip(f.publish())).code).toBe("remote-branch-rejected");
+      f.state.attempted = false;
+      expect((yield* Effect.flip(f.publish())).code).toBe("remote-branch-collision");
+      expect(f.state.prCreates).toBe(0);
+    }),
+  );
+  for (const status of [403, 422])
+    it.effect(`retries a create-ref ${status} with the same uploaded result and branch`, () =>
+      Effect.gen(function* () {
+        const f = yield* setup;
+        f.state.transientRejectionOnCreate = true;
+        f.state.transientRejectionStatus = status;
+        expect((yield* Effect.flip(f.publish())).code).toBe("remote-branch-rejected");
+        f.state.attempted = false;
+        expect(f.state.prCreates).toBe(0);
+        expect(
+          yield* f.remoteGit(["for-each-ref", "--format=%(refname)", "refs/heads/t3auto/"]),
+        ).toBe("");
+        expect((yield* f.publish()).headSha).toBe(f.input.commitSha);
+        expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([1, 2, 1]);
+      }),
+    );
+  it.effect("blocks a foreign same-commit branch appearing after a rejected creation", () =>
+    Effect.gen(function* () {
+      const f = yield* setup;
+      f.state.transientRejectionOnCreate = true;
+      expect((yield* Effect.flip(f.publish())).code).toBe("remote-branch-rejected");
+      f.state.attempted = false;
+      yield* f.remoteGit(["update-ref", `refs/heads/${f.input.branchName}`, f.input.commitSha]);
+      expect((yield* Effect.flip(f.publish())).code).toBe("remote-branch-collision");
+      expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([1, 1, 0]);
     }),
   );
   for (const state of ["closed", "merged"] as const)

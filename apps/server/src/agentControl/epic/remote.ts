@@ -85,6 +85,9 @@ const CreatedRef = Schema.Struct({
   ref: Schema.String,
   object: Schema.Struct({ sha: Schema.String }),
 });
+const decodeRejection = Schema.decodeUnknownOption(
+  Schema.fromJsonString(Schema.Struct({ message: Schema.String })),
+);
 const marker = (input: EpicHandoffRemoteAuthority) =>
   `<!-- t3auto-epic-handoff:${input.ownershipToken} -->`;
 const tagRef = (input: EpicHandoffRemoteAuthority) =>
@@ -204,24 +207,44 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
           ),
         ),
       );
+    const separator = /\r?\n\r?\n/.exec(result.stdout);
+    const responseBody = separator
+      ? result.stdout.slice(separator.index + separator[0].length)
+      : "";
     if (result.exitCode !== 0) {
-      if (/^HTTP\/[\d.]+ 422\b/m.test(result.stdout) || /HTTP 422/.test(result.stderr))
+      const status = Number(
+        /^HTTP\/[\d.]+ (\d{3})\b/m.exec(result.stdout)?.[1] ??
+          /HTTP (\d{3})\b/.exec(result.stderr)?.[1],
+      );
+      if ([400, 401, 403, 404, 409, 422, 429].includes(status)) {
+        // 422 also covers validation and spam protection. Retain the known
+        // rejection before any further network work can lose that distinction.
+        const rejection = decodeRejection(responseBody);
+        const explicitCollision =
+          status === 422 &&
+          Option.isSome(rejection) &&
+          rejection.value.message === "Reference already exists";
+        if (explicitCollision)
+          return yield* failure(
+            "remote-branch-collision",
+            "GitHub rejected creation of the occupied handoff branch. Nothing was overwritten.",
+          );
         return yield* failure(
-          "remote-branch-collision",
-          "GitHub rejected creation of the handoff branch. Its name may already be occupied; nothing was overwritten.",
+          "remote-branch-rejected",
+          "GitHub rejected branch creation. Retry to check its validation or access restrictions and reconcile the same branch name.",
         );
+      }
       return yield* failure(
         "remote-unavailable",
         "GitHub did not confirm branch creation. Retry to reconcile the same handoff.",
       );
     }
-    const separator = /\r?\n\r?\n/.exec(result.stdout);
     if (!separator)
       return yield* failure(
         "remote-response-invalid",
         "GitHub returned an incomplete branch response. Retry to reconcile its state.",
       );
-    return result.stdout.slice(separator.index + separator[0].length);
+    return responseBody;
   });
   const decode = <S extends Schema.Constraint>(schema: S, raw: string) =>
     Schema.decodeEffect(Schema.fromJsonString(schema))(raw).pipe(

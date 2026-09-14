@@ -265,12 +265,19 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
           ...handoff,
           status: [
             "remote-unavailable",
+            "remote-branch-rejected",
             "remote-response-invalid",
             "handoff-unavailable",
             "handoff-persistence-failed",
           ].includes(failure.code)
             ? "failed"
             : "blocked",
+          // A known rejection cannot authorize adopting a branch that appears later.
+          branchCreationAttempted:
+            failure.code === "remote-branch-rejected" ||
+            failure.code === "handoff-persistence-failed"
+              ? false
+              : (handoff.branchCreationAttempted ?? false),
           updatedAt: yield* now,
           error: failure,
         });
