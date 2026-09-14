@@ -248,7 +248,221 @@ const finalInput = (accepted: AgentControlEpicAcceptedResult): AgentControlEpicV
   },
 });
 
+const configureResultFilter = Effect.fn("configureResultFilter")(function* (
+  repo: Repo,
+  reversible = false,
+) {
+  yield* io(() =>
+    NodeFSP.writeFile(
+      NodePath.join(repo.cwd, ".git", "info", "attributes"),
+      "source.txt filter=change-result\n",
+    ),
+  );
+  const script = NodePath.join(repo.root, "filter.cjs");
+  yield* io(() =>
+    NodeFSP.writeFile(
+      script,
+      "const fs = require('node:fs'); process.stdout.write(fs.readFileSync(0, 'utf8').replaceAll(process.argv[2], process.argv[3]));",
+    ),
+  );
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  const command = `${quote(process.execPath)} ${quote(script)}`;
+  yield* git(repo.cwd, [
+    "config",
+    "filter.change-result.clean",
+    `${command} 'accepted A' 'unverified B'`,
+  ]);
+  if (reversible)
+    yield* git(repo.cwd, [
+      "config",
+      "filter.change-result.smudge",
+      `${command} 'unverified B' 'accepted A'`,
+    ]);
+});
+
 describe("Epic accepted results and common verification", () => {
+  it.effect(
+    "rejects a captured tree that materializes different files after Git clean filtering",
+    () =>
+      Effect.gen(function* () {
+        const repo = yield* repository;
+        yield* configureResultFilter(repo);
+        yield* session(
+          repo,
+          Effect.gen(function* () {
+            yield* initialize(repo);
+            const hooks = yield* makeEpicResults;
+            const error = yield* hooks.capture(captureInput).pipe(Effect.flip);
+            expect(error.message).toContain("Git checkout would change the verified files");
+            expect(yield* git(repo.cwd, ["rev-parse", "HEAD"])).toBe(repo.base);
+            const sql = yield* SqlClient.SqlClient;
+            expect((yield* sql`SELECT * FROM agent_control_epic_capture_intents`).length).toBe(0);
+          }),
+        );
+      }),
+  );
+  it.effect("retains reversible filters whose next checkout preserves verified bytes", () =>
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      yield* configureResultFilter(repo, true);
+      yield* session(
+        repo,
+        Effect.gen(function* () {
+          yield* initialize(repo);
+          const hooks = yield* makeEpicResults;
+          const accepted = yield* hooks.capture(captureInput);
+          const next = NodePath.join(repo.root, "next-task");
+          yield* git(repo.cwd, ["worktree", "add", "--detach", next, accepted.commitSha]);
+          expect(yield* io(() => NodeFSP.readFile(NodePath.join(next, "source.txt"), "utf8"))).toBe(
+            "accepted A\n",
+          );
+          expect(yield* hooks.capture(captureInput)).toEqual(accepted);
+        }),
+      );
+    }),
+  );
+  it.effect("resolves checkout attributes from the captured index instead of source files", () =>
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      yield* configureResultFilter(repo, true);
+      yield* io(() =>
+        NodeFSP.writeFile(
+          NodePath.join(repo.cwd, ".git", "info", "attributes"),
+          ".gitattributes filter=attrs\n",
+        ),
+      );
+      yield* io(() =>
+        NodeFSP.writeFile(
+          NodePath.join(repo.cwd, ".gitattributes"),
+          "source.txt filter=change-result\n",
+        ),
+      );
+      const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+      const command = `${quote(process.execPath)} ${quote(NodePath.join(repo.root, "filter.cjs"))}`;
+      yield* git(repo.cwd, [
+        "config",
+        "filter.attrs.clean",
+        `${command} 'filter=change-result' '-filter'`,
+      ]);
+      yield* git(repo.cwd, [
+        "config",
+        "filter.attrs.smudge",
+        `${command} '-filter' 'filter=change-result'`,
+      ]);
+      yield* session(
+        repo,
+        Effect.gen(function* () {
+          yield* initialize(repo);
+          const hooks = yield* makeEpicResults;
+          const error = yield* hooks.capture(captureInput).pipe(Effect.flip);
+          expect(error.message).toContain("Git checkout would change the verified files");
+          expect(yield* git(repo.cwd, ["rev-parse", "HEAD"])).toBe(repo.base);
+          const sql = yield* SqlClient.SqlClient;
+          expect((yield* sql`SELECT * FROM agent_control_epic_capture_intents`).length).toBe(0);
+        }),
+      );
+    }),
+  );
+  it.effect(
+    "rejects a post-check raw edit hidden by the clean filter even when checkout matches",
+    () =>
+      Effect.gen(function* () {
+        const repo = yield* repository;
+        yield* configureResultFilter(repo);
+        yield* session(
+          repo,
+          Effect.gen(function* () {
+            yield* initialize(repo);
+            const canonicalBefore = yield* git(repo.cwd, ["diff", "HEAD", "--", "source.txt"]);
+            yield* io(() =>
+              NodeFSP.writeFile(NodePath.join(repo.cwd, "source.txt"), "unverified B\n"),
+            );
+            expect(yield* git(repo.cwd, ["diff", "HEAD", "--", "source.txt"])).toBe(
+              canonicalBefore,
+            );
+            const hooks = yield* makeEpicResults;
+            const error = yield* hooks.capture(captureInput).pipe(Effect.flip);
+            expect(error.message).toContain("no longer matches its accepted mandatory checks");
+            expect(yield* git(repo.cwd, ["rev-parse", "HEAD"])).toBe(repo.base);
+            const sql = yield* SqlClient.SqlClient;
+            expect((yield* sql`SELECT * FROM agent_control_epic_capture_intents`).length).toBe(0);
+          }),
+        );
+      }),
+  );
+  it.effect("revalidates checkout bytes when recovering a published capture intent", () =>
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      yield* configureResultFilter(repo, true);
+      yield* session(
+        repo,
+        Effect.gen(function* () {
+          yield* initialize(repo);
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TRIGGER simulate_crash BEFORE INSERT ON agent_control_epic_capture_results BEGIN SELECT RAISE(ABORT,'simulated crash'); END`;
+          const hooks = yield* makeEpicResults;
+          yield* hooks.capture(captureInput).pipe(Effect.flip);
+          expect((yield* sql`SELECT * FROM agent_control_epic_capture_intents`).length).toBe(1);
+          yield* sql`DROP TRIGGER simulate_crash`;
+          yield* git(repo.cwd, ["config", "--unset", "filter.change-result.smudge"]);
+          const recovered = yield* makeEpicResults;
+          const error = yield* recovered.capture(captureInput).pipe(Effect.flip);
+          expect(error.message).toContain("Git checkout would change the verified files");
+          expect((yield* sql`SELECT * FROM agent_control_epic_capture_results`).length).toBe(0);
+        }),
+      );
+    }),
+  );
+  it.effect("rejects checkout conversion changes made during otherwise green final checks", () =>
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      yield* configureResultFilter(repo, true);
+      yield* session(
+        repo,
+        Effect.gen(function* () {
+          yield* initialize(repo);
+          const hooks = yield* makeEpicResults.pipe(
+            Effect.provideService(EpicCheckExecutor, {
+              execute: () =>
+                git(repo.cwd, ["config", "--unset", "filter.change-result.smudge"]).pipe(
+                  Effect.orDie,
+                  Effect.as(success),
+                ),
+            }),
+          );
+          const accepted = yield* hooks.capture(captureInput);
+          const error = yield* hooks.verify(finalInput(accepted)).pipe(Effect.flip);
+          expect(error.message).toContain("Git checkout would change the verified files");
+          const sql = yield* SqlClient.SqlClient;
+          expect(
+            (yield* sql`SELECT status FROM agent_control_verification_check_results WHERE provider_delivery_id='epic-final:epic-1:1'`)[0]
+              ?.status,
+          ).toBe("passed");
+        }),
+      );
+    }),
+  );
+  it.effect("does not adopt a legacy intent or capture receipt without raw-file evidence", () =>
+    testWithRepo((repo) =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const tree = yield* git(repo.cwd, ["rev-parse", "HEAD^{tree}"]);
+        yield* sql`INSERT INTO agent_control_epic_capture_intents VALUES (${captureInput.childRunId},${captureInput.epicRunId},${captureInput.projectId},${canonicalJson({ ...captureInput })},${repo.base},${repo.base},${tree},'legacy-digest','legacy-manifest',${at})`;
+        const hooks = yield* makeEpicResults;
+        const intentError = yield* hooks.capture(captureInput).pipe(Effect.flip);
+        expect(intentError.message).toContain("predates raw-file verification");
+        const resultJson = canonicalJson({
+          commitSha: repo.base,
+          treeSha: tree,
+          codeDigest: "legacy-digest",
+          evidenceId: "legacy-evidence",
+        });
+        yield* sql`INSERT INTO agent_control_epic_capture_results VALUES (${captureInput.childRunId},${resultJson},${sha256Utf8(resultJson)},${at})`;
+        const receiptError = yield* hooks.capture(captureInput).pipe(Effect.flip);
+        expect(receiptError.message).toContain("predates raw-file verification");
+      }),
+    ),
+  );
   it.effect(
     "drains an in-flight Git mutation before releasing capture ownership on interruption",
     () =>

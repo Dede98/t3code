@@ -165,6 +165,36 @@ describe("Epic dependency policy", () => {
       [],
     );
   });
+  it("ignores dependency response order while retaining membership order and edges", () => {
+    const frozen = {
+      ...source,
+      tasks: source.tasks.map((task) =>
+        task.issue.number === 3 ? { ...task, dependencies: [issue(2), issue(4)] } : task,
+      ),
+    };
+    const state = { ...initial(), source: frozen };
+    const reordered = {
+      ...frozen,
+      tasks: frozen.tasks.map((task) => ({
+        ...task,
+        dependencies: task.dependencies.toReversed(),
+      })),
+    };
+    assert.deepEqual(epicSourceChanges(state, reordered), []);
+    assert.equal(
+      epicSourceChanges(state, { ...reordered, tasks: reordered.tasks.toReversed() })[0]?.code,
+      "scope-changed",
+    );
+    assert.equal(
+      epicSourceChanges(state, {
+        ...reordered,
+        tasks: reordered.tasks.map((task) =>
+          task.issue.number === 3 ? { ...task, dependencies: [issue(2)] } : task,
+        ),
+      })[0]?.code,
+      "scope-changed",
+    );
+  });
 });
 
 describe("Epic persistence and existing selection", () => {

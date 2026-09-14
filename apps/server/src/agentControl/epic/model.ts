@@ -21,7 +21,10 @@ export const epicStructureDigest = (source: AgentControlEpicSource) =>
     tasks: source.tasks.map((task) => ({
       issue: identity(task.issue),
       position: task.position,
-      dependencies: task.dependencies.map(identity),
+      // GitHub dependency response order does not define execution order.
+      dependencies: task.dependencies
+        .map(identity)
+        .toSorted((a, b) => a.issueNodeId.localeCompare(b.issueNodeId)),
     })),
   });
 

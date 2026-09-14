@@ -1,5 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -30,6 +32,7 @@ import {
   assessVerificationChecks,
   executeVerificationCheck,
   snapshotVerificationCode,
+  VERIFICATION_CODE_SNAPSHOT_PREFIX,
   type VerificationCheckCommandResult,
   type VerificationCheckManifest,
 } from "../verificationTurn/checkEvidence.ts";
@@ -71,6 +74,67 @@ const git = (cwd: string, args: readonly string[], env?: NodeJS.ProcessEnv) =>
 const decodeAccepted = Schema.decodeUnknownEffect(
   Schema.fromJsonString(AgentControlEpicAcceptedResult),
 );
+
+const rawFileDigest = async (path: string) => {
+  const file = await NodeFSP.open(
+    path,
+    NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW | NodeFS.constants.O_NONBLOCK,
+  );
+  try {
+    if (!(await file.stat()).isFile()) throw fail("The captured file type changed.");
+    const hash = NodeCrypto.createHash("sha256");
+    for await (const chunk of file.createReadStream({ autoClose: false })) hash.update(chunk);
+    return hash.digest("hex");
+  } finally {
+    await file.close();
+  }
+};
+
+/** A clean Git status can hide a lossy clean/smudge conversion. Check the next checkout's bytes. */
+const verifyMaterializedIndex = Effect.fn("verifyMaterializedEpicIndex")(function* (
+  cwd: string,
+  temporary: string,
+  indexEnv: NodeJS.ProcessEnv,
+) {
+  const materialized = yield* Effect.tryPromise(() =>
+    NodeFSP.mkdtemp(NodePath.join(temporary, "materialized-")),
+  );
+  const gitDir = yield* git(cwd, ["rev-parse", "--absolute-git-dir"]);
+  // Resolve attributes from the empty destination and captured index, as a fresh
+  // worktree does. --prefix alone would reuse potentially different source attrs.
+  yield* git(
+    materialized,
+    ["--git-dir", gitDir, "--work-tree", materialized, "checkout-index", "--all"],
+    indexEnv,
+  );
+  const entries = (yield* git(cwd, ["ls-files", "--stage", "-z"], indexEnv))
+    .split("\0")
+    .filter(Boolean);
+  const matches = yield* Effect.tryPromise(async () => {
+    for (const entry of entries) {
+      const name = entry.slice(entry.indexOf("\t") + 1);
+      const source = NodePath.join(cwd, name);
+      const retained = NodePath.join(materialized, name);
+      const [before, after] = await Promise.all([NodeFSP.lstat(source), NodeFSP.lstat(retained)]);
+      if (before.isSymbolicLink() && after.isSymbolicLink()) {
+        if ((await NodeFSP.readlink(source)) !== (await NodeFSP.readlink(retained))) return false;
+      } else if (
+        !before.isFile() ||
+        !after.isFile() ||
+        (before.mode & 0o111) !== (after.mode & 0o111) ||
+        before.size !== after.size ||
+        (await rawFileDigest(source)) !== (await rawFileDigest(retained))
+      ) {
+        return false;
+      }
+    }
+    return true;
+  });
+  if (!matches)
+    return yield* fail(
+      "Git checkout would change the verified files. Resolve the file conversion before accepting this result.",
+    );
+});
 
 const decodeCodexSettings = Schema.decodeUnknownEffect(CodexSettings);
 const isEpicRpcError = Schema.is(AgentControlEpicRpcError);
@@ -205,6 +269,17 @@ export const makeEpicResults = Effect.gen(function* () {
         let intent = (yield* readIntent(input.childRunId))[0];
         if (intent && intent.inputJson !== inputJson)
           return yield* fail("The result capture belongs to another Epic or base.");
+        if (intent && !intent.codeDigest.startsWith(VERIFICATION_CODE_SNAPSHOT_PREFIX))
+          return yield* fail(
+            "This result predates raw-file verification evidence and cannot be accepted automatically. Review the saved evidence and end the affected Epic run.",
+          );
+        const temp = yield* Effect.acquireRelease(
+          Effect.tryPromise(() =>
+            NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-epic-index-")),
+          ),
+          (path) => Effect.promise(() => NodeFSP.rm(path, { recursive: true, force: true })),
+        );
+        const indexEnv = { GIT_INDEX_FILE: NodePath.join(temp, "index") };
         const prior = yield* sql<{
           resultJson: string;
           resultDigest: string;
@@ -218,6 +293,8 @@ export const makeEpicResults = Effect.gen(function* () {
             (yield* git(cwd, ["rev-parse", `${result.commitSha}^{tree}`])) !== result.treeSha
           )
             return yield* fail("Accepted result commit is unavailable.");
+          yield* git(cwd, ["read-tree", result.commitSha], indexEnv);
+          yield* verifyMaterializedIndex(cwd, temp, indexEnv);
           return result;
         }
         if (!intent) {
@@ -255,16 +332,10 @@ export const makeEpicResults = Effect.gen(function* () {
           const submodules = yield* git(cwd, ["submodule", "status", "--recursive"]);
           if (submodules)
             return yield* fail("Epic result capture does not yet support submodule worktrees.");
-          const temp = yield* Effect.acquireRelease(
-            Effect.tryPromise(() =>
-              NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-epic-index-")),
-            ),
-            (path) => Effect.promise(() => NodeFSP.rm(path, { recursive: true, force: true })),
-          );
-          const indexEnv = { GIT_INDEX_FILE: NodePath.join(temp, "index") };
           yield* git(cwd, ["read-tree", "HEAD"], indexEnv);
           yield* git(cwd, ["add", "--all", "--", "."], indexEnv);
           const treeSha = yield* git(cwd, ["write-tree"], indexEnv);
+          yield* verifyMaterializedIndex(cwd, temp, indexEnv);
           const commitSha = yield* git(
             cwd,
             [
@@ -296,6 +367,9 @@ export const makeEpicResults = Effect.gen(function* () {
             manifestDigest: assessment.digest,
             createdAt: proof.finalizedAt,
           };
+        } else {
+          yield* git(cwd, ["read-tree", intent.commitSha], indexEnv);
+          yield* verifyMaterializedIndex(cwd, temp, indexEnv);
         }
         const currentHead = yield* git(cwd, ["rev-parse", "HEAD"]);
         if (currentHead === intent.sourceHead) {
@@ -340,6 +414,12 @@ export const makeEpicResults = Effect.gen(function* () {
       member.accepted?.commitSha !== input.commitSha
     )
       return Effect.fail(fail("The final accepted result is incomplete."));
+    if (!member.accepted.codeDigest.startsWith(VERIFICATION_CODE_SNAPSHOT_PREFIX))
+      return Effect.fail(
+        fail(
+          "The accepted result predates raw-file verification evidence. Review the saved evidence and end the affected Epic run.",
+        ),
+      );
     const captureInput = {
       epicRunId: input.epicRunId,
       projectId: input.projectId,
@@ -363,6 +443,15 @@ export const makeEpicResults = Effect.gen(function* () {
             return yield* fail("The common result changed during final verification.");
         });
         yield* authorize;
+        const temporary = yield* Effect.acquireRelease(
+          Effect.tryPromise(() =>
+            NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-epic-final-index-")),
+          ),
+          (path) => Effect.promise(() => NodeFSP.rm(path, { recursive: true, force: true })),
+        );
+        const indexEnv = { GIT_INDEX_FILE: NodePath.join(temporary, "index") };
+        yield* git(cwd, ["read-tree", input.commitSha], indexEnv);
+        yield* verifyMaterializedIndex(cwd, temporary, indexEnv);
         const documents = yield* sql<{
           codeDigest: string;
           checksJson: string;
@@ -403,6 +492,7 @@ export const makeEpicResults = Effect.gen(function* () {
             }),
           });
         }
+        yield* verifyMaterializedIndex(cwd, temporary, indexEnv);
         const assessment = yield* assessVerificationChecks(sql, {
           evidence: {
             providerDeliveryId: evidenceId,

@@ -98,7 +98,9 @@ Tasks run sequentially through the existing stages and bounded repair. Each next
 from the previous task's verified, accepted commit. The Epic succeeds only after the required
 checks pass again on the combined result. Current mandatory-check execution requires a Codex
 verification route; Planning and Implementation keep their configured routes and fallbacks.
-No changes are pushed and no GitHub issues are closed or commented on.
+Git file conversions must preserve the checked files when the accepted commit is checked out again.
+Conversions that change those files block acceptance. No changes are pushed and no GitHub issues
+are closed or commented on.
 
 Reloads and server restarts retain the same Epic run. Membership or dependency changes block it
 instead of silently changing scope. Resolve a transient blocker and resume the saved run, or end

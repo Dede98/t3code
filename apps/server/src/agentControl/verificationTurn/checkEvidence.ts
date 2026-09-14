@@ -2,6 +2,7 @@ import { AgentControlRunOnceReadNotifications } from "../runOnce/readNotificatio
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
@@ -47,6 +48,21 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
     hash.update(":");
     hash.update(value);
   };
+  const addFile = async (path: string, size: number) => {
+    const file = await NodeFSP.open(
+      path,
+      NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW | NodeFS.constants.O_NONBLOCK,
+    );
+    try {
+      if (!(await file.stat()).isFile())
+        throw failure("Verification encountered an unsupported file type.");
+      hash.update(String(size));
+      hash.update(":");
+      for await (const chunk of file.createReadStream({ autoClose: false })) hash.update(chunk);
+    } finally {
+      await file.close();
+    }
+  };
   add(await git(["rev-parse", "HEAD"]));
   add(
     await git([
@@ -68,12 +84,36 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
     const stat = await NodeFSP.lstat(path);
     add(name);
     add(String(stat.mode));
-    add(stat.isSymbolicLink() ? await NodeFSP.readlink(path) : await NodeFSP.readFile(path));
+    if (stat.isSymbolicLink()) add(await NodeFSP.readlink(path));
+    else await addFile(path, stat.size);
   }
-  const gitlinks = (await git(["ls-files", "--stage", "-z"]))
+  const tracked = (await git(["ls-files", "--stage", "-z"]))
     .toString("utf8")
     .split("\0")
-    .filter((entry) => entry.startsWith("160000 "));
+    .filter(Boolean)
+    .sort();
+  // Git diff applies clean filters and can hide different bytes from the checks.
+  // Bind the files themselves, including executable permissions and symlink targets.
+  for (const entry of tracked) {
+    if (entry.startsWith("160000 ")) continue;
+    const name = entry.slice(entry.indexOf("\t") + 1);
+    const path = NodePath.join(cwd, name);
+    const stat = await NodeFSP.lstat(path).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code === "ENOENT" || cause.code === "ENOTDIR") return null;
+      throw cause;
+    });
+    add(name);
+    if (stat === null) {
+      add("missing");
+      continue;
+    }
+    add(String(stat.mode));
+    if (stat.isSymbolicLink()) add(await NodeFSP.readlink(path));
+    else if (stat.isFile()) await addFile(path, stat.size);
+    else if (stat.isDirectory()) add("directory");
+    else throw failure("Verification encountered an unsupported tracked file type.");
+  }
+  const gitlinks = tracked.filter((entry) => entry.startsWith("160000 "));
   for (const entry of gitlinks) {
     const name = entry.slice(entry.indexOf("\t") + 1);
     const path = NodePath.join(cwd, name);
@@ -91,8 +131,14 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
   }
   return hash.digest("hex");
 };
+// Legacy digests did not bind raw tracked bytes. Equality deliberately invalidates
+// in-flight legacy proofs; persisted historical evidence is never rewritten.
+export const VERIFICATION_CODE_SNAPSHOT_PREFIX = "raw-v2:";
 export const snapshotVerificationCode = (cwd: string) =>
-  Effect.tryPromise({ try: () => readVerificationSnapshot(cwd), catch: failure });
+  Effect.tryPromise({
+    try: async () => VERIFICATION_CODE_SNAPSHOT_PREFIX + (await readVerificationSnapshot(cwd)),
+    catch: failure,
+  });
 
 export interface VerificationCheckClaim {
   readonly evidence: {
