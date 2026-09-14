@@ -99,8 +99,8 @@ from the previous task's verified, accepted commit. The Epic succeeds only after
 checks pass again on the combined result. Current mandatory-check execution requires a Codex
 verification route; Planning and Implementation keep their configured routes and fallbacks.
 Git file conversions must preserve the checked files when the accepted commit is checked out again.
-Conversions that change those files block acceptance. No changes are pushed and no GitHub issues
-are closed or commented on.
+Conversions that change those files block acceptance. Completion does not publish changes or
+close or comment on GitHub issues.
 
 Reloads and server restarts retain the same Epic run. Membership or dependency changes block it
 instead of silently changing scope. Resolve a transient blocker and resume the saved run, or end
@@ -109,6 +109,15 @@ exhausted repair requires inspection and ending that Epic; resuming does not era
 old execution. Turning automation off prevents additional task starts. Accepted commits, child
 threads and checks remain available for review. A completed Epic never moves on to unrelated
 issues automatically.
+
+After successful common-result verification, choose **Review publication** in the Epic panel.
+Review the repository, target branch and verified commit, then choose **Create Draft PR** to publish
+that exact result for human review. This requires administrative access to the selected environment
+and its GitHub credentials. Publication uses a branch dedicated to the Epic run and does not start
+another model turn. Repository or target-branch changes can block publication until resolved.
+If interrupted, retry the same handoff; T3 Code checks the existing branch and pull request first.
+The saved PR remains available after reload and under previous Epics. A closed or merged PR is
+never replaced automatically, and a publication failure retains the local result and its evidence.
 
 ## Project icons
 

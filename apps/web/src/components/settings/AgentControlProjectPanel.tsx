@@ -14,6 +14,7 @@ import {
   agentControlEndBlockedRunInput,
   agentControlCanEndBlockedRun,
   agentControlModeChangeBlocker,
+  agentControlEpicHandoffPermissionBlocker,
   agentControlSnapshotReady,
   agentControlSnapshotFresh,
   agentControlStartBlockers,
@@ -374,6 +375,10 @@ function AgentControlProjectPanelContent({
           environmentId={environmentId}
           projectId={projectId}
           readiness={readiness}
+          handoffPermissionBlocker={
+            agentControlEpicHandoffPermissionBlocker(sessionResult) ??
+            (!fresh ? "Checking current state and permissions in this environment." : null)
+          }
           onRefresh={() => {
             refreshSnapshot();
             refreshPreflight();

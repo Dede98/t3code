@@ -8,6 +8,7 @@ import {
   type AgentControlRunOnceSnapshotInput,
   AgentControlEpicRpcError,
   type AgentControlEpicStartInput,
+  type AgentControlEpicHandoffPublishInput,
   AgentControlCommandPreviouslyRejectedError,
   AgentControlProjectRevisionConflictError,
   CommandId,
@@ -68,6 +69,12 @@ type EpicCall = {
   response: Deferred.Deferred<never, AgentControlEpicRpcError>;
 };
 
+type HandoffCall = {
+  environmentId: EnvironmentId;
+  input: AgentControlEpicHandoffPublishInput;
+  response: Deferred.Deferred<never, AgentControlEpicRpcError>;
+};
+
 function confirmed(input: AgentControlSetProjectModeInput): AgentControlSetProjectModeResult {
   return {
     state: {
@@ -90,9 +97,20 @@ const makeHarness = Effect.fn("makeAgentControlCommandHarness")(function* () {
   const epicCalls: EpicCall[] = [];
   const epicArrivals = yield* Queue.unbounded<EpicCall>();
   const savedRunArrivals = yield* Queue.unbounded<SavedRunCall>();
+  const handoffArrivals = yield* Queue.unbounded<HandoffCall>();
+  const handoffCalls: HandoffCall[] = [];
   const supervisors = new Map<EnvironmentId, EnvironmentSupervisor["Service"]>();
   for (const id of [environmentId, otherEnvironmentId]) {
     const client = {
+      [AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff]: Effect.fn(function* (
+        input: AgentControlEpicHandoffPublishInput,
+      ) {
+        const response = yield* Deferred.make<never, AgentControlEpicRpcError>();
+        const call = { environmentId: id, input, response };
+        handoffCalls.push(call);
+        yield* Queue.offer(handoffArrivals, call);
+        return yield* Deferred.await(response);
+      }),
       [AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot]: Effect.fn(function* (
         input: AgentControlRunOnceSnapshotInput,
       ) {
@@ -175,6 +193,8 @@ const makeHarness = Effect.fn("makeAgentControlCommandHarness")(function* () {
     epicCalls,
     epicArrivals,
     savedRunArrivals,
+    handoffArrivals,
+    handoffCalls,
   };
 });
 
@@ -365,4 +385,64 @@ it.effect("keeps distinct historical child lookups separate while sharing projec
       expect(registry.get(atoms.pending(firstTarget))).toBe(false);
     }),
   ),
+);
+
+it.effect(
+  "deduplicates handoff clicks across remounts while isolating projects, environments and Epic runs",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { registry, atoms, handoffArrivals, handoffCalls } = yield* makeHarness();
+        const publication = {
+          environmentId,
+          input: {
+            projectId: target.input.projectId,
+            commandId: CommandId.make("publish-epic"),
+            expectedRevision: 7,
+            epicRunId: "epic-a",
+            expectedCommitSha: "verified-commit",
+            expectedTargetBranch: "main",
+          },
+        };
+        const unmount = registry.mount(atoms.pending(publication));
+        const first = atoms.epicPublishHandoff.run(registry, publication);
+        const firstCall = yield* Queue.take(handoffArrivals);
+        unmount();
+        const remount = registry.mount(atoms.pending(publication));
+        const repeated = atoms.epicPublishHandoff.run(registry, { ...publication });
+        expect(handoffCalls).toHaveLength(1);
+        expect(registry.get(atoms.pending(publication))).toBe(true);
+        const failure = new AgentControlEpicRpcError({
+          code: "offline",
+          message: "Reconnect and retry the same handoff",
+        });
+        for (const separate of [
+          { ...publication, environmentId: otherEnvironmentId },
+          {
+            ...publication,
+            input: { ...publication.input, projectId: ProjectId.make("project-b") },
+          },
+          { ...publication, input: { ...publication.input, epicRunId: "epic-b" } },
+        ]) {
+          const request = atoms.epicPublishHandoff.run(registry, separate);
+          const call = yield* Queue.take(handoffArrivals);
+          expect(call).toMatchObject(separate);
+          yield* Deferred.fail(call.response, failure);
+          expect((yield* Effect.promise(() => request))._tag).toBe("Failure");
+          expect(registry.get(atoms.pending(publication))).toBe(true);
+        }
+        yield* Deferred.fail(firstCall.response, failure);
+        const results = yield* Effect.promise(() => Promise.all([first, repeated]));
+        expect(results.every((result) => result._tag === "Failure")).toBe(true);
+        expect(handoffCalls).toHaveLength(4);
+        expect(registry.get(atoms.pending(publication))).toBe(false);
+        const retry = atoms.epicPublishHandoff.run(registry, publication);
+        const retryCall = yield* Queue.take(handoffArrivals);
+        expect(retryCall.input).toEqual(firstCall.input);
+        yield* Deferred.fail(retryCall.response, failure);
+        yield* Effect.promise(() => retry);
+        expect(registry.get(atoms.pending(publication))).toBe(false);
+        remount();
+      }),
+    ),
 );

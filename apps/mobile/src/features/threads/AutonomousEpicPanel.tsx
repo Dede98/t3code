@@ -8,6 +8,8 @@ import {
   agentControlEpicStartBlockers,
   agentControlEpicStartInput,
   agentControlEpicStatus,
+  agentControlEpicHandoffBlockers,
+  agentControlEpicPublishHandoffInput,
   type AgentControlReadiness,
 } from "@t3tools/client-runtime/state/agent-control";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -15,12 +17,15 @@ import {
   AgentControlRunOnceId,
   type AgentControlRunOnceView,
   type AgentControlEpicPreview,
+  type AgentControlEpicHandoffPreview,
+  type AgentControlEpicRuntimeView,
   type EnvironmentId,
   type ProjectId,
 } from "@t3tools/contracts";
 import { AppText as Text, AppTextInput as TextInput } from "../../components/AppText";
 import { agentControlEnvironment } from "../../state/agent-control";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 
 function Action({
   children,
@@ -48,6 +53,7 @@ type Props = {
   environmentId: EnvironmentId;
   projectId: ProjectId;
   readiness: AgentControlReadiness;
+  handoffPermissionBlocker: string | null;
   onRefresh: () => void;
   readOnly?: boolean;
   renderRun: (run: AgentControlRunOnceView) => ReactNode;
@@ -57,6 +63,7 @@ export function AutonomousEpicPanel({
   environmentId,
   projectId,
   readiness,
+  handoffPermissionBlocker,
   onRefresh,
   readOnly = false,
   renderRun,
@@ -419,6 +426,15 @@ export function AutonomousEpicPanel({
               ))}
             </View>
           ))}
+          <EpicHandoff
+            key={JSON.stringify([environmentId, projectId, epic.epicRunId, readiness.connected])}
+            environmentId={environmentId}
+            epic={epic}
+            connected={readiness.connected}
+            pending={readiness.pending}
+            permissionBlocker={handoffPermissionBlocker}
+            onRefresh={onRefresh}
+          />
           {!epic.finalVerification ? (
             <Text className="text-sm text-foreground-muted">
               Common result verification has not completed.
@@ -443,6 +459,7 @@ export function AutonomousEpicPanel({
                   environmentId={environmentId}
                   projectId={projectId}
                   readOnly
+                  handoffPermissionBlocker={handoffPermissionBlocker}
                   readiness={{
                     ...readiness,
                     snapshot: { ...readiness.snapshot!, epic: saved, epicHistory: [] },
@@ -456,6 +473,169 @@ export function AutonomousEpicPanel({
         </View>
       ) : null}
       {loadedRun ? renderRun(loadedRun) : null}
+      {error ? (
+        <Text accessibilityRole="alert" className="text-sm text-destructive">
+          {error}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+type HandoffProps = {
+  environmentId: EnvironmentId;
+  epic: AgentControlEpicRuntimeView;
+  connected: boolean;
+  pending: boolean;
+  permissionBlocker: string | null;
+  onRefresh: () => void;
+};
+
+function EpicHandoff({
+  environmentId,
+  epic: savedEpic,
+  connected,
+  pending,
+  permissionBlocker,
+  onRefresh,
+}: HandoffProps) {
+  const [preview, setPreview] = useState<AgentControlEpicHandoffPreview | null>(null);
+  const [observed, setObserved] = useState<AgentControlEpicRuntimeView | null>(null);
+  const [busy, setBusy] = useState<"inspect" | "publish" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+  const inFlight = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const inspect = useAtomCommand(agentControlEnvironment.epicPreviewHandoff, {
+    reportFailure: false,
+  });
+  const publish = useAtomCommand(agentControlEnvironment.epicPublishHandoff, {
+    reportFailure: false,
+  });
+  const epic = observed && observed.revision > savedEpic.revision ? observed : savedEpic;
+  const handoff =
+    preview?.handoff && (!epic.handoff || preview.handoff.updatedAt > epic.handoff.updatedAt)
+      ? preview.handoff
+      : epic.handoff;
+  const currentEpic = handoff ? { ...epic, handoff } : epic;
+  const blockers = agentControlEpicHandoffBlockers({
+    epic: currentEpic,
+    connected,
+    pending: pending || busy !== null,
+    permissionBlocker,
+  });
+  const publishBlockers = agentControlEpicHandoffBlockers({
+    epic: currentEpic,
+    connected,
+    pending: pending || busy !== null,
+    permissionBlocker,
+    preview,
+  });
+  const pullRequest = handoff?.pullRequest;
+  const target = handoff ?? preview;
+
+  async function execute(action: "inspect" | "publish") {
+    if (inFlight.current || blockers.length > 0) return;
+    if (action === "publish" && (!preview || publishBlockers.length > 0)) return;
+    inFlight.current = true;
+    setBusy(action);
+    setError(null);
+    try {
+      if (action === "inspect") {
+        setPreview(null);
+        const result = await inspect({
+          environmentId,
+          input: { projectId: epic.projectId, epicRunId: epic.epicRunId },
+        });
+        if (!mounted.current) return;
+        if (result._tag === "Success") setPreview(result.value);
+        else setError(agentControlCommandErrorMessage(squashAtomCommandFailure(result)));
+      } else if (preview) {
+        const result = await publish({
+          environmentId,
+          input: agentControlEpicPublishHandoffInput(currentEpic, preview),
+        });
+        if (!mounted.current) return;
+        setPreview(null);
+        if (result._tag === "Success") setObserved(result.value);
+        else setError(agentControlCommandErrorMessage(squashAtomCommandFailure(result)));
+        onRefresh();
+      }
+    } catch (cause) {
+      if (mounted.current) setError(agentControlCommandErrorMessage(cause));
+    } finally {
+      inFlight.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  }
+
+  return (
+    <View className="gap-2 rounded-xl border border-border-subtle p-3">
+      <Text className="text-sm font-t3-bold">Human review</Text>
+      {target ? (
+        <View className="gap-1">
+          <Text selectable className="text-xs">
+            Repository: {target.repository.nameWithOwner}
+          </Text>
+          <Text selectable className="text-xs">
+            Target branch: {target.targetBranch ?? "Unavailable"}
+          </Text>
+          <Text selectable className="text-xs">
+            Verified commit: {target.commitSha ?? "Unavailable"}
+          </Text>
+          <Text selectable className="text-xs">
+            Review branch: {target.branchName ?? "Assigned when publication starts"}
+          </Text>
+        </View>
+      ) : (
+        <Text className="text-sm text-foreground-muted">
+          Review the repository, target branch and verified common commit before publishing a Draft
+          PR.
+        </Text>
+      )}
+      {busy || handoff?.status === "publishing" ? (
+        <Text accessibilityLiveRegion="polite" className="text-sm">
+          {busy === "inspect" ? "Checking publication…" : "Handoff in progress…"}
+        </Text>
+      ) : null}
+      {pullRequest ? (
+        <Action
+          onPress={() => {
+            void tryOpenExternalUrl(pullRequest.url, "pull-request").then((opened) => {
+              if (!opened && mounted.current)
+                setError("Could not open the pull request. Try opening it again.");
+            });
+          }}
+        >
+          {`Open ${pullRequest.isDraft && pullRequest.state === "open" ? "Draft PR" : "PR"} #${pullRequest.number} · ${pullRequest.state}`}
+        </Action>
+      ) : (
+        <>
+          {(preview ? publishBlockers : blockers).map((blocker) => (
+            <Text key={blocker} className="text-sm text-destructive">
+              {blocker}
+            </Text>
+          ))}
+          <Action disabled={blockers.length > 0} onPress={() => void execute("inspect")}>
+            {handoff || error ? "Review and retry handoff" : "Review publication"}
+          </Action>
+          {preview ? (
+            <Action disabled={publishBlockers.length > 0} onPress={() => void execute("publish")}>
+              {handoff ? "Retry Draft PR handoff" : "Create Draft PR"}
+            </Action>
+          ) : null}
+        </>
+      )}
+      {handoff?.error ? (
+        <Text accessibilityRole="alert" className="text-sm text-destructive">
+          {handoff.error.message}
+        </Text>
+      ) : null}
       {error ? (
         <Text accessibilityRole="alert" className="text-sm text-destructive">
           {error}

@@ -15,6 +15,7 @@ import {
   agentControlEndBlockedRunInput,
   agentControlCanEndBlockedRun,
   agentControlModeChangeBlocker,
+  agentControlEpicHandoffPermissionBlocker,
   agentControlSnapshotReady,
   agentControlSnapshotFresh,
   agentControlStageHeading,
@@ -632,6 +633,10 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
           environmentId={environmentId}
           projectId={projectId}
           readiness={readiness}
+          handoffPermissionBlocker={
+            agentControlEpicHandoffPermissionBlocker(sessionResult) ??
+            (!fresh ? "Checking current state and permissions in this environment." : null)
+          }
           renderRun={(run) => <RunResult run={run} environmentId={environmentId} />}
           onRefresh={() => {
             refreshSnapshot();

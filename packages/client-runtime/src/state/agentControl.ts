@@ -17,6 +17,8 @@ import {
   type AgentControlEpicRuntimeView,
   type AgentControlEpicStartInput,
   type AgentControlEpicControlInput,
+  type AgentControlEpicHandoffPreview,
+  type AgentControlEpicHandoffPublishInput,
   type EnvironmentId,
   type ProjectId,
 } from "@t3tools/contracts";
@@ -77,6 +79,28 @@ export function createAgentControlEnvironmentAtoms<R, E>(
           mode: "singleFlight",
           key: (target) =>
             JSON.stringify([target.environmentId, target.input.projectId, target.input.runId]),
+        },
+      }),
+    ),
+    epicPreviewHandoff: withPending(
+      createEnvironmentRpcCommand(runtime, {
+        label: "agent-control-epic:preview-handoff",
+        tag: AGENT_CONTROL_EPIC_RPC_METHODS.previewHandoff,
+        concurrency: {
+          mode: "singleFlight",
+          key: ({ environmentId, input }) =>
+            JSON.stringify([environmentId, input.projectId, input.epicRunId]),
+        },
+      }),
+    ),
+    epicPublishHandoff: withPending(
+      createEnvironmentRpcCommand(runtime, {
+        label: "agent-control-epic:publish-handoff",
+        tag: AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff,
+        concurrency: {
+          mode: "singleFlight",
+          key: ({ environmentId, input }) =>
+            JSON.stringify([environmentId, input.projectId, input.epicRunId]),
         },
       }),
     ),
@@ -165,6 +189,19 @@ export function agentControlModeChangeBlocker<E>(
   }
   if (!session.value.authenticated || !session.value.scopes?.includes(AuthAccessWriteScope)) {
     return "Your session in this environment lacks administrative permission (access:write) to start runs or change task intake. Ask the environment administrator for an admin pairing link; you can still review saved runs.";
+  }
+  return null;
+}
+
+/** Publication requires known administrative scope in the selected environment. */
+export function agentControlEpicHandoffPermissionBlocker<E>(
+  session: AsyncResult.AsyncResult<AuthSessionState, E>,
+): string | null {
+  if (session._tag !== "Success" || session.waiting) {
+    return "Verify your permissions in this environment before publishing. Reconnect if the permission check failed.";
+  }
+  if (!session.value.authenticated || !session.value.scopes?.includes(AuthAccessWriteScope)) {
+    return "Publishing requires administrative permission (access:write) in this environment. Ask its administrator for an admin pairing link.";
   }
   return null;
 }
@@ -358,6 +395,80 @@ export function agentControlEpicStatus(epic: AgentControlEpicRuntimeView): Agent
   if (epic.status === "verifying")
     return { label: "Verifying common Epic result", tone: "running" };
   return { label: "Epic in progress", tone: "running" };
+}
+
+/** A server preview is usable only for the displayed project, run and accepted commit. */
+export function agentControlEpicHandoffBlockers(input: {
+  epic: AgentControlEpicRuntimeView;
+  connected: boolean;
+  pending: boolean;
+  permissionBlocker: string | null;
+  preview?: AgentControlEpicHandoffPreview | null;
+}): string[] {
+  const { epic, preview } = input;
+  const blockers: string[] = [];
+  if (input.permissionBlocker !== null) blockers.push(input.permissionBlocker);
+  if (!input.connected) blockers.push("Reconnect to this environment before publishing.");
+  if (input.pending) blockers.push("A request is in progress. Wait for the server response.");
+  if (agentControlEpicStatus(epic).tone !== "success")
+    blockers.push("Publication requires successful verification of the accepted common commit.");
+  if (epic.handoff?.pullRequest)
+    blockers.push(
+      "This Epic already has a pull request. Open the saved pull request to review it.",
+    );
+  if (epic.handoff?.status === "publishing")
+    blockers.push("The environment is publishing this Epic. Its saved progress will update here.");
+  if (preview) {
+    if (
+      preview.projectId !== epic.projectId ||
+      preview.epicRunId !== epic.epicRunId ||
+      preview.commitSha !== epic.acceptedCommitSha ||
+      preview.repository.repositoryNodeId !== epic.source.repository.repositoryNodeId ||
+      preview.repository.nameWithOwner !== epic.source.repository.nameWithOwner
+    )
+      blockers.push(
+        "The publication preview no longer matches this Epic. Review publication again.",
+      );
+    blockers.push(...preview.blockers.map((blocker) => blocker.message));
+    if (!preview.canPublish || !preview.targetBranch || !preview.commitSha)
+      blockers.push("Review publication again after resolving the reported blockers.");
+  }
+  return [...new Set(blockers)];
+}
+
+/** Retry identity is tied to the durable run and the exact reviewed publication target. */
+export function agentControlEpicPublishHandoffInput(
+  epic: AgentControlEpicRuntimeView,
+  preview: AgentControlEpicHandoffPreview,
+): AgentControlEpicHandoffPublishInput {
+  if (
+    agentControlEpicHandoffBlockers({
+      epic,
+      preview,
+      connected: true,
+      pending: false,
+      permissionBlocker: null,
+    }).length > 0 ||
+    !preview.commitSha ||
+    !preview.targetBranch
+  )
+    throw new Error("Review a valid publication preview before creating the Draft PR.");
+  return {
+    projectId: epic.projectId,
+    epicRunId: epic.epicRunId,
+    expectedRevision: epic.revision,
+    expectedCommitSha: preview.commitSha,
+    expectedTargetBranch: preview.targetBranch,
+    commandId: CommandId.make(
+      `t3auto-epic-publish:${JSON.stringify([
+        epic.projectId,
+        epic.epicRunId,
+        epic.revision,
+        preview.commitSha,
+        preview.targetBranch,
+      ])}`,
+    ),
+  };
 }
 
 export function agentControlStartBlockers(input: AgentControlStartContext): string[] {

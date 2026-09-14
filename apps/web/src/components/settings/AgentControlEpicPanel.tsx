@@ -6,10 +6,18 @@ import {
   agentControlEpicStartBlockers,
   agentControlEpicStartInput,
   agentControlEpicStatus,
+  agentControlEpicHandoffBlockers,
+  agentControlEpicPublishHandoffInput,
   type AgentControlReadiness,
 } from "@t3tools/client-runtime/state/agent-control";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import type { AgentControlEpicPreview, EnvironmentId, ProjectId } from "@t3tools/contracts";
+import type {
+  AgentControlEpicPreview,
+  AgentControlEpicHandoffPreview,
+  AgentControlEpicRuntimeView,
+  EnvironmentId,
+  ProjectId,
+} from "@t3tools/contracts";
 import { agentControlEnvironment } from "../../state/agentControl";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
@@ -19,6 +27,7 @@ type Props = {
   environmentId: EnvironmentId;
   projectId: ProjectId;
   readiness: AgentControlReadiness;
+  handoffPermissionBlocker: string | null;
   onRefresh: () => void;
   onOpenRun: (runId: string) => void;
   readOnly?: boolean;
@@ -28,6 +37,7 @@ export function AgentControlEpicPanel({
   environmentId,
   projectId,
   readiness,
+  handoffPermissionBlocker,
   onRefresh,
   onOpenRun,
   readOnly = false,
@@ -343,6 +353,15 @@ export function AgentControlEpicPanel({
               ))}
             </details>
           ))}
+          <EpicHandoff
+            key={JSON.stringify([environmentId, projectId, epic.epicRunId, readiness.connected])}
+            environmentId={environmentId}
+            epic={epic}
+            connected={readiness.connected}
+            pending={readiness.pending}
+            permissionBlocker={handoffPermissionBlocker}
+            onRefresh={onRefresh}
+          />
           {!epic.finalVerification ? (
             <p className="text-sm text-muted-foreground">
               Common result verification has not completed.
@@ -363,6 +382,7 @@ export function AgentControlEpicPanel({
                 environmentId={environmentId}
                 projectId={projectId}
                 readOnly
+                handoffPermissionBlocker={handoffPermissionBlocker}
                 readiness={{
                   ...readiness,
                   snapshot: { ...readiness.snapshot!, epic: saved, epicHistory: [] },
@@ -373,6 +393,168 @@ export function AgentControlEpicPanel({
             </details>
           ))}
         </div>
+      ) : null}
+      {error ? (
+        <p role="alert" className="text-sm text-destructive">
+          {error}
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+type HandoffProps = {
+  environmentId: EnvironmentId;
+  epic: AgentControlEpicRuntimeView;
+  connected: boolean;
+  pending: boolean;
+  permissionBlocker: string | null;
+  onRefresh: () => void;
+};
+
+function EpicHandoff({
+  environmentId,
+  epic: savedEpic,
+  connected,
+  pending,
+  permissionBlocker,
+  onRefresh,
+}: HandoffProps) {
+  const [preview, setPreview] = useState<AgentControlEpicHandoffPreview | null>(null);
+  const [observed, setObserved] = useState<AgentControlEpicRuntimeView | null>(null);
+  const [busy, setBusy] = useState<"inspect" | "publish" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+  const inFlight = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const inspect = useAtomCommand(agentControlEnvironment.epicPreviewHandoff, {
+    reportFailure: false,
+  });
+  const publish = useAtomCommand(agentControlEnvironment.epicPublishHandoff, {
+    reportFailure: false,
+  });
+  const epic = observed && observed.revision > savedEpic.revision ? observed : savedEpic;
+  const handoff =
+    preview?.handoff && (!epic.handoff || preview.handoff.updatedAt > epic.handoff.updatedAt)
+      ? preview.handoff
+      : epic.handoff;
+  const currentEpic = handoff ? { ...epic, handoff } : epic;
+  const blockers = agentControlEpicHandoffBlockers({
+    epic: currentEpic,
+    connected,
+    pending: pending || busy !== null,
+    permissionBlocker,
+  });
+  const publishBlockers = agentControlEpicHandoffBlockers({
+    epic: currentEpic,
+    connected,
+    pending: pending || busy !== null,
+    permissionBlocker,
+    preview,
+  });
+  const pullRequest = handoff?.pullRequest;
+  const target = handoff ?? preview;
+
+  async function execute(action: "inspect" | "publish") {
+    if (inFlight.current || blockers.length > 0) return;
+    if (action === "publish" && (!preview || publishBlockers.length > 0)) return;
+    inFlight.current = true;
+    setBusy(action);
+    setError(null);
+    try {
+      if (action === "inspect") {
+        setPreview(null);
+        const result = await inspect({
+          environmentId,
+          input: { projectId: epic.projectId, epicRunId: epic.epicRunId },
+        });
+        if (!mounted.current) return;
+        if (result._tag === "Success") setPreview(result.value);
+        else setError(agentControlCommandErrorMessage(squashAtomCommandFailure(result)));
+      } else if (preview) {
+        const result = await publish({
+          environmentId,
+          input: agentControlEpicPublishHandoffInput(currentEpic, preview),
+        });
+        if (!mounted.current) return;
+        setPreview(null);
+        if (result._tag === "Success") setObserved(result.value);
+        else setError(agentControlCommandErrorMessage(squashAtomCommandFailure(result)));
+        onRefresh();
+      }
+    } catch (cause) {
+      if (mounted.current) setError(agentControlCommandErrorMessage(cause));
+    } finally {
+      inFlight.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  }
+
+  return (
+    <section className="space-y-2 rounded border p-3" aria-label="Epic review handoff">
+      <h4 className="text-sm font-medium">Human review</h4>
+      {target ? (
+        <div className="space-y-1 text-xs">
+          <p>Repository: {target.repository.nameWithOwner}</p>
+          <p className="break-all">Target branch: {target.targetBranch ?? "Unavailable"}</p>
+          <p className="break-all">Verified commit: {target.commitSha ?? "Unavailable"}</p>
+          <p className="break-all">
+            Review branch: {target.branchName ?? "Assigned when publication starts"}
+          </p>
+        </div>
+      ) : (
+        <p className="text-sm text-muted-foreground">
+          Review the repository, target branch and verified common commit before publishing a Draft
+          PR.
+        </p>
+      )}
+      {busy || handoff?.status === "publishing" ? (
+        <p role="status" className="text-sm">
+          {busy === "inspect" ? "Checking publication…" : "Handoff in progress…"}
+        </p>
+      ) : null}
+      {pullRequest ? (
+        <a href={pullRequest.url} target="_blank" rel="noreferrer" className="text-sm underline">
+          Open {pullRequest.isDraft && pullRequest.state === "open" ? "Draft PR" : "PR"} #
+          {pullRequest.number} · {pullRequest.state}
+        </a>
+      ) : (
+        <>
+          {(preview ? publishBlockers : blockers).map((blocker) => (
+            <p key={blocker} className="text-sm text-amber-600">
+              {blocker}
+            </p>
+          ))}
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={blockers.length > 0}
+              onClick={() => void execute("inspect")}
+            >
+              {handoff || error ? "Review and retry handoff" : "Review publication"}
+            </Button>
+            {preview ? (
+              <Button
+                size="sm"
+                disabled={publishBlockers.length > 0}
+                onClick={() => void execute("publish")}
+              >
+                {handoff ? "Retry Draft PR handoff" : "Create Draft PR"}
+              </Button>
+            ) : null}
+          </div>
+        </>
+      )}
+      {handoff?.error ? (
+        <p role="alert" className="text-sm text-destructive">
+          {handoff.error.message}
+        </p>
       ) : null}
       {error ? (
         <p role="alert" className="text-sm text-destructive">

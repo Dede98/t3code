@@ -2,6 +2,9 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   type AgentControlEpicPreview,
   type AgentControlEpicRuntimeView,
+  type AgentControlEpicHandoffPreview,
+  type AgentControlEpicHandoff,
+  ProjectId,
   AgentControlProjectRevisionConflictError,
   AgentControlCommandPreviouslyRejectedError,
   AgentControlRunOnceSnapshot,
@@ -25,6 +28,9 @@ import {
   agentControlEpicControlInput,
   agentControlEpicControlAllowed,
   agentControlEpicStatus,
+  agentControlEpicHandoffPermissionBlocker,
+  agentControlEpicHandoffBlockers,
+  agentControlEpicPublishHandoffInput,
   agentControlEndPausedInput,
   agentControlCommandErrorMessage,
   agentControlSnapshotFresh,
@@ -1103,5 +1109,185 @@ describe("Epic execution client state", () => {
       expect(agentControlEpicStatus({ ...succeeded, finalVerification: verification }).tone).toBe(
         "warning",
       );
+  });
+});
+
+const verifiedEpic: AgentControlEpicRuntimeView = {
+  ...epicRun,
+  status: "succeeded",
+  finalVerification: {
+    status: "passed",
+    commitSha: "common",
+    evidenceId: "common-evidence",
+    detail: "Required checks passed",
+    checks: stage.verification!.checks,
+  },
+};
+const handoffPreview: AgentControlEpicHandoffPreview = {
+  projectId: verifiedEpic.projectId,
+  epicRunId: verifiedEpic.epicRunId,
+  repository: verifiedEpic.source.repository,
+  targetBranch: "main",
+  commitSha: "common",
+  branchName: null,
+  canPublish: true,
+  blockers: [],
+  handoff: null,
+};
+const publishedHandoff: AgentControlEpicHandoff = {
+  intentId: "handoff",
+  status: "published",
+  repository: verifiedEpic.source.repository,
+  targetBranch: "main",
+  baseCommitSha: "base",
+  commitSha: "common",
+  branchName: "t3auto/epic-run",
+  verificationEvidenceId: "common-evidence",
+  requestedAt: timestamp,
+  updatedAt: timestamp,
+  pullRequest: {
+    number: 102,
+    url: "https://github.com/test/project/pull/102",
+    state: "open",
+    isDraft: true,
+    headSha: "common",
+    baseBranch: "main",
+  },
+  error: null,
+};
+const handoffReadiness = {
+  epic: verifiedEpic,
+  connected: true,
+  pending: false,
+  permissionBlocker: null,
+  preview: handoffPreview,
+};
+
+describe("Epic human review handoff", () => {
+  it("requires known write permission from the selected environment", () => {
+    const { scopes: _scopes, ...unknownScopes } = adminSession;
+    for (const session of [
+      AsyncResult.initial<AuthSessionState>(),
+      AsyncResult.waiting(AsyncResult.success(adminSession)),
+      AsyncResult.fail(new Error("Offline")),
+      AsyncResult.success(unknownScopes),
+      AsyncResult.success({ ...adminSession, authenticated: false }),
+      AsyncResult.success({ ...adminSession, scopes: AuthStandardClientScopes }),
+    ]) {
+      const permissionBlocker = agentControlEpicHandoffPermissionBlocker(session);
+      expect(permissionBlocker).not.toBeNull();
+      expect(agentControlEpicHandoffBlockers({ ...handoffReadiness, permissionBlocker })).toContain(
+        permissionBlocker,
+      );
+    }
+    expect(agentControlEpicHandoffPermissionBlocker(AsyncResult.success(adminSession))).toBeNull();
+    expect(agentControlEpicHandoffBlockers(handoffReadiness)).toEqual([]);
+  });
+
+  it("allows initial publication before the server allocates its unique review branch", () => {
+    expect(handoffPreview.branchName).toBeNull();
+    expect(handoffPreview.handoff).toBeNull();
+    expect(agentControlEpicHandoffBlockers(handoffReadiness)).toEqual([]);
+    expect(
+      agentControlEpicPublishHandoffInput(verifiedEpic, handoffPreview).expectedTargetBranch,
+    ).toBe("main");
+  });
+
+  it("binds explicit publication to the inspected accepted commit and target", () => {
+    const input = agentControlEpicPublishHandoffInput(verifiedEpic, handoffPreview);
+    expect(input).toMatchObject({
+      projectId: verifiedEpic.projectId,
+      epicRunId: "epic-run",
+      expectedCommitSha: "common",
+      expectedTargetBranch: "main",
+      expectedRevision: 7,
+    });
+    expect(agentControlEpicPublishHandoffInput({ ...verifiedEpic }, { ...handoffPreview })).toEqual(
+      input,
+    );
+    expect(agentControlEpicHandoffBlockers({ ...handoffReadiness, pending: true })).not.toEqual([]);
+    expect(agentControlEpicHandoffBlockers({ ...handoffReadiness, connected: false })).not.toEqual(
+      [],
+    );
+    for (const preview of [
+      { ...handoffPreview, projectId: ProjectId.make("other-project") },
+      { ...handoffPreview, epicRunId: "other-run" },
+      { ...handoffPreview, commitSha: "unverified-head" },
+      {
+        ...handoffPreview,
+        repository: { ...handoffPreview.repository, repositoryNodeId: "foreign-repo" },
+      },
+      {
+        ...handoffPreview,
+        repository: { ...handoffPreview.repository, nameWithOwner: "other/repo" },
+      },
+      { ...handoffPreview, targetBranch: null },
+      { ...handoffPreview, canPublish: false },
+    ]) {
+      expect(agentControlEpicHandoffBlockers({ ...handoffReadiness, preview })).not.toEqual([]);
+      expect(() => agentControlEpicPublishHandoffInput(verifiedEpic, preview)).toThrow();
+    }
+  });
+
+  it("blocks missing or mismatched common verification and forwards concrete remote blockers", () => {
+    for (const epic of [
+      { ...verifiedEpic, finalVerification: null },
+      { ...verifiedEpic, acceptedCommitSha: "different" },
+      { ...verifiedEpic, finalVerification: { ...verifiedEpic.finalVerification!, checks: [] } },
+    ])
+      expect(agentControlEpicHandoffBlockers({ ...handoffReadiness, epic })).not.toEqual([]);
+    const message = "The remote branch belongs to a different Epic run.";
+    expect(
+      agentControlEpicHandoffBlockers({
+        ...handoffReadiness,
+        preview: {
+          ...handoffPreview,
+          canPublish: false,
+          blockers: [{ code: "foreign-branch", issueNumber: null, message }],
+        },
+      }),
+    ).toContain(message);
+  });
+
+  it("retains published links across snapshot reloads and history, including closed or merged PRs", () => {
+    for (const state of ["open", "closed", "merged"] as const) {
+      const epic = {
+        ...verifiedEpic,
+        handoff: { ...publishedHandoff, pullRequest: { ...publishedHandoff.pullRequest!, state } },
+      };
+      const restored = decodeSnapshot(
+        JSON.parse(JSON.stringify({ ...snapshot, epic: null, epicHistory: [epic] })),
+      );
+      const saved = restored.epicHistory![0]!;
+      expect(saved.handoff?.pullRequest?.url).toBe(publishedHandoff.pullRequest!.url);
+      expect(saved.handoff?.pullRequest?.state).toBe(state);
+      expect(agentControlEpicHandoffBlockers({ ...handoffReadiness, epic: saved })).toContain(
+        "This Epic already has a pull request. Open the saved pull request to review it.",
+      );
+    }
+  });
+
+  it("allows retry of a failed durable handoff without losing the local result", () => {
+    const epic = {
+      ...verifiedEpic,
+      handoff: {
+        ...publishedHandoff,
+        status: "failed" as const,
+        pullRequest: null,
+        error: { code: "offline", message: "GitHub is unavailable" },
+      },
+    };
+    expect(agentControlEpicHandoffBlockers({ ...handoffReadiness, epic })).toEqual([]);
+    expect(agentControlEpicPublishHandoffInput(epic, handoffPreview).expectedCommitSha).toBe(
+      "common",
+    );
+    expect(epic.acceptedCommitSha).toBe("common");
+    expect(epic.finalVerification).toEqual(verifiedEpic.finalVerification);
+    expect(
+      agentControlEpicHandoffBlockers({
+        ...handoffReadiness,
+        epic: { ...epic, handoff: { ...epic.handoff, status: "publishing" } },
+      }),
+    ).not.toEqual([]);
   });
 });
