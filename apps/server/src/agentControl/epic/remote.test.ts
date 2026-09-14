@@ -116,7 +116,7 @@ const setup = Effect.gen(function* () {
     merged_at: string | null;
     draft: boolean;
     body: string;
-    head: { ref: string; sha: string; repo: { node_id: string } };
+    head: { ref: string; sha: string; repo: { node_id: string } | null };
     base: { ref: string; repo: { node_id: string } };
   };
   const state = {
@@ -124,6 +124,9 @@ const setup = Effect.gen(function* () {
     tagPushes: 0,
     branchCreates: 0,
     prCreates: 0,
+    vcsCalls: 0,
+    apiCalls: [] as { endpoint: string; cwd: string; method: string }[],
+    failPrRead: false,
     prs: [] as Pr[],
     loseTagReply: false,
     loseBranchReply: false,
@@ -147,6 +150,7 @@ const setup = Effect.gen(function* () {
     run: (request) =>
       Effect.tryPromise({
         try: async () => {
+          state.vcsCalls++;
           if (request.command === "gh") {
             state.branchCreates++;
             if (state.collisionOnCreate)
@@ -201,7 +205,16 @@ const setup = Effect.gen(function* () {
       Effect.tryPromise({
         try: async () => {
           const endpoint = request.args[3]!;
+          state.apiCalls.push({
+            endpoint,
+            cwd: request.cwd,
+            method: request.stdin ? "POST" : "GET",
+          });
           if (endpoint.includes("/pulls?")) return output(encodeJson([state.prs]));
+          if (/\/pulls\/\d+$/.test(endpoint)) {
+            if (state.failPrRead) throw new Error("read unavailable /Users/private TOKEN");
+            return output(encodeJson(state.prs[0]));
+          }
           if (endpoint.endsWith("/pulls")) {
             state.prCreates++;
             const body = decodePrRequest(request.stdin!);
@@ -257,10 +270,101 @@ const setup = Effect.gen(function* () {
     );
   const remoteGit = (args: ReadonlyArray<string>) =>
     io(async () => (await runGit(bare, args)).trim());
-  return { input, state, remote, publish, git, remoteGit, cwd };
+  const read = () =>
+    remote.readPullRequest({
+      cwd,
+      repository: input.repository,
+      pullRequest: { number: 10, url: "https://github.com/test-owner/test-repo/pull/10" },
+    });
+  return { input, state, remote, publish, read, git, remoteGit, cwd };
 });
 
 it.layer(NodeServices.layer)("Epic handoff remote", (it) => {
+  for (const state of ["closed", "merged"] as const)
+    it.effect(
+      `reads a saved ${state} PR after branch deletion without Git or write permission`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* setup;
+          yield* f.publish();
+          f.state.prs[0]!.state = "closed";
+          if (state === "merged") f.state.prs[0]!.merged_at = "2026-09-14T00:00:00Z";
+          f.state.prs[0]!.head.repo = null;
+          f.state.denyWrite = true;
+          yield* f.remoteGit(["update-ref", "-d", `refs/heads/${f.input.branchName}`]);
+          yield* f.git([
+            "push",
+            f.input.cwd.replace(/local$/, "remote.git"),
+            "HEAD:refs/heads/main",
+          ]);
+          const vcsCalls = f.state.vcsCalls;
+          f.state.apiCalls.length = 0;
+          expect((yield* f.read()).state).toBe(state);
+          expect(f.state.vcsCalls).toBe(vcsCalls);
+          expect(f.state.apiCalls).toEqual([
+            { endpoint: "repos/test-owner/test-repo", cwd: f.cwd, method: "GET" },
+            { endpoint: "repos/test-owner/test-repo/pulls/10", cwd: f.cwd, method: "GET" },
+          ]);
+          expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([1, 1, 1]);
+        }),
+    );
+  it.effect("reads reopened and ready-for-review PRs including human head and base changes", () =>
+    Effect.gen(function* () {
+      const f = yield* setup;
+      yield* f.publish();
+      f.state.prs[0]!.state = "closed";
+      expect((yield* f.read()).state).toBe("closed");
+      f.state.prs[0]!.state = "open";
+      expect((yield* f.read()).isDraft).toBe(true);
+      f.state.prs[0]!.draft = false;
+      f.state.prs[0]!.head.sha = f.input.baseCommitSha;
+      f.state.prs[0]!.base.ref = "human-review-target";
+      expect(yield* f.read()).toMatchObject({
+        number: 10,
+        state: "open",
+        isDraft: false,
+        headSha: f.input.baseCommitSha,
+        baseBranch: "human-review-target",
+      });
+      expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([1, 1, 1]);
+    }),
+  );
+  for (const mismatch of ["repository", "base-repository", "number", "url"] as const)
+    it.effect(
+      `rejects a saved PR read with changed ${mismatch} identity without remote mutations`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* setup;
+          yield* f.publish();
+          if (mismatch === "repository") f.state.repositoryId = "foreign-repo";
+          if (mismatch === "base-repository") f.state.prs[0]!.base.repo.node_id = "foreign-repo";
+          if (mismatch === "number") f.state.prs[0]!.number = 11;
+          if (mismatch === "url")
+            f.state.prs[0]!.html_url = "https://github.com/foreign/repo/pull/10";
+          const vcsCalls = f.state.vcsCalls;
+          const error = yield* Effect.flip(f.read());
+          expect(error.code).toBe(
+            mismatch === "repository" ? "repository-identity-changed" : "pull-request-collision",
+          );
+          expect(f.state.vcsCalls).toBe(vcsCalls);
+          expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([1, 1, 1]);
+        }),
+    );
+  it.effect(
+    "returns a sanitized read failure and retries the same saved PR without remote mutations",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* setup;
+        yield* f.publish();
+        f.state.failPrRead = true;
+        const error = yield* Effect.flip(f.read());
+        expect(error.code).toBe("remote-unavailable");
+        expect(error.message).not.toMatch(/TOKEN|\/Users\//);
+        f.state.failPrRead = false;
+        expect((yield* f.read()).number).toBe(10);
+        expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([1, 1, 1]);
+      }),
+  );
   it.effect("publishes exactly the verified commit with a draft and factual safe evidence", () =>
     Effect.gen(function* () {
       const f = yield* setup;

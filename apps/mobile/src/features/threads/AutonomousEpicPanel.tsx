@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useEffectEvent, useRef, useState, type ReactNode } from "react";
 import { Pressable, View } from "react-native";
 import { useNavigation } from "@react-navigation/native";
 import {
@@ -501,7 +501,7 @@ function EpicHandoff({
 }: HandoffProps) {
   const [preview, setPreview] = useState<AgentControlEpicHandoffPreview | null>(null);
   const [observed, setObserved] = useState<AgentControlEpicRuntimeView | null>(null);
-  const [busy, setBusy] = useState<"inspect" | "publish" | null>(null);
+  const [busy, setBusy] = useState<"inspect" | "publish" | "refresh" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(true);
   const inFlight = useRef(false);
@@ -519,7 +519,7 @@ function EpicHandoff({
   });
   const epic = observed && observed.revision > savedEpic.revision ? observed : savedEpic;
   const handoff =
-    preview?.handoff && (!epic.handoff || preview.handoff.updatedAt > epic.handoff.updatedAt)
+    preview?.handoff && (!epic.handoff || preview.handoff.updatedAt >= epic.handoff.updatedAt)
       ? preview.handoff
       : epic.handoff;
   const currentEpic = handoff ? { ...epic, handoff } : epic;
@@ -539,15 +539,16 @@ function EpicHandoff({
   const pullRequest = handoff?.pullRequest;
   const target = handoff ?? preview;
 
-  async function execute(action: "inspect" | "publish") {
-    if (inFlight.current || blockers.length > 0) return;
+  async function execute(action: "inspect" | "publish" | "refresh") {
+    if (inFlight.current) return;
+    if (action === "refresh" ? !connected || !pullRequest : blockers.length > 0) return;
     if (action === "publish" && (!preview || publishBlockers.length > 0)) return;
     inFlight.current = true;
     setBusy(action);
     setError(null);
     try {
-      if (action === "inspect") {
-        setPreview(null);
+      if (action === "inspect" || action === "refresh") {
+        if (action === "inspect") setPreview(null);
         const result = await inspect({
           environmentId,
           input: { projectId: epic.projectId, epicRunId: epic.epicRunId },
@@ -573,6 +574,18 @@ function EpicHandoff({
       if (mounted.current) setBusy(null);
     }
   }
+
+  const refreshSavedPullRequest = useEffectEvent(() => void execute("refresh"));
+  useEffect(() => {
+    if (!connected || !pullRequest?.number) return;
+    let active = true;
+    queueMicrotask(() => {
+      if (active) refreshSavedPullRequest();
+    });
+    return () => {
+      active = false;
+    };
+  }, [connected, pullRequest?.number]);
 
   return (
     <View className="gap-2 rounded-xl border border-border-subtle p-3">
@@ -600,20 +613,40 @@ function EpicHandoff({
       )}
       {busy || handoff?.status === "publishing" ? (
         <Text accessibilityLiveRegion="polite" className="text-sm">
-          {busy === "inspect" ? "Checking publication…" : "Handoff in progress…"}
+          {busy === "refresh"
+            ? "Refreshing PR state…"
+            : busy === "inspect"
+              ? "Checking publication…"
+              : "Handoff in progress…"}
         </Text>
       ) : null}
       {pullRequest ? (
-        <Action
-          onPress={() => {
-            void tryOpenExternalUrl(pullRequest.url, "pull-request").then((opened) => {
-              if (!opened && mounted.current)
-                setError("Could not open the pull request. Try opening it again.");
-            });
-          }}
-        >
-          {`Open ${pullRequest.isDraft && pullRequest.state === "open" ? "Draft PR" : "PR"} #${pullRequest.number} · ${pullRequest.state}`}
-        </Action>
+        <>
+          <Action
+            onPress={() => {
+              void tryOpenExternalUrl(pullRequest.url, "pull-request").then((opened) => {
+                if (!opened && mounted.current)
+                  setError("Could not open the pull request. Try opening it again.");
+              });
+            }}
+          >
+            {`Open ${pullRequest.isDraft && pullRequest.state === "open" ? "Draft PR" : "PR"} #${pullRequest.number} · ${pullRequest.state}`}
+          </Action>
+          <Action disabled={!connected || busy !== null} onPress={() => void execute("refresh")}>
+            Refresh PR state
+          </Action>
+          {preview?.blockers
+            .filter((blocker) => blocker.code !== "handoff-pr-unavailable")
+            .map((blocker) => (
+              <Text
+                key={blocker.code}
+                accessibilityRole="alert"
+                className="text-sm text-destructive"
+              >
+                {blocker.message}
+              </Text>
+            ))}
+        </>
       ) : (
         <>
           {(preview ? publishBlockers : blockers).map((blocker) => (

@@ -4,6 +4,7 @@ import {
   AgentControlEpicRpcError,
   CommandId,
   type AgentControlEpicHandoff,
+  type AgentControlEpicHandoffPullRequest,
   type AgentControlEpicHandoffPreview,
   type AgentControlEpicHandoffPreviewInput,
   type AgentControlEpicHandoffPublishInput,
@@ -31,6 +32,25 @@ const mapError = (cause: unknown) =>
 const branchFor = (state: AgentControlEpicRuntimeView, intentId: string) =>
   `t3auto/epic-${state.source.epic.number}-${intentId}`;
 
+const pullRequestOutcome = (pullRequest: AgentControlEpicHandoffPullRequest) => {
+  const blocked = pullRequest.state !== "open" || !pullRequest.isDraft;
+  return {
+    status: blocked ? ("blocked" as const) : ("published" as const),
+    pullRequest,
+    error: blocked
+      ? {
+          code: "handoff-pr-unavailable",
+          message:
+            pullRequest.state === "merged"
+              ? "The existing pull request was merged. This handoff will not create a replacement."
+              : pullRequest.state === "closed"
+                ? "The existing pull request was closed. Reopen it on GitHub to continue review."
+                : "The existing pull request is no longer a draft. Open it on GitHub to continue review.",
+        }
+      : null,
+  };
+};
+
 export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: {
   readonly onChange: (projectId: ProjectId) => Effect.Effect<void>;
   readonly withProjectLock: <A, E, R>(
@@ -57,10 +77,57 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
       .withTransaction(saveEpicRun(sql, state, { handoff }))
       .pipe(Effect.tap(() => options.onChange(state.projectId)));
 
-  const previewHandoff = Effect.fn("EpicHandoff.preview")(function* (
+  const previewLocked = Effect.fn("EpicHandoff.preview")(function* (
     input: AgentControlEpicHandoffPreviewInput,
   ): Effect.fn.Return<AgentControlEpicHandoffPreview, AgentControlEpicRpcError> {
-    const state = yield* load(input).pipe(Effect.mapError(mapError));
+    let state = yield* load(input).pipe(Effect.mapError(mapError));
+    let refreshError: { code: string; message: string } | undefined;
+    if (state.handoff?.pullRequest) {
+      const handoff = state.handoff;
+      const refreshed = yield* Effect.result(
+        Effect.gen(function* () {
+          const projects = yield* sql<{
+            cwd: string;
+          }>`SELECT workspace_root AS cwd FROM projection_projects WHERE project_id=${state.projectId} AND deleted_at IS NULL`;
+          if (!projects[0])
+            return yield* epicError(
+              "epic-unavailable",
+              "The project is no longer available in this environment.",
+            );
+          // Published PRs remain observable after branch deletion, a merge, or
+          // changed publication eligibility. The saved repository and PR own this read.
+          return yield* remote.readPullRequest({
+            cwd: projects[0].cwd,
+            repository: handoff.repository,
+            pullRequest: handoff.pullRequest!,
+          });
+        }),
+      );
+      if (refreshed._tag === "Failure") {
+        const cause = refreshed.failure;
+        refreshError =
+          isEpicError(cause) || isRemoteError(cause)
+            ? { code: cause.code, message: cause.message }
+            : {
+                code: "handoff-refresh-unavailable",
+                message:
+                  "The pull request state could not be refreshed. Retry to update its last known state.",
+              };
+      } else {
+        const outcome = pullRequestOutcome(refreshed.success);
+        if (
+          epicDigest(outcome) !==
+          epicDigest({
+            status: handoff.status,
+            pullRequest: handoff.pullRequest,
+            error: handoff.error,
+          })
+        )
+          state = yield* persist(state, { ...handoff, ...outcome, updatedAt: yield* now }).pipe(
+            Effect.mapError(mapError),
+          );
+      }
+    }
     const base = {
       projectId: state.projectId,
       epicRunId: state.epicRunId,
@@ -80,7 +147,11 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
       return {
         ...base,
         canPublish: false,
-        blockers: state.handoff.error ? [{ ...state.handoff.error, issueNumber: null }] : [],
+        blockers: refreshError
+          ? [{ ...refreshError, issueNumber: null }]
+          : state.handoff.error
+            ? [{ ...state.handoff.error, issueNumber: null }]
+            : [],
       };
     const checked = yield* Effect.result(
       Effect.gen(function* () {
@@ -225,23 +296,10 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
                 },
               ),
             );
-            const blocked = pullRequest.state !== "open" || !pullRequest.isDraft;
             handoff = {
               ...handoff!,
-              status: blocked ? "blocked" : "published",
-              pullRequest,
+              ...pullRequestOutcome(pullRequest),
               updatedAt: yield* now,
-              error: blocked
-                ? {
-                    code: "handoff-pr-unavailable",
-                    message:
-                      pullRequest.state === "merged"
-                        ? "The existing pull request was merged. This handoff will not create a replacement."
-                        : pullRequest.state === "closed"
-                          ? "The existing pull request was closed. Reopen it on GitHub to continue review."
-                          : "The existing pull request is no longer a draft. Open it on GitHub to continue review.",
-                  }
-                : null,
             };
             state = yield* persist(state, handoff);
             return state;
@@ -324,5 +382,7 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
       }).pipe(Effect.catch(() => Effect.void));
     }
   }, Effect.mapError(mapError));
+  const previewHandoff = (input: AgentControlEpicHandoffPreviewInput) =>
+    options.withProjectLock(input.projectId, previewLocked(input));
   return { previewHandoff, publishHandoff, recoverPending };
 });

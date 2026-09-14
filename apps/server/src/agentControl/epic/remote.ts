@@ -36,9 +36,17 @@ export interface EpicHandoffRemotePublishInput extends EpicHandoffRemoteAuthorit
   readonly childCheckCount: number;
   readonly finalCheckCount: number;
 }
+export interface EpicHandoffRemoteReadInput {
+  readonly cwd: string;
+  readonly repository: { readonly repositoryNodeId: string; readonly nameWithOwner: string };
+  readonly pullRequest: { readonly number: number; readonly url: string };
+}
 export class EpicHandoffRemote extends Context.Service<
   EpicHandoffRemote,
   {
+    readonly readPullRequest: (
+      input: EpicHandoffRemoteReadInput,
+    ) => Effect.Effect<AgentControlEpicHandoffPullRequest, EpicHandoffRemoteError>;
     readonly prepare: (
       input: EpicHandoffRemoteAuthority,
       options?: { readonly initialPreview: boolean },
@@ -80,6 +88,14 @@ const PullRequest = Schema.Struct({
     repo: Schema.NullOr(Schema.Struct({ node_id: Schema.String })),
   }),
   base: Schema.Struct({ ref: Schema.String, repo: Schema.Struct({ node_id: Schema.String }) }),
+});
+const normalizePullRequest = (pr: typeof PullRequest.Type): AgentControlEpicHandoffPullRequest => ({
+  number: pr.number,
+  url: pr.html_url,
+  state: pr.merged_at !== null ? "merged" : pr.state,
+  isDraft: pr.draft,
+  headSha: pr.head.sha,
+  baseBranch: pr.base.ref,
 });
 const CreatedRef = Schema.Struct({
   ref: Schema.String,
@@ -149,7 +165,7 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
       );
   });
   const api = Effect.fn("EpicHandoffRemote.api")(function* (
-    input: EpicHandoffRemoteAuthority,
+    input: { readonly cwd: string },
     endpoint: string,
     body?: unknown,
     paginate = false,
@@ -255,8 +271,51 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
         ),
       ),
     );
-  const endpoint = (input: EpicHandoffRemoteAuthority, suffix = "") =>
-    `repos/${input.repository.nameWithOwner}${suffix}`;
+  const endpoint = (
+    input: { readonly repository: { readonly nameWithOwner: string } },
+    suffix = "",
+  ) => `repos/${input.repository.nameWithOwner}${suffix}`;
+
+  const readPullRequest: EpicHandoffRemote["Service"]["readPullRequest"] = Effect.fn(
+    "EpicHandoffRemote.readPullRequest",
+  )(function* (input) {
+    const expectedUrl = `https://github.com/${input.repository.nameWithOwner}/pull/${input.pullRequest.number}`;
+    if (
+      !/^[a-zA-Z0-9-]+\/[a-zA-Z0-9_.-]+$/.test(input.repository.nameWithOwner) ||
+      !Number.isSafeInteger(input.pullRequest.number) ||
+      input.pullRequest.number < 1 ||
+      input.pullRequest.url !== expectedUrl
+    )
+      return yield* failure(
+        "handoff-authority-invalid",
+        "The saved pull request identity is invalid.",
+      );
+    const repository = yield* decode(Repository, (yield* api(input, endpoint(input))).stdout);
+    if (
+      repository.node_id !== input.repository.repositoryNodeId ||
+      repository.full_name.toLowerCase() !== input.repository.nameWithOwner.toLowerCase()
+    )
+      return yield* failure(
+        "repository-identity-changed",
+        "GitHub repository identity changed since publication. The saved pull request was preserved.",
+      );
+    const pr = yield* decode(
+      PullRequest,
+      (yield* api(input, endpoint(input, `/pulls/${input.pullRequest.number}`))).stdout,
+    );
+    if (
+      pr.number !== input.pullRequest.number ||
+      pr.html_url !== expectedUrl ||
+      pr.base.repo.node_id !== input.repository.repositoryNodeId
+    )
+      return yield* failure(
+        "pull-request-collision",
+        "GitHub returned a different pull request. The saved pull request was preserved.",
+      );
+    // Human review may change the head, base, draft status, or remove the branch.
+    // Reading the saved PR must not re-run publication checks or create anything.
+    return normalizePullRequest(pr);
+  });
 
   const validate = Effect.fn("EpicHandoffRemote.validate")(function* (
     input: EpicHandoffRemoteAuthority,
@@ -447,14 +506,7 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
         "pull-request-collision",
         "The existing pull request does not match this verified Epic handoff.",
       );
-    return {
-      number: pr.number,
-      url: pr.html_url,
-      state: pr.merged_at !== null ? ("merged" as const) : pr.state,
-      isDraft: pr.draft,
-      headSha: pr.head.sha,
-      baseBranch: pr.base.ref,
-    };
+    return normalizePullRequest(pr);
   });
   const prepare = Effect.fn("EpicHandoffRemote.prepare")(function* (
     input: EpicHandoffRemoteAuthority,
@@ -574,6 +626,6 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
       return result;
     },
   );
-  return EpicHandoffRemote.of({ prepare, publish });
+  return EpicHandoffRemote.of({ prepare, publish, readPullRequest });
 });
 export const EpicHandoffRemoteLive = Layer.effect(EpicHandoffRemote, makeEpicHandoffRemote);

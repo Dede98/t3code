@@ -3,6 +3,7 @@ import {
   CommandId,
   ProjectId,
   type AgentControlEpicRuntimeView,
+  type AgentControlEpicHandoffPullRequest,
   type AgentControlEpicHandoffPublishInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -112,24 +113,184 @@ const request = (epicRunId = "run"): AgentControlEpicHandoffPublishInput => ({
 });
 const seed = Effect.fn("seedHandoff")(function* (state: AgentControlEpicRuntimeView) {
   const sql = yield* SqlClient.SqlClient;
+  yield* sql`CREATE TABLE IF NOT EXISTS projection_projects(project_id TEXT PRIMARY KEY, workspace_root TEXT, deleted_at TEXT)`;
+  yield* sql`INSERT OR IGNORE INTO projection_projects VALUES(${state.projectId}, '/fixture/repo', NULL)`;
   yield* sql`CREATE TABLE IF NOT EXISTS agent_control_epic_runs(epic_run_id TEXT PRIMARY KEY,project_id TEXT,revision INTEGER,state_json TEXT,state_digest TEXT)`;
   yield* sql`CREATE TABLE IF NOT EXISTS agent_control_epic_history(epic_run_id TEXT,revision INTEGER,state_json TEXT,state_digest TEXT,PRIMARY KEY(epic_run_id,revision))`;
   yield* sql`INSERT INTO agent_control_epic_runs VALUES(${state.epicRunId},${state.projectId},${state.revision},${epicJson(state)},${epicDigest(state)})`;
   yield* sql`INSERT INTO agent_control_epic_history VALUES(${state.epicRunId},${state.revision},${epicJson(state)},${epicDigest(state)})`;
 });
-const build = (remote: EpicHandoffRemote["Service"]) =>
+type TestRemote = Omit<EpicHandoffRemote["Service"], "readPullRequest"> &
+  Partial<Pick<EpicHandoffRemote["Service"], "readPullRequest">>;
+const build = (
+  remote: TestRemote,
+  verify: EpicHandoffEvidence["Service"]["verify"] = () => Effect.succeed(proof),
+) =>
   Effect.gen(function* () {
     const semaphore = yield* Semaphore.make(1);
     return yield* makeEpicHandoff({
       onChange: () => Effect.void,
       withProjectLock: (_id, effect) => semaphore.withPermit(effect),
     }).pipe(
-      Effect.provideService(EpicHandoffEvidence, { verify: () => Effect.succeed(proof) }),
-      Effect.provideService(EpicHandoffRemote, remote),
+      Effect.provideService(EpicHandoffEvidence, { verify }),
+      Effect.provideService(EpicHandoffRemote, {
+        readPullRequest: () => Effect.succeed(pr),
+        ...remote,
+      }),
     );
   });
 
 describe("Epic handoff persistence and recovery", () => {
+  for (const state of ["closed", "merged"] as const)
+    it.effect(
+      `refreshes a published PR to ${state} after restart without creating a replacement`,
+      () =>
+        Effect.gen(function* () {
+          yield* seed(initial());
+          let publishes = 0;
+          let reads = 0;
+          const remote: TestRemote = {
+            prepare: () => Effect.die("Publication preparation must not run for a saved PR"),
+            publish: () => {
+              publishes++;
+              return Effect.succeed(pr);
+            },
+            readPullRequest: (input) => {
+              reads++;
+              assert.deepEqual(input, { cwd: "/fixture/repo", repository, pullRequest: pr });
+              return Effect.succeed({ ...pr, state });
+            },
+          };
+          const first = yield* build(remote);
+          const published = yield* first.publishHandoff(request());
+          const restarted = yield* build(remote, () =>
+            Effect.die("Publication verification must not gate reading a saved PR"),
+          );
+          yield* restarted.recoverPending();
+          const preview = yield* restarted.previewHandoff(request());
+          assert.isFalse(preview.canPublish);
+          assert.equal(preview.handoff?.pullRequest?.state, state);
+          assert.equal(preview.handoff?.status, "blocked");
+          assert.equal(preview.handoff?.intentId, published.handoff?.intentId);
+          const saved = yield* loadEpicRun(yield* SqlClient.SqlClient, "run");
+          assert.deepEqual(saved?.handoff, preview.handoff);
+          assert.equal(saved?.acceptedCommitSha, commitSha);
+          assert.deepEqual(saved?.finalVerification, published.finalVerification);
+          const replay = yield* restarted.publishHandoff(request());
+          assert.deepEqual(replay, saved);
+          assert.equal(publishes, 1);
+          assert.equal(reads, 1);
+        }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+    );
+
+  it.effect(
+    "persists reopened and ready PR states, retaining the verified commit when humans update the PR",
+    () =>
+      Effect.gen(function* () {
+        yield* seed(initial());
+        let current: AgentControlEpicHandoffPullRequest = { ...pr, state: "closed" };
+        let publishes = 0;
+        const service = yield* build({
+          prepare: () => Effect.void,
+          publish: () => {
+            publishes++;
+            return Effect.succeed(pr);
+          },
+          readPullRequest: () => Effect.succeed(current),
+        });
+        yield* service.publishHandoff(request());
+        yield* service.previewHandoff(request());
+        current = { ...pr, isDraft: false, headSha: "c".repeat(40), baseBranch: "review" };
+        const ready = yield* service.previewHandoff(request());
+        assert.equal(ready.handoff?.pullRequest?.isDraft, false);
+        assert.equal(ready.handoff?.pullRequest?.headSha, current.headSha);
+        assert.equal(ready.commitSha, commitSha);
+        assert.equal(ready.handoff?.commitSha, commitSha);
+        assert.equal(ready.handoff?.targetBranch, "main");
+        current = { ...current, isDraft: true };
+        const reopened = yield* service.previewHandoff(request());
+        assert.equal(reopened.handoff?.status, "published");
+        assert.isNull(reopened.handoff?.error);
+        assert.isFalse(reopened.canPublish);
+        assert.equal(publishes, 1);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("retains the published result when refresh fails and permits a read retry", () =>
+    Effect.gen(function* () {
+      yield* seed(initial());
+      let unavailable = true;
+      const service = yield* build({
+        prepare: () => Effect.void,
+        publish: () => Effect.succeed(pr),
+        readPullRequest: () =>
+          unavailable
+            ? Effect.fail(
+                new EpicHandoffRemoteError({
+                  code: "remote-unavailable",
+                  message: "Retry the PR read.",
+                }),
+              )
+            : Effect.succeed({ ...pr, state: "merged" }),
+      });
+      const published = yield* service.publishHandoff(request());
+      const failed = yield* service.previewHandoff(request());
+      assert.deepEqual(failed.handoff, published.handoff);
+      assert.isFalse(failed.canPublish);
+      assert.equal(failed.blockers[0]?.code, "remote-unavailable");
+      assert.deepEqual(yield* loadEpicRun(yield* SqlClient.SqlClient, "run"), published);
+      unavailable = false;
+      assert.equal(
+        (yield* service.previewHandoff(request())).handoff?.pullRequest?.state,
+        "merged",
+      );
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect(
+    "serializes concurrent refreshes, writes changed state once, and isolates project/run identities",
+    () =>
+      Effect.gen(function* () {
+        yield* seed(initial());
+        yield* seed(initial("other-run"));
+        let reads = 0;
+        const started = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const service = yield* build({
+          prepare: () => Effect.void,
+          publish: () => Effect.succeed(pr),
+          readPullRequest: () =>
+            Effect.gen(function* () {
+              reads++;
+              yield* Deferred.succeed(started, undefined);
+              yield* Deferred.await(release);
+              return { ...pr, state: "closed" as const };
+            }),
+        });
+        const published = yield* service.publishHandoff(request());
+        const first = yield* service.previewHandoff(request()).pipe(Effect.forkChild);
+        yield* Deferred.await(started);
+        const second = yield* service.previewHandoff(request()).pipe(Effect.forkChild);
+        yield* Deferred.succeed(release, undefined);
+        const results = yield* Effect.all([Fiber.join(first), Fiber.join(second)]);
+        assert.deepEqual(results[0], results[1]);
+        assert.equal(reads, 2);
+        const sql = yield* SqlClient.SqlClient;
+        const saved = yield* loadEpicRun(sql, "run");
+        assert.equal(saved?.revision, published.revision + 1);
+        assert.isUndefined((yield* loadEpicRun(sql, "other-run"))?.handoff);
+        const wrongProject = yield* Effect.result(
+          service.previewHandoff({ ...request(), projectId: ProjectId.make("other-project") }),
+        );
+        const missingRun = yield* Effect.result(
+          service.previewHandoff({ ...request(), epicRunId: "absent" }),
+        );
+        assert.equal(wrongProject._tag, "Failure");
+        assert.equal(missingRun._tag, "Failure");
+        assert.equal(reads, 2);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
   it.effect(
     "publishes the exact accepted commit once under concurrent requests and replays durable history",
     () =>
@@ -172,7 +333,7 @@ describe("Epic handoff persistence and recovery", () => {
         let branches = 0;
         let prs = 0;
         let token: string | undefined;
-        const adapter: EpicHandoffRemote["Service"] = {
+        const adapter: TestRemote = {
           prepare: () => Effect.void,
           publish: (input, hooks) =>
             Effect.gen(function* () {

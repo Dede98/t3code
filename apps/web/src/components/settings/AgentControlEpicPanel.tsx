@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import {
   agentControlCommandErrorMessage,
   agentControlEpicControlAllowed,
@@ -422,7 +422,7 @@ function EpicHandoff({
 }: HandoffProps) {
   const [preview, setPreview] = useState<AgentControlEpicHandoffPreview | null>(null);
   const [observed, setObserved] = useState<AgentControlEpicRuntimeView | null>(null);
-  const [busy, setBusy] = useState<"inspect" | "publish" | null>(null);
+  const [busy, setBusy] = useState<"inspect" | "publish" | "refresh" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(true);
   const inFlight = useRef(false);
@@ -440,7 +440,7 @@ function EpicHandoff({
   });
   const epic = observed && observed.revision > savedEpic.revision ? observed : savedEpic;
   const handoff =
-    preview?.handoff && (!epic.handoff || preview.handoff.updatedAt > epic.handoff.updatedAt)
+    preview?.handoff && (!epic.handoff || preview.handoff.updatedAt >= epic.handoff.updatedAt)
       ? preview.handoff
       : epic.handoff;
   const currentEpic = handoff ? { ...epic, handoff } : epic;
@@ -460,15 +460,16 @@ function EpicHandoff({
   const pullRequest = handoff?.pullRequest;
   const target = handoff ?? preview;
 
-  async function execute(action: "inspect" | "publish") {
-    if (inFlight.current || blockers.length > 0) return;
+  async function execute(action: "inspect" | "publish" | "refresh") {
+    if (inFlight.current) return;
+    if (action === "refresh" ? !connected || !pullRequest : blockers.length > 0) return;
     if (action === "publish" && (!preview || publishBlockers.length > 0)) return;
     inFlight.current = true;
     setBusy(action);
     setError(null);
     try {
-      if (action === "inspect") {
-        setPreview(null);
+      if (action === "inspect" || action === "refresh") {
+        if (action === "inspect") setPreview(null);
         const result = await inspect({
           environmentId,
           input: { projectId: epic.projectId, epicRunId: epic.epicRunId },
@@ -495,6 +496,18 @@ function EpicHandoff({
     }
   }
 
+  const refreshSavedPullRequest = useEffectEvent(() => void execute("refresh"));
+  useEffect(() => {
+    if (!connected || !pullRequest?.number) return;
+    let active = true;
+    queueMicrotask(() => {
+      if (active) refreshSavedPullRequest();
+    });
+    return () => {
+      active = false;
+    };
+  }, [connected, pullRequest?.number]);
+
   return (
     <section className="space-y-2 rounded border p-3" aria-label="Epic review handoff">
       <h4 className="text-sm font-medium">Human review</h4>
@@ -515,14 +528,42 @@ function EpicHandoff({
       )}
       {busy || handoff?.status === "publishing" ? (
         <p role="status" className="text-sm">
-          {busy === "inspect" ? "Checking publication…" : "Handoff in progress…"}
+          {busy === "refresh"
+            ? "Refreshing PR state…"
+            : busy === "inspect"
+              ? "Checking publication…"
+              : "Handoff in progress…"}
         </p>
       ) : null}
       {pullRequest ? (
-        <a href={pullRequest.url} target="_blank" rel="noreferrer" className="text-sm underline">
-          Open {pullRequest.isDraft && pullRequest.state === "open" ? "Draft PR" : "PR"} #
-          {pullRequest.number} · {pullRequest.state}
-        </a>
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            <a
+              href={pullRequest.url}
+              target="_blank"
+              rel="noreferrer"
+              className="text-sm underline"
+            >
+              Open {pullRequest.isDraft && pullRequest.state === "open" ? "Draft PR" : "PR"} #
+              {pullRequest.number} · {pullRequest.state}
+            </a>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!connected || busy !== null}
+              onClick={() => void execute("refresh")}
+            >
+              Refresh PR state
+            </Button>
+          </div>
+          {preview?.blockers
+            .filter((blocker) => blocker.code !== "handoff-pr-unavailable")
+            .map((blocker) => (
+              <p key={blocker.code} role="alert" className="text-sm text-amber-600">
+                {blocker.message}
+              </p>
+            ))}
+        </>
       ) : (
         <>
           {(preview ? publishBlockers : blockers).map((blocker) => (
