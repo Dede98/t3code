@@ -28,6 +28,8 @@ import {
 } from "@t3tools/client-runtime/state/agent-control-setup";
 import {
   CommandId,
+  AgentControlRunOnceId,
+  type AgentControlRunOnceView,
   type AgentControlPreflightRuntimeResult,
   type AgentControlTaskId,
   type EnvironmentId,
@@ -53,6 +55,7 @@ import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { SettingsSection } from "./settingsLayout";
 import { AgentControlProjectSetupPanel } from "./AgentControlProjectSetup";
+import { AgentControlEpicPanel } from "./AgentControlEpicPanel";
 
 function PreflightDetails({ preflight }: { preflight: AgentControlPreflightRuntimeResult }) {
   return (
@@ -135,6 +138,10 @@ function AgentControlProjectPanelContent({
     label: "change autonomous task mode",
     reportFailure: false,
   });
+  const loadSavedRun = useAtomCommand(agentControlEnvironment.getRun, { reportFailure: false });
+  const loadedRunId = useRef<string | null>(null);
+  const runDetailsRef = useRef<HTMLDivElement>(null);
+  const [loadedRun, setLoadedRun] = useState<AgentControlRunOnceView | null>(null);
   const mounted = useRef(false);
   useEffect(() => {
     mounted.current = true;
@@ -168,6 +175,7 @@ function AgentControlProjectPanelContent({
     (!fresh ? "Checking the current environment state before allowing changes." : null);
   const navigate = useNavigate();
   const [taskId, setTaskId] = useState<AgentControlTaskId | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [localPending, setPending] = useState(false);
   const [setupStatus, setSetupStatus] = useState({ pending: true, dirty: false });
   const pending = localPending || commandPending;
@@ -181,33 +189,17 @@ function AgentControlProjectPanelContent({
   const selectedTaskId = taskId ?? snapshot?.nextTaskId ?? null;
   const selectedTask = snapshot?.tasks.find((task) => task.taskId === selectedTaskId);
   const selectedRun =
-    snapshot?.runs.find((run) => run.state.status === "active") ?? snapshot?.runs[0];
+    snapshot?.runs.find((run) => run.state.runId === selectedRunId) ??
+    (loadedRun?.state.runId === selectedRunId ? loadedRun : null) ??
+    snapshot?.runs.find((run) => run.state.status === "active") ??
+    snapshot?.runs[0];
   const armedStatus = agentControlArmedStatus(snapshot);
   const canChangeIntake =
     modeChangeBlocker === null &&
     agentControlSnapshotReady(snapshotResult, connected) &&
     !pending &&
     !snapshot?.runs.some((run) => run.state.status === "active");
-  const blockers = agentControlStartBlockers({
-    policy:
-      policyResult !== freshness.policyResult &&
-      policyResult._tag === "Success" &&
-      !policyResult.waiting
-        ? policy
-        : null,
-    snapshot,
-    preflight:
-      preflightResult !== freshness.preflightResult &&
-      preflightResult._tag === "Success" &&
-      !preflightResult.waiting
-        ? preflight
-        : null,
-    selectedTaskId,
-    connected: agentControlSnapshotReady(snapshotResult, connected),
-    pending,
-    modeChangeBlocker: modeChangeBlocker ?? setupStartBlocker,
-  });
-  const armedBlockers = agentControlArmBlockers({
+  const readiness = {
     policy:
       policyResult !== freshness.policyResult &&
       policyResult._tag === "Success" &&
@@ -224,7 +216,9 @@ function AgentControlProjectPanelContent({
     connected: agentControlSnapshotReady(snapshotResult, connected),
     pending,
     modeChangeBlocker: modeChangeBlocker ?? setupStartBlocker,
-  });
+  };
+  const blockers = agentControlStartBlockers({ ...readiness, selectedTaskId });
+  const armedBlockers = agentControlArmBlockers(readiness);
   const disarmInput = agentControlDisarmInput({
     snapshot,
     connected: agentControlSnapshotReady(snapshotResult, connected),
@@ -296,6 +290,29 @@ function AgentControlProjectPanelContent({
     }
   };
 
+  const openSavedRun = async (runId: string) => {
+    setSelectedRunId(runId);
+    loadedRunId.current = runId;
+    if (!snapshot?.runs.some((run) => run.state.runId === runId)) {
+      const result = await loadSavedRun({
+        environmentId,
+        input: { projectId, runId: AgentControlRunOnceId.make(runId) },
+      });
+      if (!mounted.current || loadedRunId.current !== runId) return;
+      if (result._tag === "Failure") {
+        setError(agentControlCommandErrorMessage(squashAtomCommandFailure(result)));
+        return;
+      }
+      const saved = result.value.runs.find((run) => run.state.runId === runId);
+      if (!saved) {
+        setError("The saved task run is unavailable in this environment.");
+        return;
+      }
+      setLoadedRun(saved);
+    }
+    runDetailsRef.current?.scrollIntoView({ block: "start" });
+  };
+
   const openThread = (threadId: ThreadId, changes = false) => {
     if (changes)
       useRightPanelStore.getState().open(scopeThreadRef(environmentId, threadId), "diff");
@@ -352,6 +369,18 @@ function AgentControlProjectPanelContent({
             refreshPreflight();
             refreshSnapshot();
           }}
+        />
+        <AgentControlEpicPanel
+          environmentId={environmentId}
+          projectId={projectId}
+          readiness={readiness}
+          onRefresh={() => {
+            refreshSnapshot();
+            refreshPreflight();
+            refreshPolicy();
+            refreshSession();
+          }}
+          onOpenRun={(runId) => void openSavedRun(runId)}
         />
         {!snapshot ? (
           <p className="text-sm text-muted-foreground">Loading saved tasks and runs…</p>
@@ -550,9 +579,33 @@ function AgentControlProjectPanelContent({
           </p>
         )}
         {selectedRun ? (
-          <div className="space-y-3 border-t pt-4">
+          <div ref={runDetailsRef} className="space-y-3 border-t pt-4">
+            {snapshot && snapshot.runs.length > 1 ? (
+              <Select
+                value={selectedRun.state.runId}
+                onValueChange={(value) => {
+                  if (value) void openSavedRun(value);
+                }}
+              >
+                <SelectTrigger size="sm" aria-label="Saved task run">
+                  <SelectValue>{selectedRun.task?.title ?? selectedRun.state.runId}</SelectValue>
+                </SelectTrigger>
+                <SelectPopup>
+                  {!snapshot.runs.some((run) => run.state.runId === selectedRun.state.runId) ? (
+                    <SelectItem value={selectedRun.state.runId}>
+                      {selectedRun.task?.title ?? selectedRun.state.runId}
+                    </SelectItem>
+                  ) : null}
+                  {snapshot.runs.map((run) => (
+                    <SelectItem key={run.state.runId} value={run.state.runId}>
+                      {run.task?.title ?? run.state.runId} · {agentControlRunStatus(run).label}
+                    </SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+            ) : null}
             <p className="text-sm text-muted-foreground">
-              {selectedRun.state.status === "active" ? "Current run" : "Latest saved run"} ·{" "}
+              {selectedRun.state.status === "active" ? "Current run" : "Saved run"} ·{" "}
               {new Date(selectedRun.state.updatedAt).toLocaleString()}
             </p>
             <div>

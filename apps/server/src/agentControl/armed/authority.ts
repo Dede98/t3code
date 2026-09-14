@@ -908,9 +908,17 @@ export const loadArmedCatchUpProjectIds = Effect.fn("loadArmedCatchUpProjectIds"
       WHERE status IN ('claimed', 'activated')
     `,
   ]);
+  const epicInstalled =
+    yield* sql`SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='agent_control_epic_targets'`;
+  const epics =
+    epicInstalled.length === 0
+      ? []
+      : yield* sql<{
+          readonly projectId: unknown;
+        }>`SELECT project_id AS "projectId" FROM main.agent_control_epic_targets`;
   const projects: Array<ProjectId> = [];
   const unique = new Set<string>();
-  for (const row of [...armed, ...dispatches]) {
+  for (const row of [...armed, ...dispatches, ...epics]) {
     if (typeof row.projectId !== "string" || row.projectId.length === 0) {
       return yield* fail("armed-recovery" as ProjectId, "projection-corrupt");
     }

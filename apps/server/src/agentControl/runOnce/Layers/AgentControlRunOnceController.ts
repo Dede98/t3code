@@ -1,3 +1,4 @@
+import { bindEpicChildRun, loadSelectedEpic } from "../../epic/authority.ts";
 import { persistRunOnceDiagnostic } from "../diagnostics.ts";
 import {
   AgentControlRunOnceId,
@@ -1584,10 +1585,14 @@ const make = Effect.gen(function* () {
                     "source-watermark-stale",
                   );
                 }
+                const selectedEpic = yield* loadSelectedEpic(sql, projectId);
                 const expected =
                   [...authority.tasks]
                     .filter(
                       (task) =>
+                        (selectedEpic === null ||
+                          (selectedEpic.status === "running" &&
+                            task.taskId === selectedEpic.activeTaskId)) &&
                         task.status === "candidate" &&
                         task.sourceGate === "eligible" &&
                         task.stage === "intake" &&
@@ -1637,6 +1642,7 @@ const make = Effect.gen(function* () {
                     "task-history-corrupt",
                   );
                 }
+                if (taskId !== null) yield* bindEpicChildRun(sql, projectId, taskId, run!.runId);
                 const step = taskId === null ? "no-eligible-task" : "task-selected";
                 const result = yield* writeRunOnceStepInTransaction(sql, {
                   runId: run!.runId,

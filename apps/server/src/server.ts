@@ -1,3 +1,8 @@
+import { AgentControlEpic } from "./agentControl/epic/Services/AgentControlEpic.ts";
+import { AgentControlEpicProgress } from "./agentControl/epic/Services/AgentControlEpicProgress.ts";
+import { AgentControlEpicLive } from "./agentControl/epic/Layers/AgentControlEpic.ts";
+import { EpicResultsLive, EpicCheckExecutorLive } from "./agentControl/epic/results.ts";
+import { layer as EpicGithubClientLive } from "./agentControl/github/Layers/GithubIssueTrackerClient.ts";
 import { makeAgentControlRunOnceReadModel } from "./agentControl/runOnce/readModel.ts";
 import { AgentControlRunOnceReadModel } from "./agentControl/runOnce/Services/AgentControlRunOnceReadModel.ts";
 import { AgentControlRunOnceReadNotificationsLive } from "./agentControl/runOnce/readNotifications.ts";
@@ -808,7 +813,30 @@ const AgentControlRunOnceControllerServiceLayerLive = AgentControlRunOnceControl
   Layer.provide(RuntimeCoreDependenciesBaseLive),
 );
 
+const AgentControlEpicServiceLive = AgentControlEpicLive.pipe(
+  Layer.provide(
+    EpicResultsLive.pipe(
+      Layer.provide(EpicCheckExecutorLive),
+      Layer.provide(AgentControlWorktreeControllerServiceLayerLive),
+      Layer.provide(RuntimeCoreDependenciesBaseLive),
+    ),
+  ),
+  Layer.provide(
+    EpicGithubClientLive.pipe(Layer.provide(GitHubCli.layer), Layer.provide(VcsProcess.layer)),
+  ),
+  Layer.provide(AgentControlRuntimeServicesLayerLive),
+  Layer.provide(RuntimeCoreDependenciesBaseLive),
+);
+const AgentControlEpicProgressLive = Layer.effect(
+  AgentControlEpicProgress,
+  Effect.map(AgentControlEpic, (service) => ({
+    processProject: service.processProject,
+    subscribeChanges: service.subscribeChanges,
+  })),
+).pipe(Layer.provide(AgentControlEpicServiceLive));
+
 const AgentControlArmedSchedulerLayerLive = AgentControlArmedSchedulerLive.pipe(
+  Layer.provide(AgentControlEpicProgressLive),
   Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
   Layer.provideMerge(AgentControlTaskIntakeReactorLayerLive),
   Layer.provideMerge(AgentControlRunOnceControllerServiceLayerLive),
@@ -864,6 +892,7 @@ const AgentControlRunOnceReadModelLive = Layer.effect(
 );
 
 const RuntimeCoreDependenciesLive = Layer.mergeAll(
+  AgentControlEpicServiceLive,
   AgentControlRunOnceReadModelLive,
   RuntimeCoreDependenciesBaseLive,
   AgentControlPolicyLayerLive,

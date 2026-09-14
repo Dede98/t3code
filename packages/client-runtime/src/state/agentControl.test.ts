@@ -1,5 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
+  type AgentControlEpicPreview,
+  type AgentControlEpicRuntimeView,
   AgentControlProjectRevisionConflictError,
   AgentControlCommandPreviouslyRejectedError,
   AgentControlRunOnceSnapshot,
@@ -18,6 +20,11 @@ import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
 
 import {
+  agentControlEpicStartBlockers,
+  agentControlEpicStartInput,
+  agentControlEpicControlInput,
+  agentControlEpicControlAllowed,
+  agentControlEpicStatus,
   agentControlEndPausedInput,
   agentControlCommandErrorMessage,
   agentControlSnapshotFresh,
@@ -839,4 +846,262 @@ describe("Armed start and paused states", () => {
       }
     },
   );
+});
+
+// Synthetic state tests exercise client authority and evidence rules; GitHub compatibility is
+// verified against the native relationship reader separately.
+const epicPreview: AgentControlEpicPreview = {
+  canStart: true,
+  projectId: snapshot.projectId,
+  source: {
+    format: "github-native-sub-issues-v1",
+    repository: { repositoryNodeId: "repository", nameWithOwner: "test/project" },
+    epic: {
+      repositoryNodeId: "repository",
+      nameWithOwner: "test/project",
+      issueNodeId: "epic",
+      number: 100,
+      url: "https://github.com/test/project/issues/100",
+      title: "Synthetic Epic",
+      state: "open",
+      subIssueCount: 1,
+    },
+    tasks: [
+      {
+        issue: {
+          repositoryNodeId: "repository",
+          nameWithOwner: "test/project",
+          issueNodeId: "issue",
+          number: 101,
+          url: "https://github.com/test/project/issues/101",
+          title: "Child task",
+          state: "open",
+          subIssueCount: 0,
+        },
+        position: 0,
+        dependencies: [],
+      },
+    ],
+    blockers: [],
+    fingerprint: "scope-fingerprint",
+    inspectedAt: timestamp,
+  },
+  blockers: [],
+};
+const epicRun: AgentControlEpicRuntimeView = {
+  epicRunId: "epic-run",
+  projectId: snapshot.projectId,
+  revision: 7,
+  status: "running",
+  source: epicPreview.source,
+  checks: policy.projectPolicy!.policy.verificationChecks!,
+  members: [
+    {
+      issueNodeId: "issue",
+      issueNumber: 101,
+      taskId: task.taskId,
+      childRunId: run.state.runId,
+      status: "accepted",
+      baseCommitSha: "base",
+      reservationId: "reservation",
+      taskFinalizationEvidenceId: "finalized",
+      accepted: {
+        commitSha: "common",
+        treeSha: "tree",
+        codeDigest: "digest",
+        evidenceId: "accepted-evidence",
+      },
+    },
+  ],
+  activeTaskId: null,
+  acceptedCommitSha: "common",
+  blockers: [],
+  blockerHistory: [],
+  verificationAttempt: 1,
+  finalVerification: null,
+  finalVerificationHistory: [],
+  createdAt: timestamp,
+  updatedAt: timestamp,
+};
+
+describe("Epic execution client state", () => {
+  it("admits inspected scope independently of unrelated backlog ordering and retains stable command identity", () => {
+    const readiness = { ...start, snapshot: { ...snapshot, tasks: [], nextTaskId: null } };
+    expect(agentControlEpicStartBlockers(readiness, epicPreview)).toEqual([]);
+    const input = agentControlEpicStartInput(snapshot, epicPreview);
+    expect(input.expectedFingerprint).toBe(epicPreview.source.fingerprint);
+    expect(input.expectedRevision).toBe(snapshot.projectState.revision);
+    expect(
+      agentControlEpicStartInput(decodeSnapshot(JSON.parse(JSON.stringify(snapshot))), epicPreview),
+    ).toEqual(input);
+    expect(
+      agentControlEpicStartInput(snapshot, {
+        ...epicPreview,
+        source: { ...epicPreview.source, fingerprint: "changed" },
+      }).commandId,
+    ).not.toBe(input.commandId);
+  });
+
+  it("shows structural and intake blockers before start, including failed or missing preview", () => {
+    const message = "Nested sub-issues are not supported";
+    const preview = {
+      ...epicPreview,
+      canStart: false,
+      blockers: [{ code: "nested-sub-issues", issueNumber: 101, message }],
+    };
+    expect(agentControlEpicStartBlockers(start, preview)).toContain(message);
+    expect(agentControlEpicStartBlockers(start, { ...preview, canStart: true })).toEqual([]);
+    expect(
+      agentControlEpicStartBlockers(start, {
+        ...epicPreview,
+        source: {
+          ...epicPreview.source,
+          blockers: [
+            {
+              code: "missing-prerequisite",
+              issueNumber: 101,
+              message: "A different child requires an open external prerequisite",
+            },
+          ],
+        },
+      }),
+    ).toEqual([]);
+    expect(agentControlEpicStartBlockers(start, null)).toContain(
+      "Inspect an Epic in this project before starting.",
+    );
+    expect(agentControlEpicStartBlockers({ ...start, policy: null }, epicPreview)).toContain(
+      "Load the project's verification configuration before starting.",
+    );
+  });
+
+  it("checks selected environment permissions for Epic start, resume, stop and clear", () => {
+    const blocker = agentControlModeChangeBlocker(
+      AsyncResult.success({ ...adminSession, scopes: AuthStandardClientScopes }),
+    );
+    expect(
+      agentControlEpicStartBlockers({ ...start, modeChangeBlocker: blocker }, epicPreview),
+    ).toContain(blocker);
+    const readiness = {
+      ...start,
+      snapshot: { ...snapshot, epic: { ...epicRun, status: "blocked" as const } },
+      modeChangeBlocker: blocker,
+    };
+    for (const action of ["resume", "stop", "clear"] as const) {
+      expect(agentControlEpicControlAllowed(readiness, action)).toBe(false);
+      expect(
+        agentControlEpicControlAllowed(
+          { ...readiness, modeChangeBlocker: null, connected: false },
+          action,
+        ),
+      ).toBe(false);
+      expect(
+        agentControlEpicControlAllowed(
+          { ...readiness, modeChangeBlocker: null, pending: true },
+          action,
+        ),
+      ).toBe(false);
+    }
+  });
+
+  it("resumes only the same Epic and preserves control identity at its revision", () => {
+    const readiness = {
+      ...start,
+      snapshot: { ...snapshot, epic: epicRun, armed: { enabled: false } },
+    };
+    expect(agentControlEpicControlAllowed(readiness, "resume")).toBe(true);
+    expect(
+      agentControlEpicControlAllowed(
+        {
+          ...readiness,
+          snapshot: {
+            ...readiness.snapshot,
+            epic: {
+              ...epicRun,
+              status: "blocked",
+              members: epicRun.members.map((member) => ({ ...member, status: "failed" })),
+            },
+          },
+        },
+        "resume",
+      ),
+    ).toBe(false);
+    expect(
+      agentControlEpicControlAllowed(
+        { ...readiness, snapshot: { ...readiness.snapshot, armed: { enabled: true } } },
+        "resume",
+      ),
+    ).toBe(false);
+    const input = agentControlEpicControlInput(epicRun, "resume");
+    expect(input).toMatchObject({ epicRunId: "epic-run", expectedRevision: 7 });
+    expect(agentControlEpicControlInput({ ...epicRun }, "resume")).toEqual(input);
+    expect(agentControlEpicControlInput({ ...epicRun, revision: 8 }, "resume").commandId).not.toBe(
+      input.commandId,
+    );
+    expect(agentControlEpicControlInput(epicRun, "stop").commandId).not.toBe(input.commandId);
+  });
+
+  it("retains a completed or stopped scope until explicitly cleared with automation off", () => {
+    const readiness = {
+      ...start,
+      snapshot: {
+        ...snapshot,
+        epic: { ...epicRun, status: "stopped" as const },
+        armed: { enabled: false },
+      },
+    };
+    expect(agentControlArmBlockers(readiness)).toContain(
+      "This project has an Epic execution target. Use its resume or end controls.",
+    );
+    expect(agentControlStartBlockers(readiness)).toContain(
+      "This project has an Epic execution target. Use its resume or end controls.",
+    );
+    expect(agentControlEpicControlAllowed(readiness, "resume")).toBe(false);
+    expect(agentControlEpicControlAllowed(readiness, "stop")).toBe(false);
+    expect(agentControlEpicControlAllowed(readiness, "clear")).toBe(true);
+    expect(
+      agentControlEpicControlAllowed(
+        { ...readiness, snapshot: { ...readiness.snapshot, armed: { enabled: true } } },
+        "clear",
+      ),
+    ).toBe(false);
+    expect(
+      agentControlArmBlockers({ ...readiness, snapshot: { ...readiness.snapshot, epic: null } }),
+    ).toEqual([]);
+  });
+
+  it("never substitutes green child runs for final common-result verification", () => {
+    const succeeded = { ...epicRun, status: "succeeded" as const };
+    expect(agentControlEpicStatus(succeeded).tone).toBe("warning");
+    const finalVerification = {
+      status: "passed" as const,
+      commitSha: "common",
+      evidenceId: "final",
+      detail: "Required checks passed",
+      checks: stage.verification!.checks,
+    };
+    expect(agentControlEpicStatus({ ...succeeded, finalVerification }).tone).toBe("success");
+    expect(
+      agentControlEpicStatus({
+        ...succeeded,
+        finalVerification,
+        checks: [...succeeded.checks, { ...succeeded.checks[0]!, id: "second-required" }],
+      }).tone,
+    ).toBe("warning");
+    for (const verification of [
+      { ...finalVerification, commitSha: "different-commit" },
+      { ...finalVerification, checks: [] },
+      { ...finalVerification, status: "failed" as const },
+      {
+        ...finalVerification,
+        checks: finalVerification.checks.map((check) => ({ ...check, status: "failed" as const })),
+      },
+      {
+        ...finalVerification,
+        checks: finalVerification.checks.map((check) => ({ ...check, completedAt: null })),
+      },
+    ])
+      expect(agentControlEpicStatus({ ...succeeded, finalVerification: verification }).tone).toBe(
+        "warning",
+      );
+  });
 });

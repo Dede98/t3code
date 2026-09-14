@@ -1,3 +1,6 @@
+import { AgentControlRunOnceCheckView } from "./agentControlVerificationView.ts";
+export { AgentControlRunOnceCheckView } from "./agentControlVerificationView.ts";
+import { AgentControlEpicRuntimeView } from "./agentControlEpicRuntime.ts";
 /** Durable Run-Once execution and project-scoped client read models. */
 import * as Schema from "effect/Schema";
 import { AgentControlStageRunState } from "./agentControlStageRun.ts";
@@ -123,17 +126,6 @@ export const AgentControlRunOnceSnapshotInput = Schema.Struct({
 });
 export type AgentControlRunOnceSnapshotInput = typeof AgentControlRunOnceSnapshotInput.Type;
 
-export const AgentControlRunOnceCheckView = Schema.Struct({
-  id: Schema.String,
-  command: Schema.String,
-  args: Schema.Array(Schema.String),
-  cwd: Schema.String,
-  required: Schema.Boolean,
-  status: Schema.Literals(["passed", "failed", "unavailable", "stale", "missing", "running"]),
-  exitCode: Schema.NullOr(Schema.Int),
-  output: Schema.NullOr(Schema.String),
-  completedAt: Schema.NullOr(IsoDateTime),
-});
 export const AgentControlRunOnceVerificationView = Schema.Struct({
   providerDeliveryId: Schema.String,
   verdict: Schema.NullOr(Schema.Literals(["passed", "failed"])),
@@ -162,6 +154,8 @@ export const AgentControlRunOnceView = Schema.Struct({
 });
 export type AgentControlRunOnceView = typeof AgentControlRunOnceView.Type;
 export const AgentControlRunOnceSnapshot = Schema.Struct({
+  epic: Schema.optionalKey(Schema.NullOr(AgentControlEpicRuntimeView)),
+  epicHistory: Schema.optionalKey(Schema.Array(AgentControlEpicRuntimeView)),
   /** Absent on older servers; clients must not interpret unknown authority as off. */
   armed: Schema.optionalKey(Schema.Struct({ enabled: Schema.Boolean })),
   blockers: Schema.Array(Schema.String),

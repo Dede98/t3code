@@ -3,6 +3,8 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { loadSelectedEpic } from "../epic/authority.ts";
+
 export const AGENT_CONTROL_RUN_ONCE_CANDIDATE_SQL = `SELECT candidate.task_id AS "taskId"
 FROM main.agent_control_task_states AS candidate
 INDEXED BY idx_agent_control_run_once_candidates
@@ -19,6 +21,16 @@ const decodeRows = Schema.decodeUnknownEffect(Schema.Array(CandidateRow));
 
 export const selectAgentControlRunOnceCandidate = Effect.fn("selectAgentControlRunOnceCandidate")(
   function* (sql: SqlClient.SqlClient, projectId: ProjectId, githubIntakeSequence: number) {
+    const epic = yield* loadSelectedEpic(sql, projectId);
+    if (epic !== null) {
+      if (epic.status !== "running" || epic.activeTaskId === null) return null;
+      const rows = yield* sql<
+        Record<string, unknown>
+      >`SELECT task_id AS "taskId" FROM main.agent_control_task_states
+        WHERE project_id=${projectId} AND task_id=${epic.activeTaskId}
+        AND github_intake_sequence=${githubIntakeSequence} AND status='candidate' AND source_gate='eligible' AND stage='intake'`;
+      return (yield* decodeRows(rows))[0]?.taskId ?? null;
+    }
     const rows = yield* sql.unsafe<Record<string, unknown>>(AGENT_CONTROL_RUN_ONCE_CANDIDATE_SQL, [
       projectId,
       githubIntakeSequence,

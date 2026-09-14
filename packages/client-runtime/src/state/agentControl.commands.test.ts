@@ -1,6 +1,13 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
+  AGENT_CONTROL_EPIC_RPC_METHODS,
+  AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
+  AgentControlRunOnceId,
+  type AgentControlRunOnceSnapshot,
+  type AgentControlRunOnceSnapshotInput,
+  AgentControlEpicRpcError,
+  type AgentControlEpicStartInput,
   AgentControlCommandPreviouslyRejectedError,
   AgentControlProjectRevisionConflictError,
   CommandId,
@@ -49,6 +56,18 @@ type PendingCall = {
   response: Deferred.Deferred<AgentControlSetProjectModeResult, AgentControlRuntimeRpcError>;
 };
 
+type SavedRunCall = {
+  environmentId: EnvironmentId;
+  input: AgentControlRunOnceSnapshotInput;
+  response: Deferred.Deferred<AgentControlRunOnceSnapshot>;
+};
+
+type EpicCall = {
+  environmentId: EnvironmentId;
+  input: AgentControlEpicStartInput;
+  response: Deferred.Deferred<never, AgentControlEpicRpcError>;
+};
+
 function confirmed(input: AgentControlSetProjectModeInput): AgentControlSetProjectModeResult {
   return {
     state: {
@@ -68,9 +87,28 @@ function confirmed(input: AgentControlSetProjectModeInput): AgentControlSetProje
 const makeHarness = Effect.fn("makeAgentControlCommandHarness")(function* () {
   const calls: PendingCall[] = [];
   const arrivals = yield* Queue.unbounded<PendingCall>();
+  const epicCalls: EpicCall[] = [];
+  const epicArrivals = yield* Queue.unbounded<EpicCall>();
+  const savedRunArrivals = yield* Queue.unbounded<SavedRunCall>();
   const supervisors = new Map<EnvironmentId, EnvironmentSupervisor["Service"]>();
   for (const id of [environmentId, otherEnvironmentId]) {
     const client = {
+      [AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot]: Effect.fn(function* (
+        input: AgentControlRunOnceSnapshotInput,
+      ) {
+        const response = yield* Deferred.make<AgentControlRunOnceSnapshot>();
+        yield* Queue.offer(savedRunArrivals, { environmentId: id, input, response });
+        return yield* Deferred.await(response);
+      }),
+      [AGENT_CONTROL_EPIC_RPC_METHODS.start]: Effect.fn(function* (
+        input: AgentControlEpicStartInput,
+      ) {
+        const response = yield* Deferred.make<never, AgentControlEpicRpcError>();
+        const call = { environmentId: id, input, response };
+        epicCalls.push(call);
+        yield* Queue.offer(epicArrivals, call);
+        return yield* Deferred.await(response);
+      }),
       [AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode]: Effect.fn(function* (
         input: AgentControlSetProjectModeInput,
       ) {
@@ -129,7 +167,15 @@ const makeHarness = Effect.fn("makeAgentControlCommandHarness")(function* () {
   const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (registry) =>
     Effect.sync(() => registry.dispose()),
   );
-  return { registry, atoms: createAgentControlEnvironmentAtoms(runtime), calls, arrivals };
+  return {
+    registry,
+    atoms: createAgentControlEnvironmentAtoms(runtime),
+    calls,
+    arrivals,
+    epicCalls,
+    epicArrivals,
+    savedRunArrivals,
+  };
 });
 
 describe("autonomous task mode commands", () => {
@@ -234,3 +280,89 @@ describe("autonomous task mode commands", () => {
       ),
   );
 });
+
+it.effect(
+  "Epic starts deduplicate across remounts and retain shared pending while another project command is active",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { registry, atoms, arrivals, epicArrivals, epicCalls } = yield* makeHarness();
+        const epicTarget = {
+          environmentId,
+          input: {
+            projectId: target.input.projectId,
+            commandId: CommandId.make("epic-start"),
+            expectedRevision: 3,
+            epicNumber: 100,
+            expectedFingerprint: "native-scope",
+          },
+        };
+        const unmount = registry.mount(atoms.pending(epicTarget));
+        const first = atoms.epicStart.run(registry, epicTarget);
+        const call = yield* Queue.take(epicArrivals);
+        unmount();
+        const remount = registry.mount(atoms.pending(epicTarget));
+        const repeated = atoms.epicStart.run(registry, { ...epicTarget });
+        expect(epicCalls).toHaveLength(1);
+        expect(registry.get(atoms.pending(epicTarget))).toBe(true);
+        expect(
+          registry.get(atoms.pending({ ...epicTarget, environmentId: otherEnvironmentId })),
+        ).toBe(false);
+
+        const modeRequest = atoms.setMode.run(registry, target);
+        const modeCall = yield* Queue.take(arrivals);
+        const failure = new AgentControlEpicRpcError({
+          code: "scope-changed",
+          message: "Inspect the changed Epic again",
+        });
+        yield* Deferred.fail(call.response, failure);
+        const results = yield* Effect.promise(() => Promise.all([first, repeated]));
+        expect(results.every((result) => result._tag === "Failure")).toBe(true);
+        expect(epicCalls).toHaveLength(1);
+        expect(registry.get(atoms.pending(epicTarget))).toBe(true);
+        yield* Deferred.succeed(modeCall.response, confirmed(modeCall.input));
+        yield* Effect.promise(() => modeRequest);
+        expect(registry.get(atoms.pending(epicTarget))).toBe(false);
+        remount();
+      }),
+    ),
+);
+
+it.effect("keeps distinct historical child lookups separate while sharing project pending", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { registry, atoms, savedRunArrivals } = yield* makeHarness();
+      const firstTarget = {
+        environmentId,
+        input: {
+          projectId: target.input.projectId,
+          runId: AgentControlRunOnceId.make("old-child-a"),
+        },
+      };
+      const secondTarget = {
+        ...firstTarget,
+        input: { ...firstTarget.input, runId: AgentControlRunOnceId.make("old-child-b") },
+      };
+      const first = atoms.getRun.run(registry, firstTarget);
+      const firstCall = yield* Queue.take(savedRunArrivals);
+      const second = atoms.getRun.run(registry, secondTarget);
+      const secondCall = yield* Queue.take(savedRunArrivals);
+      expect(firstCall.input.runId).toBe("old-child-a");
+      expect(secondCall.input.runId).toBe("old-child-b");
+      const result: AgentControlRunOnceSnapshot = {
+        projectId: target.input.projectId,
+        projectState: { ...confirmed(target.input).state, schemaVersion: 1 },
+        tasks: [],
+        runs: [],
+        nextTaskId: null,
+        blockers: [],
+      };
+      yield* Deferred.succeed(secondCall.response, result);
+      yield* Effect.promise(() => second);
+      expect(registry.get(atoms.pending(firstTarget))).toBe(true);
+      yield* Deferred.succeed(firstCall.response, result);
+      yield* Effect.promise(() => first);
+      expect(registry.get(atoms.pending(firstTarget))).toBe(false);
+    }),
+  ),
+);

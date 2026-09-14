@@ -1421,7 +1421,7 @@ const seedRunOnceCommittedVerificationFinalization = Effect.fn(
         CREATE TEMP TRIGGER run_once_verification_handoff_seed_insert
         AFTER INSERT ON run_once_verification_handoff_seed
         BEGIN
-          INSERT INTO main.agent_control_verification_handoff_accepted
+          INSERT INTO agent_control_verification_handoff_accepted
           SELECT * FROM temp.run_once_verification_handoff_seed WHERE rowid = NEW.rowid;
         END
       `;

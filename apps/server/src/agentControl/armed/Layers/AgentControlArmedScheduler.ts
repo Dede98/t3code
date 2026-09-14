@@ -1,3 +1,5 @@
+import { loadSelectedEpic } from "../../epic/authority.ts";
+import { AgentControlEpicProgress } from "../../epic/Services/AgentControlEpicProgress.ts";
 import { type AgentControlArmedDispatch, type ProjectId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
@@ -265,6 +267,7 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
   const taskEngine = yield* AgentControlTaskEngine;
   const taskIntake = yield* AgentControlTaskIntakeReactor;
   const runOnce = yield* AgentControlRunOnceController;
+  const epicProgress = yield* AgentControlEpicProgress;
   const ownerId = `armed-controller-${yield* crypto.randomUUIDv4}`;
   const runtimeFailure = yield* Deferred.make<never, AgentControlArmedError>();
   const reportFailure = (failure: AgentControlArmedError) =>
@@ -391,6 +394,8 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
 
   const processProject: AgentControlArmedSchedulerShape["processProject"] = (projectId) =>
     Effect.gen(function* () {
+      const selectedEpic = yield* loadSelectedEpic(sql, projectId);
+      if (selectedEpic !== null) yield* epicProgress.processProject(projectId);
       const dispatch = yield* withAgentControlRunOnceProjectFence(
         projectId,
         Effect.gen(function* () {
@@ -427,6 +432,7 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
       // completion, never a Human supersession.
       if (preflight.mode === "armed" && preflight.pausedFromMode === null) {
         yield* finishArmedDispatch(sql, dispatch, "completed", preflight.updatedAt as string);
+        if (selectedEpic !== null) yield* processProject(projectId);
         return;
       }
       if (preflight.mode !== "run-once" || preflight.pausedFromMode !== null) {
@@ -459,6 +465,7 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
       if (state.status !== "activated") return;
       if (state.mode === "armed" && state.pausedFromMode === null) {
         yield* finishArmedDispatch(sql, dispatch, "completed", state.updatedAt as string);
+        if (selectedEpic !== null) yield* processProject(projectId);
         return;
       }
       if (state.mode !== "run-once") {
@@ -537,6 +544,14 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
         schedule,
         "task",
       );
+      if (epicProgress.subscribeChanges !== undefined) {
+        yield* superviseAgentControlRunOnceListener(
+          epicProgress.subscribeChanges,
+          catchUp,
+          schedule,
+          "task",
+        );
+      }
       yield* recover;
       yield* Deferred.succeed(ready, undefined);
     });

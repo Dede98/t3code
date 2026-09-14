@@ -1,3 +1,4 @@
+import { loadEpicRun, loadSelectedEpic } from "../epic/authority.ts";
 import {
   AgentControlInternalPersistenceError,
   AgentControlRunOnceSnapshot,
@@ -25,6 +26,7 @@ import {
 } from "./selection.ts";
 import { deriveRunOnceCommandId } from "./identity.ts";
 
+const encodeEpicRunIds = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
 const decodeSnapshot = Schema.decodeUnknownEffect(AgentControlRunOnceSnapshot);
 const encodeSnapshot = Schema.encodeSync(Schema.fromJsonString(AgentControlRunOnceSnapshot));
 const decodeRun = Schema.decodeUnknownEffect(AgentControlRunOnceState);
@@ -108,6 +110,20 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
             (yield* isAgentControlRunOnceCandidateVacant(sql, input.projectId, candidateTaskId))
               ? candidateTaskId
               : null;
+          const epic = yield* loadSelectedEpic(sql, input.projectId);
+          const epicTables =
+            yield* sql`SELECT 1 FROM sqlite_schema WHERE name='agent_control_epic_runs' AND type='table'`;
+          const historicalIds = epicTables.length
+            ? yield* sql<{
+                epicRunId: string;
+              }>`SELECT epic_run_id AS "epicRunId" FROM agent_control_epic_runs WHERE project_id=${input.projectId} AND (${epic?.epicRunId ?? null} IS NULL OR epic_run_id != ${epic?.epicRunId ?? null}) ORDER BY rowid DESC LIMIT 5`
+            : [];
+          const epicHistory = (yield* Effect.forEach(historicalIds, (row) =>
+            loadEpicRun(sql, row.epicRunId),
+          )).filter((run) => run !== null);
+          const epicRunIds =
+            epic?.members.flatMap((member) => (member.childRunId ? [member.childRunId] : [])) ?? [];
+
           const rows = yield* sql`
         SELECT 1 AS "schemaVersion", run_id AS "runId", project_id AS "projectId", status,
           next_ordinal AS "nextOrdinal", last_step AS "lastStep", task_id AS "taskId",
@@ -118,7 +134,14 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
           reset_project_revision AS "resetProjectRevision", updated_at AS "updatedAt"
         FROM main.agent_control_run_once_states
         WHERE project_id = ${input.projectId} AND (${input.runId ?? null} IS NULL OR run_id = ${input.runId ?? null})
-        ORDER BY activation_project_revision DESC LIMIT 1
+        AND (${input.runId !== undefined || epicRunIds.length === 0 ? 1 : 0} OR status = 'active'
+          OR run_id = (SELECT latest.run_id FROM main.agent_control_run_once_states latest WHERE latest.project_id=${input.projectId} ORDER BY latest.activation_project_revision DESC LIMIT 1)
+          OR run_id IN (
+          SELECT value FROM json_each(${encodeEpicRunIds(epicRunIds)})
+        ))
+        ORDER BY (status='active') DESC,
+          (run_id IN (SELECT value FROM json_each(${encodeEpicRunIds(epic?.members.flatMap((member) => (member.childRunId ? [member.childRunId] : [])) ?? [])}))) DESC,
+          activation_project_revision DESC LIMIT ${input.runId !== undefined || epicRunIds.length === 0 ? 1 : 100}
       `;
           const diagnostics = yield* sql<{ runId: string | null; errorCode: string }>`
         SELECT run_id AS "runId", error_code AS "errorCode" FROM main.agent_control_run_once_diagnostics
@@ -290,6 +313,8 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
             });
           }
           return yield* decodeSnapshot({
+            epic,
+            epicHistory,
             armed,
             blockers: diagnostics.map((item) => item.errorCode),
             projectId: input.projectId,

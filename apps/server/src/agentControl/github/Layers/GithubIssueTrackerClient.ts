@@ -11,6 +11,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import * as GitHubCli from "../../../sourceControl/GitHubCli.ts";
+import { makeEpicInspector } from "../githubEpicSource.ts";
 import { reduceGithubIssueTimeline } from "../githubTimelineReducer.ts";
 import {
   GithubIssueTrackerClient,
@@ -116,7 +117,7 @@ export interface GithubIssueTrackerClientOptions {
 
 const mapCliError = (
   error: GitHubCli.GitHubCliError,
-  operation: "resolve-repository" | "list-issues" | "read-timeline",
+  operation: GithubIssueTrackerClientError["operation"],
 ) => {
   let code: GithubIssueTrackerClientError["code"];
   if (error._tag === "GitHubCliUnavailableError") code = "github-unavailable";
@@ -133,7 +134,7 @@ const mapCliError = (
   return new GithubIssueTrackerClientError({ code, operation });
 };
 
-const decodeFailure = (operation: "resolve-repository" | "list-issues" | "read-timeline") =>
+const decodeFailure = (operation: GithubIssueTrackerClientError["operation"]) =>
   new GithubIssueTrackerClientError({ code: "github-decode-failed", operation });
 
 const sameRepository = (
@@ -162,7 +163,7 @@ export const make = Effect.fn("GithubIssueTrackerClient.make")(function* (
   const executeJson = Effect.fn("GithubIssueTrackerClient.executeJson")(function* (
     cwd: string,
     args: ReadonlyArray<string>,
-    operation: "resolve-repository" | "list-issues" | "read-timeline",
+    operation: GithubIssueTrackerClientError["operation"],
   ) {
     const output = yield* github
       .execute({ cwd, args, timeoutMs })
@@ -429,7 +430,13 @@ export const make = Effect.fn("GithubIssueTrackerClient.make")(function* (
     };
   });
 
-  return GithubIssueTrackerClient.of({ resolveRepository, pollIssues });
+  const inspectEpic = makeEpicInspector({
+    resolveRepository,
+    execute: (cwd, args) => executeJson(cwd, args, "inspect-epic"),
+    pageSize: restPageSize,
+    maxPages: maxIssuePages,
+  });
+  return GithubIssueTrackerClient.of({ resolveRepository, pollIssues, inspectEpic });
 });
 
 export const layer = Layer.effect(GithubIssueTrackerClient, make());

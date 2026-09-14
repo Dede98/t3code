@@ -1,4 +1,13 @@
 import {
+  AGENT_CONTROL_EPIC_RPC_METHODS,
+  AgentControlEpicPreviewInput,
+  AgentControlEpicStartInput,
+  AgentControlEpicControlInput,
+  AgentControlEpicPreview,
+  AgentControlEpicRuntimeView,
+  AgentControlEpicRpcError,
+} from "./agentControlEpicRuntime.ts";
+import {
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
   AgentControlRunOnceSnapshotInput,
   AgentControlRunOnceSnapshot,
@@ -477,6 +486,31 @@ export const WS_METHODS = {
   subscribeResourceTelemetry: "subscribeResourceTelemetry",
 } as const;
 
+export const WsAgentControlEpicPreviewRpc = Rpc.make(AGENT_CONTROL_EPIC_RPC_METHODS.preview, {
+  payload: AgentControlEpicPreviewInput,
+  success: AgentControlEpicPreview,
+  error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
+});
+export const WsAgentControlEpicStartRpc = Rpc.make(AGENT_CONTROL_EPIC_RPC_METHODS.start, {
+  payload: AgentControlEpicStartInput,
+  success: AgentControlEpicRuntimeView,
+  error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
+});
+export const WsAgentControlEpicResumeRpc = Rpc.make(AGENT_CONTROL_EPIC_RPC_METHODS.resume, {
+  payload: AgentControlEpicControlInput,
+  success: AgentControlEpicRuntimeView,
+  error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
+});
+export const WsAgentControlEpicStopRpc = Rpc.make(AGENT_CONTROL_EPIC_RPC_METHODS.stop, {
+  payload: AgentControlEpicControlInput,
+  success: AgentControlEpicRuntimeView,
+  error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
+});
+export const WsAgentControlEpicClearRpc = Rpc.make(AGENT_CONTROL_EPIC_RPC_METHODS.clear, {
+  payload: AgentControlEpicControlInput,
+  success: AgentControlEpicRuntimeView,
+  error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
+});
 export const WsAgentControlRunOnceGetSnapshotRpc = Rpc.make(
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot,
   {
@@ -1566,6 +1600,11 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
 });
 
 export const WsRpcGroup = RpcGroup.make(
+  WsAgentControlEpicPreviewRpc,
+  WsAgentControlEpicStartRpc,
+  WsAgentControlEpicResumeRpc,
+  WsAgentControlEpicStopRpc,
+  WsAgentControlEpicClearRpc,
   WsAgentControlRunOnceGetSnapshotRpc,
   WsAgentControlRunOnceSubscribeRpc,
   WsAgentControlGetPolicyRpc,

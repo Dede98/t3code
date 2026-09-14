@@ -42,6 +42,7 @@ import {
   requireRunOnceMethod,
   withAgentControlRunOnceProjectFence,
 } from "../../runOnce/context.ts";
+import { loadEpicRunBase } from "../../epic/authority.ts";
 import { loadRunOnceRepair } from "../../runOnce/repair.ts";
 import {
   loadAuthoritativeInitialStageRunHistory,
@@ -109,6 +110,8 @@ import {
 import { AgentControlWorktreeEngine } from "../Services/AgentControlWorktreeEngine.ts";
 import { AgentControlWorktreeEventStore } from "../Services/AgentControlWorktreeEventStore.ts";
 import { AgentControlWorktreeStateRepository } from "../Services/AgentControlWorktreeStateRepository.ts";
+
+const isWorktreeRpcError = Schema.is(AgentControlWorktreeRpcError);
 
 const GIT_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const INTERNAL_TRANSITION_COMMAND_PREFIX = "agent-control-internal-worktree-v1-";
@@ -3968,25 +3971,32 @@ const make = Effect.gen(function* () {
       if (baseBranch.length === 0) {
         return yield* error("default-remote-ref-unavailable", operation, projectId, taskId);
       }
-      const baseRef = `${remote.name}/${baseBranch}`;
-      const resolved = yield* workflow
-        .resolveRemoteTrackingCommit({
-          cwd: canonical.projectWorkspace,
-          refName: baseRef,
-          fallbackRemoteName: remote.name,
-        })
-        .pipe(
-          Effect.mapError((failure) =>
-            error(
-              failure.exitCode === undefined
-                ? "repository-unavailable"
-                : "default-remote-ref-unavailable",
-              operation,
-              projectId,
-              taskId,
-            ),
-          ),
-        );
+      const runId = yield* AgentControlRunOnceExecutionContext;
+      const epicBase = yield* loadEpicRunBase(sql, projectId, taskId, runId).pipe(
+        Effect.mapError(() => error("source-snapshot-stale", operation, projectId, taskId)),
+      );
+      const baseRef = epicBase ?? `${remote.name}/${baseBranch}`;
+      const resolved =
+        epicBase !== null
+          ? { commitSha: epicBase }
+          : yield* workflow
+              .resolveRemoteTrackingCommit({
+                cwd: canonical.projectWorkspace,
+                refName: baseRef,
+                fallbackRemoteName: remote.name,
+              })
+              .pipe(
+                Effect.mapError((failure) =>
+                  error(
+                    failure.exitCode === undefined
+                      ? "repository-unavailable"
+                      : "default-remote-ref-unavailable",
+                    operation,
+                    projectId,
+                    taskId,
+                  ),
+                ),
+              );
       if (!GIT_OBJECT_ID.test(resolved.commitSha)) {
         return yield* error("default-remote-ref-unavailable", operation, projectId, taskId);
       }
@@ -4032,7 +4042,10 @@ const make = Effect.gen(function* () {
   const inspectRepositoryIdentity = Effect.fn(
     "AgentControlWorktreeController.inspectRepositoryIdentity",
   )(function* (
-    canonical: Effect.Success<ReturnType<typeof preflight>>,
+    canonical: Pick<
+      Effect.Success<ReturnType<typeof preflight>>,
+      "repository" | "projectWorkspace"
+    >,
     state: AgentControlWorktreeReservationState,
     operation: AgentControlWorktreeRpcError["operation"],
   ) {
@@ -4235,9 +4248,19 @@ const make = Effect.gen(function* () {
 
   const inspect = Effect.fn("AgentControlWorktreeController.inspect")(function* (
     state: AgentControlWorktreeReservationState,
-    canonical: Effect.Success<ReturnType<typeof preflight>>,
+    canonical: Pick<
+      Effect.Success<ReturnType<typeof preflight>>,
+      "repository" | "projectWorkspace"
+    > &
+      Partial<
+        Pick<
+          Effect.Success<ReturnType<typeof preflight>>,
+          "readyReuseAuthority" | "reuseStage" | "lease" | "repairMayReuseEdits"
+        >
+      >,
     requireOwnership: boolean,
     reservedTarget: AgentControlWorktreeTargetIdentity | null = null,
+    acceptedResult = false,
   ): Effect.fn.Return<
     | {
         readonly _tag: "exact";
@@ -4255,12 +4278,13 @@ const make = Effect.gen(function* () {
     // Verification and its durably authorized repair consume existing edits and
     // commits. Ownership, source history and the lease retain their usual guards.
     const inspectingImplementation =
-      requireOwnership &&
-      canonical.readyReuseAuthority !== null &&
-      ((canonical.reuseStage?.stageKind === "verification" &&
-        canonical.reuseStage.status === "prepared" &&
-        canonical.lease.status === "reserved") ||
-        canonical.repairMayReuseEdits);
+      acceptedResult ||
+      (requireOwnership &&
+        canonical.readyReuseAuthority !== null &&
+        ((canonical.reuseStage?.stageKind === "verification" &&
+          canonical.reuseStage.status === "prepared" &&
+          canonical.lease?.status === "reserved") ||
+          canonical.repairMayReuseEdits));
     const pathIdentity = yield* validateExistingAgentControlWorktreePath({
       target: state.internalWorktreePath,
       repositoryWorkspace: state.repositoryWorkspace,
@@ -6038,12 +6062,121 @@ const make = Effect.gen(function* () {
       Effect.provideService(AgentControlRunOnceExecutionContext, runId),
     );
 
+  const useAcceptedWorktree: NonNullable<
+    AgentControlWorktreeControllerShape["useAcceptedWorktree"]
+  > = (input, callback) =>
+    withAgentControlRunOnceProjectFence(
+      input.projectId,
+      Effect.gen(function* () {
+        const state = yield* engine.loadAuthoritative(input.reservationId);
+        const unavailable = () =>
+          error(
+            "state-not-available",
+            "materialize",
+            input.projectId,
+            input.taskId,
+            input.reservationId,
+          );
+        if (
+          !state ||
+          state.projectId !== input.projectId ||
+          state.taskId !== input.taskId ||
+          state.status !== "ready"
+        )
+          return yield* unavailable();
+        const lock = yield* getLock(state.repositoryCommonDir);
+        return yield* lock.withPermit(
+          withAgentControlRepositoryLock({
+            repositoryCommonDir: state.repositoryCommonDir,
+            runtimeHolderId: holderId,
+            effect: Effect.gen(function* () {
+              const authority = yield* sql`
+            SELECT evidence.task_finalization_evidence_id
+            FROM agent_control_task_verification_finalization_evidence evidence
+            JOIN agent_control_task_verification_finalization_receipts receipt
+              ON receipt.receipt_id = evidence.receipt_id AND receipt.status = 'accepted'
+              AND receipt.task_finalization_evidence_id = evidence.task_finalization_evidence_id
+            JOIN agent_control_task_verification_finalization_markers marker
+              ON marker.marker_id = evidence.marker_id AND marker.receipt_id = receipt.receipt_id
+              AND marker.task_finalization_evidence_id = evidence.task_finalization_evidence_id
+            JOIN agent_control_run_once_states run
+              ON run.project_id = evidence.project_id AND run.task_id = evidence.task_id
+              AND run.run_id = ${input.childRunId} AND run.worktree_reservation_id = ${input.reservationId}
+            JOIN agent_control_task_states task ON task.task_id = evidence.task_id AND task.status = 'succeeded'
+            WHERE evidence.task_finalization_evidence_id = ${input.taskFinalizationEvidenceId}
+              AND evidence.project_id = ${input.projectId} AND evidence.task_id = ${input.taskId}
+              AND evidence.verification_outcome = 'succeeded' AND evidence.verification_verdict = 'passed'
+          `;
+              const projects = yield* sql<{
+                workspaceRoot: string;
+              }>`SELECT workspace_root AS "workspaceRoot" FROM projection_projects WHERE project_id=${input.projectId} AND deleted_at IS NULL`;
+              const tracker = yield* github.get(input.projectId);
+              const fresh = yield* engine.loadAuthoritative(input.reservationId);
+              if (
+                authority.length !== 1 ||
+                !projects[0] ||
+                Option.isNone(tracker) ||
+                !tracker.value.config ||
+                !fresh ||
+                fresh.revision !== state.revision ||
+                fresh.sequence !== state.sequence ||
+                fresh.ownershipFingerprint !== state.ownershipFingerprint
+              )
+                return yield* unavailable();
+              const observed = yield* inspect(
+                fresh,
+                {
+                  projectWorkspace: projects[0].workspaceRoot,
+                  repository: tracker.value.config.repository,
+                },
+                true,
+                null,
+                true,
+              );
+              if (
+                observed._tag !== "exact" ||
+                observed.ownershipFingerprint !== fresh.ownershipFingerprint
+              )
+                return yield* unavailable();
+              return fresh;
+            }).pipe(
+              Effect.mapError((cause) =>
+                isWorktreeRpcError(cause)
+                  ? cause
+                  : error(
+                      "internal-persistence-error",
+                      "materialize",
+                      input.projectId,
+                      input.taskId,
+                      input.reservationId,
+                    ),
+              ),
+              Effect.flatMap((fresh) => Effect.scoped(callback(fresh))),
+            ),
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fs),
+            Effect.provideService(Path.Path, path),
+            Effect.catchTag("AgentControlRepositoryLockError", () =>
+              error(
+                "repository-lock-unavailable",
+                "materialize",
+                input.projectId,
+                input.taskId,
+                input.reservationId,
+              ),
+            ),
+          ),
+        );
+      }),
+    );
+
   return AgentControlWorktreeController.of({
     reserveAndMaterialize,
     reserveAndMaterializeForRunOnce,
     reconcile,
     useReadyWorktree,
     useReadyWorktreeForRunOnce,
+    useAcceptedWorktree,
   });
 });
 

@@ -1,6 +1,8 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AgentControlRunOnceId,
+  AgentControlTaskId,
+  type AgentControlEpicRuntimeView,
   ProjectId,
   type AgentControlRunOnceSnapshot,
 } from "@t3tools/contracts";
@@ -30,6 +32,7 @@ const persistence = Layer.effectDiscard(runMigrations()).pipe(
     }),
   ),
 );
+import { epicDigest, epicJson } from "../epic/authority.ts";
 import { AgentControlRuntimeLayerLive } from "../runtimeLayer.ts";
 import { AgentControlRunOnceController } from "./Services/AgentControlRunOnceController.ts";
 import { persistRunOnceDiagnostic, persistVerificationRunOnceDiagnostic } from "./diagnostics.ts";
@@ -641,5 +644,233 @@ layer("Run-Once client read model", (it) => {
         enabled: false,
       });
     }).pipe(Effect.scoped),
+  );
+  it.effect(
+    "keeps selected Epic children visible, retains cleared proof history and loads older child runs on demand",
+    () =>
+      Effect.gen(function* () {
+        yield* allowReadFixtures;
+        const sql = yield* SqlClient.SqlClient;
+        const read = yield* makeAgentControlRunOnceReadModel;
+        const id = ProjectId.make("epic-history-read");
+        yield* insertFixture("projection_projects", {
+          project_id: id,
+          title: "Epic history",
+          workspace_root: "/isolated/epic-history",
+          default_model_selection_json: null,
+          scripts_json: "[]",
+          created_at: at,
+          updated_at: at,
+          deleted_at: null,
+        });
+        const insertRun = (name: string, revision: number, active = false) =>
+          insertFixture("agent_control_run_once_states", {
+            run_id: name,
+            project_id: id,
+            status: active ? "active" : "completed",
+            next_ordinal: 10,
+            last_step: active ? "thread-activated" : "completed",
+            task_id: `${name}-task`,
+            stage_run_id: null,
+            lease_id: null,
+            worktree_reservation_id: null,
+            controlled_thread_reservation_id: null,
+            terminal_task_event_id: active ? null : `${name}-terminal`,
+            activation_project_revision: revision,
+            reset_project_revision: active ? null : revision + 1,
+            updated_at: at,
+          });
+        const olderChild = "historic-epic-child";
+        const childA = "selected-epic-child-a";
+        const childB = "selected-epic-child-b";
+        const ordinary = "latest-ordinary-run";
+        yield* insertRun(olderChild, 1);
+        yield* insertRun(childA, 3);
+        yield* insertRun(childB, 5, true);
+        yield* insertRun(ordinary, 8);
+        const check = {
+          id: "test",
+          command: "node",
+          args: ["--test"],
+          cwd: ".",
+          required: true,
+          timeoutMs: 1_000,
+          allowTemporaryFiles: false,
+          resultFormat: "exit-code" as const,
+        };
+        const makeEpic = (
+          name: string,
+          childIds: string[],
+          selected: boolean,
+        ): AgentControlEpicRuntimeView => {
+          const final = {
+            status: "passed" as const,
+            commitSha: `${name}-commit`,
+            evidenceId: `${name}-final`,
+            detail: "Common result checked",
+            checks: [
+              {
+                id: check.id,
+                command: check.command,
+                args: check.args,
+                cwd: check.cwd,
+                required: check.required,
+                status: "passed" as const,
+                exitCode: 0,
+                output: "Saved required-check evidence",
+                completedAt: at,
+              },
+            ],
+          };
+          return {
+            epicRunId: name,
+            projectId: id,
+            revision: 1,
+            status: selected ? "running" : "succeeded",
+            source: {
+              format: "github-native-sub-issues-v1",
+              repository: { repositoryNodeId: "repo", nameWithOwner: "test/read-model" },
+              epic: {
+                repositoryNodeId: "repo",
+                nameWithOwner: "test/read-model",
+                issueNodeId: name,
+                number: selected ? 100 : 90,
+                url: `https://github.com/test/read-model/issues/${selected ? 100 : 90}`,
+                title: name,
+                state: "open",
+                subIssueCount: childIds.length,
+              },
+              tasks: childIds.map((child, position) => ({
+                position,
+                dependencies: [],
+                issue: {
+                  repositoryNodeId: "repo",
+                  nameWithOwner: "test/read-model",
+                  issueNodeId: child,
+                  number: position + 1,
+                  url: `https://github.com/test/read-model/issues/${position + 1}`,
+                  title: child,
+                  state: "open",
+                  subIssueCount: 0,
+                },
+              })),
+              blockers: [],
+              fingerprint: `${name}-scope`,
+              inspectedAt: at,
+            },
+            checks: [check],
+            members: childIds.map((child, index) => ({
+              issueNodeId: child,
+              issueNumber: index + 1,
+              taskId: AgentControlTaskId.make(`${child}-task`),
+              childRunId: child,
+              status: selected && child === childB ? "running" : "accepted",
+              baseCommitSha: `${name}-base`,
+              reservationId: `${child}-worktree`,
+              taskFinalizationEvidenceId: `${child}-finalized`,
+              accepted:
+                selected && child === childB
+                  ? null
+                  : {
+                      commitSha: `${name}-commit`,
+                      treeSha: `${name}-tree`,
+                      codeDigest: `${name}-digest`,
+                      evidenceId: `${child}-accepted`,
+                    },
+            })),
+            activeTaskId: selected ? AgentControlTaskId.make(`${childB}-task`) : null,
+            acceptedCommitSha: `${name}-commit`,
+            blockers: [],
+            blockerHistory: [],
+            verificationAttempt: 1,
+            finalVerification: selected ? null : final,
+            finalVerificationHistory: selected ? [] : [final],
+            createdAt: at,
+            updatedAt: at,
+          };
+        };
+        const olderEpic = makeEpic("historic-epic", [olderChild], false);
+        const selectedEpic = makeEpic("selected-epic", [childA, childB], true);
+        for (const epic of [olderEpic, selectedEpic]) {
+          const state = {
+            epic_run_id: epic.epicRunId,
+            revision: epic.revision,
+            state_json: epicJson(epic),
+            state_digest: epicDigest(epic),
+          };
+          yield* insertFixture("agent_control_epic_runs", { ...state, project_id: id });
+          yield* insertFixture("agent_control_epic_history", state);
+        }
+        yield* insertFixture("agent_control_epic_targets", {
+          project_id: id,
+          epic_run_id: selectedEpic.epicRunId,
+        });
+        const selected = yield* read.getSnapshot({ projectId: id });
+        assert.equal(selected.epic?.epicRunId, selectedEpic.epicRunId);
+        assert.deepStrictEqual(
+          selected.runs.map((run) => run.state.runId),
+          [childB, childA, ordinary],
+        );
+        assert.deepStrictEqual(selected.epicHistory, [olderEpic]);
+        assert.equal(
+          selected.epicHistory?.[0]?.finalVerification?.checks[0]?.output,
+          "Saved required-check evidence",
+        );
+        // Child stage data from cleared Epics is fetched explicitly, keeping streamed snapshots small.
+        const historic = yield* read.getSnapshot({
+          projectId: id,
+          runId: AgentControlRunOnceId.make(olderChild),
+        });
+        assert.deepStrictEqual(
+          historic.runs.map((run) => run.state.runId),
+          [olderChild],
+        );
+        assert.equal(historic.epic?.epicRunId, selectedEpic.epicRunId);
+        yield* insertFixture("projection_projects", {
+          project_id: "different-project",
+          title: "Other project",
+          workspace_root: "/isolated/other-project",
+          default_model_selection_json: null,
+          scripts_json: "[]",
+          created_at: at,
+          updated_at: at,
+          deleted_at: null,
+        });
+        assert.deepStrictEqual(
+          (yield* read.getSnapshot({
+            projectId: ProjectId.make("different-project"),
+            runId: AgentControlRunOnceId.make(olderChild),
+          })).runs,
+          [],
+        );
+
+        yield* sql`UPDATE agent_control_run_once_states SET status='completed',reset_project_revision=6 WHERE run_id=${childB}`;
+        yield* sql`DELETE FROM agent_control_epic_targets WHERE project_id=${id}`;
+        const cleared = yield* read.getSnapshot({ projectId: id });
+        assert.isNull(cleared.epic);
+        assert.deepStrictEqual(
+          cleared.runs.map((run) => run.state.runId),
+          [ordinary],
+        );
+        assert.deepStrictEqual(
+          cleared.epicHistory?.map((epic) => epic.epicRunId),
+          [selectedEpic.epicRunId, olderEpic.epicRunId],
+        );
+        assert.deepStrictEqual(
+          (yield* read.getSnapshot({
+            projectId: id,
+            runId: AgentControlRunOnceId.make(childA),
+          })).runs.map((run) => run.state.runId),
+          [childA],
+        );
+        const activeOrdinary = "new-ordinary-active";
+        yield* insertRun(activeOrdinary, 10, true);
+        const resumedOrdinary = yield* read.getSnapshot({ projectId: id });
+        assert.deepStrictEqual(
+          resumedOrdinary.runs.map((run) => run.state.runId),
+          [activeOrdinary],
+        );
+        assert.deepStrictEqual(resumedOrdinary.epicHistory, cleared.epicHistory);
+      }).pipe(Effect.scoped),
   );
 });

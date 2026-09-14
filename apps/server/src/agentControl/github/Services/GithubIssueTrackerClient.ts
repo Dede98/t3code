@@ -1,4 +1,5 @@
 import type {
+  AgentControlEpicSource,
   AgentControlGithubIssueSnapshot,
   AgentControlGithubRepositoryBinding,
   AgentControlGithubTrackerSettings,
@@ -25,7 +26,12 @@ export class GithubIssueTrackerClientError extends Schema.TaggedError<GithubIssu
   "GithubIssueTrackerClientError",
   {
     code: GithubIssueTrackerClientErrorCode,
-    operation: Schema.Literals(["resolve-repository", "list-issues", "read-timeline"]),
+    operation: Schema.Literals([
+      "resolve-repository",
+      "list-issues",
+      "read-timeline",
+      "inspect-epic",
+    ]),
   },
 ) {}
 
@@ -40,6 +46,12 @@ export interface GithubIssuePollResult {
 }
 
 export interface GithubIssueTrackerClientShape {
+  readonly inspectEpic?: (input: {
+    readonly cwd: string;
+    readonly locator: GithubRepositoryLocator;
+    readonly expectedRepository: AgentControlGithubRepositoryBinding;
+    readonly epicNumber: number;
+  }) => Effect.Effect<AgentControlEpicSource, GithubIssueTrackerClientError>;
   readonly resolveRepository: (input: {
     readonly cwd: string;
     readonly locator: GithubRepositoryLocator;

@@ -1,3 +1,5 @@
+import { AgentControlEpic } from "./agentControl/epic/Services/AgentControlEpic.ts";
+import { AGENT_CONTROL_EPIC_RPC_METHODS, AgentControlEpicRpcError } from "@t3tools/contracts";
 import { AgentControlRunOnceReadModel } from "./agentControl/runOnce/Services/AgentControlRunOnceReadModel.ts";
 import {
   sameUsageLimitCommandCoverage,
@@ -502,6 +504,26 @@ const makeWsRpcLayer = (
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const agentControlRunOnce = yield* AgentControlRunOnceReadModel;
+      const epicService = yield* Effect.serviceOption(AgentControlEpic);
+      const unavailableEpic = () =>
+        Effect.fail(
+          new AgentControlEpicRpcError({
+            code: "epic-runtime-unavailable",
+            message: "Epic execution is unavailable on this server.",
+          }),
+        );
+      const agentControlEpic = Option.getOrElse(epicService, () =>
+        AgentControlEpic.of({
+          get: unavailableEpic,
+          preview: unavailableEpic,
+          start: unavailableEpic,
+          resume: unavailableEpic,
+          stop: unavailableEpic,
+          clear: unavailableEpic,
+          processProject: unavailableEpic,
+          subscribeChanges: Effect.succeed(Stream.empty),
+        }),
+      );
       const agentControlPolicy = yield* AgentControlPolicy.AgentControlPolicyService;
       const agentControlRuntime = yield* AgentControlRuntime.AgentControlEngine;
       const agentControlGithub = yield* AgentControlGithubIntake.AgentControlGithubIntake;
@@ -1483,6 +1505,28 @@ const makeWsRpcLayer = (
             agentControlControlledThreadActivation.activateInitial(input),
             { "rpc.aggregate": "agent-control-controlled-thread-reservation" },
           ),
+        [AGENT_CONTROL_EPIC_RPC_METHODS.preview]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_EPIC_RPC_METHODS.preview,
+            agentControlEpic.preview(input),
+            { "rpc.aggregate": "agent-control" },
+          ),
+        [AGENT_CONTROL_EPIC_RPC_METHODS.start]: (input) =>
+          observeRpcEffect(AGENT_CONTROL_EPIC_RPC_METHODS.start, agentControlEpic.start(input), {
+            "rpc.aggregate": "agent-control",
+          }),
+        [AGENT_CONTROL_EPIC_RPC_METHODS.resume]: (input) =>
+          observeRpcEffect(AGENT_CONTROL_EPIC_RPC_METHODS.resume, agentControlEpic.resume(input), {
+            "rpc.aggregate": "agent-control",
+          }),
+        [AGENT_CONTROL_EPIC_RPC_METHODS.stop]: (input) =>
+          observeRpcEffect(AGENT_CONTROL_EPIC_RPC_METHODS.stop, agentControlEpic.stop(input), {
+            "rpc.aggregate": "agent-control",
+          }),
+        [AGENT_CONTROL_EPIC_RPC_METHODS.clear]: (input) =>
+          observeRpcEffect(AGENT_CONTROL_EPIC_RPC_METHODS.clear, agentControlEpic.clear(input), {
+            "rpc.aggregate": "agent-control",
+          }),
         [AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot]: (input) =>
           observeRpcEffect(
             AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot,

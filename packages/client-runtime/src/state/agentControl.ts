@@ -2,6 +2,7 @@ import {
   AGENT_CONTROL_RPC_METHODS,
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
+  AGENT_CONTROL_EPIC_RPC_METHODS,
   CommandId,
   AuthAccessWriteScope,
   type AuthSessionState,
@@ -12,6 +13,10 @@ import {
   type AgentControlRunOnceView,
   type AgentControlSetProjectModeInput,
   type AgentControlTaskId,
+  type AgentControlEpicPreview,
+  type AgentControlEpicRuntimeView,
+  type AgentControlEpicStartInput,
+  type AgentControlEpicControlInput,
   type EnvironmentId,
   type ProjectId,
 } from "@t3tools/contracts";
@@ -23,6 +28,7 @@ import {
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
+  type AtomCommand,
 } from "./runtime.ts";
 
 /** One project subscription follows the environment session across reconnects. */
@@ -31,7 +37,28 @@ export function createAgentControlEnvironmentAtoms<R, E>(
 ) {
   const commandKey = (target: { environmentId: EnvironmentId; input: { projectId: ProjectId } }) =>
     JSON.stringify([target.environmentId, target.input.projectId]);
-  const pending = Atom.family((_key: string) => Atom.make(false).pipe(Atom.keepAlive));
+  const pendingCount = Atom.family((_key: string) => Atom.make(0).pipe(Atom.keepAlive));
+  const pending = Atom.family((key: string) =>
+    Atom.make((get) => get(pendingCount(key)) > 0).pipe(Atom.keepAlive),
+  );
+  function withPending<
+    W extends { environmentId: EnvironmentId; input: { projectId: ProjectId } },
+    A,
+    F,
+  >(command: AtomCommand<W, A, F>): AtomCommand<W, A, F> {
+    return {
+      ...command,
+      run: async (registry, target) => {
+        const atom = pendingCount(commandKey(target));
+        registry.set(atom, registry.get(atom) + 1);
+        try {
+          return await command.run(registry, target);
+        } finally {
+          registry.set(atom, registry.get(atom) - 1);
+        }
+      },
+    };
+  }
   const setMode = createEnvironmentRpcCommand(runtime, {
     label: "environment-data:agent-control:set-mode",
     tag: AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode,
@@ -42,6 +69,52 @@ export function createAgentControlEnvironmentAtoms<R, E>(
     },
   });
   return {
+    getRun: withPending(
+      createEnvironmentRpcCommand(runtime, {
+        label: "agent-control:load-saved-run",
+        tag: AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot,
+        concurrency: {
+          mode: "singleFlight",
+          key: (target) =>
+            JSON.stringify([target.environmentId, target.input.projectId, target.input.runId]),
+        },
+      }),
+    ),
+    epicPreview: withPending(
+      createEnvironmentRpcCommand(runtime, {
+        label: "agent-control-epic:preview",
+        tag: AGENT_CONTROL_EPIC_RPC_METHODS.preview,
+        concurrency: { mode: "singleFlight", key: commandKey },
+      }),
+    ),
+    epicStart: withPending(
+      createEnvironmentRpcCommand(runtime, {
+        label: "agent-control-epic:start",
+        tag: AGENT_CONTROL_EPIC_RPC_METHODS.start,
+        concurrency: { mode: "singleFlight", key: commandKey },
+      }),
+    ),
+    epicResume: withPending(
+      createEnvironmentRpcCommand(runtime, {
+        label: "agent-control-epic:resume",
+        tag: AGENT_CONTROL_EPIC_RPC_METHODS.resume,
+        concurrency: { mode: "singleFlight", key: commandKey },
+      }),
+    ),
+    epicStop: withPending(
+      createEnvironmentRpcCommand(runtime, {
+        label: "agent-control-epic:stop",
+        tag: AGENT_CONTROL_EPIC_RPC_METHODS.stop,
+        concurrency: { mode: "singleFlight", key: commandKey },
+      }),
+    ),
+    epicClear: withPending(
+      createEnvironmentRpcCommand(runtime, {
+        label: "agent-control-epic:clear",
+        tag: AGENT_CONTROL_EPIC_RPC_METHODS.clear,
+        concurrency: { mode: "singleFlight", key: commandKey },
+      }),
+    ),
     snapshot: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:agent-control:run-once",
       tag: AGENT_CONTROL_RUN_ONCE_RPC_METHODS.subscribe,
@@ -59,18 +132,7 @@ export function createAgentControlEnvironmentAtoms<R, E>(
     }),
     pending: (target: { environmentId: EnvironmentId; input: { projectId: ProjectId } }) =>
       pending(commandKey(target)),
-    setMode: {
-      ...setMode,
-      run: async (registry, target) => {
-        const atom = pending(commandKey(target));
-        registry.set(atom, true);
-        try {
-          return await setMode.run(registry, target);
-        } finally {
-          registry.set(atom, false);
-        }
-      },
-    } satisfies typeof setMode,
+    setMode: withPending(setMode),
   };
 }
 
@@ -182,6 +244,122 @@ type AgentControlStartContext = {
   modeChangeBlocker: string | null;
 };
 
+export type AgentControlReadiness = Omit<AgentControlStartContext, "selectedTaskId">;
+
+export function agentControlEpicStartBlockers(
+  input: AgentControlReadiness,
+  preview: AgentControlEpicPreview | null,
+): string[] {
+  const blockers = agentControlActivationBlockers({ ...input, selectedTaskId: null }, "epic");
+  if (!preview || preview.projectId !== input.snapshot?.projectId) {
+    blockers.push("Inspect an Epic in this project before starting.");
+  } else {
+    if (!preview.canStart) {
+      blockers.push(...preview.blockers.map((blocker) => blocker.message));
+      blockers.push(...preview.source.blockers.map((blocker) => blocker.message));
+      if (preview.blockers.length === 0 && preview.source.blockers.length === 0)
+        blockers.push("The inspected Epic has no executable work.");
+    }
+  }
+  const epic = input.snapshot?.epic;
+  if (epic) {
+    blockers.push(
+      "Resume the existing Epic or end it and return to ordinary tasks before selecting another Epic.",
+    );
+  }
+  return [...new Set(blockers)];
+}
+
+export function agentControlEpicStartInput(
+  snapshot: AgentControlRunOnceSnapshot,
+  preview: AgentControlEpicPreview,
+): AgentControlEpicStartInput {
+  return {
+    projectId: snapshot.projectId,
+    commandId: CommandId.make(
+      `t3auto-epic-start:${JSON.stringify([
+        snapshot.projectId,
+        snapshot.projectState.revision,
+        preview.source.epic.issueNodeId,
+        preview.source.fingerprint,
+      ])}`,
+    ),
+    expectedRevision: snapshot.projectState.revision,
+    epicNumber: preview.source.epic.number,
+    expectedFingerprint: preview.source.fingerprint,
+  };
+}
+
+export function agentControlEpicControlInput(
+  epic: AgentControlEpicRuntimeView,
+  action: "resume" | "stop" | "clear",
+): AgentControlEpicControlInput {
+  return {
+    projectId: epic.projectId,
+    epicRunId: epic.epicRunId,
+    expectedRevision: epic.revision,
+    commandId: CommandId.make(
+      `t3auto-epic-${action}:${JSON.stringify([epic.projectId, epic.epicRunId, epic.revision])}`,
+    ),
+  };
+}
+
+export function agentControlEpicControlAllowed(
+  readiness: AgentControlReadiness,
+  action: "resume" | "stop" | "clear",
+): boolean {
+  const epic = readiness.snapshot?.epic;
+  if (!epic || !readiness.connected || readiness.pending || readiness.modeChangeBlocker !== null)
+    return false;
+  const terminal = epic.status === "succeeded" || epic.status === "stopped";
+  if (action === "clear")
+    return (
+      terminal &&
+      readiness.snapshot?.armed?.enabled === false &&
+      !readiness.snapshot.runs.some((run) => run.state.status === "active")
+    );
+  if (action === "stop") return !terminal;
+  return (
+    !epic.members.some((member) => member.status === "failed") &&
+    (epic.status === "blocked" ||
+      (epic.status === "running" && readiness.snapshot?.armed?.enabled === false)) &&
+    readiness.preflight?.ok === true &&
+    readiness.policy?.projectPolicy?.policy.verificationChecks?.some((check) => check.required) ===
+      true
+  );
+}
+
+/** Success requires the final checks to identify the accepted common commit. */
+export function agentControlEpicStatus(epic: AgentControlEpicRuntimeView): AgentControlStatusView {
+  if (epic.status === "succeeded") {
+    const verification = epic.finalVerification;
+    const verified =
+      verification?.status === "passed" &&
+      verification.commitSha === epic.acceptedCommitSha &&
+      epic.checks.some((check) => check.required) &&
+      epic.checks.every((configured) => {
+        if (!configured.required) return true;
+        const check = verification.checks.find((item) => item.id === configured.id);
+        return (
+          check?.required === true &&
+          check.status === "passed" &&
+          check.exitCode === 0 &&
+          check.completedAt !== null
+        );
+      });
+    return verified
+      ? { label: "Epic succeeded · common result verified", tone: "success" }
+      : { label: "Epic verification evidence incomplete", tone: "warning" };
+  }
+  if (epic.status === "blocked")
+    return { label: "Epic blocked · action required", tone: "warning" };
+  if (epic.status === "stopped")
+    return { label: "Epic ended · evidence retained", tone: "neutral" };
+  if (epic.status === "verifying")
+    return { label: "Verifying common Epic result", tone: "running" };
+  return { label: "Epic in progress", tone: "running" };
+}
+
 export function agentControlStartBlockers(input: AgentControlStartContext): string[] {
   return agentControlActivationBlockers(input, "run-once");
 }
@@ -209,7 +387,7 @@ export function agentControlArmBlockers(
 
 function agentControlActivationBlockers(
   input: AgentControlStartContext,
-  mode: "run-once" | "armed",
+  mode: "run-once" | "armed" | "epic",
 ): string[] {
   const blockers: string[] = [];
   if (input.modeChangeBlocker !== null) blockers.push(input.modeChangeBlocker);
@@ -228,6 +406,9 @@ function agentControlActivationBlockers(
   if (snapshot === null) {
     blockers.push("Waiting for the server's task and run snapshot.");
   } else {
+    if (mode !== "epic" && snapshot.epic) {
+      blockers.push("This project has an Epic execution target. Use its resume or end controls.");
+    }
     blockers.push(...snapshot.blockers.map(agentControlErrorMessage));
     if (snapshot.projectState.mode !== "observe") {
       blockers.push(

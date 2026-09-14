@@ -1,5 +1,9 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProjectId } from "@t3tools/contracts";
+import {
+  AgentControlTaskId,
+  ProjectId,
+  type AgentControlEpicRuntimeView,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -15,6 +19,7 @@ import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import { canonicalJson } from "../initialPlanning/eventEvidence.ts";
 import { fingerprintRunOnceModeCommand } from "../runOnce/authority.ts";
 import { claimArmedDispatch } from "./authority.ts";
+import { epicDigest, epicJson, saveEpicRun } from "../epic/authority.ts";
 
 const at = "2026-09-02T08:00:00.000Z";
 const later = "2026-09-02T08:00:01.000Z";
@@ -189,6 +194,83 @@ const insertCandidate = Effect.fn("insertArmedCandidate")(function* (
     )
   `;
 });
+
+it.live("Epic selection extends persisted Armed guards without releasing unrelated tasks", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 83 });
+    const sequence = yield* seedArmedSource(sql);
+    yield* insertCandidate(sql, sequence);
+    yield* sql`INSERT INTO agent_control_task_states
+    SELECT 'armed-task-2',project_id,repository_node_id,'armed-issue-2',2,'https://github.test/owner/repo/issues/2',status,source_gate,stage,source_updated_at,github_intake_sequence,state_json,created_at,updated_at,revision,last_event_sequence
+    FROM agent_control_task_states WHERE task_id='armed-task-1'`;
+    const issue = {
+      repositoryNodeId: "armed-repository",
+      nameWithOwner: "owner/repo",
+      issueNodeId: "armed-issue-2",
+      number: 2,
+      url: "https://github.com/owner/repo/issues/2",
+      title: "Epic child",
+      state: "open" as const,
+      subIssueCount: 0,
+    };
+    const state: AgentControlEpicRuntimeView = {
+      epicRunId: "armed-epic",
+      projectId,
+      revision: 1,
+      status: "blocked",
+      source: {
+        format: "github-native-sub-issues-v1",
+        repository: { repositoryNodeId: "armed-repository", nameWithOwner: "owner/repo" },
+        epic: { ...issue, number: 10, issueNodeId: "epic-root", subIssueCount: 1 },
+        tasks: [{ issue, position: 0, dependencies: [] }],
+        blockers: [],
+        fingerprint: "source",
+        inspectedAt: at,
+      },
+      checks: [],
+      members: [
+        {
+          issueNodeId: issue.issueNodeId,
+          issueNumber: 2,
+          taskId: AgentControlTaskId.make("armed-task-2"),
+          childRunId: null,
+          status: "running",
+          baseCommitSha: null,
+          reservationId: null,
+          taskFinalizationEvidenceId: null,
+          accepted: null,
+        },
+      ],
+      activeTaskId: AgentControlTaskId.make("armed-task-2"),
+      acceptedCommitSha: null,
+      blockers: [],
+      blockerHistory: [],
+      verificationAttempt: 1,
+      finalVerification: null,
+      finalVerificationHistory: [],
+      createdAt: at,
+      updatedAt: at,
+    };
+    yield* sql`INSERT INTO agent_control_epic_runs(epic_run_id,project_id,revision,state_json,state_digest) VALUES (${state.epicRunId},${projectId},1,${epicJson(state)},${epicDigest(state)})`;
+    yield* sql`INSERT INTO agent_control_epic_history(epic_run_id,revision,state_json,state_digest) VALUES (${state.epicRunId},1,${epicJson(state)},${epicDigest(state)})`;
+    yield* sql`INSERT INTO agent_control_epic_targets(project_id,epic_run_id) VALUES (${projectId},${state.epicRunId})`;
+    assert.equal(
+      (yield* claimArmedDispatch(sql, { projectId, ownerId: "owner", claimedAt: later, expiresAt }))
+        ._tag,
+      "no-candidate",
+    );
+    yield* sql.withTransaction(saveEpicRun(sql, state, { status: "running" }));
+    const claim = yield* claimArmedDispatch(sql, {
+      projectId,
+      ownerId: "owner",
+      claimedAt: later,
+      expiresAt,
+    });
+    assert.equal(claim._tag, "dispatch");
+    if (claim._tag === "dispatch") assert.equal(claim.dispatch.selectedTaskId, "armed-task-2");
+  }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+);
 
 it.live("persists one decision per epoch and grants one claim across two WAL connections", () =>
   Effect.scoped(

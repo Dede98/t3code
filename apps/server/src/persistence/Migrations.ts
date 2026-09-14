@@ -129,6 +129,9 @@ import AgentMigration0080 from "./Migrations/080_AgentControlRunOnceDiagnostics.
 
 import AgentMigration0081 from "./Migrations/081_AgentControlRunOnceSelectedTask.ts";
 import AgentMigration0082 from "./Migrations/082_AgentControlCompactVerificationPrompt.ts";
+import AgentMigration0083 from "./Migrations/083_AgentControlEpicExecution.ts";
+
+import AgentMigration0084 from "./Migrations/084_AgentControlEpicResults.ts";
 
 const agentMigrationEntries = [
   [34, "OrchestrationCommandAuthority", AgentMigration0034],
@@ -180,6 +183,8 @@ const agentMigrationEntries = [
   [80, "AgentControlRunOnceDiagnostics", AgentMigration0080],
   [81, "AgentControlRunOnceSelectedTask", AgentMigration0081],
   [82, "AgentControlCompactVerificationPrompt", AgentMigration0082],
+  [83, "AgentControlEpicExecution", AgentMigration0083],
+  [84, "AgentControlEpicResults", AgentMigration0084],
 ] as const;
 
 const migrationEntries = [

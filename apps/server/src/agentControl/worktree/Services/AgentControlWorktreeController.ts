@@ -43,6 +43,17 @@ export interface AgentControlWorktreeControllerShape {
    * child fibers are closed before this method returns. Callers must not escape
    * work into detached or foreign scopes.
    */
+  /** Terminal-result boundary: validates immutable successful task evidence under repository locks. */
+  readonly useAcceptedWorktree?: <A, E, R>(
+    input: {
+      readonly projectId: ProjectId;
+      readonly taskId: AgentControlTaskId;
+      readonly childRunId: AgentControlRunOnceId;
+      readonly reservationId: AgentControlWorktreeReservationState["reservationId"];
+      readonly taskFinalizationEvidenceId: string;
+    },
+    callback: (state: AgentControlWorktreeReservationState) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | AgentControlWorktreeRpcError, Exclude<R, Scope.Scope>>;
   readonly useReadyWorktree: <A, E, R>(
     input: {
       readonly projectId: ProjectId;

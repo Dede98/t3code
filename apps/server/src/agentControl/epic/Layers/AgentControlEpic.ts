@@ -1,0 +1,753 @@
+import {
+  AgentControlEpicRpcError,
+  AgentControlProjectPolicy,
+  AgentControlTaskId,
+  CommandId,
+  type AgentControlEpicBlocker,
+  type AgentControlEpicRuntimeView,
+  type AgentControlEpicControlInput,
+  type AgentControlEpicStartInput,
+  type AgentControlEpicPreviewInput,
+  type ProjectId,
+} from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
+import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { GithubIssueTrackerClient } from "../../github/Services/GithubIssueTrackerClient.ts";
+import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
+import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
+import { AgentControlRunOnceReadNotifications } from "../../runOnce/readNotifications.ts";
+import { makeAgentControlRunOnceKeyedFence } from "../../runOnce/context.ts";
+import { AgentControlEpic } from "../Services/AgentControlEpic.ts";
+import { AgentControlEpicResultHooks } from "../Services/AgentControlEpicResultHooks.ts";
+import {
+  epicDigest,
+  epicError,
+  epicJson,
+  loadEpicRun,
+  loadSelectedEpic,
+  saveEpicRun,
+} from "../authority.ts";
+import { epicSourceChanges, selectEpicMember } from "../model.ts";
+
+const isEpicError = Schema.is(AgentControlEpicRpcError);
+const mapError = (cause: unknown) =>
+  isEpicError(cause)
+    ? cause
+    : epicError(
+        "epic-unavailable",
+        "Epic execution could not obtain complete source or persistence authority.",
+      );
+const decodePolicy = Schema.decodeUnknownEffect(Schema.fromJsonString(AgentControlProjectPolicy));
+
+export const makeAgentControlEpic = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const client = yield* GithubIssueTrackerClient;
+  const github = yield* AgentControlGithubStateRepository;
+  const engine = yield* AgentControlEngine;
+  const results = yield* AgentControlEpicResultHooks;
+  const notifications = yield* AgentControlRunOnceReadNotifications;
+  const changes = yield* PubSub.unbounded<ProjectId>();
+  const publish = (projectId: ProjectId) =>
+    notifications
+      .publishProject(projectId)
+      .pipe(Effect.andThen(PubSub.publish(changes, projectId)), Effect.asVoid);
+  const locks = makeAgentControlRunOnceKeyedFence<ProjectId>();
+  const get = (projectId: ProjectId) =>
+    loadSelectedEpic(sql, projectId).pipe(Effect.mapError(mapError));
+
+  const inspect = Effect.fn("AgentControlEpic.inspect")(function* (
+    input: AgentControlEpicPreviewInput,
+  ) {
+    const state = yield* github.get(input.projectId);
+    if (Option.isNone(state) || !state.value.config || !client.inspectEpic)
+      return yield* epicError(
+        "source-unavailable",
+        "Configure GitHub intake with native Epic support first.",
+      );
+    const projects = yield* sql<{
+      cwd: string;
+    }>`SELECT workspace_root AS cwd FROM projection_projects WHERE project_id=${input.projectId} AND deleted_at IS NULL`;
+    if (!projects[0])
+      return yield* epicError(
+        "project-unavailable",
+        "The selected environment no longer has this project.",
+      );
+    const repository = state.value.config.repository;
+    const [owner, name] = repository.nameWithOwner.split("/");
+    if (!owner || !name)
+      return yield* epicError(
+        "source-unavailable",
+        "The configured repository identity is invalid.",
+      );
+    return yield* client.inspectEpic({
+      cwd: projects[0].cwd,
+      locator: { owner, name },
+      expectedRepository: repository,
+      epicNumber: input.epicNumber,
+    });
+  });
+
+  const sourceTasks = Effect.fn("AgentControlEpic.sourceTasks")(function* (projectId: ProjectId) {
+    const snapshot = yield* github.getCompletedSnapshot(projectId);
+    if (Option.isNone(snapshot))
+      return yield* epicError(
+        "intake-incomplete",
+        "A complete successful GitHub intake is required.",
+      );
+    const reconcile = yield* sql<{
+      status: string;
+      target: number;
+      completed: number;
+    }>`SELECT status,target_sequence AS target,last_completed_sequence AS completed FROM agent_control_task_reconcile_states WHERE project_id=${projectId}`;
+    const sequence = snapshot.value.sourcePrecondition.githubIntakeSequence;
+    if (
+      reconcile.length !== 1 ||
+      reconcile[0]!.status !== "completed" ||
+      reconcile[0]!.target !== sequence ||
+      reconcile[0]!.completed !== sequence
+    )
+      return yield* epicError("intake-incomplete", "GitHub task reconciliation has not completed.");
+    return yield* sql<{
+      taskId: string;
+      issueNodeId: string;
+      status: string;
+      sourceGate: string;
+      stage: string;
+      sequence: number;
+    }>`SELECT task_id AS "taskId",issue_node_id AS "issueNodeId",status,source_gate AS "sourceGate",stage,github_intake_sequence AS sequence FROM agent_control_task_states WHERE project_id=${projectId} AND github_intake_sequence=${sequence}`;
+  });
+
+  const preview = Effect.fn("AgentControlEpic.preview")(function* (
+    input: AgentControlEpicPreviewInput,
+  ) {
+    const source = yield* inspect(input);
+    const blockers: Array<AgentControlEpicBlocker> = [...source.blockers];
+    const tasks = yield* sourceTasks(input.projectId).pipe(
+      Effect.catch((cause) => {
+        const error = mapError(cause);
+        blockers.push({ code: error.code, issueNumber: null, message: error.message });
+        return Effect.succeed([]);
+      }),
+    );
+    for (const member of source.tasks) {
+      if (member.issue.state === "closed") continue;
+      const task = tasks.find((task) => task.issueNodeId === member.issue.issueNodeId);
+      if (
+        !task ||
+        task.status !== "candidate" ||
+        task.sourceGate !== "eligible" ||
+        task.stage !== "intake"
+      )
+        blockers.push({
+          code: task ? "task-not-approved" : "missing-issue",
+          issueNumber: member.issue.number,
+          message: task
+            ? `Issue #${member.issue.number} has no current trusted execution approval or already has execution history.`
+            : `Issue #${member.issue.number} is missing from the completed intake.`,
+        });
+    }
+    const policies = yield* sql<{
+      policy: string;
+    }>`SELECT policy_json AS policy FROM agent_control_project_policies WHERE project_id=${input.projectId}`;
+    const policy = yield* decodePolicy(policies[0]?.policy ?? "{}");
+    if (!policy.verificationChecks?.some((check) => check.required))
+      blockers.push({
+        code: "verification-checks-missing",
+        issueNumber: null,
+        message: "Configure at least one required verification check before starting an Epic.",
+      });
+    const fatal = new Set([
+      "nested-sub-issues",
+      "cross-repository",
+      "empty-epic",
+      "closed-epic",
+      "intake-incomplete",
+      "verification-checks-missing",
+      "epic-unavailable",
+    ]);
+    return {
+      projectId: input.projectId,
+      source,
+      blockers,
+      canStart: !blockers.some((item) => fatal.has(item.code)),
+    };
+  }, Effect.mapError(mapError));
+
+  const persist = (
+    previous: AgentControlEpicRuntimeView,
+    changes: Partial<AgentControlEpicRuntimeView>,
+  ) =>
+    sql
+      .withTransaction(saveEpicRun(sql, previous, changes))
+      .pipe(Effect.tap(() => publish(previous.projectId)));
+  const block = (
+    state: AgentControlEpicRuntimeView,
+    blockers: ReadonlyArray<AgentControlEpicBlocker>,
+  ) =>
+    persist(state, {
+      status: "blocked",
+      blockers,
+      blockerHistory: [...state.blockerHistory, { recordedAt: state.updatedAt, blockers }],
+    });
+  const replayCommand = Effect.fn("AgentControlEpic.replayCommand")(function* (
+    kind: string,
+    input: AgentControlEpicStartInput | AgentControlEpicControlInput,
+  ) {
+    const rows = yield* sql<{
+      runId: string;
+      digest: string;
+    }>`SELECT epic_run_id AS "runId",request_digest AS digest FROM agent_control_epic_commands WHERE command_id=${input.commandId}`;
+    if (!rows[0]) return null;
+    if (rows[0].digest !== epicDigest({ kind, input }))
+      return yield* epicError(
+        "command-conflict",
+        "This Epic command identity was already used for another request.",
+      );
+    return yield* loadEpicRun(sql, rows[0].runId);
+  });
+  const recordCommand = (
+    kind: string,
+    input: AgentControlEpicStartInput | AgentControlEpicControlInput,
+    runId: string,
+  ) =>
+    sql`INSERT INTO main.agent_control_epic_commands(command_id,request_digest,epic_run_id) VALUES (${input.commandId},${epicDigest({ kind, input })},${runId})`;
+
+  const modeIntent = (
+    state: AgentControlEpicRuntimeView,
+    commandId: CommandId,
+    expectedRevision: number,
+    mode: "armed" | "observe",
+  ) =>
+    sql`INSERT INTO main.agent_control_epic_mode_intents(command_id,epic_run_id,expected_revision,mode) VALUES (${`epic-mode-${commandId}`},${state.epicRunId},${expectedRevision},${mode})`;
+  const recoverModeIntent = Effect.fn("AgentControlEpic.recoverModeIntent")(function* (
+    state: AgentControlEpicRuntimeView,
+  ) {
+    const intents = yield* sql<{
+      commandId: string;
+      expectedRevision: number;
+      mode: "armed" | "observe";
+    }>`SELECT command_id AS "commandId",expected_revision AS "expectedRevision",mode FROM main.agent_control_epic_mode_intents WHERE epic_run_id=${state.epicRunId} AND status='pending' ORDER BY rowid`;
+    for (const intent of intents) {
+      const project = yield* engine.getProjectState({ projectId: state.projectId });
+      const committed =
+        yield* sql`SELECT 1 FROM main.agent_control_events WHERE command_id=${intent.commandId} AND stream_id=${state.projectId} AND event_type='agentControl.project.mode.changed'`;
+      if (committed.length === 0 && project.revision === intent.expectedRevision) {
+        yield* engine.dispatchHuman({
+          projectId: state.projectId,
+          expectedRevision: intent.expectedRevision,
+          commandId: CommandId.make(intent.commandId),
+          mode: intent.mode,
+        });
+      } else if (committed.length === 0) {
+        // A later human mode command supersedes pending activation, including an explicit off.
+        yield* sql`UPDATE main.agent_control_epic_mode_intents SET status='superseded' WHERE command_id=${intent.commandId} AND status='pending'`;
+        continue;
+      }
+      yield* sql`UPDATE main.agent_control_epic_mode_intents SET status='applied' WHERE command_id=${intent.commandId} AND status='pending'`;
+    }
+  });
+
+  const start = (input: AgentControlEpicStartInput) =>
+    locks
+      .withPermit(
+        input.projectId,
+        Effect.gen(function* () {
+          const replay = yield* replayCommand("start", input);
+          if (replay) {
+            yield* recoverModeIntent(replay);
+            return replay;
+          }
+          const inspected = yield* preview(input);
+          if (inspected.source.fingerprint !== input.expectedFingerprint)
+            return yield* epicError(
+              "scope-changed",
+              "The Epic changed since preview. Inspect its current scope before starting.",
+            );
+          if (!inspected.canStart)
+            return yield* epicError(
+              "start-blocked",
+              inspected.blockers.map((item) => item.message).join(" "),
+            );
+          const policyRows = yield* sql<{
+            policy: string;
+          }>`SELECT policy_json AS policy FROM agent_control_project_policies WHERE project_id=${input.projectId}`;
+          const policy = yield* decodePolicy(policyRows[0]?.policy ?? "{}");
+          const now = DateTime.formatIso(yield* DateTime.now);
+          const state: AgentControlEpicRuntimeView = {
+            epicRunId: `epic-${epicDigest({ projectId: input.projectId, commandId: input.commandId })}`,
+            projectId: input.projectId,
+            revision: 1,
+            status: "running",
+            source: inspected.source,
+            checks: policy.verificationChecks ?? [],
+            members: inspected.source.tasks.map((task) => ({
+              issueNodeId: task.issue.issueNodeId,
+              issueNumber: task.issue.number,
+              taskId: null,
+              childRunId: null,
+              status: task.issue.state === "closed" ? "external-closed" : "pending",
+              baseCommitSha: null,
+              reservationId: null,
+              taskFinalizationEvidenceId: null,
+              accepted: null,
+            })),
+            activeTaskId: null,
+            acceptedCommitSha: null,
+            blockers: [],
+            blockerHistory: [],
+            verificationAttempt: 1,
+            finalVerification: null,
+            finalVerificationHistory: [],
+            createdAt: now,
+            updatedAt: now,
+          };
+          const persisted = yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const replay = yield* replayCommand("start", input);
+              if (replay) return replay;
+              const existing = yield* loadSelectedEpic(sql, input.projectId);
+              if (existing)
+                return yield* epicError(
+                  "epic-already-selected",
+                  "Finish and clear the selected Epic before starting another run.",
+                );
+              const project = yield* engine.getProjectState({ projectId: input.projectId });
+              if (project.revision !== input.expectedRevision)
+                return yield* epicError(
+                  "revision-conflict",
+                  "Project automation changed. Reload before starting the Epic.",
+                );
+              const activeRuns =
+                yield* sql`SELECT 1 FROM main.agent_control_run_once_states WHERE project_id=${input.projectId} AND status='active'`;
+              if (activeRuns.length !== 0)
+                return yield* epicError(
+                  "project-busy",
+                  "An admitted Run Once task still owns execution in this project.",
+                );
+              if (
+                project.mode === "run-once" ||
+                project.mode === "armed" ||
+                project.pausedFromMode === "run-once"
+              )
+                return yield* epicError(
+                  "project-busy",
+                  "Turn automation off and finish the active task before selecting an Epic.",
+                );
+              const json = epicJson(state);
+              const digest = epicDigest(state);
+              yield* sql`INSERT INTO main.agent_control_epic_runs(epic_run_id,project_id,revision,state_json,state_digest) VALUES (${state.epicRunId},${state.projectId},${state.revision},${json},${digest})`;
+              yield* sql`INSERT INTO main.agent_control_epic_history(epic_run_id,revision,state_json,state_digest) VALUES (${state.epicRunId},${state.revision},${json},${digest})`;
+              yield* sql`INSERT INTO main.agent_control_epic_targets(project_id,epic_run_id) VALUES (${state.projectId},${state.epicRunId})`;
+              yield* recordCommand("start", input, state.epicRunId);
+              yield* modeIntent(state, input.commandId, input.expectedRevision, "armed");
+              return state;
+            }),
+          );
+          yield* publish(input.projectId);
+          yield* recoverModeIntent(persisted);
+          return persisted;
+        }),
+      )
+      .pipe(Effect.mapError(mapError));
+
+  const control = (kind: "resume" | "stop" | "clear", input: AgentControlEpicControlInput) =>
+    locks
+      .withPermit(
+        input.projectId,
+        Effect.gen(function* () {
+          const replay = yield* replayCommand(kind, input);
+          if (replay) {
+            yield* recoverModeIntent(replay);
+            return replay;
+          }
+          const current = yield* get(input.projectId);
+          if (!current || current.epicRunId !== input.epicRunId)
+            return yield* epicError("epic-missing", "This Epic run is no longer selected.");
+          if (current.revision !== input.expectedRevision)
+            return yield* epicError(
+              "revision-conflict",
+              "Epic progress changed. Reload before continuing.",
+            );
+          if (kind === "resume" && (current.status === "stopped" || current.status === "succeeded"))
+            return yield* epicError(
+              "epic-terminal",
+              "A completed or stopped Epic run cannot be resumed.",
+            );
+          if (kind === "clear") {
+            yield* sql.withTransaction(
+              Effect.gen(function* () {
+                const selected = yield* loadSelectedEpic(sql, input.projectId);
+                const project = yield* engine.getProjectState({ projectId: input.projectId });
+                const activeRuns =
+                  yield* sql`SELECT 1 FROM main.agent_control_run_once_states WHERE project_id=${input.projectId} AND status='active'`;
+                if (
+                  !selected ||
+                  selected.epicRunId !== current.epicRunId ||
+                  selected.revision !== input.expectedRevision
+                )
+                  return yield* epicError(
+                    "revision-conflict",
+                    "Epic progress changed before clearing its selection.",
+                  );
+                if (
+                  (selected.status !== "stopped" && selected.status !== "succeeded") ||
+                  activeRuns.length !== 0 ||
+                  project.mode === "armed" ||
+                  project.mode === "run-once" ||
+                  project.pausedFromMode === "run-once"
+                )
+                  return yield* epicError(
+                    "clear-blocked",
+                    "Stop the Epic and turn automation off before returning to ordinary tasks.",
+                  );
+                yield* sql`DELETE FROM main.agent_control_epic_targets WHERE project_id=${input.projectId} AND epic_run_id=${input.epicRunId}`;
+                yield* recordCommand(kind, input, current.epicRunId);
+              }),
+            );
+            yield* publish(input.projectId);
+            return current;
+          }
+          const modeState = yield* engine.getProjectState({ projectId: input.projectId });
+          const updated = yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const updated = yield* saveEpicRun(
+                sql,
+                current,
+                kind === "stop"
+                  ? { status: "stopped" }
+                  : {
+                      status: "running",
+                      blockers: [],
+                      verificationAttempt:
+                        current.finalVerification !== null ||
+                        (current.acceptedCommitSha !== null &&
+                          current.members.every(
+                            (member) =>
+                              member.status === "accepted" || member.status === "external-closed",
+                          ))
+                          ? current.verificationAttempt + 1
+                          : current.verificationAttempt,
+                    },
+              );
+              yield* recordCommand(kind, input, current.epicRunId);
+              if (
+                (kind === "resume" &&
+                  modeState.mode !== "armed" &&
+                  modeState.mode !== "run-once") ||
+                (kind === "stop" && (modeState.mode === "armed" || modeState.mode === "run-once"))
+              )
+                yield* modeIntent(
+                  updated,
+                  input.commandId,
+                  modeState.revision,
+                  kind === "resume" ? "armed" : "observe",
+                );
+              return updated;
+            }),
+          );
+          yield* publish(input.projectId);
+          yield* recoverModeIntent(updated);
+          return updated;
+        }),
+      )
+      .pipe(Effect.mapError(mapError));
+
+  const processProject = (projectId: ProjectId) =>
+    locks
+      .withPermit(
+        projectId,
+        Effect.gen(function* () {
+          let state = yield* get(projectId);
+          if (state) yield* recoverModeIntent(state);
+          if (
+            !state ||
+            state.status === "succeeded" ||
+            state.status === "stopped" ||
+            state.status === "blocked"
+          )
+            return;
+          const active = state.members.find(
+            (member) => member.taskId === state!.activeTaskId && member.status === "running",
+          );
+          if (active?.childRunId) {
+            const terminal = yield* sql<{
+              status: string;
+              evidenceId: string;
+              reservationId: string | null;
+            }>`
+        SELECT json_extract(event.payload_json,'$.status') AS status,evidence.task_finalization_evidence_id AS "evidenceId",run.worktree_reservation_id AS "reservationId"
+        FROM agent_control_task_verification_finalization_evidence evidence
+        JOIN agent_control_task_verification_finalization_receipts receipt ON receipt.task_finalization_evidence_id=evidence.task_finalization_evidence_id AND receipt.status='accepted'
+        JOIN agent_control_task_verification_finalization_markers marker ON marker.task_finalization_evidence_id=evidence.task_finalization_evidence_id AND marker.receipt_id=receipt.receipt_id
+        JOIN agent_control_events event ON event.event_id=evidence.task_event_id
+        JOIN agent_control_run_once_states run ON run.run_id=${active.childRunId} AND run.task_id=evidence.task_id AND run.project_id=evidence.project_id
+        WHERE evidence.project_id=${projectId} AND evidence.task_id=${active.taskId}`;
+            if (!terminal.length) {
+              const attention = yield* sql<{
+                status: string;
+              }>`SELECT status FROM main.agent_control_task_states WHERE task_id=${active.taskId} AND project_id=${projectId}`;
+              if (attention[0]?.status === "needs-attention")
+                yield* block(state, [
+                  {
+                    code: "child-needs-attention",
+                    issueNumber: active.issueNumber,
+                    message:
+                      "The active child requires human attention. Inspect its thread and evidence, then resume this Epic or stop it.",
+                  },
+                ]);
+              return;
+            }
+            if (terminal.length !== 1)
+              return yield* epicError(
+                "authority-conflict",
+                "Epic child finalization is ambiguous.",
+              );
+            const result = terminal[0]!;
+            if (result.status !== "succeeded" || !result.reservationId) {
+              state = yield* persist(state, {
+                members: state.members.map((member) =>
+                  member === active
+                    ? { ...member, status: "failed", taskFinalizationEvidenceId: result.evidenceId }
+                    : member,
+                ),
+              });
+              yield* block(state, [
+                {
+                  code: "child-failed",
+                  issueNumber: active.issueNumber,
+                  message:
+                    "The child task failed or exhausted its bounded repair. Its changes were not accepted. Inspect its thread and evidence, then stop this Epic run.",
+                },
+              ]);
+              return;
+            }
+            const accepted = yield* results
+              .capture({
+                epicRunId: state.epicRunId,
+                projectId,
+                taskId: active.taskId!,
+                childRunId: active.childRunId,
+                reservationId: result.reservationId,
+                previousCommitSha: state.acceptedCommitSha,
+                taskFinalizationEvidenceId: result.evidenceId,
+              })
+              .pipe(
+                Effect.catch((error) =>
+                  Effect.gen(function* () {
+                    yield* block(state!, [
+                      { code: error.code, issueNumber: active.issueNumber, message: error.message },
+                    ]);
+                    return null;
+                  }),
+                ),
+              );
+            if (!accepted) return;
+            state = yield* persist(state, {
+              activeTaskId: null,
+              acceptedCommitSha: accepted.commitSha,
+              members: state.members.map((member) =>
+                member === active
+                  ? {
+                      ...member,
+                      status: "accepted",
+                      accepted,
+                      reservationId: result.reservationId,
+                      taskFinalizationEvidenceId: result.evidenceId,
+                    }
+                  : member,
+              ),
+            });
+          }
+          const project = yield* engine.getProjectState({ projectId });
+          if (project.mode !== "armed" || project.pausedFromMode !== null) return;
+          const inspected = yield* inspect({
+            projectId,
+            epicNumber: state.source.epic.number,
+          }).pipe(
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                const error = mapError(cause);
+                yield* block(state!, [
+                  { code: error.code, issueNumber: null, message: error.message },
+                ]);
+                return null;
+              }),
+            ),
+          );
+          if (!inspected) return;
+          const changes = epicSourceChanges(state, inspected);
+          if (changes.length) {
+            yield* block(state, changes);
+            return;
+          }
+          const externalPrerequisites = [...(state.externalPrerequisites ?? [])];
+          for (const task of inspected.tasks) {
+            for (const dependency of task.dependencies) {
+              if (
+                dependency.state === "closed" &&
+                !state.members.some((member) => member.issueNodeId === dependency.issueNodeId) &&
+                !externalPrerequisites.some((item) => item.issueNodeId === dependency.issueNodeId)
+              ) {
+                externalPrerequisites.push({
+                  issueNodeId: dependency.issueNodeId,
+                  issueNumber: dependency.number,
+                  observedAt: inspected.inspectedAt,
+                });
+              }
+            }
+          }
+          if (externalPrerequisites.length !== (state.externalPrerequisites?.length ?? 0))
+            state = yield* persist(state, { externalPrerequisites });
+          if (state.members.some((member) => member.status === "failed")) {
+            yield* block(state, [
+              {
+                code: "child-failed",
+                issueNumber: null,
+                message:
+                  "A failed child requires inspection. Stop this Epic before starting a new scope.",
+              },
+            ]);
+            return;
+          }
+          const availableTasks = yield* sourceTasks(projectId).pipe(
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                const error = mapError(cause);
+                yield* block(state!, [
+                  { code: error.code, issueNumber: null, message: error.message },
+                ]);
+                return null;
+              }),
+            ),
+          );
+          if (!availableTasks) return;
+          if (state.activeTaskId !== null) {
+            const selected = availableTasks.find((task) => task.taskId === state!.activeTaskId);
+            if (
+              !selected ||
+              selected.status !== "candidate" ||
+              selected.sourceGate !== "eligible" ||
+              selected.stage !== "intake"
+            )
+              yield* block(state, [
+                {
+                  code: selected ? "task-not-approved" : "missing-issue",
+                  issueNumber: active?.issueNumber ?? null,
+                  message:
+                    "The selected child lost its complete, trusted intake authority before starting. Restore its approval and resume, or stop this Epic.",
+                },
+              ]);
+            return;
+          }
+          const eligibleIssueIds = new Set(
+            availableTasks
+              .filter(
+                (task) =>
+                  task.status === "candidate" &&
+                  task.sourceGate === "eligible" &&
+                  task.stage === "intake",
+              )
+              .map((task) => task.issueNodeId),
+          );
+          const next = selectEpicMember(state, eligibleIssueIds);
+          if (!next) {
+            if (state.members.some((member) => member.status === "pending")) {
+              yield* block(state, [
+                {
+                  code: "dependencies-blocked",
+                  issueNumber: null,
+                  message:
+                    "No remaining task has current trusted approval and all explicit prerequisites satisfied. Check missing issues, approvals, prerequisites, and dependency cycles.",
+                },
+              ]);
+              return;
+            }
+            const lastAccepted = state.members
+              .toReversed()
+              .find((member) => member.accepted?.commitSha === state!.acceptedCommitSha);
+            if (!lastAccepted || !state.acceptedCommitSha) {
+              yield* block(state, [
+                {
+                  code: "no-accepted-result",
+                  issueNumber: null,
+                  message:
+                    "All members were externally closed; T3 has no accepted result to verify.",
+                },
+              ]);
+              return;
+            }
+            if (state.status !== "verifying")
+              state = yield* persist(state, { status: "verifying" });
+            const finalVerification = yield* results
+              .verify({
+                epicRunId: state.epicRunId,
+                projectId,
+                commitSha: state.acceptedCommitSha!,
+                checks: state.checks,
+                lastAccepted,
+                attempt: state.verificationAttempt,
+              })
+              .pipe(
+                Effect.catch((error) =>
+                  Effect.gen(function* () {
+                    yield* block(state!, [
+                      { code: error.code, issueNumber: null, message: error.message },
+                    ]);
+                    return null;
+                  }),
+                ),
+              );
+            if (!finalVerification) return;
+            if (finalVerification.commitSha !== state.acceptedCommitSha)
+              return yield* epicError(
+                "authority-conflict",
+                "Epic verification checked a different result commit.",
+              );
+            state = yield* persist(state, {
+              finalVerification,
+              finalVerificationHistory: [...state.finalVerificationHistory, finalVerification],
+              status: finalVerification.status === "passed" ? "succeeded" : "verifying",
+            });
+            if (finalVerification.status !== "passed")
+              yield* block(state, [
+                {
+                  code: "final-verification-failed",
+                  issueNumber: null,
+                  message: finalVerification.detail,
+                },
+              ]);
+            return;
+          }
+          const task = availableTasks.find((item) => item.issueNodeId === next.issue.issueNodeId)!;
+          const taskId = AgentControlTaskId.make(task.taskId);
+          yield* persist(state, {
+            activeTaskId: taskId,
+            members: state.members.map((member) =>
+              member.issueNodeId === next.issue.issueNodeId
+                ? { ...member, taskId, status: "running", baseCommitSha: state!.acceptedCommitSha }
+                : member,
+            ),
+          });
+        }),
+      )
+      .pipe(Effect.mapError(mapError));
+
+  return AgentControlEpic.of({
+    subscribeChanges: PubSub.subscribe(changes).pipe(Effect.map(Stream.fromSubscription)),
+    get,
+    preview,
+    start,
+    resume: (input) => control("resume", input),
+    stop: (input) => control("stop", input),
+    clear: (input) => control("clear", input),
+    processProject,
+  });
+});
+
+export const AgentControlEpicLive = Layer.effect(AgentControlEpic, makeAgentControlEpic);

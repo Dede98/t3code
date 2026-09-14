@@ -85,6 +85,29 @@ Open a stage's thread or changes to review the result. Web and desktop offer the
 or file-manager actions for its worktree. Mobile can copy the worktree path; its files remain on
 the connected environment.
 
+### Run an existing Epic
+
+In **Autonomous tasks**, inspect an Epic by its GitHub issue number, review its tasks and start
+blockers, then start the Epic. This version reads native GitHub Sub-Issues in their saved order and
+native **blocked by** dependencies. It supports one level in the project's repository; nested or
+cross-repository structures are blocked. Links and issue-description checklists do not define the
+scope or grant execution approval. Each open task still needs the configured trusted ready label.
+Already closed tasks are shown as externally closed, without a T3 verification claim.
+
+Tasks run sequentially through the existing stages and bounded repair. Each next worktree starts
+from the previous task's verified, accepted commit. The Epic succeeds only after the required
+checks pass again on the combined result. Current mandatory-check execution requires a Codex
+verification route; Planning and Implementation keep their configured routes and fallbacks.
+No changes are pushed and no GitHub issues are closed or commented on.
+
+Reloads and server restarts retain the same Epic run. Membership or dependency changes block it
+instead of silently changing scope. Resolve a transient blocker and resume the saved run, or end
+it and explicitly clear its target before returning to ordinary automation. A failed task's
+exhausted repair requires inspection and ending that Epic; resuming does not erase or retry its
+old execution. Turning automation off prevents additional task starts. Accepted commits, child
+threads and checks remain available for review. A completed Epic never moves on to unrelated
+issues automatically.
+
 ## Project icons
 
 Choose an icon, emoji, or image from the project to make it easier to recognize. The choice applies

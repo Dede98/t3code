@@ -3,6 +3,7 @@ import {
   AGENT_CONTROL_GITHUB_RPC_METHODS,
   AGENT_CONTROL_RPC_METHODS,
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
+  AGENT_CONTROL_EPIC_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS,
   AGENT_CONTROL_STAGE_RUN_RPC_METHODS,
@@ -33,6 +34,11 @@ type WsRpcMethod = RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"];
  * runtime failure.
  */
 export const RPC_REQUIRED_SCOPES = {
+  [AGENT_CONTROL_EPIC_RPC_METHODS.preview]: AuthOrchestrationReadScope,
+  [AGENT_CONTROL_EPIC_RPC_METHODS.start]: AuthAccessWriteScope,
+  [AGENT_CONTROL_EPIC_RPC_METHODS.resume]: AuthAccessWriteScope,
+  [AGENT_CONTROL_EPIC_RPC_METHODS.stop]: AuthAccessWriteScope,
+  [AGENT_CONTROL_EPIC_RPC_METHODS.clear]: AuthAccessWriteScope,
   [AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot]: AuthOrchestrationReadScope,
   [AGENT_CONTROL_RUN_ONCE_RPC_METHODS.subscribe]: AuthOrchestrationReadScope,
   [AGENT_CONTROL_RUNTIME_RPC_METHODS.getProjectState]: AuthOrchestrationReadScope,

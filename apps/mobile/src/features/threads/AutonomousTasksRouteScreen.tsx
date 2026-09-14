@@ -57,6 +57,7 @@ import { agentControlEnvironment } from "../../state/agent-control";
 import { agentControlSetupEnvironment } from "../../state/agent-control-setup";
 import { serverEnvironment } from "../../state/server";
 import { AutonomousProjectSetupForm } from "./AutonomousProjectSetupForm";
+import { AutonomousEpicPanel } from "./AutonomousEpicPanel";
 import { useProject } from "../../state/entities";
 import { useEnvironmentPresentation } from "../../state/presentation";
 import { useEnvironmentQuery } from "../../state/query";
@@ -627,6 +628,18 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
             </Text>
           </View>
         ) : null}
+        <AutonomousEpicPanel
+          environmentId={environmentId}
+          projectId={projectId}
+          readiness={readiness}
+          renderRun={(run) => <RunResult run={run} environmentId={environmentId} />}
+          onRefresh={() => {
+            refreshSnapshot();
+            refreshPreflight();
+            refreshPolicy();
+            refreshSession();
+          }}
+        />
         <Text className="text-base font-t3-bold">Run once · Choose task</Text>
         {snapshot.data?.tasks.length === 0 ? (
           <Text className="text-sm text-foreground-muted">
