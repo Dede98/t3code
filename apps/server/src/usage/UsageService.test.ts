@@ -17,6 +17,7 @@ import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Scheduler from "effect/Scheduler";
 import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
@@ -105,6 +106,7 @@ describe("collectUsageTranscriptSources", () => {
     ]);
   });
 });
+const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 function claudeLine(id: number, outputTokens: number, model = "claude-fable-5"): string {
   return `${JSON.stringify({
@@ -154,6 +156,7 @@ const serviceLayers = (input: {
   readonly onRatesFetch?: () => void;
   /** Defaults to an unparsable document so every scan retries the fetch. */
   readonly ratesDocument?: unknown;
+  readonly sources?: Effect.Effect<ReadonlyArray<Pick<ProviderInstance, "usageHistorySource">>>;
 }) =>
   ServerConfig.layerTest(process.cwd(), { prefix: input.prefix }).pipe(
     Layer.provideMerge(NodeServices.layer),
@@ -174,14 +177,19 @@ const serviceLayers = (input: {
     Layer.provideMerge(
       Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
         getInstance: () => Effect.succeed(undefined),
-        listInstances: Effect.succeed([
-          {
-            usageHistorySource: {
-              provider: "claude",
-              transcriptDirectory: NodePath.join(input.home, "claude", "projects"),
+        listInstances: (
+          input.sources ??
+          Effect.succeed<ReadonlyArray<Pick<ProviderInstance, "usageHistorySource">>>([
+            {
+              usageHistorySource: {
+                provider: "claude" as const,
+                transcriptDirectory: NodePath.join(input.home, "claude", "projects"),
+              },
             },
-          } as ProviderInstance,
-        ]),
+          ])
+        ).pipe(
+          Effect.map((instances) => instances.map((instance) => instance as ProviderInstance)),
+        ),
         listUnavailable: Effect.succeed([]),
         streamChanges: Stream.empty,
         subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), PubSub.subscribe),
@@ -194,6 +202,165 @@ function totalOutputTokens(summary: { buckets: readonly { totals: { outputTokens
 }
 
 describe("UsageService", () => {
+  it.live("reads registry account sources once across shared and aliased homes", () =>
+    Effect.gen(function* () {
+      const { transcript, settings, home } = yield* setup;
+      const codexHome = NodePath.join(home, "codex-account");
+      const alias = NodePath.join(home, "codex-alias");
+      const claudeHome = NodePath.join(home, "claude-account");
+      const grokHome = NodePath.join(home, "grok-account");
+      yield* Effect.promise(async () => {
+        await NodeFSP.writeFile(transcript, claudeLine(1, 5));
+        await NodeFSP.mkdir(NodePath.join(claudeHome, "projects"), { recursive: true });
+        await NodeFSP.writeFile(
+          NodePath.join(claudeHome, "projects", "session.jsonl"),
+          claudeLine(2, 7),
+        );
+        await NodeFSP.mkdir(NodePath.join(codexHome, "sessions"), { recursive: true });
+        await NodeFSP.symlink(codexHome, alias, "junction");
+        await NodeFSP.writeFile(
+          NodePath.join(codexHome, "sessions", "rollout.jsonl"),
+          [
+            { type: "session_meta", payload: { id: "codex-account-session" } },
+            { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+            {
+              type: "event_msg",
+              timestamp: "2026-08-01T10:00:00Z",
+              payload: {
+                type: "token_count",
+                info: { last_token_usage: { input_tokens: 10, output_tokens: 11 } },
+              },
+            },
+          ]
+            .map((line) => encodeUnknownJsonString(line))
+            .join("\n") + "\n",
+        );
+        await NodeFSP.mkdir(NodePath.join(grokHome, "sessions", "session"), { recursive: true });
+        await NodeFSP.writeFile(
+          NodePath.join(grokHome, "sessions", "session", "updates.jsonl"),
+          encodeUnknownJsonString({
+            timestamp: Date.parse("2026-08-01T10:00:00Z") / 1000,
+            method: "_x.ai/session/update",
+            params: {
+              sessionId: "grok-account-session",
+              update: {
+                sessionUpdate: "turn_completed",
+                prompt_id: "prompt-1",
+                usage: { inputTokens: 10, outputTokens: 13 },
+              },
+            },
+          }) + "\n",
+        );
+      });
+      const service = yield* UsageService.make.pipe(
+        Effect.provide(
+          serviceLayers({
+            prefix: "usage-service-accounts-test",
+            home,
+            settings,
+            sources: Effect.succeed([
+              {
+                usageHistorySource: {
+                  provider: "claude",
+                  transcriptDirectory: NodePath.join(home, "claude", "projects"),
+                },
+              },
+              {
+                usageHistorySource: {
+                  provider: "claude",
+                  transcriptDirectory: NodePath.join(claudeHome, "projects"),
+                },
+              },
+              ...[codexHome, alias, codexHome].map((root) => ({
+                usageHistorySource: {
+                  provider: "codex" as const,
+                  transcriptDirectory: NodePath.join(root, "sessions"),
+                },
+              })),
+              {
+                usageHistorySource: {
+                  provider: "grok",
+                  transcriptDirectory: NodePath.join(grokHome, "sessions"),
+                  fileName: "updates.jsonl",
+                },
+              },
+            ]),
+          }),
+        ),
+      );
+      const summary = yield* service.readSummary(WINDOW);
+      assert.strictEqual(totalOutputTokens(summary), 36);
+      const sources = summary.sources.filter((source) => source.status === "ok");
+      assert.strictEqual(sources.length, 4);
+      assert.strictEqual(
+        sources.reduce((sum, source) => sum + source.scannedFiles, 0),
+        4,
+      );
+      assert.strictEqual(
+        sources.filter((source) => source.fingerprint.provider === "codex").length,
+        1,
+      );
+    }).pipe(Effect.scoped),
+  );
+
+  it.live("refreshes registry account roots without scanning legacy or nested homes", () =>
+    Effect.gen(function* () {
+      const { transcript, settings, home } = yield* setup;
+      const configured = NodePath.join(home, "configured");
+      const environmentHome = NodePath.join(home, "environment");
+      yield* Effect.promise(async () => {
+        await NodeFSP.writeFile(transcript, claudeLine(1, 100));
+        for (const [index, root] of [configured, environmentHome].entries()) {
+          await NodeFSP.mkdir(NodePath.join(root, "projects"), { recursive: true });
+          await NodeFSP.writeFile(
+            NodePath.join(root, "projects", "session.jsonl"),
+            claudeLine(index + 2, index + 7),
+          );
+        }
+        await NodeFSP.mkdir(NodePath.join(configured, ".claude", "projects"), {
+          recursive: true,
+        });
+        await NodeFSP.writeFile(
+          NodePath.join(configured, ".claude", "projects", "wrong.jsonl"),
+          claudeLine(4, 1000),
+        );
+      });
+      let currentHome = configured;
+      yield* Effect.gen(function* () {
+        const service = yield* UsageService.make;
+        const first = yield* service.readSummary(WINDOW);
+        assert.strictEqual(totalOutputTokens(first), 7);
+        assert.include(
+          first.sources.map((source) => source.fingerprint.resolvedHomePath),
+          yield* Effect.promise(() => NodeFSP.realpath(NodePath.join(configured, "projects"))),
+        );
+        currentHome = environmentHome;
+        const second = yield* service.readSummary(WINDOW);
+        assert.strictEqual(totalOutputTokens(second), 8);
+        assert.include(
+          second.sources.map((source) => source.fingerprint.resolvedHomePath),
+          yield* Effect.promise(() => NodeFSP.realpath(NodePath.join(environmentHome, "projects"))),
+        );
+      }).pipe(
+        Effect.provide(
+          serviceLayers({
+            prefix: "usage-service-home-refresh-test",
+            home,
+            settings,
+            sources: Effect.sync(() => [
+              {
+                usageHistorySource: {
+                  provider: "claude",
+                  transcriptDirectory: NodePath.join(currentHome, "projects"),
+                },
+              },
+            ]),
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped),
+  );
+
   it.live("reprices unchanged transcripts when custom prices are added, edited, or removed", () =>
     Effect.gen(function* () {
       const { transcript, settings, home } = yield* setup;
@@ -267,13 +434,16 @@ describe("UsageService", () => {
         const secondScanStarted = yield* Deferred.make<void>();
         const releaseRates = yield* Deferred.make<void>();
         let homeProbes = 0;
+        const transcriptRoot = yield* fileSystem.realPath(
+          NodePath.join(home, "claude", "projects"),
+        );
         const service = yield* UsageService.make.pipe(
           Effect.provideService(FileSystem.FileSystem, {
             ...fileSystem,
             exists: (path) =>
               fileSystem.exists(path).pipe(
                 Effect.tap(() => {
-                  if (path !== NodePath.join(home, "claude", "projects")) return Effect.void;
+                  if (path !== transcriptRoot) return Effect.void;
                   homeProbes += 1;
                   return Deferred.succeed(
                     homeProbes === 1 ? firstScanStarted : secondScanStarted,

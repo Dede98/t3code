@@ -47,6 +47,12 @@ import {
   AttachmentUploadSigningKeyError,
 } from "./assets.ts";
 import {
+  WorktreeSetupCancelInput,
+  WorktreeSetupCancelResult,
+  WorktreeSetupStreamEvent,
+  WorktreeSetupSubscribeInput,
+} from "./worktreeSetup.ts";
+import {
   GitActionProgressEvent,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
@@ -121,6 +127,9 @@ import {
   PullRequestOperationError,
   PullRequestReactionInput,
   PullRequestRef,
+  PullRequestRoutingResult,
+  PullRequestRoutingIdentityInput,
+  PullRequestRoutingIdentityResult,
   PullRequestStack,
   PullRequestLinkedThreadsResult,
   PullRequestSummary,
@@ -380,6 +389,8 @@ export const WS_METHODS = {
   pullRequestsList: "pullRequests.list",
   pullRequestsListStats: "pullRequests.listStats",
   pullRequestsSummary: "pullRequests.summary",
+  pullRequestsRouting: "pullRequests.routing",
+  pullRequestsRoutingIdentity: "pullRequests.routingIdentity",
   pullRequestsStack: "pullRequests.stack",
   pullRequestsLinkedThreads: "pullRequests.linkedThreads",
   pullRequestsDetail: "pullRequests.detail",
@@ -408,6 +419,8 @@ export const WS_METHODS = {
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
+  subscribeWorktreeSetup: "subscribeWorktreeSetup",
+  worktreeSetupCancel: "worktreeSetup.cancel",
   subscribeTerminalEvents: "subscribeTerminalEvents",
   subscribeTerminalMetadata: "subscribeTerminalMetadata",
   subscribePreviewEvents: "subscribePreviewEvents",
@@ -689,6 +702,18 @@ const WsPullRequestsListStatsRpc = Rpc.make(WS_METHODS.pullRequestsListStats, {
   error: PullRequestRpcError,
 });
 
+const WsPullRequestsRoutingRpc = Rpc.make(WS_METHODS.pullRequestsRouting, {
+  payload: PullRequestRef,
+  success: PullRequestRoutingResult,
+  error: PullRequestRpcError,
+});
+
+const WsPullRequestsRoutingIdentityRpc = Rpc.make(WS_METHODS.pullRequestsRoutingIdentity, {
+  payload: PullRequestRoutingIdentityInput,
+  success: PullRequestRoutingIdentityResult,
+  error: PullRequestRpcError,
+});
+
 const WsPullRequestsSummaryRpc = Rpc.make(WS_METHODS.pullRequestsSummary, {
   payload: PullRequestRef,
   success: PullRequestSummary,
@@ -938,6 +963,19 @@ const WsVcsRefreshStatusRpc = Rpc.make(WS_METHODS.vcsRefreshStatus, {
   payload: VcsStatusInput,
   success: VcsStatusResult,
   error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+});
+
+const WsSubscribeWorktreeSetupRpc = Rpc.make(WS_METHODS.subscribeWorktreeSetup, {
+  payload: WorktreeSetupSubscribeInput,
+  success: WorktreeSetupStreamEvent,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
+const WsWorktreeSetupCancelRpc = Rpc.make(WS_METHODS.worktreeSetupCancel, {
+  payload: WorktreeSetupCancelInput,
+  success: WorktreeSetupCancelResult,
+  error: EnvironmentAuthorizationError,
 });
 
 const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction, {
@@ -1349,6 +1387,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsPullRequestsListRpc,
   WsPullRequestsListStatsRpc,
   WsPullRequestsSummaryRpc,
+  WsPullRequestsRoutingRpc,
+  WsPullRequestsRoutingIdentityRpc,
   WsPullRequestsStackRpc,
   WsPullRequestsLinkedThreadsRpc,
   WsPullRequestsDetailRpc,
@@ -1386,6 +1426,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsAttachmentsDeleteRpc,
   WsProviderUploadFeedbackRpc,
   WsSubscribeVcsStatusRpc,
+  WsSubscribeWorktreeSetupRpc,
+  WsWorktreeSetupCancelRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
   WsGitRunStackedActionRpc,

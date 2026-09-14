@@ -1,8 +1,8 @@
 # External MCP servers
 
 T3 Code can attach remote Streamable HTTP MCP servers to provider sessions. Open **Settings →
-Integrations → External MCP servers**, add a unique server ID and an HTTPS endpoint, then add any
-required headers. Mark credentials such as `Authorization` as secret. Secret values are stored by
+Integrations → External MCP servers**, select one connected environment in the settings header,
+add a unique server ID and an HTTPS endpoint, then add any required headers. Mark credentials such as `Authorization` as secret. Secret values are stored by
 the T3 server and are not returned to connected clients or written into `settings.json`.
 
 Changes apply to new sessions. You can disable a server without deleting it, or select the provider

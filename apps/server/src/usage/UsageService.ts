@@ -270,7 +270,18 @@ export const make = Effect.gen(function* () {
 
   /** Resolves every unique transcript directory advertised by configured instances. */
   const resolveTranscriptDirs = Effect.fn("UsageService.resolveTranscriptDirs")(function* () {
-    return collectUsageTranscriptSources(yield* providerInstanceRegistry.listInstances);
+    const instances = yield* providerInstanceRegistry.listInstances;
+    const sources = yield* Effect.forEach(instances, (instance) =>
+      Effect.gen(function* () {
+        const source = instance.usageHistorySource;
+        if (source === undefined) return {};
+        const transcriptDirectory = yield* fileSystem
+          .realPath(source.transcriptDirectory)
+          .pipe(Effect.orElseSucceed(() => source.transcriptDirectory));
+        return { usageHistorySource: { ...source, transcriptDirectory } };
+      }),
+    );
+    return collectUsageTranscriptSources(sources);
   });
 
   /**

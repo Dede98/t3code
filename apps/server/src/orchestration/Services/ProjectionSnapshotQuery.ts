@@ -167,6 +167,10 @@ export interface ProjectionSnapshotQueryShape {
     projectId: ProjectId,
   ) => Effect.Effect<Option.Option<OrchestrationProjectShell>, ProjectionRepositoryError>;
 
+  readonly getProjectShells: (
+    projectIds?: ReadonlyArray<ProjectId>,
+  ) => Effect.Effect<ReadonlyArray<OrchestrationProjectShell>, ProjectionRepositoryError>;
+
   /**
    * Read the earliest active thread for a project.
    */
@@ -209,7 +213,7 @@ export interface ProjectionSnapshotQueryShape {
   /** Read the active thread and session facts used to ingest provider events. */
   readonly getThreadRuntimeContext: (threadId: ThreadId) => Effect.Effect<
     Option.Option<
-      Pick<OrchestrationThreadShell, "id" | "title" | "session"> & {
+      Pick<OrchestrationThreadShell, "id" | "projectId" | "title" | "session"> & {
         readonly boundProviderInstanceId: ProviderInstanceId | null;
       }
     >,

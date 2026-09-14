@@ -16,13 +16,22 @@ const ClientSettingsJson = fromLenientJson(ClientSettingsSchema);
 const decodeClientSettingsDocument = Schema.decodeEffect(
   fromLenientJson(Schema.Record(Schema.String, Schema.Unknown)),
 );
+const decodeClientSettingsRecord = Schema.decodeUnknownEffect(
+  Schema.Record(Schema.String, Schema.Unknown),
+);
 const decodeClientSettingsValue = Schema.decodeUnknownEffect(ClientSettingsSchema);
 const decodeClientSettingsJson = Effect.fnUntraced(function* (raw: string) {
   const document = yield* decodeClientSettingsDocument(raw);
   // Select the shape before validation so invalid legacy settings cannot become defaults.
-  return yield* decodeClientSettingsValue(
+  const value = yield* decodeClientSettingsRecord(
     Object.hasOwn(document, "settings") ? document.settings : document,
   );
+  const settings = yield* decodeClientSettingsValue(value);
+  // Existing desktop installs already delivered thread notifications. Preserve
+  // that choice when adding the shared controls; an explicit off stays off.
+  return Object.hasOwn(value, "notificationMode")
+    ? settings
+    : { ...settings, notificationMode: "notifications" as const };
 });
 const encodeClientSettingsJson = Schema.encodeEffect(ClientSettingsJson);
 

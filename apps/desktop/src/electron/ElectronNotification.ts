@@ -54,6 +54,7 @@ export const make = Effect.sync(() => {
           title: input.title,
           ...(input.subtitle === undefined ? {} : { subtitle: input.subtitle }),
           body: input.body,
+          silent: true,
         });
         const removeIfCurrent = () => {
           if (activeByKey.get(input.key) === notification) {

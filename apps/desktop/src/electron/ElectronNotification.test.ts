@@ -77,6 +77,7 @@ describe("ElectronNotification", () => {
 
       assert.isTrue(shown);
       assert.deepEqual(notificationInstances[0]?.options, {
+        silent: true,
         title: "Input needed",
         subtitle: "T3 Code",
         body: "Notification support",

@@ -18,6 +18,8 @@ import * as DesktopClientSettings from "./DesktopClientSettings.ts";
 
 const clientSettings: ClientSettings = {
   ...DEFAULT_CLIENT_SETTINGS,
+  notificationMode: "notifications-and-sound",
+  inAppNotificationsEnabled: true,
   appearanceContrast: 100,
   browserDefaultViewport: { _tag: "preset", width: 1024, height: 600, presetId: "nest-hub" },
   browserDefaultZoomFactor: 1.25,
@@ -34,6 +36,7 @@ const clientSettings: ClientSettings = {
   contextWindowMeterEnabled: false,
   composerCollapseOnScroll: true,
   dismissedProviderUpdateNotificationKeys: [],
+  diffFilesCollapsed: true,
   diffIgnoreWhitespace: true,
   diffLayout: "stacked",
   environmentIdentificationMode: "artwork",
@@ -220,6 +223,18 @@ describe("DesktopClientSettings", () => {
     ),
   );
 
+  it.effect("preserves an explicit notification opt-out", () =>
+    withClientSettings(
+      Effect.gen(function* () {
+        const settings = yield* DesktopClientSettings.DesktopClientSettings;
+        yield* settings.set({ ...clientSettings, notificationMode: "off" });
+        const persisted = yield* settings.get;
+        assert.isTrue(Option.isSome(persisted));
+        if (Option.isSome(persisted)) assert.equal(persisted.value.notificationMode, "off");
+      }),
+    ),
+  );
+
   it.effect("loads lenient direct client settings documents", () =>
     withClientSettings(
       Effect.gen(function* () {
@@ -239,6 +254,7 @@ describe("DesktopClientSettings", () => {
         assert.isTrue(Option.isSome(persisted));
         if (Option.isSome(persisted)) {
           assert.equal(persisted.value.timestampFormat, "24-hour");
+          assert.equal(persisted.value.notificationMode, "notifications");
         }
       }),
     ),
@@ -264,6 +280,7 @@ describe("DesktopClientSettings", () => {
         assert.isTrue(Option.isSome(persisted));
         if (Option.isSome(persisted)) {
           assert.equal(persisted.value.timestampFormat, "12-hour");
+          assert.equal(persisted.value.notificationMode, "notifications");
         }
       }),
     ),
@@ -278,7 +295,13 @@ describe("DesktopClientSettings", () => {
         yield* fileSystem.makeDirectory(environment.stateDir, { recursive: true });
         yield* fileSystem.writeFileString(environment.clientSettingsPath, "{}\n");
 
-        assert.deepEqual(yield* settings.get, Option.some(yield* decodeClientSettingsJson("{}")));
+        assert.deepEqual(
+          yield* settings.get,
+          Option.some({
+            ...(yield* decodeClientSettingsJson("{}")),
+            notificationMode: "notifications",
+          }),
+        );
       }),
     ),
   );
