@@ -345,13 +345,30 @@ it.live.each([
     recoverMissing: false,
     sourceChange: "terminal-retry-shared-git-dir",
   },
+  {
+    blockedMode: "run-once",
+    intakeRefreshes: 0,
+    recoverMissing: false,
+    sourceChange: "terminal-retry-cancelled",
+  },
+  {
+    blockedMode: "run-once",
+    intakeRefreshes: 0,
+    recoverMissing: false,
+    sourceChange: "terminal-retry-cancelled-shared-git-dir",
+  },
 ] as const)(
   "isolates a persisted $blockedMode project blocker with $intakeRefreshes intake refreshes (recover missing: $recoverMissing, source change: $sourceChange) while independent tasks run and fresh authority resolves it",
   ({ blockedMode, intakeRefreshes, recoverMissing, sourceChange }) =>
     Effect.scoped(
       Effect.gen(function* () {
+        const cancelledRetry =
+          sourceChange === "terminal-retry-cancelled" ||
+          sourceChange === "terminal-retry-cancelled-shared-git-dir";
         const terminalRetry =
-          sourceChange === "terminal-retry" || sourceChange === "terminal-retry-shared-git-dir";
+          sourceChange === "terminal-retry" ||
+          sourceChange === "terminal-retry-shared-git-dir" ||
+          cancelledRetry;
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-armed-production-" });
@@ -1032,7 +1049,7 @@ it.live.each([
                 permit.stage === "verification" && permit.threadId === input.event.threadId,
             );
             const resultSource =
-              verificationPermit === undefined
+              verificationPermit === undefined || input.event.payload.state !== "completed"
                 ? undefined
                 : yield* loadSealableVerificationResultSource(sql, {
                     threadId: input.event.threadId,
@@ -1068,12 +1085,12 @@ it.live.each([
               threadId: input.event.threadId,
               session: {
                 threadId: input.event.threadId,
-                status: input.event.payload.state === "completed" ? "ready" : "error",
+                status: input.event.payload.state === "failed" ? "error" : "ready",
                 providerName: provider,
                 providerInstanceId,
                 runtimeMode: input.runtimeMode,
                 activeTurnId: null,
-                lastError: input.event.payload.state === "completed" ? null : "provider failed",
+                lastError: input.event.payload.state === "failed" ? "provider failed" : null,
                 updatedAt: input.event.createdAt,
               },
               providerRuntimeLifecycle: {
@@ -1091,7 +1108,7 @@ it.live.each([
           readonly prefix: string;
           readonly threadId: ThreadId;
           readonly turnId: TurnId;
-          readonly state: "completed" | "failed";
+          readonly state: "completed" | "failed" | "interrupted";
         }) {
           const terminalAt = DateTime.formatIso(yield* DateTime.now);
           const session = fakeProvider.sessions.get(input.threadId);
@@ -1105,9 +1122,9 @@ it.live.each([
           void previousLastError;
           const terminalSession: ProviderSession = {
             ...terminalBase,
-            status: input.state === "completed" ? "ready" : "error",
+            status: input.state === "failed" ? "error" : "ready",
             updatedAt: terminalAt,
-            ...(input.state === "completed" ? {} : { lastError: "provider failed" }),
+            ...(input.state === "failed" ? { lastError: "provider failed" } : {}),
           };
           fakeProvider.sessions.set(input.threadId, terminalSession);
           const event = {
@@ -1612,7 +1629,7 @@ it.live.each([
             prefix: `armed-production-verification-${runOrdinal}`,
             threadId: ThreadId.make(verificationDelivery!.threadId),
             turnId: TurnId.make(verificationDelivery!.providerTurnId),
-            state: "completed",
+            state: cancelledRetry ? "interrupted" : "completed",
           });
           yield* projectProviderTerminal({
             prefix: `armed-production-verification-${runOrdinal}`,
@@ -1666,12 +1683,17 @@ it.live.each([
           yield* controller.processProject(projectId);
           assert.deepStrictEqual(
             yield* sql`SELECT status FROM agent_control_task_states WHERE task_id=${firstTaskId}`,
-            [{ status: "failed" }],
+            [{ status: cancelledRetry ? "cancelled" : "failed" }],
           );
           assert.deepStrictEqual(
             yield* sql`SELECT status, last_step AS step FROM agent_control_run_once_states
               WHERE project_id=${projectId}`,
             [{ status: "completed", step: "completed" }],
+          );
+          assert.deepStrictEqual(
+            yield* sql`SELECT status FROM agent_control_stage_run_lease_states
+              WHERE project_id=${projectId}`,
+            [{ status: "released" }],
           );
           const oldReservations = yield* sql<{
             status: string;
@@ -1694,8 +1716,14 @@ it.live.each([
           const oldFinalization =
             yield* sql`SELECT * FROM agent_control_verification_finalization_evidence
             WHERE project_id=${projectId}`;
-          assert.equal(oldFinalization[0]!.terminal_cause, "verification-invalid-output");
-          assert.equal(oldFinalization[0]!.invalid_output_code, "missing-final-message");
+          assert.equal(
+            oldFinalization[0]!.terminal_cause,
+            cancelledRetry ? "provider-delivery-interrupted" : "verification-invalid-output",
+          );
+          assert.equal(
+            oldFinalization[0]!.invalid_output_code,
+            cancelledRetry ? null : "missing-final-message",
+          );
           const oldWorktreeHead = yield* git(oldReservations[0]!.internal_worktree_path, [
             "rev-parse",
             "HEAD",
@@ -1707,7 +1735,9 @@ it.live.each([
             mode: "manual",
           });
           const retryProjectId = ProjectId.make("terminal-retry-second-checkout");
-          const sharedGitDir = sourceChange === "terminal-retry-shared-git-dir";
+          const sharedGitDir =
+            sourceChange === "terminal-retry-shared-git-dir" ||
+            sourceChange === "terminal-retry-cancelled-shared-git-dir";
           const retryRepository = sharedGitDir
             ? {
                 cwd: yield* fs.makeTempDirectoryScoped({

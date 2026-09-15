@@ -358,7 +358,11 @@ const make = Effect.gen(function* () {
           previousTask.source.issueNumber !== task.source.issueNumber
         )
           continue;
-        if (previousTask.status !== "succeeded" && previousTask.status !== "failed") {
+        if (
+          previousTask.status !== "succeeded" &&
+          previousTask.status !== "failed" &&
+          previousTask.status !== "cancelled"
+        ) {
           return yield* rpcError("reservation-conflict", command);
         }
         const lease = yield* loadAuthoritativeLeaseState(
