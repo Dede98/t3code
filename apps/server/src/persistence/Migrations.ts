@@ -1,3 +1,4 @@
+import AgentMigration0085 from "./Migrations/085_AgentControlEpicQueue.ts";
 /**
  * Migration runner with an inline loader.
  *
@@ -185,6 +186,7 @@ const agentMigrationEntries = [
   [82, "AgentControlCompactVerificationPrompt", AgentMigration0082],
   [83, "AgentControlEpicExecution", AgentMigration0083],
   [84, "AgentControlEpicResults", AgentMigration0084],
+  [85, "AgentControlEpicQueue", AgentMigration0085],
 ] as const;
 
 const migrationEntries = [

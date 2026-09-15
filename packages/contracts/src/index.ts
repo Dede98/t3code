@@ -5,6 +5,7 @@ export * from "./agentControlRunOnce.ts";
 export * from "./agentControlArmed.ts";
 export * from "./agentControlGithub.ts";
 export * from "./agentControlEpic.ts";
+export * from "./agentControlEpicQueue.ts";
 export * from "./agentControlEpicRuntime.ts";
 export * from "./agentControlTask.ts";
 export * from "./agentControlStageRun.ts";

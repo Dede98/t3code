@@ -760,179 +760,192 @@ else {
 });
 
 describe("Epic handoff retained verification authority", () => {
-  it.effect(
-    "binds publication to actual capture and common check receipts and rejects changed authority",
-    () =>
-      testWithRepo((repo) =>
-        Effect.gen(function* () {
-          const sql = yield* SqlClient.SqlClient;
-          const hooks = yield* makeEpicResults.pipe(
-            Effect.provideService(EpicCheckExecutor, { execute: () => Effect.succeed(success) }),
-          );
-          const accepted = yield* hooks.capture(captureInput);
-          const final = yield* hooks.verify(finalInput(accepted));
-          let original = { ...reservation(repo), baseRef: "origin/main" };
-          const spy = yield* Effect.acquireRelease(
-            Effect.sync(() =>
-              vi
-                .spyOn(WorktreeAuthority, "loadAuthoritativeWorktreeReservation")
-                .mockImplementation(() =>
-                  Effect.succeed(
-                    Option.some({ state: original, events: [], statesByVersion: [original] }),
-                  ),
-                ),
-            ),
-            (mock) => Effect.sync(() => mock.mockRestore()),
-          );
-          expect(spy).toBeDefined();
-          const repositoryBinding = { repositoryNodeId: "repository", nameWithOwner: "owner/repo" };
-          let githubBinding = repositoryBinding;
-          const issue = (number: number) => ({
-            ...repositoryBinding,
-            issueNodeId: "issue",
-            number,
-            title: "External title",
-            url: `https://github.com/owner/repo/issues/${number}`,
-            state: "open" as const,
-            subIssueCount: 0,
-          });
-          const state: AgentControlEpicRuntimeView = {
-            epicRunId: "epic-1",
-            projectId: ProjectId.make("project"),
-            revision: 1,
-            status: "succeeded",
-            source: {
-              format: "github-native-sub-issues-v1",
-              repository: repositoryBinding,
-              epic: issue(1),
-              tasks: [{ issue: issue(2), position: 0, dependencies: [] }],
-              blockers: [],
-              fingerprint: "source",
-              inspectedAt: at,
-            },
-            checks,
-            members: [finalInput(accepted).lastAccepted],
-            activeTaskId: null,
-            acceptedCommitSha: accepted.commitSha,
-            blockers: [],
-            blockerHistory: [],
-            verificationAttempt: 1,
-            finalVerification: final,
-            finalVerificationHistory: [final],
-            createdAt: at,
-            updatedAt: at,
-          };
-          yield* sql`CREATE TABLE projection_projects(project_id TEXT,workspace_root TEXT,deleted_at TEXT)`;
-          yield* sql`INSERT INTO projection_projects VALUES ('project',${repo.cwd},NULL)`;
-          const verifier = yield* makeEpicHandoffEvidence.pipe(
-            Effect.provide(
-              Layer.mergeAll(
-                Layer.mock(AgentControlWorktreeEventStore)({}),
-                Layer.mock(AgentControlWorktreeStateRepository)({}),
-                Layer.mock(AgentControlGithubStateRepository)({
-                  get: () =>
+  for (const queued of [false, true])
+    it.effect(
+      `binds ${queued ? "queued" : "manual"} publication to actual capture and common check receipts and rejects changed authority`,
+      () =>
+        testWithRepo((repo) =>
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            const hooks = yield* makeEpicResults.pipe(
+              Effect.provideService(EpicCheckExecutor, { execute: () => Effect.succeed(success) }),
+            );
+            const accepted = yield* hooks.capture({
+              ...captureInput,
+              previousCommitSha: queued ? repo.base : null,
+            });
+            const finalRequest = finalInput(accepted);
+            const lastAccepted = {
+              ...finalRequest.lastAccepted,
+              baseCommitSha: queued ? repo.base : null,
+            };
+            const final = yield* hooks.verify({ ...finalRequest, lastAccepted });
+            let original = { ...reservation(repo), baseRef: queued ? repo.base : "origin/main" };
+            const spy = yield* Effect.acquireRelease(
+              Effect.sync(() =>
+                vi
+                  .spyOn(WorktreeAuthority, "loadAuthoritativeWorktreeReservation")
+                  .mockImplementation(() =>
                     Effect.succeed(
-                      Option.some({
-                        ...createDefaultGithubIntakeState(state.projectId),
-                        config: {
-                          schemaVersion: 1,
-                          projectId: state.projectId,
-                          settings: {
-                            trackerKind: "github",
-                            readyLabel: "ready",
-                            pausedLabel: "paused",
-                            trustedLogins: [],
-                            pollIntervalSeconds: 60,
-                          },
-                          repository: githubBinding,
-                          revision: 1,
-                          sequence: 1,
-                          updatedAt: at,
-                        },
-                      }),
+                      Option.some({ state: original, events: [], statesByVersion: [original] }),
                     ),
-                }),
+                  ),
               ),
-            ),
-          );
-          const manifestsBefore = yield* sql<{
-            codeDigest: string;
-          }>`SELECT code_digest AS "codeDigest" FROM agent_control_verification_check_manifests WHERE provider_delivery_id=${final.evidenceId}`;
-          expect(manifestsBefore[0]!.codeDigest).not.toBe(accepted.codeDigest);
-          const { manifestDigest: _manifestDigest, ...legacyFinal } = final;
-          expect(
-            (yield* verifier.verify({
-              ...state,
-              finalVerification: legacyFinal,
-              finalVerificationHistory: [legacyFinal],
-            })).authority.commitSha,
-          ).toBe(accepted.commitSha);
-          const proof = yield* verifier.verify(state);
-          expect(proof.authority.commitSha).toBe(accepted.commitSha);
-          expect(proof.authority.baseCommitSha).toBe(repo.base);
-          expect(proof.authority.targetBranch).toBe("main");
-          expect(proof.childCheckCount).toBe(1);
-          expect(proof.finalCheckCount).toBe(1);
-          // Mutating current files does not change the immutable accepted result being published.
-          yield* io(() =>
-            NodeFSP.writeFile(NodePath.join(repo.cwd, "source.txt"), "new unverified files\n"),
-          );
-          expect((yield* verifier.verify(state)).authority.commitSha).toBe(accepted.commitSha);
-          for (const broken of [
-            { ...state, finalVerification: null },
-            { ...state, finalVerificationHistory: [] },
-            { ...state, acceptedCommitSha: "f".repeat(40) },
-            { ...state, checks: [] },
-          ]) {
-            expect((yield* verifier.verify(broken).pipe(Effect.flip)).code).toBe(
+              (mock) => Effect.sync(() => mock.mockRestore()),
+            );
+            expect(spy).toBeDefined();
+            const repositoryBinding = {
+              repositoryNodeId: "repository",
+              nameWithOwner: "owner/repo",
+            };
+            let githubBinding = repositoryBinding;
+            const issue = (number: number) => ({
+              ...repositoryBinding,
+              issueNodeId: "issue",
+              number,
+              title: "External title",
+              url: `https://github.com/owner/repo/issues/${number}`,
+              state: "open" as const,
+              subIssueCount: 0,
+            });
+            const state: AgentControlEpicRuntimeView = {
+              epicRunId: "epic-1",
+              projectId: ProjectId.make("project"),
+              revision: 1,
+              status: "succeeded",
+              source: {
+                format: "github-native-sub-issues-v1",
+                repository: repositoryBinding,
+                epic: issue(1),
+                tasks: [{ issue: issue(2), position: 0, dependencies: [] }],
+                blockers: [],
+                fingerprint: "source",
+                inspectedAt: at,
+              },
+              checks,
+              ...(queued ? { initialBase: { commitSha: repo.base, targetBranch: "main" } } : {}),
+              members: [lastAccepted],
+              activeTaskId: null,
+              acceptedCommitSha: accepted.commitSha,
+              blockers: [],
+              blockerHistory: [],
+              verificationAttempt: 1,
+              finalVerification: final,
+              finalVerificationHistory: [final],
+              createdAt: at,
+              updatedAt: at,
+            };
+            yield* sql`CREATE TABLE projection_projects(project_id TEXT,workspace_root TEXT,deleted_at TEXT)`;
+            yield* sql`INSERT INTO projection_projects VALUES ('project',${repo.cwd},NULL)`;
+            const verifier = yield* makeEpicHandoffEvidence.pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  Layer.mock(AgentControlWorktreeEventStore)({}),
+                  Layer.mock(AgentControlWorktreeStateRepository)({}),
+                  Layer.mock(AgentControlGithubStateRepository)({
+                    get: () =>
+                      Effect.succeed(
+                        Option.some({
+                          ...createDefaultGithubIntakeState(state.projectId),
+                          config: {
+                            schemaVersion: 1,
+                            projectId: state.projectId,
+                            settings: {
+                              trackerKind: "github",
+                              readyLabel: "ready",
+                              pausedLabel: "paused",
+                              trustedLogins: [],
+                              pollIntervalSeconds: 60,
+                            },
+                            repository: githubBinding,
+                            revision: 1,
+                            sequence: 1,
+                            updatedAt: at,
+                          },
+                        }),
+                      ),
+                  }),
+                ),
+              ),
+            );
+            const manifestsBefore = yield* sql<{
+              codeDigest: string;
+            }>`SELECT code_digest AS "codeDigest" FROM agent_control_verification_check_manifests WHERE provider_delivery_id=${final.evidenceId}`;
+            expect(manifestsBefore[0]!.codeDigest).not.toBe(accepted.codeDigest);
+            const { manifestDigest: _manifestDigest, ...legacyFinal } = final;
+            expect(
+              (yield* verifier.verify({
+                ...state,
+                finalVerification: legacyFinal,
+                finalVerificationHistory: [legacyFinal],
+              })).authority.commitSha,
+            ).toBe(accepted.commitSha);
+            const proof = yield* verifier.verify(state);
+            expect(proof.authority.commitSha).toBe(accepted.commitSha);
+            expect(proof.authority.baseCommitSha).toBe(repo.base);
+            expect(proof.authority.targetBranch).toBe("main");
+            expect(proof.childCheckCount).toBe(1);
+            expect(proof.finalCheckCount).toBe(1);
+            // Mutating current files does not change the immutable accepted result being published.
+            yield* io(() =>
+              NodeFSP.writeFile(NodePath.join(repo.cwd, "source.txt"), "new unverified files\n"),
+            );
+            expect((yield* verifier.verify(state)).authority.commitSha).toBe(accepted.commitSha);
+            for (const broken of [
+              { ...state, finalVerification: null },
+              { ...state, finalVerificationHistory: [] },
+              { ...state, acceptedCommitSha: "f".repeat(40) },
+              { ...state, checks: [] },
+            ]) {
+              expect((yield* verifier.verify(broken).pipe(Effect.flip)).code).toBe(
+                "handoff-evidence-invalid",
+              );
+            }
+            githubBinding = { ...repositoryBinding, repositoryNodeId: "other" };
+            expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
+              "handoff-repository-changed",
+            );
+            githubBinding = repositoryBinding;
+            yield* sql`UPDATE projection_projects SET workspace_root='/another/workspace'`;
+            expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
+              "handoff-repository-changed",
+            );
+            yield* sql`UPDATE projection_projects SET workspace_root=${repo.cwd}`;
+            original = { ...original, baseRef: "origin/other" };
+            expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
               "handoff-evidence-invalid",
             );
-          }
-          githubBinding = { ...repositoryBinding, repositoryNodeId: "other" };
-          expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
-            "handoff-repository-changed",
-          );
-          githubBinding = repositoryBinding;
-          yield* sql`UPDATE projection_projects SET workspace_root='/another/workspace'`;
-          expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
-            "handoff-repository-changed",
-          );
-          yield* sql`UPDATE projection_projects SET workspace_root=${repo.cwd}`;
-          original = { ...original, baseRef: "origin/other" };
-          expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
-            "handoff-evidence-invalid",
-          );
-          original = { ...original, baseRef: "origin/main" };
-          // Bypass immutability only in this disposable DB to exercise corruption detection.
-          yield* sql`DROP TRIGGER agent_control_epic_capture_results_no_update`;
-          yield* sql`DROP TRIGGER agent_control_verification_check_manifests_no_update`;
-          yield* sql`DROP TRIGGER agent_control_verification_check_results_no_update`;
-          yield* sql`DROP TRIGGER agent_control_verification_check_results_no_delete`;
-          const captures = yield* sql<{
-            digest: string;
-          }>`SELECT result_digest AS digest FROM agent_control_epic_capture_results`;
-          yield* sql`UPDATE agent_control_epic_capture_results SET result_digest='tampered'`;
-          expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
-            "handoff-evidence-invalid",
-          );
-          yield* sql`UPDATE agent_control_epic_capture_results SET result_digest=${captures[0]!.digest}`;
-          const manifests = yield* sql<{
-            digest: string;
-          }>`SELECT manifest_digest AS digest FROM agent_control_verification_check_manifests WHERE provider_delivery_id=${final.evidenceId}`;
-          yield* sql`UPDATE agent_control_verification_check_manifests SET manifest_digest='tampered' WHERE provider_delivery_id=${final.evidenceId}`;
-          expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
-            "handoff-evidence-invalid",
-          );
-          yield* sql`UPDATE agent_control_verification_check_manifests SET manifest_digest=${manifests[0]!.digest} WHERE provider_delivery_id=${final.evidenceId}`;
-          yield* sql`UPDATE agent_control_verification_check_results SET result_digest='tampered' WHERE provider_delivery_id=${final.evidenceId}`;
-          expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
-            "handoff-evidence-invalid",
-          );
-          yield* sql`DELETE FROM agent_control_verification_check_results WHERE provider_delivery_id=${final.evidenceId}`;
-          expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
-            "handoff-evidence-invalid",
-          );
-        }),
-      ),
-  );
+            original = { ...original, baseRef: "origin/main" };
+            // Bypass immutability only in this disposable DB to exercise corruption detection.
+            yield* sql`DROP TRIGGER agent_control_epic_capture_results_no_update`;
+            yield* sql`DROP TRIGGER agent_control_verification_check_manifests_no_update`;
+            yield* sql`DROP TRIGGER agent_control_verification_check_results_no_update`;
+            yield* sql`DROP TRIGGER agent_control_verification_check_results_no_delete`;
+            const captures = yield* sql<{
+              digest: string;
+            }>`SELECT result_digest AS digest FROM agent_control_epic_capture_results`;
+            yield* sql`UPDATE agent_control_epic_capture_results SET result_digest='tampered'`;
+            expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
+              "handoff-evidence-invalid",
+            );
+            yield* sql`UPDATE agent_control_epic_capture_results SET result_digest=${captures[0]!.digest}`;
+            const manifests = yield* sql<{
+              digest: string;
+            }>`SELECT manifest_digest AS digest FROM agent_control_verification_check_manifests WHERE provider_delivery_id=${final.evidenceId}`;
+            yield* sql`UPDATE agent_control_verification_check_manifests SET manifest_digest='tampered' WHERE provider_delivery_id=${final.evidenceId}`;
+            expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
+              "handoff-evidence-invalid",
+            );
+            yield* sql`UPDATE agent_control_verification_check_manifests SET manifest_digest=${manifests[0]!.digest} WHERE provider_delivery_id=${final.evidenceId}`;
+            yield* sql`UPDATE agent_control_verification_check_results SET result_digest='tampered' WHERE provider_delivery_id=${final.evidenceId}`;
+            expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
+              "handoff-evidence-invalid",
+            );
+            yield* sql`DELETE FROM agent_control_verification_check_results WHERE provider_delivery_id=${final.evidenceId}`;
+            expect((yield* verifier.verify(state).pipe(Effect.flip)).code).toBe(
+              "handoff-evidence-invalid",
+            );
+          }),
+        ),
+    );
 });

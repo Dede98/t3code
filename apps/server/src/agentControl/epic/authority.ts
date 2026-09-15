@@ -120,6 +120,7 @@ export const loadEpicRunBase = Effect.fn("loadEpicRunBase")(function* (
   projectId: ProjectId,
   taskId: AgentControlTaskId,
   childRunId: AgentControlRunOnceId | null,
+  targetBranch?: string,
 ) {
   const epic = yield* loadSelectedEpic(sql, projectId);
   if (!epic) return null;
@@ -136,10 +137,19 @@ export const loadEpicRunBase = Effect.fn("loadEpicRunBase")(function* (
       "authority-conflict",
       "The worktree is not bound to the active Epic child run.",
     );
-  if (member.baseCommitSha !== epic.acceptedCommitSha)
+  if (member.baseCommitSha !== (epic.acceptedCommitSha ?? epic.initialBase?.commitSha ?? null))
     return yield* epicError(
       "authority-conflict",
       "The Epic child base does not match the accepted result.",
+    );
+  if (
+    epic.initialBase &&
+    targetBranch !== undefined &&
+    epic.initialBase.targetBranch !== targetBranch
+  )
+    return yield* epicError(
+      "authority-conflict",
+      "The Epic target branch changed after its base was refreshed.",
     );
   return member.baseCommitSha;
 });

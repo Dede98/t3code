@@ -3972,7 +3972,7 @@ const make = Effect.gen(function* () {
         return yield* error("default-remote-ref-unavailable", operation, projectId, taskId);
       }
       const runId = yield* AgentControlRunOnceExecutionContext;
-      const epicBase = yield* loadEpicRunBase(sql, projectId, taskId, runId).pipe(
+      const epicBase = yield* loadEpicRunBase(sql, projectId, taskId, runId, baseBranch).pipe(
         Effect.mapError(() => error("source-snapshot-stale", operation, projectId, taskId)),
       );
       const baseRef = epicBase ?? `${remote.name}/${baseBranch}`;

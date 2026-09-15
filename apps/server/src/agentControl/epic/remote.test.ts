@@ -6,7 +6,7 @@ import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, expect } from "@effect/vitest";
-import { VcsProcessSpawnError } from "@t3tools/contracts";
+import { type AgentControlEpicHandoff, VcsProcessSpawnError } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { GitHubCli, GitHubCliCommandError } from "../../sourceControl/GitHubCli.ts";
@@ -114,6 +114,7 @@ const setup = Effect.gen(function* () {
     html_url: string;
     state: "open" | "closed";
     merged_at: string | null;
+    merge_commit_sha?: string | null;
     draft: boolean;
     body: string;
     head: { ref: string; sha: string; repo: { node_id: string } | null };
@@ -127,6 +128,9 @@ const setup = Effect.gen(function* () {
     vcsCalls: 0,
     apiCalls: [] as { endpoint: string; cwd: string; method: string }[],
     failPrRead: false,
+    failFetch: false,
+    fetches: 0,
+    defaultBranch: "main",
     prs: [] as Pr[],
     loseTagReply: false,
     loseBranchReply: false,
@@ -181,6 +185,10 @@ const setup = Effect.gen(function* () {
             return output(
               `HTTP/2.0 201 Created\n\n${encodeJson({ ref: body.ref, object: { sha: body.sha } })}`,
             );
+          }
+          if (request.args[0] === "fetch") {
+            state.fetches++;
+            if (state.failFetch) throw new Error("fetch unavailable");
           }
           const args = request.args.map((arg) =>
             arg === "https://github.com/test-owner/test-repo.git" ? bare : arg,
@@ -239,7 +247,7 @@ const setup = Effect.gen(function* () {
             encodeJson({
               node_id: state.repositoryId,
               full_name: "test-owner/test-repo",
-              default_branch: "main",
+              default_branch: state.defaultBranch,
               permissions: { push: !state.denyWrite },
             }),
           );
@@ -276,10 +284,172 @@ const setup = Effect.gen(function* () {
       repository: input.repository,
       pullRequest: { number: 10, url: "https://github.com/test-owner/test-repo/pull/10" },
     });
-  return { input, state, remote, publish, read, git, remoteGit, cwd };
+  const refresh = (previousHandoff?: AgentControlEpicHandoff) =>
+    remote.refreshQueueBase!({
+      cwd,
+      repository: input.repository,
+      ...(previousHandoff ? { previousHandoff } : {}),
+    });
+  const handoff = (
+    pullRequest: AgentControlEpicHandoff["pullRequest"],
+  ): AgentControlEpicHandoff => ({
+    intentId: "handoff-1",
+    status: "published",
+    repository: input.repository,
+    targetBranch: "main",
+    baseCommitSha,
+    commitSha,
+    branchName: input.branchName,
+    verificationEvidenceId: "evidence-1",
+    requestedAt: "2026-09-14T00:00:00Z",
+    updatedAt: "2026-09-14T00:00:00Z",
+    pullRequest,
+    error: null,
+  });
+  return { input, state, remote, publish, read, refresh, handoff, git, remoteGit, cwd };
 });
 
 it.layer(NodeServices.layer)("Epic handoff remote", (it) => {
+  it.effect("refreshes the first queued Epic from the remote target instead of local HEAD", () =>
+    Effect.gen(function* () {
+      const f = yield* setup;
+      expect(yield* f.refresh()).toEqual({
+        commitSha: f.input.baseCommitSha,
+        targetBranch: "main",
+      });
+      expect(f.state.fetches).toBe(1);
+      expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([0, 0, 0]);
+    }),
+  );
+  for (const method of ["merge", "squash", "rebase"] as const)
+    it.effect(
+      `accepts a confirmed ${method} result after source deletion on a freshly fetched target`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* setup;
+          const handoff = f.handoff(yield* f.publish());
+          const tree = yield* f.git(["rev-parse", `${f.input.commitSha}^{tree}`]);
+          const mergedSha = yield* f.git([
+            "commit-tree",
+            tree,
+            "-p",
+            f.input.baseCommitSha,
+            ...(method === "merge" ? ["-p", f.input.commitSha] : []),
+            "-m",
+            `GitHub ${method} result`,
+          ]);
+          const targetTip = yield* f.git([
+            "commit-tree",
+            tree,
+            "-p",
+            mergedSha,
+            "-m",
+            "later target change",
+          ]);
+          yield* f.git([
+            "push",
+            f.cwd.replace(/local$/, "remote.git"),
+            `${targetTip}:refs/heads/main`,
+          ]);
+          yield* f.remoteGit(["update-ref", "-d", `refs/heads/${f.input.branchName}`]);
+          f.state.prs[0]!.state = "closed";
+          f.state.prs[0]!.merged_at = "2026-09-14T00:00:00Z";
+          f.state.prs[0]!.merge_commit_sha = mergedSha;
+          f.state.prs[0]!.head.repo = null;
+          f.state.denyWrite = true;
+          expect(yield* f.git(["rev-parse", "refs/remotes/origin/main"])).toBe(
+            f.input.baseCommitSha,
+          );
+          expect(yield* f.refresh(handoff)).toEqual({ commitSha: targetTip, targetBranch: "main" });
+          expect(yield* f.refresh(handoff)).toEqual({ commitSha: targetTip, targetBranch: "main" });
+          expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([1, 1, 1]);
+        }),
+    );
+  it.effect("waits through closed and reopened PRs and ignores the unmerged test merge SHA", () =>
+    Effect.gen(function* () {
+      const f = yield* setup;
+      const handoff = f.handoff(yield* f.publish());
+      f.state.prs[0]!.merge_commit_sha = f.input.commitSha;
+      expect((yield* f.read()).mergeCommitSha).toBeNull();
+      expect((yield* Effect.flip(f.refresh(handoff))).code).toBe("pull-request-review-pending");
+      f.state.prs[0]!.state = "closed";
+      expect((yield* Effect.flip(f.refresh(handoff))).code).toBe("pull-request-closed");
+      f.state.prs[0]!.state = "open";
+      expect((yield* Effect.flip(f.refresh(handoff))).code).toBe("pull-request-review-pending");
+      expect(f.state.fetches).toBe(0);
+      f.state.prs[0]!.state = "closed";
+      f.state.prs[0]!.merged_at = "2026-09-14T00:00:00Z";
+      yield* f.git([
+        "push",
+        f.cwd.replace(/local$/, "remote.git"),
+        `${f.input.commitSha}:refs/heads/main`,
+      ]);
+      expect((yield* f.refresh(handoff)).commitSha).toBe(f.input.commitSha);
+    }),
+  );
+  for (const error of [
+    "fetch",
+    "github",
+    "missing-merge",
+    "absent-merge",
+    "target",
+    "repository",
+    "remote",
+    "ambiguous-remote",
+  ] as const)
+    it.effect(`blocks queue advancement for ${error} and recovers without remote writes`, () =>
+      Effect.gen(function* () {
+        const f = yield* setup;
+        const handoff = f.handoff(yield* f.publish());
+        f.state.prs[0]!.state = "closed";
+        f.state.prs[0]!.merged_at = "2026-09-14T00:00:00Z";
+        f.state.prs[0]!.merge_commit_sha = f.input.commitSha;
+        if (error !== "absent-merge")
+          yield* f.git([
+            "push",
+            f.cwd.replace(/local$/, "remote.git"),
+            `${f.input.commitSha}:refs/heads/main`,
+          ]);
+        if (error === "fetch") f.state.failFetch = true;
+        if (error === "github") f.state.failPrRead = true;
+        if (error === "missing-merge") f.state.prs[0]!.merge_commit_sha = null;
+        if (error === "target") f.state.prs[0]!.base.ref = "other";
+        if (error === "repository") f.state.repositoryId = "other";
+        if (error === "remote")
+          yield* f.git(["remote", "set-url", "origin", "https://github.com/foreign/repo.git"]);
+        if (error === "ambiguous-remote")
+          yield* f.git([
+            "remote",
+            "add",
+            "duplicate",
+            "https://github.com/test-owner/test-repo.git",
+          ]);
+        const failure = yield* Effect.flip(f.refresh(handoff));
+        expect(failure.code).toBe(
+          {
+            fetch: "target-fetch-failed",
+            github: "remote-unavailable",
+            "missing-merge": "merge-evidence-missing",
+            "absent-merge": "merge-not-in-target",
+            target: "target-branch-changed",
+            repository: "repository-identity-changed",
+            remote: "repository-identity-changed",
+            "ambiguous-remote": "repository-identity-changed",
+          }[error],
+        );
+        expect(failure.message).not.toMatch(/TOKEN|\/Users\//);
+        if (error === "fetch" || error === "github") {
+          expect(yield* f.git(["rev-parse", "refs/remotes/origin/main"])).toBe(
+            f.input.baseCommitSha,
+          );
+          f.state.failFetch = false;
+          f.state.failPrRead = false;
+          expect((yield* f.refresh(handoff)).commitSha).toBe(f.input.commitSha);
+        }
+        expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([1, 1, 1]);
+      }),
+    );
+
   for (const state of ["closed", "merged"] as const)
     it.effect(
       `reads a saved ${state} PR after branch deletion without Git or write permission`,

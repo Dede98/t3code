@@ -1,5 +1,7 @@
 import type {
+  AgentControlEpicHandoff,
   AgentControlEpicHandoffPullRequest,
+  AgentControlGithubRepositoryBinding,
   AgentControlWorktreeRepositoryIdentity,
 } from "@t3tools/contracts";
 import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
@@ -41,9 +43,20 @@ export interface EpicHandoffRemoteReadInput {
   readonly repository: { readonly repositoryNodeId: string; readonly nameWithOwner: string };
   readonly pullRequest: { readonly number: number; readonly url: string };
 }
+export interface EpicQueueBaseInput {
+  readonly cwd: string;
+  readonly repository: AgentControlGithubRepositoryBinding;
+  readonly previousHandoff?: AgentControlEpicHandoff;
+}
 export class EpicHandoffRemote extends Context.Service<
   EpicHandoffRemote,
   {
+    readonly refreshQueueBase?: (
+      input: EpicQueueBaseInput,
+    ) => Effect.Effect<
+      { readonly commitSha: string; readonly targetBranch: string },
+      EpicHandoffRemoteError
+    >;
     readonly readPullRequest: (
       input: EpicHandoffRemoteReadInput,
     ) => Effect.Effect<AgentControlEpicHandoffPullRequest, EpicHandoffRemoteError>;
@@ -80,6 +93,7 @@ const PullRequest = Schema.Struct({
   html_url: Schema.String,
   state: Schema.Literals(["open", "closed"]),
   merged_at: Schema.NullOr(Schema.String),
+  merge_commit_sha: Schema.optionalKey(Schema.NullOr(Schema.String)),
   draft: Schema.Boolean,
   body: Schema.NullOr(Schema.String),
   head: Schema.Struct({
@@ -96,6 +110,7 @@ const normalizePullRequest = (pr: typeof PullRequest.Type): AgentControlEpicHand
   isDraft: pr.draft,
   headSha: pr.head.sha,
   baseBranch: pr.base.ref,
+  mergeCommitSha: pr.merged_at === null ? null : (pr.merge_commit_sha ?? null),
 });
 const CreatedRef = Schema.Struct({
   ref: Schema.String,
@@ -142,7 +157,7 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const git = Effect.fn("EpicHandoffRemote.git")(function* (
-    input: EpicHandoffRemoteAuthority,
+    input: { readonly cwd: string },
     args: ReadonlyArray<string>,
     stdin?: string,
   ) {
@@ -315,6 +330,133 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
     // Human review may change the head, base, draft status, or remove the branch.
     // Reading the saved PR must not re-run publication checks or create anything.
     return normalizePullRequest(pr);
+  });
+
+  const refreshQueueBase: NonNullable<EpicHandoffRemote["Service"]["refreshQueueBase"]> = Effect.fn(
+    "EpicHandoffRemote.refreshQueueBase",
+  )(function* (input) {
+    if (!/^[a-zA-Z0-9-]+\/[a-zA-Z0-9_.-]+$/.test(input.repository.nameWithOwner))
+      return yield* failure(
+        "handoff-authority-invalid",
+        "The approved repository identity is invalid.",
+      );
+    const repository = yield* decode(Repository, (yield* api(input, endpoint(input))).stdout);
+    if (
+      repository.node_id !== input.repository.repositoryNodeId ||
+      repository.full_name.toLowerCase() !== input.repository.nameWithOwner.toLowerCase()
+    )
+      return yield* failure(
+        "repository-identity-changed",
+        "The approved GitHub repository identity changed.",
+      );
+    const targetBranch = repository.default_branch;
+    yield* git(input, ["check-ref-format", `refs/heads/${targetBranch}`]);
+    const expectedKey = `github.com/${input.repository.nameWithOwner}`.toLowerCase();
+    const remotes = (yield* git(input, ["remote"])).stdout.trim().split("\n").filter(Boolean);
+    const matching: { name: string; url: string }[] = [];
+    for (const name of remotes) {
+      const urls = (yield* git(input, ["remote", "get-url", "--all", name])).stdout
+        .trim()
+        .split("\n");
+      if (urls.some((url) => normalizeGitRemoteUrl(url) === expectedKey)) {
+        if (urls.length !== 1)
+          return yield* failure(
+            "repository-identity-changed",
+            "The approved repository has an ambiguous local remote mapping.",
+          );
+        matching.push({ name, url: urls[0]! });
+      }
+    }
+    const remote = matching[0];
+    if (matching.length !== 1 || !remote)
+      return yield* failure(
+        "repository-identity-changed",
+        "Exactly one local remote must identify the approved GitHub repository.",
+      );
+    const targetRef = `refs/remotes/${remote.name}/${targetBranch}`;
+    const defaultRef = (yield* git(input, [
+      "symbolic-ref",
+      "--quiet",
+      `refs/remotes/${remote.name}/HEAD`,
+    ])).stdout.trim();
+    if (defaultRef !== targetRef)
+      return yield* failure(
+        "target-branch-changed",
+        "The local default branch does not match GitHub. Refresh the repository mapping before continuing.",
+      );
+    let mergeCommitSha: string | null = null;
+    const handoff = input.previousHandoff;
+    if (handoff) {
+      if (
+        handoff.repository.repositoryNodeId !== input.repository.repositoryNodeId ||
+        handoff.repository.nameWithOwner.toLowerCase() !==
+          input.repository.nameWithOwner.toLowerCase() ||
+        !handoff.pullRequest
+      )
+        return yield* failure(
+          "handoff-authority-invalid",
+          "The previous Epic has no matching saved pull request identity.",
+        );
+      const pr = yield* readPullRequest({
+        cwd: input.cwd,
+        repository: handoff.repository,
+        pullRequest: handoff.pullRequest,
+      });
+      if (pr.state !== "merged")
+        return yield* failure(
+          pr.state === "closed" ? "pull-request-closed" : "pull-request-review-pending",
+          pr.state === "closed"
+            ? "The previous Epic's pull request was closed without merge. Reopen or merge it before continuing."
+            : "The previous Epic is waiting for human review and merge.",
+        );
+      if (handoff.targetBranch !== targetBranch || pr.baseBranch !== targetBranch)
+        return yield* failure(
+          "target-branch-changed",
+          "The merged pull request does not target the approved default branch.",
+        );
+      mergeCommitSha = pr.mergeCommitSha ?? null;
+      if (!mergeCommitSha || !objectId.test(mergeCommitSha))
+        return yield* failure(
+          "merge-evidence-missing",
+          "GitHub has not confirmed the merged result commit. No next Epic was started.",
+        );
+    }
+    // Fetch the validated URL and explicit target ref; configured refspecs and
+    // deleted PR branches cannot substitute a different base.
+    yield* git(input, [
+      "fetch",
+      "--no-tags",
+      "--no-write-fetch-head",
+      remote.url,
+      `+refs/heads/${targetBranch}:${targetRef}`,
+    ]).pipe(
+      Effect.mapError(() =>
+        failure(
+          "target-fetch-failed",
+          "The target branch could not be refreshed. No next Epic was started on the old base.",
+        ),
+      ),
+    );
+    const commitSha = (yield* git(input, [
+      "rev-parse",
+      "--verify",
+      `${targetRef}^{commit}`,
+    ])).stdout.trim();
+    if (!objectId.test(commitSha))
+      return yield* failure(
+        "target-base-invalid",
+        "Git did not confirm a valid fetched target commit.",
+      );
+    if (mergeCommitSha)
+      yield* git(input, ["merge-base", "--is-ancestor", mergeCommitSha, commitSha]).pipe(
+        Effect.mapError(() =>
+          failure(
+            "merge-not-in-target",
+            "The freshly fetched target branch does not contain GitHub's confirmed merge commit.",
+          ),
+        ),
+      );
+    return { commitSha, targetBranch };
   });
 
   const validate = Effect.fn("EpicHandoffRemote.validate")(function* (
@@ -626,6 +768,6 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
       return result;
     },
   );
-  return EpicHandoffRemote.of({ prepare, publish, readPullRequest });
+  return EpicHandoffRemote.of({ prepare, publish, readPullRequest, refreshQueueBase });
 });
 export const EpicHandoffRemoteLive = Layer.effect(EpicHandoffRemote, makeEpicHandoffRemote);

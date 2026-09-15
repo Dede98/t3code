@@ -23,6 +23,11 @@ import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
 
 import {
+  agentControlEpicQueueChangeBlockers,
+  agentControlEpicQueueApproveBlockers,
+  agentControlEpicQueueChangeInput,
+  agentControlEpicQueueMoveInput,
+  agentControlEpicQueueView,
   agentControlEpicStartBlockers,
   agentControlEpicStartInput,
   agentControlEpicControlInput,
@@ -1289,5 +1294,183 @@ describe("Epic human review handoff", () => {
         epic: { ...epic, handoff: { ...epic.handoff, status: "publishing" } },
       }),
     ).not.toEqual([]);
+  });
+});
+
+describe("Epic queue client state", () => {
+  const entry = {
+    entryId: "a",
+    source: epicPreview.source,
+    approvedAt: timestamp,
+    epicRunId: epicRun.epicRunId,
+    status: "active" as const,
+    blockers: [],
+  };
+  const queued: AgentControlRunOnceSnapshot = {
+    ...snapshot,
+    epic: epicRun,
+    armed: { enabled: true },
+    epicQueue: {
+      projectId: snapshot.projectId,
+      revision: 4,
+      entries: [
+        entry,
+        { ...entry, entryId: "b", epicRunId: null, status: "pending" },
+        { ...entry, entryId: "c", epicRunId: null, status: "pending" },
+      ],
+      nextEntryId: "b",
+      waitReason: "Waiting for human review and merge.",
+      nextCheckAt: null,
+    },
+  };
+
+  it("allows explicit approval during active work without treating open dependencies as rejection", () => {
+    const readiness = {
+      ...start,
+      snapshot: { ...snapshot, epic: epicRun, runs: [run] },
+      preflight: null,
+      policy: null,
+    };
+    const blockedPreview = { ...epicPreview, canStart: false };
+    expect(agentControlEpicQueueApproveBlockers(readiness, blockedPreview)).toEqual([]);
+    expect(
+      agentControlEpicQueueApproveBlockers({ ...readiness, snapshot: queued }, blockedPreview),
+    ).toContain("This Epic is already in the approved queue.");
+    expect(
+      agentControlEpicQueueApproveBlockers(readiness, {
+        ...blockedPreview,
+        projectId: ProjectId.make("other"),
+      }),
+    ).toContain("Inspect an Epic in this project before approving it.");
+  });
+
+  it("blocks queue edits for unknown, refreshing, revoked and wrong-environment permissions", () => {
+    for (const session of [
+      AsyncResult.initial<AuthSessionState>(),
+      AsyncResult.waiting(AsyncResult.success(adminSession)),
+      AsyncResult.fail(new Error("reconnect")),
+      AsyncResult.success({ ...adminSession, scopes: AuthStandardClientScopes }),
+      AsyncResult.success({ ...adminSession, authenticated: false }),
+    ]) {
+      expect(
+        agentControlEpicQueueChangeBlockers({
+          ...start,
+          modeChangeBlocker: agentControlModeChangeBlocker(session),
+        }).length,
+      ).toBeGreaterThan(0);
+    }
+    for (const overrides of [{ connected: false }, { pending: true }, { snapshot: null }]) {
+      expect(
+        agentControlEpicQueueChangeBlockers({ ...start, ...overrides }).length,
+      ).toBeGreaterThan(0);
+    }
+    expect(agentControlEpicQueueChangeBlockers(start)).toEqual([]);
+  });
+
+  it("moves the complete pending order and never moves active or merged entries", () => {
+    expect(agentControlEpicQueueMoveInput(queued, "c", -1)?.action).toEqual({
+      kind: "reorder",
+      entryIds: ["c", "b"],
+    });
+    expect(agentControlEpicQueueMoveInput(queued, "b", 1)?.action).toEqual({
+      kind: "reorder",
+      entryIds: ["c", "b"],
+    });
+    expect(agentControlEpicQueueMoveInput(queued, "a", 1)).toBeNull();
+    expect(agentControlEpicQueueMoveInput(queued, "b", -1)).toBeNull();
+    expect(agentControlEpicQueueMoveInput(queued, "c", 1)).toBeNull();
+    expect(
+      agentControlEpicQueueMoveInput(
+        {
+          ...queued,
+          epicQueue: {
+            ...queued.epicQueue!,
+            entries: [{ ...entry, status: "merged" }],
+          },
+        },
+        "a",
+        1,
+      ),
+    ).toBeNull();
+  });
+
+  it("keeps identities stable at a revision and changes identity for a new order or revision", () => {
+    const action = { kind: "remove" as const, entryId: "b" };
+    const first = agentControlEpicQueueChangeInput(queued, action);
+    expect(agentControlEpicQueueChangeInput(queued, action)).toEqual(first);
+    expect(first.expectedRevision).toBe(4);
+    expect(
+      agentControlEpicQueueChangeInput(
+        {
+          ...queued,
+          epicQueue: {
+            ...queued.epicQueue!,
+            revision: 5,
+          },
+        },
+        action,
+      ).commandId,
+    ).not.toBe(first.commandId);
+    expect(
+      agentControlEpicQueueChangeInput(queued, { ...action, entryId: "c" }).commandId,
+    ).not.toBe(first.commandId);
+    expect(agentControlEpicQueueChangeInput(snapshot, action).expectedRevision).toBe(0);
+  });
+
+  it("shows the server's next candidate, active Epic and review wait independently of local success", () => {
+    expect(agentControlEpicQueueView(queued)).toMatchObject({
+      active: { entryId: "a" },
+      next: { entryId: "b" },
+      waitReason: "Waiting for human review and merge.",
+    });
+    expect(agentControlArmedStatus(queued).label).toContain("human review and merge");
+    expect(
+      agentControlArmedStatus({ ...queued, armed: { ...queued.armed!, enabled: false } }),
+    ).toMatchObject({ enabled: false });
+    expect(agentControlEpicQueueView(snapshot)).toBeNull();
+    const empty = {
+      ...queued,
+      epic: null,
+      epicQueue: {
+        ...queued.epicQueue!,
+        entries: [],
+        nextEntryId: null,
+        waitReason: null,
+      },
+    };
+    expect(agentControlArmedStatus(empty).label).toContain("eligible approved Epic");
+  });
+
+  it("allows re-arm while a queued Epic waits and keeps manual starts out of queue mode", () => {
+    expect(
+      agentControlArmBlockers({
+        ...start,
+        snapshot: {
+          ...queued,
+          runs: [],
+          armed: { ...queued.armed!, enabled: false },
+        },
+      }),
+    ).toEqual([]);
+    expect(agentControlEpicStartBlockers({ ...start, snapshot: queued }, epicPreview)).toContain(
+      "Approve this Epic for the queue and enable Armed to start it.",
+    );
+    expect(agentControlStartBlockers({ ...start, snapshot: { ...queued, epic: null } })).toContain(
+      "This project uses an approved Epic queue. Enable Armed to continue it.",
+    );
+    expect(
+      agentControlEpicControlAllowed(
+        {
+          ...start,
+          snapshot: {
+            ...queued,
+            armed: { enabled: false },
+            runs: [],
+            epic: { ...epicRun, status: "succeeded" },
+          },
+        },
+        "clear",
+      ),
+    ).toBe(false);
   });
 });

@@ -195,6 +195,37 @@ describe("Epic dependency policy", () => {
       "scope-changed",
     );
   });
+  it("keeps old sources compatible while fencing new Epic dependency edges and reopened prerequisites", () => {
+    assert.deepEqual(epicSourceChanges(initial(), { ...source, dependencies: [] }), []);
+    const frozen = {
+      ...source,
+      dependencies: [
+        { ...issue(90), state: "closed" as const },
+        { ...issue(91), state: "closed" as const },
+      ],
+    };
+    const state = { ...initial(), source: frozen };
+    assert.deepEqual(
+      epicSourceChanges(state, { ...frozen, dependencies: frozen.dependencies.toReversed() }),
+      [],
+    );
+    assert.equal(epicSourceChanges(initial(), frozen)[0]?.code, "scope-changed");
+    assert.equal(
+      epicSourceChanges(state, { ...frozen, dependencies: [] })[0]?.code,
+      "scope-changed",
+    );
+    assert.deepEqual(
+      epicSourceChanges(state, { ...frozen, dependencies: [issue(90), frozen.dependencies[1]!] }),
+      [
+        {
+          code: "prerequisite-reopened",
+          issueNumber: 90,
+          message: "Epic prerequisite #90 was reopened.",
+        },
+      ],
+    );
+    assert.deepEqual(epicSourceChanges(state, frozen), []);
+  });
 });
 
 describe("Epic persistence and existing selection", () => {
@@ -242,6 +273,34 @@ describe("Epic persistence and existing selection", () => {
             yield* Effect.exit(sql`UPDATE agent_control_epic_history SET state_json='{}'`),
           ),
         );
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+  it.effect(
+    "binds the first queued child to its fetched SHA and rejects a changed target mapping",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations({ toMigrationInclusive: 85 });
+        const taskId = AgentControlTaskId.make("task-2");
+        const runId = AgentControlRunOnceId.make("queued-child");
+        const commitSha = "a".repeat(40);
+        const state = {
+          ...initial(),
+          initialBase: { commitSha, targetBranch: "main" },
+          activeTaskId: taskId,
+          members: initial().members.map((member) =>
+            member.issueNumber === 2
+              ? { ...member, taskId, status: "running" as const, baseCommitSha: commitSha }
+              : member,
+          ),
+        };
+        yield* seedRun(sql, state);
+        yield* sql.withTransaction(bindEpicChildRun(sql, projectId, taskId, runId));
+        assert.equal(yield* loadEpicRunBase(sql, projectId, taskId, runId, "main"), commitSha);
+        const error = yield* loadEpicRunBase(sql, projectId, taskId, runId, "other").pipe(
+          Effect.flip,
+        );
+        assert.propertyVal(error, "code", "authority-conflict");
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
   it.effect("competing revisions cannot adopt the same result twice or rewrite scope", () =>

@@ -1,4 +1,6 @@
 import type {
+  AgentControlEpicQueue,
+  AgentControlEpicQueueChangeInput,
   AgentControlEpicControlInput,
   AgentControlEpicHandoffPreviewInput,
   AgentControlEpicHandoffPreview,
@@ -16,6 +18,9 @@ import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
 export interface AgentControlEpicShape {
+  readonly changeQueue: (
+    input: AgentControlEpicQueueChangeInput,
+  ) => Effect.Effect<AgentControlEpicQueue, AgentControlEpicRpcError>;
   readonly previewHandoff: (
     input: AgentControlEpicHandoffPreviewInput,
   ) => Effect.Effect<AgentControlEpicHandoffPreview, AgentControlEpicRpcError>;

@@ -41,6 +41,7 @@ export const AgentControlEpicSource = Schema.Struct({
   format: Schema.Literal("github-native-sub-issues-v1"),
   repository: AgentControlGithubRepositoryBinding,
   epic: AgentControlEpicIssue,
+  dependencies: Schema.optionalKey(Schema.Array(AgentControlEpicIssue)),
   tasks: Schema.Array(AgentControlEpicTaskSource),
   blockers: Schema.Array(AgentControlEpicSourceBlocker),
   fingerprint: TrimmedNonEmptyString,

@@ -72,6 +72,7 @@ export const AgentControlEpicHandoffPullRequest = Schema.Struct({
   isDraft: Schema.Boolean,
   headSha: Schema.String,
   baseBranch: Schema.String,
+  mergeCommitSha: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 export type AgentControlEpicHandoffPullRequest = typeof AgentControlEpicHandoffPullRequest.Type;
 export const AgentControlEpicHandoff = Schema.Struct({
@@ -100,6 +101,9 @@ export const AgentControlEpicRuntimeView = Schema.Struct({
   members: Schema.Array(AgentControlEpicMemberView),
   activeTaskId: Schema.NullOr(AgentControlTaskId),
   acceptedCommitSha: Schema.NullOr(Schema.String),
+  initialBase: Schema.optionalKey(
+    Schema.Struct({ commitSha: Schema.String, targetBranch: Schema.String }),
+  ),
   externalPrerequisites: Schema.optionalKey(
     Schema.Array(
       Schema.Struct({

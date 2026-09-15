@@ -3,6 +3,8 @@ import {
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AGENT_CONTROL_EPIC_RPC_METHODS,
+  AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS,
+  type AgentControlEpicQueueChangeInput,
   CommandId,
   AuthAccessWriteScope,
   type AuthSessionState,
@@ -71,6 +73,13 @@ export function createAgentControlEnvironmentAtoms<R, E>(
     },
   });
   return {
+    epicQueueChange: withPending(
+      createEnvironmentRpcCommand(runtime, {
+        label: "agent-control-epic:change-queue",
+        tag: AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS.change,
+        concurrency: { mode: "singleFlight", key: commandKey },
+      }),
+    ),
     getRun: withPending(
       createEnvironmentRpcCommand(runtime, {
         label: "agent-control:load-saved-run",
@@ -283,6 +292,78 @@ type AgentControlStartContext = {
 
 export type AgentControlReadiness = Omit<AgentControlStartContext, "selectedTaskId">;
 
+/** Queue approval is independent of execution readiness: dependencies may still be open. */
+export function agentControlEpicQueueChangeBlockers(input: AgentControlReadiness): string[] {
+  const blockers: string[] = [];
+  if (input.modeChangeBlocker !== null) blockers.push(input.modeChangeBlocker);
+  if (!input.connected)
+    blockers.push("Reconnect to this environment before changing the Epic queue.");
+  if (input.pending) blockers.push("Wait for the current project action to finish.");
+  if (!input.snapshot) blockers.push("Waiting for the current project state.");
+  return blockers;
+}
+
+export function agentControlEpicQueueApproveBlockers(
+  input: AgentControlReadiness,
+  preview: AgentControlEpicPreview | null,
+): string[] {
+  const blockers = agentControlEpicQueueChangeBlockers(input);
+  if (!preview || preview.projectId !== input.snapshot?.projectId) {
+    blockers.push("Inspect an Epic in this project before approving it.");
+  } else if (
+    input.snapshot?.epicQueue?.entries.some(
+      (entry) => entry.source.epic.issueNodeId === preview.source.epic.issueNodeId,
+    )
+  ) {
+    blockers.push("This Epic is already in the approved queue.");
+  }
+  return blockers;
+}
+
+export function agentControlEpicQueueChangeInput(
+  snapshot: AgentControlRunOnceSnapshot,
+  action: AgentControlEpicQueueChangeInput["action"],
+): AgentControlEpicQueueChangeInput {
+  const expectedRevision = snapshot.epicQueue?.revision ?? 0;
+  return {
+    projectId: snapshot.projectId,
+    expectedRevision,
+    action,
+    commandId: CommandId.make(
+      `t3auto-epic-queue:${JSON.stringify([snapshot.projectId, expectedRevision, action])}`,
+    ),
+  };
+}
+
+/** Move only waiting entries; the request contains their complete order for revision checking. */
+export function agentControlEpicQueueMoveInput(
+  snapshot: AgentControlRunOnceSnapshot,
+  entryId: string,
+  direction: -1 | 1,
+): AgentControlEpicQueueChangeInput | null {
+  const entryIds =
+    snapshot.epicQueue?.entries
+      .filter((entry) => entry.status === "pending")
+      .map((entry) => entry.entryId) ?? [];
+  const index = entryIds.indexOf(entryId);
+  const other = index + direction;
+  if (index < 0 || other < 0 || other >= entryIds.length) return null;
+  [entryIds[index], entryIds[other]] = [entryIds[other]!, entryIds[index]!];
+  return agentControlEpicQueueChangeInput(snapshot, { kind: "reorder", entryIds });
+}
+
+export function agentControlEpicQueueView(snapshot: AgentControlRunOnceSnapshot | null) {
+  const queue = snapshot?.epicQueue;
+  if (!queue) return null;
+  return {
+    entries: queue.entries,
+    active: queue.entries.find((entry) => entry.status === "active") ?? null,
+    next: queue.entries.find((entry) => entry.entryId === queue.nextEntryId) ?? null,
+    waitReason: queue.waitReason,
+    nextCheckAt: queue.nextCheckAt,
+  };
+}
+
 export function agentControlEpicStartBlockers(
   input: AgentControlReadiness,
   preview: AgentControlEpicPreview | null,
@@ -297,6 +378,9 @@ export function agentControlEpicStartBlockers(
       if (preview.blockers.length === 0 && preview.source.blockers.length === 0)
         blockers.push("The inspected Epic has no executable work.");
     }
+  }
+  if (input.snapshot?.epicQueue) {
+    blockers.push("Approve this Epic for the queue and enable Armed to start it.");
   }
   const epic = input.snapshot?.epic;
   if (epic) {
@@ -352,6 +436,9 @@ export function agentControlEpicControlAllowed(
   if (action === "clear")
     return (
       terminal &&
+      !readiness.snapshot?.epicQueue?.entries.some(
+        (entry) => entry.status === "active" && entry.epicRunId === epic.epicRunId,
+      ) &&
       readiness.snapshot?.armed?.enabled === false &&
       !readiness.snapshot.runs.some((run) => run.state.status === "active")
     );
@@ -484,6 +571,7 @@ export function agentControlArmBlockers(
       "This environment has not supplied automatic mode authority. Reconnect to an updated server before enabling automatic mode.",
     );
   if (
+    !input.snapshot?.epicQueue &&
     input.snapshot?.nextTaskId === null &&
     input.snapshot.tasks.some(
       (task) => task.status === "candidate" && task.sourceGate === "eligible",
@@ -517,10 +605,11 @@ function agentControlActivationBlockers(
   if (snapshot === null) {
     blockers.push("Waiting for the server's task and run snapshot.");
   } else {
-    if (mode !== "epic" && snapshot.epic) {
+    if (mode !== "epic" && snapshot.epic && !(mode === "armed" && snapshot.epicQueue)) {
       blockers.push("This project has an Epic execution target. Use its resume or end controls.");
     }
-    blockers.push(...snapshot.blockers.map(agentControlErrorMessage));
+    if (!(mode === "armed" && snapshot.epicQueue))
+      blockers.push(...snapshot.blockers.map(agentControlErrorMessage));
     if (snapshot.projectState.mode !== "observe") {
       blockers.push(
         snapshot.projectState.mode === "run-once"
@@ -534,6 +623,8 @@ function agentControlActivationBlockers(
       blockers.push("The previous run has not finished releasing its resources.");
     }
     if (mode === "run-once") {
+      if (snapshot.epicQueue)
+        blockers.push("This project uses an approved Epic queue. Enable Armed to continue it.");
       const task = snapshot.tasks.find((candidate) => candidate.taskId === input.selectedTaskId);
       if (!task) blockers.push("Select an eligible task.");
       else if (
@@ -691,7 +782,7 @@ export function agentControlRunStatus(run: AgentControlRunOnceView): AgentContro
 }
 
 export const agentControlArmedExplanation =
-  "Automatic mode (Armed) lets this environment start eligible tasks for this project one after another, including tasks that become eligible later. The server chooses their order and checks admission. It stays enabled until you turn it off.";
+  "Automatic mode (Armed) starts eligible work for this project. With an Epic queue, it follows your approved order and waits for explicit PR publication and a confirmed human merge before continuing. An empty Epic queue waits for approval of more Epics. Without a queue, eligible tasks run in server order. Armed stays enabled until you turn it off.";
 export const agentControlDisarmExplanation =
   "Turning off automatic mode prevents new tasks from starting automatically. Work already admitted can continue, including later stages of the current task. This does not interrupt provider turns or guarantee that the task will finish. Saved threads, changes and check evidence remain available. Task intake stays enabled.";
 
@@ -709,6 +800,28 @@ export function agentControlArmedStatus(
           : "Automatic mode off",
       tone: "neutral",
     };
+  const queue = agentControlEpicQueueView(snapshot);
+  if (queue) {
+    if (queue.waitReason)
+      return {
+        enabled: true,
+        label: `Automatic mode on · ${queue.waitReason}`,
+        tone: "warning",
+      };
+    if (queue.active)
+      return {
+        enabled: true,
+        label: `Automatic mode on · Epic #${queue.active.source.epic.number} active`,
+        tone: "running",
+      };
+    return {
+      enabled: true,
+      label: queue.next
+        ? `Automatic mode on · next eligible Epic #${queue.next.source.epic.number}`
+        : "Automatic mode on · waiting for an eligible approved Epic",
+      tone: "neutral",
+    };
+  }
   const active = snapshot.runs.find((run) => run.state.status === "active");
   const status = active ? agentControlRunStatus(active) : null;
   if (snapshot.blockers.length > 0 || status?.tone === "warning" || status?.tone === "danger") {

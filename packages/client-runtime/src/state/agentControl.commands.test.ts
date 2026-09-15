@@ -2,6 +2,9 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AGENT_CONTROL_EPIC_RPC_METHODS,
+  AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS,
+  type AgentControlEpicQueueChangeInput,
+  type AgentControlEpicQueue,
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
   AgentControlRunOnceId,
   type AgentControlRunOnceSnapshot,
@@ -69,6 +72,12 @@ type EpicCall = {
   response: Deferred.Deferred<never, AgentControlEpicRpcError>;
 };
 
+type QueueCall = {
+  environmentId: EnvironmentId;
+  input: AgentControlEpicQueueChangeInput;
+  response: Deferred.Deferred<AgentControlEpicQueue, AgentControlEpicRpcError>;
+};
+
 type HandoffCall = {
   environmentId: EnvironmentId;
   input: AgentControlEpicHandoffPublishInput;
@@ -92,6 +101,8 @@ function confirmed(input: AgentControlSetProjectModeInput): AgentControlSetProje
 }
 
 const makeHarness = Effect.fn("makeAgentControlCommandHarness")(function* () {
+  const queueCalls: QueueCall[] = [];
+  const queueArrivals = yield* Queue.unbounded<QueueCall>();
   const calls: PendingCall[] = [];
   const arrivals = yield* Queue.unbounded<PendingCall>();
   const epicCalls: EpicCall[] = [];
@@ -102,6 +113,15 @@ const makeHarness = Effect.fn("makeAgentControlCommandHarness")(function* () {
   const supervisors = new Map<EnvironmentId, EnvironmentSupervisor["Service"]>();
   for (const id of [environmentId, otherEnvironmentId]) {
     const client = {
+      [AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS.change]: Effect.fn(function* (
+        input: AgentControlEpicQueueChangeInput,
+      ) {
+        const response = yield* Deferred.make<AgentControlEpicQueue, AgentControlEpicRpcError>();
+        const call = { environmentId: id, input, response };
+        queueCalls.push(call);
+        yield* Queue.offer(queueArrivals, call);
+        return yield* Deferred.await(response);
+      }),
       [AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff]: Effect.fn(function* (
         input: AgentControlEpicHandoffPublishInput,
       ) {
@@ -187,6 +207,8 @@ const makeHarness = Effect.fn("makeAgentControlCommandHarness")(function* () {
   );
   return {
     registry,
+    queueCalls,
+    queueArrivals,
     atoms: createAgentControlEnvironmentAtoms(runtime),
     calls,
     arrivals,
@@ -443,6 +465,60 @@ it.effect(
         yield* Effect.promise(() => retry);
         expect(registry.get(atoms.pending(publication))).toBe(false);
         remount();
+      }),
+    ),
+);
+
+it.effect(
+  "queue changes deduplicate, preserve server authority on conflict and isolate environments",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { registry, atoms, queueCalls, queueArrivals } = yield* makeHarness();
+        const queueTarget = {
+          environmentId,
+          input: {
+            projectId: target.input.projectId,
+            expectedRevision: 4,
+            commandId: CommandId.make("queue-remove-b"),
+            action: { kind: "remove" as const, entryId: "b" },
+          },
+        };
+        const first = atoms.epicQueueChange.run(registry, queueTarget);
+        const call = yield* Queue.take(queueArrivals);
+        const duplicate = atoms.epicQueueChange.run(registry, queueTarget);
+        expect(queueCalls).toHaveLength(1);
+        expect(registry.get(atoms.pending(queueTarget))).toBe(true);
+        const other = { ...queueTarget, environmentId: otherEnvironmentId };
+        expect(registry.get(atoms.pending(other))).toBe(false);
+        const independent = atoms.epicQueueChange.run(registry, other);
+        const independentCall = yield* Queue.take(queueArrivals);
+        expect(independentCall.environmentId).toBe(otherEnvironmentId);
+        const saved: AgentControlEpicQueue = {
+          projectId: target.input.projectId,
+          revision: 5,
+          entries: [],
+          nextEntryId: null,
+          waitReason: "Waiting for approval",
+          nextCheckAt: null,
+        };
+        yield* Deferred.succeed(independentCall.response, saved);
+        expect(yield* Effect.promise(() => independent)).toMatchObject({
+          _tag: "Success",
+          value: saved,
+        });
+        expect(registry.get(atoms.pending(queueTarget))).toBe(true);
+        yield* Deferred.fail(
+          call.response,
+          new AgentControlEpicRpcError({
+            code: "revision-conflict",
+            message: "Another client changed the queue. Refresh and retry.",
+          }),
+        );
+        const results = yield* Effect.promise(() => Promise.all([first, duplicate]));
+        expect(results.every((result) => result._tag === "Failure")).toBe(true);
+        expect(registry.get(atoms.pending(queueTarget))).toBe(false);
+        expect(queueCalls).toHaveLength(2);
       }),
     ),
 );

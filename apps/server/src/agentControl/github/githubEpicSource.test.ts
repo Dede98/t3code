@@ -151,9 +151,89 @@ describe("native GitHub epic source", () => {
     }),
   );
 
+  it.effect("reads all Epic prerequisites and waits for open same-repository issues", () =>
+    Effect.gen(function* () {
+      const { run, calls } = fixture({
+        root: rawIssue(1, 3, 3),
+        dependencies: {
+          1: [rawIssue(90), { ...rawIssue(91), state: "closed" }, rawIssue(92)],
+          3: [rawIssue(2)],
+        },
+      });
+      const source = yield* run;
+      expect(source.dependencies?.map((issue) => issue.number)).toEqual([90, 91, 92]);
+      expect(source.blockers).toMatchObject([
+        { code: "missing-prerequisite", issueNumber: 1 },
+        { code: "missing-prerequisite", issueNumber: 1 },
+      ]);
+      expect(source.blockers[0]?.message).toContain("#90");
+      expect(source.blockers[1]?.message).toContain("#92");
+      expect(calls.filter((args) => args[3]?.includes("/1/dependencies/")).length).toBe(4);
+      expect(source.fingerprint).not.toBe(epicSourceFingerprint(source.epic, source.tasks));
+      expect(
+        epicSourceFingerprint(source.epic, source.tasks, source.dependencies?.toReversed()),
+      ).toBe(source.fingerprint);
+    }),
+  );
+
+  it.effect("allows closed Epic prerequisites but rejects cross-repository prerequisites", () =>
+    Effect.gen(function* () {
+      const source = yield* fixture({
+        root: rawIssue(1, 3, 1),
+        dependencies: { 1: [{ ...rawIssue(90), state: "closed" }], 3: [rawIssue(2)] },
+      }).run;
+      expect(source.blockers).toEqual([]);
+      const crossRepository = yield* fixture({
+        root: rawIssue(1, 3, 1),
+        dependencies: {
+          1: [
+            {
+              ...rawIssue(90),
+              state: "closed",
+              repository_url: "https://api.github.com/repos/owner/other",
+              html_url: "https://github.com/owner/other/issues/90",
+            },
+          ],
+          3: [rawIssue(2)],
+        },
+      }).run;
+      expect(crossRepository.blockers).toMatchObject([
+        { code: "cross-repository", issueNumber: 1 },
+      ]);
+    }),
+  );
+
   for (const [name, options] of [
     ["missing child", { children: [rawIssue(3), rawIssue(2)] }],
     ["missing dependency", { dependencies: {} }],
+    ["missing Epic dependency", { root: rawIssue(1, 3, 1) }],
+    [
+      "Epic dependency changed with the same count",
+      {
+        root: rawIssue(1, 3, 1),
+        dependencies: { 1: [rawIssue(90)], 3: [rawIssue(2)] },
+        transform: (path: string, value: unknown, call: number) =>
+          path.includes("/1/dependencies/") && call === 2 ? [rawIssue(91)] : value,
+      },
+    ],
+    [
+      "Epic dependency state changed during inspection",
+      {
+        root: rawIssue(1, 3, 1),
+        dependencies: { 1: [rawIssue(90)], 3: [rawIssue(2)] },
+        transform: (path: string, value: unknown, call: number) =>
+          path.includes("/1/dependencies/") && call === 2
+            ? [{ ...rawIssue(90), state: "closed" }]
+            : value,
+      },
+    ],
+    [
+      "Epic dependency summary changed during inspection",
+      {
+        transform: (path: string, value: unknown, call: number) =>
+          path === "repos/owner/repo/issues/1" && call === 2 ? rawIssue(1, 3, 1) : value,
+      },
+    ],
     [
       "conflicting issue state across relationship responses",
       { dependencies: { 3: [{ ...rawIssue(2), state: "closed" }] } },
@@ -193,6 +273,18 @@ describe("native GitHub epic source", () => {
   it.effect("rejects page limits instead of accepting partial success", () =>
     Effect.gen(function* () {
       const error = yield* fixture({ maxPages: 1 }).run.pipe(Effect.flip);
+      expect(error.code).toBe("pagination-overflow");
+    }),
+  );
+
+  it.effect("rejects a truncated Epic prerequisite list at the page limit", () =>
+    Effect.gen(function* () {
+      const error = yield* fixture({
+        root: rawIssue(1, 1, 3),
+        children: [rawIssue(2)],
+        dependencies: { 1: [rawIssue(90), rawIssue(91), rawIssue(92)] },
+        maxPages: 1,
+      }).run.pipe(Effect.flip);
       expect(error.code).toBe("pagination-overflow");
     }),
   );

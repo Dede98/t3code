@@ -1,4 +1,9 @@
 import {
+  AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS,
+  AgentControlEpicQueue,
+  AgentControlEpicQueueChangeInput,
+} from "./agentControlEpicQueue.ts";
+import {
   AGENT_CONTROL_EPIC_RPC_METHODS,
   AgentControlEpicPreviewInput,
   AgentControlEpicStartInput,
@@ -502,6 +507,14 @@ export const WsAgentControlEpicHandoffPublishRpc = Rpc.make(
   {
     payload: AgentControlEpicHandoffPublishInput,
     success: AgentControlEpicRuntimeView,
+    error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
+  },
+);
+export const WsAgentControlEpicQueueChangeRpc = Rpc.make(
+  AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS.change,
+  {
+    payload: AgentControlEpicQueueChangeInput,
+    success: AgentControlEpicQueue,
     error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
   },
 );
@@ -1619,6 +1632,7 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
 });
 
 export const WsRpcGroup = RpcGroup.make(
+  WsAgentControlEpicQueueChangeRpc,
   WsAgentControlEpicPreviewRpc,
   WsAgentControlEpicHandoffPreviewRpc,
   WsAgentControlEpicHandoffPublishRpc,

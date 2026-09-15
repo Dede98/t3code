@@ -1,3 +1,4 @@
+import { loadEpicQueue } from "../epic/queueAuthority.ts";
 import { AgentControlTaskId, type ProjectId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -31,6 +32,7 @@ export const selectAgentControlRunOnceCandidate = Effect.fn("selectAgentControlR
         AND github_intake_sequence=${githubIntakeSequence} AND status='candidate' AND source_gate='eligible' AND stage='intake'`;
       return (yield* decodeRows(rows))[0]?.taskId ?? null;
     }
+    if (yield* loadEpicQueue(sql, projectId)) return null;
     const rows = yield* sql.unsafe<Record<string, unknown>>(AGENT_CONTROL_RUN_ONCE_CANDIDATE_SQL, [
       projectId,
       githubIntakeSequence,

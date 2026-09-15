@@ -1,6 +1,11 @@
+import { loadEpicQueue } from "../../epic/queueAuthority.ts";
 import { loadSelectedEpic } from "../../epic/authority.ts";
 import { AgentControlEpicProgress } from "../../epic/Services/AgentControlEpicProgress.ts";
-import { type AgentControlArmedDispatch, type ProjectId } from "@t3tools/contracts";
+import {
+  AgentControlEpicRpcError,
+  type AgentControlArmedDispatch,
+  type ProjectId,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -41,6 +46,7 @@ const RETRY_BASE_MS = 25;
 const RETRY_MAX_MS = 1_000;
 const RETRY_LIMIT = 6;
 const isArmedError = Schema.is(AgentControlArmedError);
+const isEpicError = Schema.is(AgentControlEpicRpcError);
 
 export interface AgentControlArmedSchedulerHooks {
   readonly afterClaim?: (dispatch: AgentControlArmedDispatch) => Effect.Effect<void>;
@@ -75,6 +81,9 @@ export const makeAgentControlArmedWorkScheduler = Effect.fn("makeAgentControlArm
     awaitReady: Effect.Effect<void>,
     retryLimit: number,
     reportFailure: (failure: AgentControlArmedError) => Effect.Effect<void> = () => Effect.void,
+    nextCheck: (
+      projectId: ProjectId,
+    ) => Effect.Effect<number | null, AgentControlArmedError> = () => Effect.succeed(null),
   ) {
     const wakeups = yield* Queue.dropping<void>(PROJECT_WORKERS);
     // One coalesced retry wakeup drives one scoped timer coordinator. Delayed
@@ -126,8 +135,10 @@ export const makeAgentControlArmedWorkScheduler = Effect.fn("makeAgentControlArm
     });
     const run = (projectId: ProjectId, retry: number) =>
       Effect.gen(function* () {
-        const exit = yield* Effect.exit(processProject(projectId));
-        if (Exit.isSuccess(exit)) return null;
+        const exit = yield* Effect.exit(
+          processProject(projectId).pipe(Effect.andThen(nextCheck(projectId))),
+        );
+        if (Exit.isSuccess(exit)) return { delay: exit.value, retry: false };
         if (exit.cause.reasons.some(Cause.isInterruptReason))
           return yield* Effect.failCause(exit.cause);
         const failures = exit.cause.reasons
@@ -149,7 +160,7 @@ export const makeAgentControlArmedWorkScheduler = Effect.fn("makeAgentControlArm
         if (retryAt !== undefined) {
           const now = DateTime.toEpochMillis(yield* DateTime.now);
           const target = DateTime.toEpochMillis(DateTime.makeUnsafe(retryAt));
-          if (target > now) return target - now;
+          if (target > now) return { delay: target - now, retry: true };
         }
         if (!transient || retry >= retryLimit) {
           const reported =
@@ -163,13 +174,17 @@ export const makeAgentControlArmedWorkScheduler = Effect.fn("makeAgentControlArm
                 cause: exit.cause,
               }),
             ),
-            Effect.as(null),
+            Effect.as({ delay: null, retry: false }),
           );
         }
-        return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.min(5, retry));
+        return {
+          delay: Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.min(5, retry)),
+          retry: true,
+        };
       });
-    const finish = (projectId: ProjectId, delay: number | null) =>
+    const finish = (projectId: ProjectId, result: { delay: number | null; retry: boolean }) =>
       Effect.gen(function* () {
+        const { delay, retry } = result;
         const retryAt = delay === null ? null : DateTime.toEpochMillis(yield* DateTime.now) + delay;
         return yield* Ref.modify(work, (state) => {
           const pending = new Set(state.pending);
@@ -187,7 +202,8 @@ export const makeAgentControlArmedWorkScheduler = Effect.fn("makeAgentControlArm
             retries.delete(projectId);
             delayed.delete(projectId);
           } else {
-            retries.set(projectId, (retries.get(projectId) ?? 0) + 1);
+            if (retry) retries.set(projectId, (retries.get(projectId) ?? 0) + 1);
+            else retries.delete(projectId);
             delayed.set(projectId, retryAt!);
           }
           return [
@@ -395,7 +411,8 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
   const processProject: AgentControlArmedSchedulerShape["processProject"] = (projectId) =>
     Effect.gen(function* () {
       const selectedEpic = yield* loadSelectedEpic(sql, projectId);
-      if (selectedEpic !== null) yield* epicProgress.processProject(projectId);
+      if (selectedEpic !== null || (yield* loadEpicQueue(sql, projectId)) !== null)
+        yield* epicProgress.processProject(projectId);
       const dispatch = yield* withAgentControlRunOnceProjectFence(
         projectId,
         Effect.gen(function* () {
@@ -473,7 +490,15 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
       }
     }).pipe(
       Effect.mapError((cause) =>
-        isArmedError(cause) ? cause : fail(projectId, "persistence", cause),
+        isArmedError(cause)
+          ? cause
+          : fail(
+              projectId,
+              isEpicError(cause) && cause.code === "authority-conflict"
+                ? "authority-conflict"
+                : "persistence",
+              cause,
+            ),
       ),
     );
 
@@ -507,6 +532,20 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
         Deferred.await(ready).pipe(Effect.andThen(activation.await)),
         retryLimit,
         reportFailure,
+        (projectId) =>
+          Effect.gen(function* () {
+            const queue = yield* loadEpicQueue(sql, projectId);
+            if (!queue) return null;
+            const project = yield* projectEngine.getProjectState({ projectId });
+            if (project.mode !== "armed" || project.pausedFromMode !== null) return null;
+            const now = DateTime.toEpochMillis(yield* DateTime.now);
+            return queue.nextCheckAt === null
+              ? null
+              : Math.max(
+                  1_000,
+                  DateTime.toEpochMillis(DateTime.makeUnsafe(queue.nextCheckAt)) - now,
+                );
+          }).pipe(Effect.mapError((cause) => fail(projectId, "persistence", cause))),
       );
       const catchUp = loadArmedCatchUpProjectIds(sql).pipe(
         Effect.flatMap((projects) => Effect.forEach(projects, schedule, { discard: true })),

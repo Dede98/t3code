@@ -1,6 +1,7 @@
 import {
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AGENT_CONTROL_EPIC_RPC_METHODS,
+  AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS,
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
   AuthAccessWriteScope,
   AuthAdministrativeScopes,
@@ -17,6 +18,11 @@ import { describe, expect, it } from "@effect/vitest";
 import { RPC_REQUIRED_SCOPES, requiredScopeForRpcMethod } from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
+  it("requires explicit environment write access for every queue mutation", () => {
+    const scope = requiredScopeForRpcMethod(AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS.change);
+    expect(scope).toBe(AuthAccessWriteScope);
+    expect(new Set<string>(AuthStandardClientScopes).has(scope)).toBe(false);
+  });
   it("requires explicit environment write access to publish an Epic result", () => {
     const scope = requiredScopeForRpcMethod(AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff);
     expect(scope).toBe(AuthAccessWriteScope);

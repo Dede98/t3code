@@ -1329,3 +1329,75 @@ layer("Armed recovery failure boundary", (it) => {
       }),
   );
 });
+
+it.effect(
+  "observes review queues on the existing timer without client wakeups and stops after disarm",
+  () =>
+    Effect.gen(function* () {
+      const id = ProjectId.make("review-queue-timer");
+      const observed = yield* Deferred.make<void>();
+      const checkedAgain = yield* Deferred.make<void>();
+      const calls = yield* Ref.make(0);
+      const armed = yield* Ref.make(true);
+      const schedule = yield* makeAgentControlArmedWorkScheduler(
+        () =>
+          Ref.updateAndGet(calls, (n) => n + 1).pipe(
+            Effect.flatMap((n) => Deferred.succeed(n === 1 ? observed : checkedAgain, undefined)),
+            Effect.asVoid,
+          ),
+        Effect.void,
+        0,
+        () => Effect.void,
+        () => Ref.get(armed).pipe(Effect.map((enabled) => (enabled ? 60_000 : null))),
+      );
+      yield* schedule(id);
+      yield* Deferred.await(observed);
+      yield* TestClock.adjust(Duration.seconds(59));
+      assert.equal(yield* Ref.get(calls), 1);
+      yield* Ref.set(armed, false);
+      yield* TestClock.adjust(Duration.seconds(1));
+      yield* Deferred.await(checkedAgain);
+      yield* TestClock.adjust(Duration.hours(1));
+      assert.equal(yield* Ref.get(calls), 2);
+    }),
+);
+
+it.effect("successful review checks preserve the bounded failure retry budget", () =>
+  Effect.gen(function* () {
+    const id = ProjectId.make("review-queue-retry-budget");
+    const signals = yield* Effect.forEach([1, 2, 3, 4, 5], () => Deferred.make<void>());
+    const calls = yield* Ref.make(0);
+    const reported = yield* Ref.make(0);
+    const schedule = yield* makeAgentControlArmedWorkScheduler(
+      () =>
+        Ref.updateAndGet(calls, (n) => n + 1).pipe(
+          Effect.flatMap((n) =>
+            Deferred.succeed(signals[n - 1]!, undefined).pipe(
+              Effect.andThen(
+                n === 4
+                  ? Effect.fail(
+                      new AgentControlArmedError({ projectId: id, reason: "persistence" }),
+                    )
+                  : Effect.void,
+              ),
+            ),
+          ),
+        ),
+      Effect.void,
+      1,
+      () => Ref.update(reported, (n) => n + 1),
+      () => Ref.get(calls).pipe(Effect.map((n) => (n < 5 ? 60_000 : null))),
+    );
+    yield* schedule(id);
+    yield* Deferred.await(signals[0]!);
+    for (const index of [1, 2, 3]) {
+      yield* TestClock.adjust(Duration.seconds(60));
+      yield* Deferred.await(signals[index]!);
+    }
+    assert.equal(yield* Ref.get(calls), 4);
+    yield* TestClock.adjust(Duration.millis(25));
+    yield* Deferred.await(signals[4]!);
+    assert.equal(yield* Ref.get(calls), 5);
+    assert.equal(yield* Ref.get(reported), 0);
+  }),
+);

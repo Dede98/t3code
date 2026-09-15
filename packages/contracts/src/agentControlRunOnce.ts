@@ -1,3 +1,4 @@
+import { AgentControlEpicQueue } from "./agentControlEpicQueue.ts";
 import { AgentControlRunOnceCheckView } from "./agentControlVerificationView.ts";
 export { AgentControlRunOnceCheckView } from "./agentControlVerificationView.ts";
 import { AgentControlEpicRuntimeView } from "./agentControlEpicRuntime.ts";
@@ -155,6 +156,7 @@ export const AgentControlRunOnceView = Schema.Struct({
 export type AgentControlRunOnceView = typeof AgentControlRunOnceView.Type;
 export const AgentControlRunOnceSnapshot = Schema.Struct({
   epic: Schema.optionalKey(Schema.NullOr(AgentControlEpicRuntimeView)),
+  epicQueue: Schema.optionalKey(Schema.NullOr(AgentControlEpicQueue)),
   epicHistory: Schema.optionalKey(Schema.Array(AgentControlEpicRuntimeView)),
   /** Absent on older servers; clients must not interpret unknown authority as off. */
   armed: Schema.optionalKey(Schema.Struct({ enabled: Schema.Boolean })),

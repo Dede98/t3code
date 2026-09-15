@@ -119,6 +119,30 @@ If interrupted, retry the same handoff; T3 Code checks the existing branch and p
 The saved PR remains available after reload and under previous Epics. A closed or merged PR is
 never replaced automatically, and a publication failure retains the local result and its evidence.
 
+### Queue approved Epics
+
+Inspect each Epic and choose **Approve for queue**, then put waiting entries in the desired order.
+The first approval keeps any already selected Epic at the front as active work. If ordinary task
+automation is running, turn it off and finish that task before enabling the queue. Approval does not
+turn Armed on. Queue edits and Armed changes require write access to the selected environment.
+
+With Armed enabled, the server chooses the first eligible approved Epic. Each entry shows its
+blockers; native GitHub dependencies and trusted task approvals still apply. A merge does not close
+an issue or satisfy a GitHub dependency on an open issue. Waiting entries can be removed or moved;
+an active entry cannot be replaced. If its membership or dependencies change, remove the waiting
+entry and approve the current scope again.
+
+After verification, explicitly publish the draft PR as above. The project waits for human review
+and merge, checking GitHub about once a minute even with no connected client. A PR closed without
+merge blocks continuation until it is reopened or its merge is confirmed. Before starting the next
+Epic, T3 Code fetches the target branch and checks that it contains GitHub's merged result. GitHub,
+fetch or repository-mapping errors retain the saved work and prevent starting on an old base.
+
+Turning Armed off prevents further starts; turning it back on resumes from the saved queue.
+An exhausted queue waits for more approvals instead of starting ordinary tasks. Completed runs,
+verification evidence and PR links remain available. A stopped or failed active Epic holds its place
+for human inspection; queue editing does not discard or retry its execution.
+
 ## Project icons
 
 Choose an icon, emoji, or image from the project to make it easier to recognize. The choice applies

@@ -1,3 +1,4 @@
+import { loadEpicQueue } from "../epic/queueAuthority.ts";
 import { loadEpicRun, loadSelectedEpic } from "../epic/authority.ts";
 import {
   AgentControlInternalPersistenceError,
@@ -315,6 +316,7 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
           return yield* decodeSnapshot({
             epic,
             epicHistory,
+            epicQueue: yield* loadEpicQueue(sql, input.projectId),
             armed,
             blockers: diagnostics.map((item) => item.errorCode),
             projectId: input.projectId,

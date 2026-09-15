@@ -18,6 +18,13 @@ export const epicStructureDigest = (source: AgentControlEpicSource) =>
   epicDigest({
     repository: source.repository.repositoryNodeId,
     epic: identity(source.epic),
+    ...(source.dependencies && source.dependencies.length > 0
+      ? {
+          dependencies: source.dependencies
+            .map(identity)
+            .toSorted((a, b) => a.issueNodeId.localeCompare(b.issueNodeId)),
+        }
+      : {}),
     tasks: source.tasks.map((task) => ({
       issue: identity(task.issue),
       position: task.position,
@@ -72,6 +79,27 @@ export const epicSourceChanges = (
       },
     ];
   const blockers: Array<AgentControlEpicBlocker> = [];
+  for (const dependency of current.dependencies ?? []) {
+    if (dependency.repositoryNodeId !== current.repository.repositoryNodeId)
+      blockers.push({
+        code: "cross-repository",
+        issueNumber: current.epic.number,
+        message: "The Epic depends on an issue in another repository.",
+      });
+    else if (dependency.state === "open") {
+      const wasClosed = epic.source.dependencies?.some(
+        (accepted) =>
+          accepted.issueNodeId === dependency.issueNodeId && accepted.state === "closed",
+      );
+      blockers.push({
+        code: wasClosed ? "prerequisite-reopened" : "missing-prerequisite",
+        issueNumber: dependency.number,
+        message: wasClosed
+          ? `Epic prerequisite #${dependency.number} was reopened.`
+          : `The Epic waits for open prerequisite #${dependency.number}.`,
+      });
+    }
+  }
   if (current.epic.state === "closed")
     blockers.push({
       code: "closed-epic",

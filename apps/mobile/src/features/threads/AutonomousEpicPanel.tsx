@@ -3,6 +3,11 @@ import { Pressable, View } from "react-native";
 import { useNavigation } from "@react-navigation/native";
 import {
   agentControlCommandErrorMessage,
+  agentControlEpicQueueChangeBlockers,
+  agentControlEpicQueueApproveBlockers,
+  agentControlEpicQueueChangeInput,
+  agentControlEpicQueueMoveInput,
+  agentControlEpicQueueView,
   agentControlEpicControlAllowed,
   agentControlEpicControlInput,
   agentControlEpicStartBlockers,
@@ -94,6 +99,10 @@ export function AutonomousEpicPanel({
   const resume = useAtomCommand(agentControlEnvironment.epicResume);
   const stop = useAtomCommand(agentControlEnvironment.epicStop);
   const clear = useAtomCommand(agentControlEnvironment.epicClear);
+  const changeQueue = useAtomCommand(agentControlEnvironment.epicQueueChange);
+  const queue = agentControlEpicQueueView(readiness.snapshot);
+  const queueBlockers = agentControlEpicQueueChangeBlockers(readiness);
+  const approvalBlockers = agentControlEpicQueueApproveBlockers(readiness, preview);
   const epic = readiness.snapshot?.epic;
   const verifications = epic
     ? [
@@ -105,7 +114,10 @@ export function AutonomousEpicPanel({
     : [];
   const blockers = agentControlEpicStartBlockers(readiness, preview);
   const previewMessages = [
-    ...new Set([...blockers, ...(preview?.blockers.map((blocker) => blocker.message) ?? [])]),
+    ...new Set([
+      ...(preview?.blockers.map((blocker) => blocker.message) ?? []),
+      ...(preview?.source.blockers.map((blocker) => blocker.message) ?? []),
+    ]),
   ];
   const source = epic?.source ?? preview?.source;
   const issueNumber = Number(number);
@@ -135,6 +147,42 @@ export function AutonomousEpicPanel({
     const saved = result.value.runs.find((run) => run.state.runId === runId);
     if (saved) setLoadedRun(saved);
     else setError("The saved task run is unavailable in this environment.");
+  }
+
+  async function editQueue(action: "approve" | "remove" | "up" | "down", entryId?: string) {
+    const snapshot = readiness.snapshot;
+    if (!snapshot || readOnly || inFlight.current || queueBlockers.length > 0) return;
+    if (action === "approve" && (!preview || approvalBlockers.length > 0)) return;
+    if (
+      action !== "approve" &&
+      !queue?.entries.some((entry) => entry.entryId === entryId && entry.status === "pending")
+    )
+      return;
+    const input =
+      action === "approve" && preview
+        ? agentControlEpicQueueChangeInput(snapshot, {
+            kind: "approve",
+            epicNumber: preview.source.epic.number,
+            expectedFingerprint: preview.source.fingerprint,
+          })
+        : action === "remove" && entryId
+          ? agentControlEpicQueueChangeInput(snapshot, { kind: "remove", entryId })
+          : entryId
+            ? agentControlEpicQueueMoveInput(snapshot, entryId, action === "up" ? -1 : 1)
+            : null;
+    if (!input) return;
+    inFlight.current = true;
+    setError(null);
+    try {
+      const result = await changeQueue({ environmentId, input });
+      if (!mounted.current) return;
+      if (result._tag === "Failure")
+        setError(agentControlCommandErrorMessage(squashAtomCommandFailure(result)));
+      else if (action === "approve") setPreview(null);
+    } finally {
+      inFlight.current = false;
+      if (mounted.current) onRefresh();
+    }
   }
 
   async function execute(action: "preview" | "start" | "resume" | "stop" | "clear") {
@@ -228,12 +276,128 @@ export function AutonomousEpicPanel({
                   {blocker}
                 </Text>
               ))}
-              <Action disabled={blockers.length > 0} onPress={() => void execute("start")}>
-                Start inspected Epic
+              <Action
+                disabled={approvalBlockers.length > 0}
+                onPress={() => void editQueue("approve")}
+              >
+                Approve for Epic queue
               </Action>
+              {approvalBlockers.map((blocker) => (
+                <Text key={blocker} className="text-sm text-destructive">
+                  {blocker}
+                </Text>
+              ))}
+              {!queue ? (
+                <>
+                  <Action disabled={blockers.length > 0} onPress={() => void execute("start")}>
+                    Start inspected Epic
+                  </Action>
+                  {blockers.map((blocker) => (
+                    <Text key={blocker} className="text-xs text-foreground-muted">
+                      Single Epic start: {blocker}
+                    </Text>
+                  ))}
+                </>
+              ) : null}
             </View>
           ) : null}
         </>
+      ) : null}
+      {!readOnly ? (
+        <Text className="text-xs text-foreground-muted">
+          Approve each inspected Epic to add it to the ordered queue. The first approval includes
+          the already selected Epic as active. Only waiting entries can be removed or reordered.
+          Armed waits for explicit publication and human merge before starting the next eligible
+          Epic.
+        </Text>
+      ) : null}
+      {queue ? (
+        <View className="gap-2">
+          <Text className="text-base font-t3-bold">Approved Epic queue</Text>
+          <Text className="text-sm">
+            Active:{" "}
+            {queue.active
+              ? `#${queue.active.source.epic.number} ${queue.active.source.epic.title}`
+              : "None"}
+          </Text>
+          <Text className="text-sm">
+            Next eligible:{" "}
+            {queue.next
+              ? `#${queue.next.source.epic.number} ${queue.next.source.epic.title}`
+              : "None"}
+          </Text>
+          {queue.waitReason ? (
+            <Text className="text-sm text-foreground-muted">{queue.waitReason}</Text>
+          ) : null}
+          {queue.nextCheckAt ? (
+            <Text className="text-xs text-foreground-muted">
+              While Armed, the server checks about once a minute.
+            </Text>
+          ) : null}
+          {queue.entries.length === 0 ? (
+            <Text className="text-sm">The queue is empty. Approve an Epic to continue.</Text>
+          ) : null}
+          {queue.entries.map((entry, index) => (
+            <View key={entry.entryId} className="gap-2 rounded-xl border border-border-subtle p-3">
+              <Text className="text-sm font-t3-bold">
+                {index + 1}. #{entry.source.epic.number} {entry.source.epic.title}
+              </Text>
+              <Text className="text-sm">
+                {entry.status === "pending"
+                  ? "Waiting"
+                  : entry.status === "active"
+                    ? "Active"
+                    : "Merged"}
+                {queue.next?.entryId === entry.entryId ? " · Next eligible" : ""}
+              </Text>
+              {entry.blockers.map((blocker) => (
+                <Text
+                  key={`${blocker.code}:${blocker.message}`}
+                  className="text-sm text-foreground-muted"
+                >
+                  {blocker.message}
+                </Text>
+              ))}
+              {!readOnly && entry.status === "pending" ? (
+                <View className="gap-2">
+                  <Action
+                    disabled={
+                      queueBlockers.length > 0 ||
+                      !readiness.snapshot ||
+                      !agentControlEpicQueueMoveInput(readiness.snapshot, entry.entryId, -1)
+                    }
+                    onPress={() => void editQueue("up", entry.entryId)}
+                  >
+                    Move up
+                  </Action>
+                  <Action
+                    disabled={
+                      queueBlockers.length > 0 ||
+                      !readiness.snapshot ||
+                      !agentControlEpicQueueMoveInput(readiness.snapshot, entry.entryId, 1)
+                    }
+                    onPress={() => void editQueue("down", entry.entryId)}
+                  >
+                    Move down
+                  </Action>
+                  <Action
+                    disabled={queueBlockers.length > 0}
+                    onPress={() => void editQueue("remove", entry.entryId)}
+                  >
+                    Remove
+                  </Action>
+                </View>
+              ) : null}
+            </View>
+          ))}
+          {!readOnly
+            ? queueBlockers.map((blocker) => (
+                <Text key={blocker} className="text-xs text-foreground-muted">
+                  {blocker}
+                </Text>
+              ))
+            : null}
+        </View>
       ) : null}
       {source ? (
         <View className="gap-2">

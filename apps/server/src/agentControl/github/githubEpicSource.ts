@@ -42,6 +42,7 @@ const incomplete = () =>
 export const epicSourceFingerprint = (
   epic: AgentControlEpicIssue,
   tasks: ReadonlyArray<AgentControlEpicTaskSource>,
+  dependencies: ReadonlyArray<AgentControlEpicIssue> = [],
 ) => {
   const identity = (issue: AgentControlEpicIssue) => [
     issue.repositoryNodeId,
@@ -61,6 +62,13 @@ export const epicSourceFingerprint = (
             .map(identity)
             .toSorted((a, b) => encodeJson(a).localeCompare(encodeJson(b))),
         ]),
+        ...(dependencies.length > 0
+          ? [
+              dependencies
+                .map(identity)
+                .toSorted((a, b) => encodeJson(a).localeCompare(encodeJson(b))),
+            ]
+          : []),
       ]),
     )
     .digest("hex");
@@ -181,7 +189,26 @@ export const makeEpicInspector = (options: {
       });
     }
     const children = yield* list(`${rootPath}/sub_issues`, epic.subIssueCount);
+    const rawEpicDependencies = yield* list(
+      `${rootPath}/dependencies/blocked_by`,
+      root.issue_dependencies_summary.total_blocked_by,
+    );
+    const dependencies = yield* Effect.forEach(rawEpicDependencies, normalize);
     const blockers: AgentControlEpicSourceBlocker[] = [];
+    for (const dependency of dependencies) {
+      if (dependency.repositoryNodeId !== repository.repositoryNodeId)
+        blockers.push({
+          code: "cross-repository",
+          issueNumber: epic.number,
+          message: `Epic #${epic.number} depends on an issue in another repository. Only same-repository dependencies are supported.`,
+        });
+      else if (dependency.state === "open")
+        blockers.push({
+          code: "missing-prerequisite",
+          issueNumber: epic.number,
+          message: `Epic #${epic.number} waits for open prerequisite #${dependency.number}. Its native GitHub dependency must be satisfied before execution.`,
+        });
+    }
     if (epic.state === "closed")
       blockers.push({
         code: "closed-epic",
@@ -271,6 +298,8 @@ export const makeEpicInspector = (options: {
     if (
       finalRoot.node_id !== root.node_id ||
       finalRoot.state !== root.state ||
+      finalRoot.issue_dependencies_summary.total_blocked_by !==
+        root.issue_dependencies_summary.total_blocked_by ||
       encodeJson(
         finalChildren.map((issue) => [
           issue.node_id,
@@ -287,6 +316,15 @@ export const makeEpicInspector = (options: {
             issue.issue_dependencies_summary.total_blocked_by,
           ]),
         )
+    )
+      return yield* incomplete();
+    const refreshedEpicDependencies = yield* Effect.forEach(
+      yield* list(`${rootPath}/dependencies/blocked_by`, dependencies.length),
+      normalize,
+    );
+    if (
+      epicSourceFingerprint(epic, [], dependencies) !==
+      epicSourceFingerprint(epic, [], refreshedEpicDependencies)
     )
       return yield* incomplete();
     yield* Effect.forEach(
@@ -309,9 +347,10 @@ export const makeEpicInspector = (options: {
       format: "github-native-sub-issues-v1",
       repository,
       epic,
+      dependencies,
       tasks,
       blockers,
-      fingerprint: epicSourceFingerprint(epic, tasks),
+      fingerprint: epicSourceFingerprint(epic, tasks, dependencies),
       inspectedAt: DateTime.formatIso(yield* DateTime.now),
     } satisfies AgentControlEpicSource;
   });

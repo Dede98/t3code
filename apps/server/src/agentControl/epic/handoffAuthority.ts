@@ -214,9 +214,10 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
         reservations.push({ member, original });
       }
       // Follow the accepted commit chain, independent of GitHub issue display order.
-      const first = reservations.find(({ member }) => member.baseCommitSha === null);
+      const initialBase = state.initialBase?.commitSha ?? null;
+      const first = reservations.find(({ member }) => member.baseCommitSha === initialBase);
       if (!first) return yield* invalid("The original Epic base could not be determined.");
-      let previous: string | null = null;
+      let previous: string | null = initialBase;
       const visited = new Set<string>();
       while (visited.size < reservations.length) {
         const next = reservations.filter(({ member }) => member.baseCommitSha === previous);
@@ -278,7 +279,13 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
       if (!first.original.repository.defaultRemoteRef.startsWith(prefix))
         return yield* invalid("The original target branch is unavailable.");
       const targetBranch = first.original.repository.defaultRemoteRef.slice(prefix.length);
-      if (first.original.baseRef !== `${first.original.repository.remoteName}/${targetBranch}`)
+      if (
+        state.initialBase
+          ? first.original.baseRef !== state.initialBase.commitSha ||
+            first.original.baseCommitSha !== state.initialBase.commitSha ||
+            targetBranch !== state.initialBase.targetBranch
+          : first.original.baseRef !== `${first.original.repository.remoteName}/${targetBranch}`
+      )
         return yield* invalid("The first child was not based on the frozen target branch.");
       return {
         authority: {

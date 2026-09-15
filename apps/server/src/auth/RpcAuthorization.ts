@@ -4,6 +4,7 @@ import {
   AGENT_CONTROL_RPC_METHODS,
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
   AGENT_CONTROL_EPIC_RPC_METHODS,
+  AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS,
   AGENT_CONTROL_RUNTIME_RPC_METHODS,
   AGENT_CONTROL_STAGE_RUN_LEASE_RPC_METHODS,
   AGENT_CONTROL_STAGE_RUN_RPC_METHODS,
@@ -34,6 +35,7 @@ type WsRpcMethod = RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"];
  * runtime failure.
  */
 export const RPC_REQUIRED_SCOPES = {
+  [AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS.change]: AuthAccessWriteScope,
   [AGENT_CONTROL_EPIC_RPC_METHODS.preview]: AuthOrchestrationReadScope,
   [AGENT_CONTROL_EPIC_RPC_METHODS.previewHandoff]: AuthOrchestrationReadScope,
   [AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff]: AuthAccessWriteScope,

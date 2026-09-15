@@ -1,5 +1,9 @@
 import { AgentControlEpic } from "./agentControl/epic/Services/AgentControlEpic.ts";
-import { AGENT_CONTROL_EPIC_RPC_METHODS, AgentControlEpicRpcError } from "@t3tools/contracts";
+import {
+  AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS,
+  AGENT_CONTROL_EPIC_RPC_METHODS,
+  AgentControlEpicRpcError,
+} from "@t3tools/contracts";
 import { AgentControlRunOnceReadModel } from "./agentControl/runOnce/Services/AgentControlRunOnceReadModel.ts";
 import {
   sameUsageLimitCommandCoverage,
@@ -514,6 +518,7 @@ const makeWsRpcLayer = (
         );
       const agentControlEpic = Option.getOrElse(epicService, () =>
         AgentControlEpic.of({
+          changeQueue: unavailableEpic,
           get: unavailableEpic,
           preview: unavailableEpic,
           previewHandoff: unavailableEpic,
@@ -1506,6 +1511,12 @@ const makeWsRpcLayer = (
             AGENT_CONTROL_CONTROLLED_THREAD_RESERVATION_RPC_METHODS.prepareInitial,
             agentControlControlledThreadActivation.activateInitial(input),
             { "rpc.aggregate": "agent-control-controlled-thread-reservation" },
+          ),
+        [AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS.change]: (input) =>
+          observeRpcEffect(
+            AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS.change,
+            agentControlEpic.changeQueue(input),
+            { "rpc.aggregate": "agent-control" },
           ),
         [AGENT_CONTROL_EPIC_RPC_METHODS.preview]: (input) =>
           observeRpcEffect(
