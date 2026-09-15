@@ -419,6 +419,7 @@ export const AGENT_CONTROL_WORKTREE_REJECTED_COMMAND_CODES = [
   "fence-token-mismatch",
   "reservation-missing",
   "reservation-conflict",
+  "accepted-authority-conflict",
   "reservation-projection-corrupt",
   "revision-conflict",
   "state-not-available",

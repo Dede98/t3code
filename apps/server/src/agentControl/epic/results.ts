@@ -9,6 +9,7 @@ import * as NodeUtil from "node:util";
 import {
   AgentControlEpicAcceptedResult,
   AgentControlEpicRpcError,
+  AgentControlWorktreeRpcError,
   AgentControlRunOnceId,
   AgentControlTaskId,
   AgentControlWorktreeReservationId,
@@ -23,6 +24,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { isSqlError } from "effect/unstable/sql/SqlError";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as CodexClient from "effect-codex-app-server/client";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -52,6 +54,8 @@ import { expandHomePath } from "../../pathExpansion.ts";
 const execFile = NodeUtil.promisify(NodeChildProcess.execFile);
 const fail = (message: string) =>
   new AgentControlEpicRpcError({ code: "epic-result-unavailable", message });
+const authorityFailure = (message: string) =>
+  new AgentControlEpicRpcError({ code: "authority-conflict", message });
 const now = Effect.map(DateTime.now, DateTime.formatIso);
 const git = (cwd: string, args: readonly string[], env?: NodeJS.ProcessEnv) =>
   Effect.tryPromise({
@@ -138,6 +142,30 @@ const verifyMaterializedIndex = Effect.fn("verifyMaterializedEpicIndex")(functio
 
 const decodeCodexSettings = Schema.decodeUnknownEffect(CodexSettings);
 const isEpicRpcError = Schema.is(AgentControlEpicRpcError);
+const isWorktreeRpcError = Schema.is(AgentControlWorktreeRpcError);
+// Persistence and invalid durable evidence must reach the worker's fatal path.
+// Local Git/check failures remain isolated to the affected project.
+const resultError = (cause: unknown, message: string) => {
+  if (isEpicRpcError(cause)) return cause;
+  if (
+    isSqlError(cause) ||
+    (isWorktreeRpcError(cause) && cause.code === "internal-persistence-error")
+  )
+    return new AgentControlEpicRpcError({
+      code: "epic-unavailable",
+      message: "Epic result persistence is unavailable.",
+    });
+  if (
+    Schema.isSchemaError(cause) ||
+    (isWorktreeRpcError(cause) &&
+      (cause.code.includes("projection-corrupt") ||
+        cause.code === "stage-run-history-ambiguous" ||
+        cause.code === "fence-token-mismatch" ||
+        cause.code === "accepted-authority-conflict"))
+  )
+    return authorityFailure("Epic result authority or persisted evidence is invalid.");
+  return fail(message);
+};
 
 /** Fixed project commands use the same Codex command sandbox as task verification; no model turn. */
 export const EpicCheckExecutor = Context.Reference<{
@@ -268,7 +296,7 @@ export const makeEpicResults = Effect.gen(function* () {
         const inputJson = canonicalJson({ ...input });
         let intent = (yield* readIntent(input.childRunId))[0];
         if (intent && intent.inputJson !== inputJson)
-          return yield* fail("The result capture belongs to another Epic or base.");
+          return yield* authorityFailure("The result capture belongs to another Epic or base.");
         if (intent && !intent.codeDigest.startsWith(VERIFICATION_CODE_SNAPSHOT_PREFIX))
           return yield* fail(
             "This result predates raw-file verification evidence and cannot be accepted automatically. Review the saved evidence and end the affected Epic run.",
@@ -286,12 +314,16 @@ export const makeEpicResults = Effect.gen(function* () {
         }>`SELECT result_json AS "resultJson",result_digest AS "resultDigest" FROM agent_control_epic_capture_results WHERE child_run_id=${input.childRunId}`;
         if (prior[0]) {
           if (!intent || sha256Utf8(prior[0].resultJson) !== prior[0].resultDigest)
-            return yield* fail("Accepted result evidence is inconsistent.");
+            return yield* authorityFailure("Accepted result evidence is inconsistent.");
           const result = yield* decodeAccepted(prior[0].resultJson);
           if (
             result.commitSha !== intent.commitSha ||
-            (yield* git(cwd, ["rev-parse", `${result.commitSha}^{tree}`])) !== result.treeSha
+            result.treeSha !== intent.treeSha ||
+            result.codeDigest !== intent.codeDigest ||
+            result.evidenceId !== `epic-capture:${input.childRunId}`
           )
+            return yield* authorityFailure("The accepted result contradicts its capture intent.");
+          if ((yield* git(cwd, ["rev-parse", `${result.commitSha}^{tree}`])) !== result.treeSha)
             return yield* fail("Accepted result commit is unavailable.");
           yield* git(cwd, ["read-tree", result.commitSha], indexEnv);
           yield* verifyMaterializedIndex(cwd, temp, indexEnv);
@@ -299,7 +331,8 @@ export const makeEpicResults = Effect.gen(function* () {
         }
         if (!intent) {
           const proof = (yield* verification(input))[0];
-          if (!proof) return yield* fail("Successful child verification evidence is missing.");
+          if (!proof)
+            return yield* authorityFailure("Successful child verification evidence is missing.");
           const assessment = yield* assessVerificationChecks(sql, {
             evidence: { ...proof, worktreePath: cwd },
             delivery: { providerTurnId: proof.providerTurnId },
@@ -314,11 +347,14 @@ export const makeEpicResults = Effect.gen(function* () {
                 ON manifest.provider_delivery_id=assessment.provider_delivery_id
               WHERE assessment.provider_delivery_id=${proof.providerDeliveryId}`;
           if (
-            assessment.code !== null ||
             seals.length !== 1 ||
             seals[0]?.code !== null ||
             seals[0].digest !== assessment.digest
           )
+            return yield* authorityFailure(
+              "The accepted child check seal is missing or inconsistent.",
+            );
+          if (assessment.code !== null)
             return yield* fail(
               "The child worktree no longer matches its accepted mandatory checks.",
             );
@@ -328,7 +364,9 @@ export const makeEpicResults = Effect.gen(function* () {
           const sourceHead = yield* git(cwd, ["rev-parse", "HEAD"]);
           const parent = input.previousCommitSha ?? state.baseCommitSha;
           if (parent !== state.baseCommitSha)
-            return yield* fail("The child was not built on the preceding accepted result.");
+            return yield* authorityFailure(
+              "The child was not built on the preceding accepted result.",
+            );
           const submodules = yield* git(cwd, ["submodule", "status", "--recursive"]);
           if (submodules)
             return yield* fail("Epic result capture does not yet support submodule worktrees.");
@@ -400,7 +438,7 @@ export const makeEpicResults = Effect.gen(function* () {
     ).pipe(
       Effect.scoped,
       Effect.mapError((cause) =>
-        isEpicRpcError(cause) ? cause : fail("The verified child result could not be accepted."),
+        resultError(cause, "The verified child result could not be accepted."),
       ),
     );
 
@@ -413,7 +451,7 @@ export const makeEpicResults = Effect.gen(function* () {
       !member.taskFinalizationEvidenceId ||
       member.accepted?.commitSha !== input.commitSha
     )
-      return Effect.fail(fail("The final accepted result is incomplete."));
+      return Effect.fail(authorityFailure("The final accepted result is incomplete."));
     if (!member.accepted.codeDigest.startsWith(VERIFICATION_CODE_SNAPSHOT_PREFIX))
       return Effect.fail(
         fail(
@@ -434,7 +472,8 @@ export const makeEpicResults = Effect.gen(function* () {
         const evidenceId = `epic-final:${input.epicRunId}:${input.attempt}`;
         const cwd = state.internalWorktreePath;
         const proof = (yield* verification(captureInput))[0];
-        if (!proof) return yield* fail("The final verification provider evidence is missing.");
+        if (!proof)
+          return yield* authorityFailure("The final verification provider evidence is missing.");
         const authorize = Effect.gen(function* () {
           if (
             (yield* git(cwd, ["rev-parse", "HEAD"])) !== input.commitSha ||
@@ -474,7 +513,7 @@ export const makeEpicResults = Effect.gen(function* () {
           (documents[0].manifestDigest !== manifest.manifestDigest ||
             documents[0].checksJson !== manifest.checksJson)
         )
-          return yield* fail(
+          return yield* authorityFailure(
             "The final verification attempt belongs to a different result or check configuration.",
           );
         yield* sql`INSERT INTO agent_control_verification_check_manifests(provider_delivery_id,handoff_id,fence_token,worktree_path,code_digest,checks_json,manifest_digest,created_at) VALUES (${evidenceId},${evidenceId},${input.attempt},${cwd},${manifest.codeDigest},${manifest.checksJson},${manifest.manifestDigest},${yield* now}) ON CONFLICT(provider_delivery_id) DO NOTHING`;
@@ -546,9 +585,7 @@ export const makeEpicResults = Effect.gen(function* () {
       }),
     ).pipe(
       Effect.scoped,
-      Effect.mapError((cause) =>
-        isEpicRpcError(cause) ? cause : fail("Final Epic checks could not be completed."),
-      ),
+      Effect.mapError((cause) => resultError(cause, "Final Epic checks could not be completed.")),
     );
   };
   return { capture, verify } satisfies AgentControlEpicResultHooksShape;

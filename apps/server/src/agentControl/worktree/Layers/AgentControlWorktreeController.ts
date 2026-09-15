@@ -6077,13 +6077,17 @@ const make = Effect.gen(function* () {
             input.taskId,
             input.reservationId,
           );
-        if (
-          !state ||
-          state.projectId !== input.projectId ||
-          state.taskId !== input.taskId ||
-          state.status !== "ready"
-        )
-          return yield* unavailable();
+        const authorityConflict = () =>
+          error(
+            "accepted-authority-conflict",
+            "materialize",
+            input.projectId,
+            input.taskId,
+            input.reservationId,
+          );
+        if (!state || state.projectId !== input.projectId || state.taskId !== input.taskId)
+          return yield* authorityConflict();
+        if (state.status !== "ready") return yield* unavailable();
         const lock = yield* getLock(state.repositoryCommonDir);
         return yield* lock.withPermit(
           withAgentControlRepositoryLock({
@@ -6114,14 +6118,13 @@ const make = Effect.gen(function* () {
               const fresh = yield* engine.loadAuthoritative(input.reservationId);
               if (
                 authority.length !== 1 ||
-                !projects[0] ||
-                Option.isNone(tracker) ||
-                !tracker.value.config ||
                 !fresh ||
                 fresh.revision !== state.revision ||
                 fresh.sequence !== state.sequence ||
                 fresh.ownershipFingerprint !== state.ownershipFingerprint
               )
+                return yield* authorityConflict();
+              if (!projects[0] || Option.isNone(tracker) || !tracker.value.config)
                 return yield* unavailable();
               const observed = yield* inspect(
                 fresh,

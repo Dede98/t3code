@@ -10,6 +10,8 @@ import { describe, expect, it, vi } from "@effect/vitest";
 import {
   AgentControlTaskId,
   AgentControlWorktreeReservationState,
+  AgentControlWorktreeRpcError,
+  AgentControlWorktreeReservationId,
   ProjectId,
   type AgentControlVerificationChecks,
   type AgentControlEpicAcceptedResult,
@@ -602,7 +604,8 @@ else {
             const sql = yield* SqlClient.SqlClient;
             yield* sql`CREATE TRIGGER simulate_crash BEFORE INSERT ON agent_control_epic_capture_results BEGIN SELECT RAISE(ABORT,'simulated crash'); END`;
             const hooks = yield* makeEpicResults;
-            yield* hooks.capture(captureInput).pipe(Effect.flip);
+            const error = yield* hooks.capture(captureInput).pipe(Effect.flip);
+            expect(error.code).toBe("epic-unavailable");
             expect((yield* sql`SELECT * FROM agent_control_epic_capture_intents`).length).toBe(1);
             expect((yield* sql`SELECT * FROM agent_control_epic_capture_results`).length).toBe(0);
             yield* sql`DROP TRIGGER simulate_crash`;
@@ -622,6 +625,112 @@ else {
       }),
   );
 
+  it.effect(
+    "propagates failed final manifest persistence and retries without duplicating checks",
+    () =>
+      testWithRepo(() =>
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          let executions = 0;
+          const hooks = yield* makeEpicResults.pipe(
+            Effect.provideService(EpicCheckExecutor, {
+              execute: () =>
+                Effect.sync(() => {
+                  executions += 1;
+                  return success;
+                }),
+            }),
+          );
+          const accepted = yield* hooks.capture(captureInput);
+          yield* sql`CREATE TRIGGER reject_final_manifest BEFORE INSERT ON agent_control_verification_check_manifests WHEN NEW.provider_delivery_id LIKE 'epic-final:%' BEGIN SELECT RAISE(ABORT,'manifest unavailable'); END`;
+          const error = yield* hooks.verify(finalInput(accepted)).pipe(Effect.flip);
+          expect(error.code).toBe("epic-unavailable");
+          expect(executions).toBe(0);
+          yield* sql`DROP TRIGGER reject_final_manifest`;
+          const verified = yield* hooks.verify(finalInput(accepted));
+          expect(verified.status).toBe("passed");
+          expect(yield* hooks.verify(finalInput(accepted))).toEqual(verified);
+          expect(executions).toBe(1);
+        }),
+      ),
+  );
+
+  it.effect("rejects corrupt persisted accepted results as lost authority", () =>
+    testWithRepo(() =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const hooks = yield* makeEpicResults;
+        yield* hooks.capture(captureInput);
+        // Simulate externally corrupted storage despite the normal immutable writer.
+        yield* sql`DROP TRIGGER agent_control_epic_capture_results_no_update`;
+        yield* sql`UPDATE agent_control_epic_capture_results SET result_json='{}',result_digest=${sha256Utf8("{}")} WHERE child_run_id=${captureInput.childRunId}`;
+        const error = yield* hooks.capture(captureInput).pipe(Effect.flip);
+        expect(error.code).toBe("authority-conflict");
+      }),
+    ),
+  );
+
+  it.effect("propagates accepted worktree authority loss from the controller", () =>
+    testWithRepo(() =>
+      Effect.gen(function* () {
+        const hooks = yield* makeEpicResults.pipe(
+          Effect.provide(
+            Layer.mock(AgentControlWorktreeController)({
+              useAcceptedWorktree: () =>
+                Effect.fail(
+                  new AgentControlWorktreeRpcError({
+                    code: "accepted-authority-conflict",
+                    operation: "materialize",
+                    projectId: captureInput.projectId,
+                    taskId: AgentControlTaskId.make(captureInput.taskId),
+                    reservationId: AgentControlWorktreeReservationId.make(
+                      captureInput.reservationId,
+                    ),
+                  }),
+                ),
+            }),
+          ),
+        );
+        expect((yield* hooks.capture(captureInput).pipe(Effect.flip)).code).toBe(
+          "authority-conflict",
+        );
+      }),
+    ),
+  );
+
+  it.effect("treats missing accepted check seals as authority loss", () =>
+    testWithRepo(() =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        // Simulate missing durable evidence, not a local source change.
+        const triggers = yield* sql<{
+          name: string;
+        }>`SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name='agent_control_verification_check_assessments'`;
+        for (const trigger of triggers) yield* sql.unsafe(`DROP TRIGGER ${trigger.name}`);
+        yield* sql`DELETE FROM agent_control_verification_check_assessments`;
+        const hooks = yield* makeEpicResults;
+        const error = yield* hooks.capture(captureInput).pipe(Effect.flip);
+        expect(error.code).toBe("authority-conflict");
+      }),
+    ),
+  );
+
+  it.effect("treats conflicting accepted commit evidence as authority loss", () =>
+    testWithRepo(() =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const hooks = yield* makeEpicResults;
+        const accepted = yield* hooks.capture(captureInput);
+        const json = canonicalJson({ ...accepted, commitSha: "f".repeat(40) });
+        yield* sql`DROP TRIGGER agent_control_epic_capture_results_no_update`;
+        yield* sql`UPDATE agent_control_epic_capture_results SET result_json=${json},result_digest=${sha256Utf8(json)} WHERE child_run_id=${captureInput.childRunId}`;
+        expect((yield* hooks.capture(captureInput).pipe(Effect.flip)).code).toBe(
+          "authority-conflict",
+        );
+      }),
+    ),
+  );
+
   it.effect("rejects stale verified files without accepting a commit", () =>
     testWithRepo((repo) =>
       Effect.gen(function* () {
@@ -630,6 +739,7 @@ else {
         );
         const hooks = yield* makeEpicResults;
         const error = yield* hooks.capture(captureInput).pipe(Effect.flip);
+        expect(error.code).toBe("epic-result-unavailable");
         expect(error.message).toContain("mandatory checks");
         expect(yield* git(repo.cwd, ["rev-parse", "HEAD"])).toBe(repo.base);
         const sql = yield* SqlClient.SqlClient;

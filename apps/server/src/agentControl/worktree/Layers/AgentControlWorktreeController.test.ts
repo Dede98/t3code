@@ -22358,3 +22358,35 @@ layer("Agent Control worktree materialization", (it) => {
     }),
   );
 });
+
+layer("Accepted Epic result worktree authority", (it) => {
+  it.effect(
+    "rejects a ready worktree without accepted finalization authority before calling the result writer",
+    () =>
+      Effect.gen(function* () {
+        const repo = yield* makeRepository();
+        const projectId = ProjectId.make("epic-accepted-authority-missing");
+        const seeded = yield* seedPrepared(projectId, repo.cwd);
+        yield* reserveLease(seeded.stageRun);
+        const controller = yield* AgentControlWorktreeController;
+        const ready = yield* controller.reserveAndMaterialize({
+          commandId: CommandId.make("epic-authority-ready"),
+          projectId,
+          taskId: seeded.task.taskId,
+        });
+        assert.equal(ready.status, "ready");
+        assert.isDefined(controller.useAcceptedWorktree);
+        const error = yield* controller.useAcceptedWorktree!(
+          {
+            projectId,
+            taskId: seeded.task.taskId,
+            reservationId: ready.reservationId,
+            childRunId: AgentControlRunOnceId.make("missing-finalization-child"),
+            taskFinalizationEvidenceId: "missing-finalization",
+          },
+          () => Effect.die("Lost authority must never reach the result writer"),
+        ).pipe(Effect.flip);
+        assert.propertyVal(error, "code", "accepted-authority-conflict");
+      }),
+  );
+});

@@ -186,6 +186,7 @@ export const AgentControlRejectedCommandErrorCode = Schema.Literals([
   "lease-recovery-required",
   "reservation-missing",
   "reservation-conflict",
+  "accepted-authority-conflict",
   "reservation-projection-corrupt",
   "worktree-missing",
   "worktree-not-ready",
