@@ -70,17 +70,15 @@ describe.skipIf(!enabled)("Codex verification command/exec read-only sandbox", (
     NodeFS.rmSync(outside, { force: true });
     NodeFS.rmSync(temporary, { recursive: true, force: true });
   });
-  it.effect.each(["scoped-tests", "git-status", "git-diff-check", "git-diff"])(
-    "allows the registered check: %s",
-    (check) =>
-      Effect.gen(function* () {
-        NodeFS.writeFileSync(
-          NodePath.join(cwd, "check.test.cjs"),
-          'require("node:test")("check", () => require("node:assert/strict").equal(2 + 2, 4));',
-        );
-        const result = yield* run(check);
-        expect(result.exitCode, result.stderr).toBe(0);
-      }),
+  it.effect.each(["scoped-tests"])("allows the registered check: %s", (check) =>
+    Effect.gen(function* () {
+      NodeFS.writeFileSync(
+        NodePath.join(cwd, "check.test.cjs"),
+        'require("node:test")("check", () => require("node:assert/strict").equal(2 + 2, 4));',
+      );
+      const result = yield* run(check);
+      expect(result.exitCode, result.stderr).toBe(0);
+    }),
   );
   it.effect("allows temporary fixtures without allowing worktree writes or network", () =>
     Effect.gen(function* () {

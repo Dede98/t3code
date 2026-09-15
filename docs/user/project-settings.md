@@ -36,7 +36,17 @@ routes can override inherited defaults; reset an override to inherit again. Full
 explicitly enabled, applies only to Implementation and Repair. Add at least one required
 verification check: its program runs with a list of separate arguments and a directory relative
 to the task worktree on the selected environment. Choose its timeout and result format to match
-the command. Saving or passing provider preflight does not execute checks.
+the command. Checks block network access by default. For HTTP integration tests, explicitly
+allow a local HTTP server in that check. In Node, start the test server with
+`server.listen({ fd: Number(process.env.T3_VERIFICATION_LISTEN_FD) })` and make requests to
+`T3_VERIFICATION_URL`. Run Node tests directly, for example
+`node --test --test-isolation=none --test-reporter=tap test.cjs`. Subprocesses and package runners
+are unavailable for local HTTP checks. Binding a new socket with `listen(port)` is unavailable.
+The check can use only that assigned loopback endpoint; external requests, including redirects,
+remain blocked. The worktree stays read-only. If temporary files are enabled, write them beneath the check's `TMPDIR`.
+Local HTTP checks require a Codex verification provider on a supported macOS environment.
+Provider readiness reports unsupported required checks before a task starts. Saving or passing
+provider preflight does not execute project checks.
 
 GitHub and policy settings save separately. Each result reports which settings were saved; a
 failed second save does not undo the first. Save or discard local edits before starting work.

@@ -395,6 +395,48 @@ describe("Run Once client state", () => {
     }
   });
 
+  it("shows the required check capability blocker for Run Once and Armed", () => {
+    const unavailable: AgentControlPreflightRuntimeResult = {
+      ...preflight,
+      ok: false,
+      roles: [
+        {
+          role: "verifier",
+          accessMode: "restricted",
+          strict: true,
+          selectedCandidateIndex: null,
+          errorCode: "role-runtime-unresolved",
+          candidates: [
+            {
+              candidateIndex: 0,
+              source: "role-route",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5.4",
+              driverKind: ProviderDriverKind.make("codex"),
+              providerStatus: "ready",
+              authStatus: "authenticated",
+              checkedAt: timestamp,
+              runtimeReady: false,
+              errorCode: "verification-checks-unavailable",
+              verificationCheckError: {
+                checkId: "http-tests",
+                message: "Assigned loopback networking is unavailable on this Linux environment.",
+              },
+            },
+          ],
+        },
+      ],
+    };
+    for (const blockers of [
+      agentControlStartBlockers({ ...start, preflight: unavailable }),
+      agentControlArmBlockers({ ...start, preflight: unavailable }),
+    ]) {
+      expect(blockers.join(" ")).toContain(
+        "Check http-tests: Assigned loopback networking is unavailable on this Linux environment.",
+      );
+    }
+  });
+
   it("restores pre-stage failures from durable server diagnostics", () => {
     const blocked = {
       ...snapshot.runs[0]!,

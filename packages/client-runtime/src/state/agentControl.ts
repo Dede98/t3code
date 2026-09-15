@@ -680,7 +680,7 @@ function agentControlActivationBlockers(
     for (const role of unresolved) {
       const reasons = role.candidates.map(
         (candidate) =>
-          `${candidate.providerInstanceId} / ${candidate.model}: ${candidate.errorCode ?? "not ready"}`,
+          `${candidate.providerInstanceId} / ${candidate.model}: ${candidate.verificationCheckError ? `Check ${candidate.verificationCheckError.checkId}: ${candidate.verificationCheckError.message}` : (candidate.errorCode ?? "not ready")}`,
       );
       blockers.push(
         `${role.role}: ${reasons.join("; ") || "No configured provider/model route"}. Check provider settings in this environment.`,

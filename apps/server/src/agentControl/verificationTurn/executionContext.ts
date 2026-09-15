@@ -11,6 +11,7 @@ export const AgentControlVerificationExecution = Context.Reference<{
   readonly threadId: ThreadId;
   readonly cwd: string;
   readonly checks: AgentControlVerificationChecks;
+  readonly inspectionBase?: string;
   readonly runCheck: <E>(
     checkId: string,
     providerTurnId: string,

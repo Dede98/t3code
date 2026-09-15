@@ -197,6 +197,22 @@ describe("autonomous project setup", () => {
       verificationChecks: [check],
     });
   });
+  it("saves explicit local HTTP permission and revokes it again without losing check arguments", async () => {
+    const h = harness();
+    await h.controller.load();
+    for (const networkAccess of ["loopback", "none"] as const) {
+      const configured = { ...check, networkAccess };
+      h.controller.setPolicy({ verificationChecks: [configured] });
+      await h.controller.savePolicy();
+      await h.controller.discard();
+      expect(h.controller.getSnapshot().policyDraft?.verificationChecks).toEqual([configured]);
+      expect(h.api.setPolicy).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          policy: { verificationChecks: [configured] },
+        }),
+      );
+    }
+  });
   it("does not lose a draft or silently overwrite a concurrent policy revision", async () => {
     const h = harness();
     await h.controller.load();

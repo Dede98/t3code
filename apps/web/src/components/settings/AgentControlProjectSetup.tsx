@@ -2,6 +2,7 @@ import { RegistryContext } from "@effect/atom-react";
 import {
   bindAgentControlSetupApi,
   agentControlPreflightErrorMessage,
+  agentControlPreflightCandidateMessage,
   createAgentControlSetupController,
   createAgentControlSetupEnvironmentAtoms,
 } from "@t3tools/client-runtime/state/agent-control-setup";
@@ -339,6 +340,22 @@ function CheckEditor({
         />
         Allow temporary files during this check
       </label>
+      <label className="flex gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={check.networkAccess === "loopback"}
+          onChange={(event) =>
+            onChange({ ...check, networkAccess: event.target.checked ? "loopback" : "none" })
+          }
+        />
+        Allow a local HTTP test server on the assigned loopback port
+      </label>
+      <p className="text-xs text-muted-foreground">
+        Network is blocked by default. Local HTTP test servers listen on the provided
+        T3_VERIFICATION_LISTEN_FD socket; requests use T3_VERIFICATION_URL. Run Node tests directly
+        with --test-isolation=none; subprocesses and package runners are unavailable. External
+        connections remain blocked. Provider readiness checks whether this environment supports it.
+      </p>
       <Button size="xs" variant="outline" onClick={onRemove}>
         Remove check
       </Button>
@@ -814,7 +831,7 @@ export function AgentControlProjectSetup({
                 .filter((candidate) => candidate.errorCode)
                 .map(
                   (candidate) =>
-                    ` · ${candidate.providerInstanceId}/${candidate.model}: ${agentControlPreflightErrorMessage(candidate.errorCode!)}`,
+                    ` · ${candidate.providerInstanceId}/${candidate.model}: ${agentControlPreflightCandidateMessage(candidate)}`,
                 )
                 .join("")}
             </p>

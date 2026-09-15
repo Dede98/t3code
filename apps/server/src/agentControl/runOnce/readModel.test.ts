@@ -238,6 +238,7 @@ const seed = Effect.gen(function* () {
     yield* insertFixture("agent_control_verification_check_manifests", {
       provider_delivery_id: `delivery-${ordinal}`,
       handoff_id: `handoff-${ordinal}`,
+      code_digest: `review-v1:${"a".repeat(40)}:raw-v3:fixture-${ordinal}`,
       checks_json: encodeUnknownJson([
         {
           id: "test",
@@ -268,6 +269,25 @@ const seed = Effect.gen(function* () {
         exitCode: ordinal === 3 ? 1 : 0,
         stdout: ordinal === 3 ? "first failure" : "final success",
         stderr: "",
+      }),
+      completed_at: at,
+    });
+    yield* insertFixture("agent_control_verification_check_starts", {
+      provider_delivery_id: `delivery-${ordinal}`,
+      check_id: "git-diff",
+      provider_turn_id: `turn-${ordinal}`,
+      manifest_digest: `manifest-${ordinal}`,
+    });
+    yield* insertFixture("agent_control_verification_check_results", {
+      provider_delivery_id: `delivery-${ordinal}`,
+      check_id: "git-diff",
+      provider_turn_id: `turn-${ordinal}`,
+      manifest_digest: `manifest-${ordinal}`,
+      status: ordinal === 3 ? "unavailable" : "passed",
+      result_json: encodeUnknownJson({
+        exitCode: ordinal === 3 ? 125 : 0,
+        stdout: ordinal === 3 ? "" : "Complete raw changes against the initial base.",
+        stderr: ordinal === 3 ? "T3_INSPECTION_INCOMPLETE: Binary change: image.png" : "",
       }),
       completed_at: at,
     });
@@ -315,6 +335,17 @@ layer("Run-Once client read model", (it) => {
         assert.equal(
           snapshot.runs[0]?.stages[4]?.verification?.checks[0]?.output?.trim(),
           "final success",
+        );
+        const inspection = snapshot.runs[0]?.stages[2]?.verification?.checks.find(
+          (check) => check.id === "git-diff",
+        );
+        assert.equal(inspection?.status, "unavailable");
+        assert.equal(inspection?.required, true);
+        assert.include(inspection?.output, "Binary change: image.png");
+        assert.equal(
+          snapshot.runs[0]?.stages[4]?.verification?.checks.find((check) => check.id === "git-diff")
+            ?.status,
+          "passed",
         );
         assert.equal(snapshot.runs[0]?.stages[4]?.verification?.verdict, "passed");
         assert.equal(snapshot.runs[0]?.stages[4]?.providerInstanceId, "codex-production");

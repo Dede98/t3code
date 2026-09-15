@@ -43,6 +43,7 @@ import {
 import {
   agentControlSetupPermissionBlocker,
   agentControlPreflightErrorMessage,
+  agentControlPreflightCandidateMessage,
   bindAgentControlSetupApi,
   createAgentControlSetupController,
 } from "@t3tools/client-runtime/state/agent-control-setup";
@@ -525,7 +526,7 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
                   : "Fallback: "}
                 {candidate.providerInstanceId} · {candidate.model} ·{" "}
                 {candidate.errorCode
-                  ? agentControlPreflightErrorMessage(candidate.errorCode)
+                  ? agentControlPreflightCandidateMessage(candidate)
                   : candidate.runtimeReady
                     ? "Ready"
                     : "Unavailable"}
@@ -553,6 +554,7 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
           <View key={check.id} className="gap-1">
             <Text className="text-sm">
               {check.id} · {check.required ? "Required" : "Optional"}
+              {check.networkAccess === "loopback" ? " · Local HTTP allowed" : " · Network blocked"}
             </Text>
             <Text selectable className="text-xs text-foreground-muted">
               {[check.command, ...check.args].join(" ")} · {check.cwd}

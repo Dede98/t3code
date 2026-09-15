@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics preferSchemaOverJson:off
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
@@ -13,6 +14,8 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { inspectVerificationChanges } from "../../provider/VerificationInspection.ts";
+import { evaluateCheckedVerificationResult } from "./checkedResult.ts";
 import Migration076 from "../../persistence/Migrations/076_AgentControlVerificationChecks.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import type { ProviderAdmissionPermit } from "../providerAdmission/model.ts";
@@ -630,4 +633,250 @@ it.effect("keeps a genuine assessment persistence failure distinct from evidence
       );
     }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
   }).pipe(Effect.scoped),
+);
+
+const inspectionBase = (cwd: string) =>
+  io(async () => (await exec("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim());
+const inspect = (sql: SqlClient.SqlClient, manifest: VerificationCheckManifest, base: string) =>
+  executeVerificationCheck(sql, {
+    manifest,
+    checkId: "git-diff",
+    providerTurnId: "turn-1",
+    authorize: Effect.void,
+    execute: io(() => inspectVerificationChanges(manifest.worktreePath, base)),
+  });
+
+it.effect(
+  "a new verification requires its own complete inspection even when every test passed",
+  () =>
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      const base = yield* inspectionBase(repo.cwd);
+      yield* io(() =>
+        NodeFSP.writeFile(NodePath.join(repo.cwd, "untracked.cjs"), "module.exports = 42;\n"),
+      );
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const sql = yield* SqlClient.SqlClient;
+        const manifest = yield* prepareVerificationCheckManifest(sql, {
+          permit: permit(),
+          cwd: repo.cwd,
+          checks,
+          inspectionBase: base,
+        });
+        yield* execute(sql, manifest);
+        assert.equal(
+          (yield* assessVerificationChecks(sql, claim(manifest))).code,
+          "verification-checks-missing",
+        );
+        const inspected = yield* inspect(sql, manifest, base);
+        assert.equal(inspected.exitCode, 0);
+        assert.include(inspected.stdout, "untracked.cjs");
+        assert.include(inspected.stdout, "module.exports = 42;");
+        assert.isNull((yield* assessVerificationChecks(sql, claim(manifest))).code);
+        assert.deepEqual(
+          yield* sql`SELECT check_id, status FROM agent_control_verification_check_results ORDER BY check_id`,
+          [
+            { check_id: "git-diff", status: "passed" },
+            { check_id: "scoped-test", status: "passed" },
+          ],
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
+    }).pipe(Effect.scoped),
+);
+
+it.effect("incomplete inspection outranks a real failed test and cannot request code repair", () =>
+  Effect.gen(function* () {
+    const repo = yield* repository;
+    const base = yield* inspectionBase(repo.cwd);
+    yield* io(() =>
+      NodeFSP.writeFile(NodePath.join(repo.cwd, "too-large.txt"), "x".repeat(30_000)),
+    );
+    yield* Effect.gen(function* () {
+      yield* initialize;
+      const sql = yield* SqlClient.SqlClient;
+      const manifest = yield* prepareVerificationCheckManifest(sql, {
+        permit: permit(),
+        cwd: repo.cwd,
+        checks,
+        inspectionBase: base,
+      });
+      yield* execute(sql, manifest, {
+        exitCode: 1,
+        stdout: "  code: 'ERR_ASSERTION'\n# fail 1\n",
+        stderr: "",
+      });
+      assert.deepEqual(
+        yield* sql`SELECT status FROM agent_control_verification_check_results WHERE check_id = 'scoped-test'`,
+        [{ status: "failed" }],
+      );
+      const inspected = yield* inspect(sql, manifest, base);
+      assert.equal(inspected.exitCode, 125);
+      assert.equal(inspected.stdout, "");
+      assert.include(inspected.stderr, "T3_INSPECTION_INCOMPLETE");
+      const assessment = yield* sealVerificationCheckAssessment(sql, claim(manifest));
+      assert.equal(assessment.code, "verification-checks-unavailable");
+      const failedVerdict = new TextEncoder().encode(
+        JSON.stringify({
+          schemaVersion: "agent-control-verification-result-v1",
+          verdict: "failed",
+          report: "Repair the failing test.",
+        }),
+      );
+      const result = yield* evaluateCheckedVerificationResult(failedVerdict, assessment.code);
+      assert.equal(result.disposition, "invalid-output");
+      assert.isNull(result.verdict);
+      assert.equal(result.errorCode, "verification-checks-unavailable");
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
+  }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "reopens complete inspection evidence and its assessment without executing inspection twice",
+  () =>
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      const base = yield* inspectionBase(repo.cwd);
+      yield* io(() =>
+        NodeFSP.writeFile(NodePath.join(repo.cwd, "source.txt"), "reviewed change\n"),
+      );
+      let executions = 0;
+      const command = io(async () => {
+        executions += 1;
+        return await inspectVerificationChanges(repo.cwd, base);
+      });
+      const first = yield* Effect.gen(function* () {
+        yield* initialize;
+        const sql = yield* SqlClient.SqlClient;
+        const manifest = yield* prepareVerificationCheckManifest(sql, {
+          permit: permit(),
+          cwd: repo.cwd,
+          checks,
+          inspectionBase: base,
+        });
+        yield* execute(sql, manifest);
+        const result = yield* executeVerificationCheck(sql, {
+          manifest,
+          checkId: "git-diff",
+          providerTurnId: "turn-1",
+          authorize: Effect.void,
+          execute: command,
+        });
+        const repeated = yield* executeVerificationCheck(sql, {
+          manifest,
+          checkId: "git-diff",
+          providerTurnId: "turn-1",
+          authorize: Effect.void,
+          execute: command,
+        });
+        assert.deepEqual(repeated, result);
+        return {
+          manifest,
+          result,
+          assessment: yield* sealVerificationCheckAssessment(sql, claim(manifest)),
+        };
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: repo.database })));
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const manifest = yield* prepareVerificationCheckManifest(sql, {
+          permit: permit(),
+          cwd: repo.cwd,
+          checks,
+          inspectionBase: base,
+        });
+        assert.deepEqual(manifest, first.manifest);
+        assert.deepEqual(
+          yield* executeVerificationCheck(sql, {
+            manifest,
+            checkId: "git-diff",
+            providerTurnId: "turn-1",
+            authorize: Effect.void,
+            execute: command,
+          }),
+          first.result,
+        );
+        assert.deepEqual(
+          yield* sealVerificationCheckAssessment(sql, claim(manifest)),
+          first.assessment,
+        );
+        assert.isNull(first.assessment.code);
+        assert.deepEqual(
+          yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_results`,
+          [{ count: 2 }],
+        );
+        assert.deepEqual(
+          yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_starts`,
+          [{ count: 2 }],
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: repo.database })));
+      assert.equal(executions, 1);
+    }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "revoked inspection authority prevents execution and rejects a result after lease loss",
+  () =>
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      const base = yield* inspectionBase(repo.cwd);
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const sql = yield* SqlClient.SqlClient;
+        const manifest = yield* prepareVerificationCheckManifest(sql, {
+          permit: permit(),
+          cwd: repo.cwd,
+          checks,
+          inspectionBase: base,
+        });
+        yield* execute(sql, manifest);
+        let executions = 0;
+        const command = io(async () => {
+          executions += 1;
+          return await inspectVerificationChanges(repo.cwd, base);
+        });
+        const revoked = Effect.fail(
+          new VerificationCheckError({ cause: "owner or stage lease revoked" }),
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              executeVerificationCheck(sql, {
+                manifest,
+                checkId: "git-diff",
+                providerTurnId: "turn-1",
+                authorize: revoked,
+                execute: command,
+              }),
+            ),
+          ),
+        );
+        assert.equal(executions, 0);
+        assert.deepEqual(
+          yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_starts WHERE check_id = 'git-diff'`,
+          [{ count: 0 }],
+        );
+        let authorizations = 0;
+        const authorize = Effect.suspend(() => (++authorizations === 1 ? Effect.void : revoked));
+        assert.equal(
+          (yield* executeVerificationCheck(sql, {
+            manifest,
+            checkId: "git-diff",
+            providerTurnId: "turn-1",
+            authorize,
+            execute: command,
+          })).exitCode,
+          125,
+        );
+        assert.equal(executions, 1);
+        assert.equal(
+          (yield* assessVerificationChecks(sql, claim(manifest))).code,
+          "verification-checks-unavailable",
+        );
+        assert.equal((yield* inspect(sql, manifest, base)).exitCode, 125);
+        assert.deepEqual(
+          yield* sql`SELECT status FROM agent_control_verification_check_results WHERE check_id = 'git-diff'`,
+          [{ status: "unavailable" }],
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
+    }).pipe(Effect.scoped),
 );

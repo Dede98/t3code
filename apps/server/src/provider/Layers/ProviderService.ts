@@ -63,6 +63,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { AgentControlVerificationChecks } from "@t3tools/contracts";
 import {
   prepareVerificationCheckManifest,
+  verificationInspectionBase,
   executeVerificationCheck,
   VerificationCheckError,
   type VerificationCheckCommandResult,
@@ -646,7 +647,27 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "Verification evidence persistence is unavailable.",
       );
     const sql = verificationSql;
-    const manifest = yield* prepareVerificationCheckManifest(sql, { permit, cwd }).pipe(
+    const bases = yield* sql<{
+      base: string;
+    }>`SELECT base_commit_sha AS base FROM agent_control_worktree_reservation_states WHERE project_id=${permit.projectId} AND task_id=${permit.taskId} AND internal_worktree_path=${cwd}`.pipe(
+      Effect.mapError((cause) =>
+        toValidationError(
+          "ProviderService.verificationExecution",
+          "Cannot resolve the fixed verification base.",
+          cause,
+        ),
+      ),
+    );
+    if (bases.length !== 1)
+      return yield* toValidationError(
+        "ProviderService.verificationExecution",
+        "The fixed verification base is unavailable.",
+      );
+    const manifest = yield* prepareVerificationCheckManifest(sql, {
+      permit,
+      cwd,
+      inspectionBase: bases[0]!.base,
+    }).pipe(
       Effect.mapError((cause) =>
         toValidationError(
           "ProviderService.verificationExecution",
@@ -668,6 +689,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       threadId: ThreadId.make(permit.threadId),
       cwd,
       checks,
+      ...(verificationInspectionBase(manifest.codeDigest)
+        ? { inspectionBase: verificationInspectionBase(manifest.codeDigest)! }
+        : {}),
       runCheck: <E>(
         checkId: string,
         providerTurnId: string,

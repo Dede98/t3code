@@ -13,6 +13,7 @@ import {
   type AgentControlGithubPollOnceInput,
   type AgentControlPolicyStateResult,
   type AgentControlPreflightRuntimeInput,
+  type AgentControlPreflightRuntimeCandidate,
   type AgentControlPreflightRuntimeResult,
   type AgentControlSetProjectPolicyInput,
   type AuthSessionState,
@@ -95,6 +96,8 @@ export function agentControlPreflightErrorMessage(code: string): string {
       "The provider is not signed in on this environment. Use its existing provider sign-in flow.",
     "provider-probe-timeout":
       "The provider readiness check timed out. Check the environment and try again.",
+    "verification-checks-unavailable":
+      "This environment cannot safely run a required verification check. Review its check requirements and use a supported provider and platform.",
     "provider-probe-failed":
       "The provider readiness check failed. Review its status in provider settings and retry.",
     "model-unavailable":
@@ -112,6 +115,19 @@ export function agentControlPreflightErrorMessage(code: string): string {
     messages[code] ??
     `Provider readiness failed (${code}). Review the environment's provider settings.`
   );
+}
+
+/** A candidate's check failure includes the concrete environment capability that is missing. */
+export function agentControlPreflightCandidateMessage(
+  candidate: AgentControlPreflightRuntimeCandidate,
+): string {
+  if (candidate.verificationCheckError)
+    return `Check ${candidate.verificationCheckError.checkId}: ${candidate.verificationCheckError.message}`;
+  return candidate.errorCode
+    ? agentControlPreflightErrorMessage(candidate.errorCode)
+    : candidate.runtimeReady
+      ? "Ready"
+      : "Unavailable";
 }
 
 export function agentControlSetupErrorMessage(error: unknown): string {

@@ -14023,23 +14023,26 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
     }),
   );
 
-  it.effect("keeps runtime timeout, interrupt, and defect failures receiptless", () =>
+  it.effect("keeps runtime capability, timeout, interrupt, and defect failures receiptless", () =>
     Effect.gen(function* () {
       const policy = yield* AgentControlPolicyService;
-      for (const failureKind of ["timeout", "interrupt", "defect"] as const) {
+      for (const failureKind of ["capability", "timeout", "interrupt", "defect"] as const) {
         const seeded = yield* seedCoordinatorReservation(`runtime-${failureKind}`);
         const baseline = yield* policy.preflightRuntime({ projectId: seeded.projectId });
         const unavailable = {
           ...baseline,
           ok: false,
           roles: baseline.roles.map((role) =>
-            role.role === "planner"
+            role.role === (failureKind === "capability" ? "verifier" : "planner")
               ? {
                   ...role,
                   candidates: role.candidates.map((candidate) => ({
                     ...candidate,
                     runtimeReady: false,
-                    errorCode: "provider-probe-timeout" as const,
+                    errorCode:
+                      failureKind === "capability"
+                        ? ("verification-checks-unavailable" as const)
+                        : ("provider-probe-timeout" as const),
                   })),
                   selectedCandidateIndex: null,
                   errorCode: "role-runtime-unresolved" as const,
@@ -14048,7 +14051,7 @@ coordinatorLayer("Controlled thread materialization coordinator", (it) => {
           ),
         };
         const failedPreflight =
-          failureKind === "timeout"
+          failureKind === "timeout" || failureKind === "capability"
             ? Effect.succeed(unavailable)
             : failureKind === "interrupt"
               ? Effect.interrupt

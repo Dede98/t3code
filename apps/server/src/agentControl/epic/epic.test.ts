@@ -4,9 +4,12 @@ import {
   AgentControlTaskId,
   CommandId,
   ProjectId,
+  ProviderInstanceId,
+  ProviderDriverKind,
   type AgentControlEpicRuntimeView,
   type AgentControlEpicSource,
   type AgentControlProjectState,
+  type AgentControlPreflightRuntimeResult,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -20,6 +23,7 @@ import { GithubIssueTrackerClient } from "../github/Services/GithubIssueTrackerC
 import { AgentControlGithubStateRepository } from "../github/Services/AgentControlGithubStateRepository.ts";
 import { createDefaultGithubIntakeState } from "../github/projector.ts";
 import { AgentControlEngine } from "../Services/AgentControlEngine.ts";
+import { AgentControlPolicyService } from "../AgentControlPolicyService.ts";
 import { selectAgentControlRunOnceCandidate } from "../runOnce/selection.ts";
 import {
   bindEpicChildRun,
@@ -415,9 +419,21 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
     inspectEpic: () => Effect.sync(() => currentSource),
   });
   const attempts: number[] = [];
+  let runtime: AgentControlPreflightRuntimeResult = {
+    ok: true,
+    staticPreflight: { ok: true, roles: [] },
+    roles: [],
+  };
   const make = () =>
     makeAgentControlEpic.pipe(
       Effect.provideService(AgentControlEngine, engine),
+      Effect.provideService(AgentControlPolicyService, {
+        getPolicy: () => Effect.die("unexpected getPolicy"),
+        setProjectPolicy: () => Effect.die("unexpected setProjectPolicy"),
+        clearProjectPolicy: () => Effect.die("unexpected clearProjectPolicy"),
+        preflightPolicy: () => Effect.die("unexpected preflightPolicy"),
+        preflightRuntime: () => Effect.sync(() => runtime),
+      }),
       Effect.provideService(AgentControlGithubStateRepository, github),
       Effect.provideService(GithubIssueTrackerClient, client),
       Effect.provideService(AgentControlEpicResultHooks, {
@@ -445,6 +461,9 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
     sql,
     make,
     attempts,
+    setRuntime: (next: AgentControlPreflightRuntimeResult) => {
+      runtime = next;
+    },
     setSource: (next: AgentControlEpicSource) => {
       currentSource = next;
     },
@@ -455,6 +474,70 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
 });
 
 describe("Epic service lifecycle", () => {
+  it.effect(
+    "blocks Epic start before any child or turn when required verification is unsupported",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        f.setRuntime({
+          ok: false,
+          staticPreflight: { ok: true, roles: [] },
+          roles: [
+            {
+              role: "verifier",
+              accessMode: "restricted",
+              strict: true,
+              selectedCandidateIndex: null,
+              errorCode: "role-runtime-unresolved",
+              candidates: [
+                {
+                  candidateIndex: 0,
+                  source: "role-route",
+                  providerInstanceId: ProviderInstanceId.make("codex"),
+                  model: "test",
+                  driverKind: ProviderDriverKind.make("codex"),
+                  providerStatus: "ready",
+                  authStatus: "authenticated",
+                  checkedAt: at,
+                  runtimeReady: false,
+                  errorCode: "verification-checks-unavailable",
+                  verificationCheckError: {
+                    checkId: "required",
+                    message: "Loopback isolation is unavailable.",
+                  },
+                },
+              ],
+            },
+          ],
+        });
+        const service = yield* f.make();
+        const preview = yield* service.preview({ projectId, epicNumber: 10 });
+        assert.isFalse(preview.canStart);
+        assert.deepEqual(preview.blockers, [
+          {
+            code: "verification-checks-unavailable",
+            issueNumber: null,
+            message: "Check required: Loopback isolation is unavailable.",
+          },
+        ]);
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              service.start({
+                projectId,
+                commandId: CommandId.make("unsupported-epic"),
+                expectedRevision: 1,
+                epicNumber: 10,
+                expectedFingerprint: source.fingerprint,
+              }),
+            ),
+          ),
+        );
+        assert.deepEqual(yield* f.sql`SELECT epic_run_id FROM agent_control_epic_runs`, []);
+        assert.deepEqual(f.attempts, []);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
   it.effect("shows a blocker when selected work loses approval before Run Once admits it", () =>
     Effect.gen(function* () {
       const f = yield* fixture();

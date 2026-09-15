@@ -25,6 +25,7 @@ import {
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   agentControlPreflightErrorMessage,
+  agentControlPreflightCandidateMessage,
   agentControlSetupPermissionBlocker,
 } from "@t3tools/client-runtime/state/agent-control-setup";
 import {
@@ -72,7 +73,7 @@ function PreflightDetails({ preflight }: { preflight: AgentControlPreflightRunti
                 {candidate.providerInstanceId} / {candidate.model}
                 {candidate.candidateIndex === role.selectedCandidateIndex ? " · Selected" : ""}
                 {candidate.errorCode
-                  ? ` · ${agentControlPreflightErrorMessage(candidate.errorCode)}`
+                  ? ` · ${agentControlPreflightCandidateMessage(candidate)}`
                   : ""}
               </div>
             ))}
@@ -574,6 +575,9 @@ function AgentControlProjectPanelContent({
                   {check.id}
                   {check.required ? " (required)" : ""}:{" "}
                   <code>{[check.command, ...check.args].join(" ")}</code> · {check.cwd}
+                  {check.networkAccess === "loopback"
+                    ? " · Local HTTP allowed"
+                    : " · Network blocked"}
                 </li>
               ))}
             </ul>

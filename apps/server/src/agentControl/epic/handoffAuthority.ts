@@ -17,6 +17,7 @@ import { AgentControlWorktreeStateRepository } from "../worktree/Services/AgentC
 import {
   assessVerificationChecks,
   VERIFICATION_CODE_SNAPSHOT_PREFIX,
+  rawVerificationCodeDigest,
 } from "../verificationTurn/checkEvidence.ts";
 import { epicDigest, epicError, epicJson } from "./authority.ts";
 import { sha256Utf8 } from "../initialPlanning/eventEvidence.ts";
@@ -205,7 +206,10 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
           checksJson: string;
           codeDigest: string;
         }>`SELECT checks_json AS "checksJson",code_digest AS "codeDigest" FROM agent_control_verification_check_manifests WHERE provider_delivery_id=${row.deliveryId}`;
-        if (childManifest.length !== 1 || childManifest[0]!.codeDigest !== row.codeDigest)
+        if (
+          childManifest.length !== 1 ||
+          rawVerificationCodeDigest(childManifest[0]!.codeDigest) !== row.codeDigest
+        )
           return yield* invalid(
             "The accepted capture no longer matches its child verification code digest.",
           );
@@ -250,7 +254,9 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
       }>`SELECT manifest_digest AS "manifestDigest", code_digest AS "codeDigest", checks_json AS "checksJson" FROM agent_control_verification_check_manifests WHERE provider_delivery_id=${final.evidenceId}`;
       if (
         manifests.length !== 1 ||
-        !manifests[0]!.codeDigest.startsWith(VERIFICATION_CODE_SNAPSHOT_PREFIX) ||
+        !rawVerificationCodeDigest(manifests[0]!.codeDigest).startsWith(
+          VERIFICATION_CODE_SNAPSHOT_PREFIX,
+        ) ||
         (final.manifestDigest !== undefined &&
           manifests[0]!.manifestDigest !== final.manifestDigest) ||
         manifests[0]!.checksJson !== epicJson(state.checks)

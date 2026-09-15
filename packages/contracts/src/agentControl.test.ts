@@ -173,6 +173,28 @@ describe("Agent Control policy contracts", () => {
     });
 
     expect(result.roles[0]?.candidates[0]?.errorCode).toBe("provider-not-ready");
+    const verificationCheckError = {
+      checkId: "http-tests",
+      message: "Loopback unavailable on Linux",
+    };
+    const capabilityResult = decodeRuntimeResult({
+      ...result,
+      roles: [
+        {
+          ...result.roles[0],
+          candidates: [
+            {
+              ...result.roles[0]?.candidates[0],
+              errorCode: "verification-checks-unavailable",
+              verificationCheckError,
+            },
+          ],
+        },
+      ],
+    });
+    expect(capabilityResult.roles[0]?.candidates[0]?.verificationCheckError).toEqual(
+      verificationCheckError,
+    );
     expect(() =>
       decodeRuntimeResult({
         ...result,
@@ -250,10 +272,16 @@ describe("controller verification manifest", () => {
     { timeoutMs: 0 },
     { id: "git-diff" },
     { resultFormat: "shell" },
+    { networkAccess: true },
+    { networkAccess: "all" },
   ])("rejects unbounded or escaping check definitions: %j", (override) => {
     expect(() =>
       decodeProjectPolicy({ verificationChecks: [{ ...check, ...override }] }),
     ).toThrow();
+  });
+  it.each(["none", "loopback"])("round-trips explicit network access %s", (networkAccess) => {
+    const policy = { verificationChecks: [{ ...check, networkAccess }] };
+    expect(decodeProjectPolicy(policy)).toEqual(policy);
   });
   it("rejects duplicate IDs", () => {
     expect(() => decodeProjectPolicy({ verificationChecks: [check, check] })).toThrow();

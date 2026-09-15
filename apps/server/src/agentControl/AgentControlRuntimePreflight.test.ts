@@ -33,6 +33,7 @@ import {
   AGENT_CONTROL_RUNTIME_PROBE_TIMEOUT_MS,
   AgentControlPolicyService,
   AgentControlPolicyServiceLive,
+  AgentControlVerificationCapabilityProbe,
 } from "./AgentControlPolicyService.ts";
 
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
@@ -161,6 +162,11 @@ function makeRuntimeLayer(
     readonly unavailable?: ReadonlyArray<ServerProvider>;
     readonly appPolicy?: AgentControlAppPolicy;
     readonly baseline?: ModelSelection;
+    readonly verificationProbe?: Pick<
+      typeof AgentControlVerificationCapabilityProbe.Service,
+      "probe"
+    >;
+    readonly inspectionProbe?: typeof AgentControlVerificationCapabilityProbe.Service.inspection;
   } = {},
 ) {
   const listedInstances = options.listedInstances ?? [
@@ -196,6 +202,15 @@ function makeRuntimeLayer(
     Layer.provideMerge(repositoryLayer),
     Layer.provide(settingsLayer),
     Layer.provide(providerLayer),
+    Layer.provide(
+      Layer.succeed(AgentControlVerificationCapabilityProbe, {
+        inspection:
+          options.inspectionProbe ?? (() => Effect.succeed({ supported: true, reason: null })),
+        ...(options.verificationProbe ?? {
+          probe: () => Effect.succeed({ supported: true, reason: null }),
+        }),
+      }),
+    ),
   );
 }
 
@@ -843,4 +858,210 @@ it.effect("runtime preflight never serializes provider messages or auth metadata
     assert.notInclude(serialized, "/private/provider");
     assert.notInclude(serialized, "example.invalid");
   }).pipe(Effect.provide(makeRuntimeLayer({ listedInstances: [instance] })));
+});
+
+const requiredHttpCheck = {
+  id: "http",
+  command: "node",
+  args: ["--test-isolation=none", "--test"],
+  cwd: ".",
+  required: true,
+  timeoutMs: 1000,
+  allowTemporaryFiles: true,
+  resultFormat: "exit-code" as const,
+  networkAccess: "loopback" as const,
+};
+
+it.effect("required unsupported HTTP checks block all roles before any provider turn", () => {
+  const probes: string[] = [];
+  return Effect.gen(function* () {
+    const projectId = ProjectId.make("runtime-check-capability");
+    yield* insertProject(projectId);
+    const service = yield* AgentControlPolicyService;
+    const result = yield* service.preflightRuntime({
+      projectId,
+      projectPolicy: { verificationChecks: [requiredHttpCheck] },
+    });
+    assert.isFalse(result.ok);
+    const verifier = roleResult(result, "verifier");
+    assert.isNull(verifier.selectedCandidateIndex);
+    assert.equal(verifier.candidates[0]?.errorCode, "verification-checks-unavailable");
+    assert.deepEqual(verifier.candidates[0]?.verificationCheckError, {
+      checkId: "http",
+      message: "Loopback isolation is unavailable on this platform.",
+    });
+    assert.deepEqual(probes, ["codex:loopback"]);
+    assert.isNotNull(roleResult(result, "planner").selectedCandidateIndex);
+  }).pipe(
+    Effect.provide(
+      makeRuntimeLayer({
+        verificationProbe: {
+          probe: (input) =>
+            Effect.sync(() => {
+              probes.push(`${input.driverKind}:${input.networkAccess}`);
+              return {
+                supported: false,
+                reason: "Loopback isolation is unavailable on this platform.",
+              };
+            }),
+        },
+      }),
+    ),
+  );
+});
+
+it.effect(
+  "verification capability filtering selects a supported fallback and keeps strict routes blocked",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("runtime-check-fallback");
+      yield* insertProject(projectId);
+      const service = yield* AgentControlPolicyService;
+      const policy = {
+        verificationChecks: [requiredHttpCheck],
+        roleRoutes: {
+          verifier: route([selection(FIRST_INSTANCE), selection(SECOND_INSTANCE)], {
+            strict: false,
+          }),
+        },
+      };
+      const result = yield* service.preflightRuntime({ projectId, projectPolicy: policy });
+      assert.isTrue(result.ok);
+      assert.equal(roleResult(result, "verifier").selectedCandidateIndex, 1);
+      assert.equal(
+        roleResult(result, "verifier").candidates[0]?.errorCode,
+        "verification-checks-unavailable",
+      );
+      const strict = yield* service.preflightRuntime({
+        projectId,
+        projectPolicy: {
+          ...policy,
+          roleRoutes: { verifier: route([selection(FIRST_INSTANCE)]) },
+        },
+      });
+      assert.isFalse(strict.ok);
+      assert.isNull(roleResult(strict, "verifier").selectedCandidateIndex);
+    }).pipe(
+      Effect.provide(
+        makeRuntimeLayer({
+          listedInstances: [
+            providerInstance({ instanceId: BASE_INSTANCE }),
+            providerInstance({ instanceId: FIRST_INSTANCE, driverKind: CLAUDE_DRIVER }),
+            providerInstance({ instanceId: SECOND_INSTANCE }),
+          ],
+          verificationProbe: {
+            probe: ({ driverKind }) =>
+              Effect.succeed({
+                supported: driverKind === "codex",
+                reason: "Only Codex provides the required verification sandbox.",
+              }),
+          },
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "default checks require the network-free capability, optional checks do not block",
+  () => {
+    const networks: string[] = [];
+    return Effect.gen(function* () {
+      const projectId = ProjectId.make("runtime-check-default");
+      yield* insertProject(projectId);
+      const service = yield* AgentControlPolicyService;
+      const { networkAccess: _, ...offlineCheck } = requiredHttpCheck;
+      const offline = yield* service.preflightRuntime({
+        projectId,
+        projectPolicy: {
+          verificationChecks: [
+            offlineCheck,
+            { ...requiredHttpCheck, id: "optional-http", required: false },
+          ],
+        },
+      });
+      assert.isTrue(offline.ok);
+      assert.deepEqual(networks, ["none"]);
+      const optional = yield* service.preflightRuntime({
+        projectId,
+        projectPolicy: {
+          verificationChecks: [{ ...requiredHttpCheck, required: false }],
+        },
+      });
+      assert.isTrue(optional.ok);
+      assert.deepEqual(networks, ["none"]);
+    }).pipe(
+      Effect.provide(
+        makeRuntimeLayer({
+          verificationProbe: {
+            probe: ({ networkAccess }) =>
+              Effect.sync(() => {
+                networks.push(networkAccess);
+                return { supported: networkAccess === "none", reason: "Loopback unavailable." };
+              }),
+          },
+        }),
+      ),
+    );
+  },
+);
+
+it.effect(
+  "an unsupported complete inspection blocks before Planning with its reserved check ID",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("runtime-inspection-capability");
+      yield* insertProject(projectId);
+      const result = yield* (yield* AgentControlPolicyService).preflightRuntime({ projectId });
+      assert.isFalse(result.ok);
+      assert.deepEqual(roleResult(result, "verifier").candidates[0]?.verificationCheckError, {
+        checkId: "git-diff",
+        message: "Safe descriptor-based inspection is unavailable.",
+      });
+    }).pipe(
+      Effect.provide(
+        makeRuntimeLayer({
+          inspectionProbe: () =>
+            Effect.succeed({
+              supported: false,
+              reason: "Safe descriptor-based inspection is unavailable.",
+            }),
+        }),
+      ),
+    ),
+);
+
+it.effect.each([
+  { command: "npm", args: ["test"] },
+  { command: "node", args: ["--test"] },
+])("an incompatible local HTTP runner blocks before any execution: %j", (runner) => {
+  let probes = 0;
+  return Effect.gen(function* () {
+    const projectId = ProjectId.make("runtime-incompatible-loopback-runner");
+    yield* insertProject(projectId);
+    const result = yield* (yield* AgentControlPolicyService).preflightRuntime({
+      projectId,
+      projectPolicy: { verificationChecks: [{ ...requiredHttpCheck, ...runner }] },
+    });
+    assert.isFalse(result.ok);
+    assert.equal(
+      roleResult(result, "verifier").candidates[0]?.verificationCheckError?.checkId,
+      "http",
+    );
+    assert.isNotEmpty(
+      roleResult(result, "verifier").candidates[0]?.verificationCheckError?.message ?? "",
+    );
+    assert.equal(probes, 0);
+  }).pipe(
+    Effect.provide(
+      makeRuntimeLayer({
+        verificationProbe: {
+          probe: () =>
+            Effect.sync(() => {
+              probes += 1;
+              return { supported: true, reason: null };
+            }),
+        },
+      }),
+    ),
+  );
 });

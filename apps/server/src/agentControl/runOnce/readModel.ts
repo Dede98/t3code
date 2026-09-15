@@ -1,3 +1,5 @@
+import { VERIFICATION_INSPECTION_DISPLAY } from "../../provider/VerificationInspection.ts";
+import { verificationInspectionBase } from "../verificationTurn/checkEvidence.ts";
 import { loadEpicQueue } from "../epic/queueAuthority.ts";
 import { loadEpicRun, loadSelectedEpic } from "../epic/authority.ts";
 import {
@@ -213,14 +215,24 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
               WHERE evaluation.project_id = ${input.projectId} AND evaluation.task_id = ${state.taskId}
                 AND evaluation.stage_run_id = ${stage.stageRunId} AND evaluation.provider_delivery_id = ${handoff.providerDeliveryId}
             `;
-                const manifests = yield* sql<{ checksJson: string; manifestDigest: string }>`
-              SELECT checks_json AS "checksJson", manifest_digest AS "manifestDigest"
+                const manifests = yield* sql<{
+                  checksJson: string;
+                  manifestDigest: string;
+                  codeDigest: string;
+                }>`
+              SELECT checks_json AS "checksJson", manifest_digest AS "manifestDigest", code_digest AS "codeDigest"
               FROM main.agent_control_verification_check_manifests WHERE provider_delivery_id = ${handoff.providerDeliveryId}
                 AND handoff_id = ${handoff.handoffId}
             `;
                 const checks = manifests[0] ? yield* decodeChecks(manifests[0].checksJson) : [];
                 const checkViews = [];
-                for (const check of checks) {
+                const displayedChecks = [
+                  ...checks,
+                  ...(manifests[0] && verificationInspectionBase(manifests[0].codeDigest)
+                    ? [VERIFICATION_INSPECTION_DISPLAY]
+                    : []),
+                ];
+                for (const check of displayedChecks) {
                   const evidence = yield* sql<{
                     status: "passed" | "failed" | "unavailable" | "stale" | null;
                     resultJson: string | null;

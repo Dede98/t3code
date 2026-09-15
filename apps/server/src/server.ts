@@ -819,6 +819,7 @@ const AgentControlRunOnceControllerServiceLayerLive = AgentControlRunOnceControl
 );
 
 const AgentControlEpicServiceLive = AgentControlEpicLive.pipe(
+  Layer.provide(AgentControlPolicyLayerLive),
   Layer.provide(
     Layer.effect(EpicHandoffEvidence, makeEpicHandoffEvidence).pipe(
       Layer.provide(AgentControlRuntimeServicesLayerLive),

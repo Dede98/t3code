@@ -2,7 +2,6 @@ import { AgentControlRunOnceReadNotifications } from "../runOnce/readNotificatio
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
-import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
@@ -14,6 +13,11 @@ import { isSqlError } from "effect/unstable/sql/SqlError";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import { canonicalJson, sha256Utf8 } from "../initialPlanning/eventEvidence.ts";
 import type { ProviderAdmissionPermit } from "../providerAdmission/model.ts";
+import {
+  verificationFilePath,
+  openVerificationFile,
+  VERIFICATION_INSPECTIONS,
+} from "../../provider/VerificationInspection.ts";
 import { classifyVerificationCheckResult } from "../../provider/CodexVerificationChecks.ts";
 
 const decodeChecks = Schema.decodeUnknownEffect(AgentControlVerificationChecks);
@@ -35,11 +39,16 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
   if (depth > 32) throw failure("Verification submodule nesting exceeds the snapshot limit.");
   const git = async (args: string[]) =>
     (
-      await exec("git", ["--no-optional-locks", ...args], {
+      await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", ...args], {
         cwd,
         encoding: "buffer",
         maxBuffer: 32 * 1024 * 1024,
-        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+        env: {
+          ...process.env,
+          GIT_OPTIONAL_LOCKS: "0",
+          GIT_NO_REPLACE_OBJECTS: "1",
+          GIT_NO_LAZY_FETCH: "1",
+        },
       })
     ).stdout;
   const hash = NodeCrypto.createHash("sha256");
@@ -49,9 +58,9 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
     hash.update(value);
   };
   const addFile = async (path: string, size: number) => {
-    const file = await NodeFSP.open(
-      path,
-      NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW | NodeFS.constants.O_NONBLOCK,
+    const file = await openVerificationFile(
+      await NodeFSP.realpath(cwd),
+      NodePath.relative(cwd, path),
     );
     try {
       if (!(await file.stat()).isFile())
@@ -64,30 +73,23 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
     }
   };
   add(await git(["rev-parse", "HEAD"]));
-  add(
-    await git([
-      "diff",
-      "HEAD",
-      "--binary",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--ignore-submodules=none",
-    ]),
-  );
   const others = (await git(["ls-files", "--others", "--exclude-standard", "-z"]))
     .toString("utf8")
     .split("\0")
     .filter(Boolean)
     .sort();
   for (const name of others) {
-    const path = NodePath.join(cwd, name);
+    const path = await verificationFilePath(cwd, name);
     const stat = await NodeFSP.lstat(path);
     add(name);
     add(String(stat.mode));
     if (stat.isSymbolicLink()) add(await NodeFSP.readlink(path));
     else await addFile(path, stat.size);
   }
-  const tracked = (await git(["ls-files", "--stage", "-z"]))
+  const tracked = Buffer.concat([
+    await git(["ls-files", "--stage", "-z"]),
+    await git(["ls-tree", "-rz", "HEAD"]),
+  ])
     .toString("utf8")
     .split("\0")
     .filter(Boolean)
@@ -97,7 +99,7 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
   for (const entry of tracked) {
     if (entry.startsWith("160000 ")) continue;
     const name = entry.slice(entry.indexOf("\t") + 1);
-    const path = NodePath.join(cwd, name);
+    const path = await verificationFilePath(cwd, name);
     const stat = await NodeFSP.lstat(path).catch((cause: NodeJS.ErrnoException) => {
       if (cause.code === "ENOENT" || cause.code === "ENOTDIR") return null;
       throw cause;
@@ -116,8 +118,14 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
   const gitlinks = tracked.filter((entry) => entry.startsWith("160000 "));
   for (const entry of gitlinks) {
     const name = entry.slice(entry.indexOf("\t") + 1);
-    const path = NodePath.join(cwd, name);
+    const path = await verificationFilePath(cwd, name);
     add(name);
+    const moduleStat = await NodeFSP.lstat(path).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code === "ENOENT") return null;
+      throw cause;
+    });
+    if (moduleStat && (!moduleStat.isDirectory() || moduleStat.isSymbolicLink()))
+      throw failure("Unsafe verification submodule root");
     // The superproject records only a commit plus a dirty flag. Bind the
     // actual submodule files so two different dirty trees cannot share proof.
     const initialized = await NodeFSP.lstat(NodePath.join(path, ".git")).then(
@@ -133,12 +141,32 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
 };
 // Legacy digests did not bind raw tracked bytes. Equality deliberately invalidates
 // in-flight legacy proofs; persisted historical evidence is never rewritten.
-export const VERIFICATION_CODE_SNAPSHOT_PREFIX = "raw-v2:";
+export const VERIFICATION_CODE_SNAPSHOT_PREFIX = "raw-v3:";
 export const snapshotVerificationCode = (cwd: string) =>
   Effect.tryPromise({
     try: async () => VERIFICATION_CODE_SNAPSHOT_PREFIX + (await readVerificationSnapshot(cwd)),
     catch: failure,
   });
+
+/** A versioned digest also binds the immutable review base without changing historical rows. */
+export const bindVerificationInspectionDigest = (base: string, digest: string) => {
+  if (!/^[a-f0-9]{40,64}$/.test(base)) throw failure("Invalid verification inspection base");
+  return `review-v1:${base}:${digest}`;
+};
+export const rawVerificationCodeDigest = (digest: string) =>
+  digest.replace(/^review-v1:[a-f0-9]{40,64}:/, "");
+export const verificationInspectionBase = (digest: string) =>
+  /^review-v1:([a-f0-9]{40,64}):/.exec(digest)?.[1];
+export const snapshotVerificationManifestCode = (
+  manifest: Pick<VerificationCheckManifest, "worktreePath" | "codeDigest">,
+) =>
+  snapshotVerificationCode(manifest.worktreePath).pipe(
+    Effect.map((digest) => {
+      const base = verificationInspectionBase(manifest.codeDigest);
+      return base ? bindVerificationInspectionDigest(base, digest) : digest;
+    }),
+  );
+const inspectionCheck = { id: "git-diff", required: true, resultFormat: "exit-code" as const };
 
 export interface VerificationCheckClaim {
   readonly evidence: {
@@ -180,6 +208,7 @@ export const prepareVerificationCheckManifest = Effect.fn("prepareVerificationCh
       readonly permit: ProviderAdmissionPermit;
       readonly cwd: string;
       readonly checks?: AgentControlVerificationChecks;
+      readonly inspectionBase?: string;
     },
   ) {
     const existing = yield* loadManifest(sql, input.permit.providerDeliveryId);
@@ -203,7 +232,12 @@ export const prepareVerificationCheckManifest = Effect.fn("prepareVerificationCh
       handoffId: input.permit.handoffId,
       fenceToken: input.permit.stageFenceToken,
       worktreePath: input.cwd,
-      codeDigest: yield* snapshotVerificationCode(input.cwd),
+      codeDigest: input.inspectionBase
+        ? bindVerificationInspectionDigest(
+            input.inspectionBase,
+            yield* snapshotVerificationCode(input.cwd),
+          )
+        : yield* snapshotVerificationCode(input.cwd),
       checksJson: canonicalJson(checks),
     };
     const digest = manifestDigest(manifest);
@@ -256,7 +290,11 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
 ) {
   const { manifest } = input;
   const checks = yield* decodeChecksJson(manifest.checksJson);
-  const check = checks.find((candidate) => candidate.id === input.checkId);
+  const check =
+    VERIFICATION_INSPECTIONS.some((id) => id === input.checkId) &&
+    verificationInspectionBase(manifest.codeDigest)
+      ? { ...inspectionCheck, id: input.checkId }
+      : checks.find((candidate) => candidate.id === input.checkId);
   if (!check) return yield* Effect.fail(failure("Unknown project check"));
   yield* input.authorize.pipe(Effect.mapError(failure));
   const prior =
@@ -269,7 +307,7 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
       sha256Utf8(prior[0].resultJson) !== prior[0].resultDigest
     )
       return unavailableResult("Verification check evidence belongs to another execution.");
-    const current = yield* snapshotVerificationCode(manifest.worktreePath).pipe(
+    const current = yield* snapshotVerificationManifestCode(manifest).pipe(
       Effect.catch(() => Effect.succeed(null)),
     );
     if (prior[0].status === "stale" || current !== manifest.codeDigest)
@@ -288,7 +326,7 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
     );
   const readNotifications = yield* AgentControlRunOnceReadNotifications;
   yield* readNotifications.publish(manifest.handoffId);
-  const before = yield* snapshotVerificationCode(manifest.worktreePath).pipe(
+  const before = yield* snapshotVerificationManifestCode(manifest).pipe(
     Effect.catch(() => Effect.succeed(null)),
   );
   const result =
@@ -300,7 +338,7 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
             Effect.succeed(unavailableResult("Verification check could not execute.")),
           ),
         );
-  const after = yield* snapshotVerificationCode(manifest.worktreePath).pipe(
+  const after = yield* snapshotVerificationManifestCode(manifest).pipe(
     Effect.catch(() => Effect.succeed(null)),
   );
   const authorized = yield* input.authorize.pipe(
@@ -358,8 +396,11 @@ export const assessVerificationChecks = Effect.fn("assessVerificationChecks")(fu
   )
     return { code: "verification-checks-stale" as const, digest };
   const checks = yield* decodeChecksJson(manifest.checksJson);
-  const required = checks.filter((check) => check.required);
-  if (!required.length) code = "verification-checks-missing";
+  const required = [
+    ...checks.filter((check) => check.required),
+    ...(verificationInspectionBase(manifest.codeDigest) ? [inspectionCheck] : []),
+  ];
+  if (!checks.some((check) => check.required)) code = "verification-checks-missing";
   for (const check of required) {
     const result = results.find((item) => item.checkId === check.id);
     if (!result) {
@@ -385,7 +426,7 @@ export const assessVerificationChecks = Effect.fn("assessVerificationChecks")(fu
       code ??= "verification-checks-failed";
   }
   if (options.checkCurrentCode !== false) {
-    const current = yield* snapshotVerificationCode(manifest.worktreePath).pipe(
+    const current = yield* snapshotVerificationManifestCode(manifest).pipe(
       Effect.catch(() => Effect.succeed(null)),
     );
     if (current !== manifest.codeDigest) code = "verification-checks-stale";

@@ -11,6 +11,7 @@ import {
 import {
   agentControlSetupErrorMessage,
   agentControlPreflightErrorMessage,
+  agentControlPreflightCandidateMessage,
   type createAgentControlSetupController,
 } from "@t3tools/client-runtime/state/agent-control-setup";
 import { useState, useSyncExternalStore } from "react";
@@ -265,6 +266,18 @@ function CheckEditor({
         onChange={(allowTemporaryFiles) => onChange({ ...check, allowTemporaryFiles })}
         disabled={disabled}
       />
+      <Toggle
+        label="Allow local HTTP on the assigned loopback port"
+        value={check.networkAccess === "loopback"}
+        onChange={(allowed) => onChange({ ...check, networkAccess: allowed ? "loopback" : "none" })}
+        disabled={disabled}
+      />
+      <Text className="text-xs text-foreground-muted">
+        Network is blocked by default. Local HTTP test servers listen on the provided
+        T3_VERIFICATION_LISTEN_FD socket; requests use T3_VERIFICATION_URL. Run Node tests directly
+        with --test-isolation=none; subprocesses and package runners are unavailable. External
+        connections remain blocked. Provider readiness checks this environment's support.
+      </Text>
       <Text className="text-xs text-foreground-muted">Result format</Text>
       <View className="flex-row flex-wrap gap-2">
         {(["exit-code", "node-test", "vitest-json"] as const).map((format) => (
@@ -737,7 +750,7 @@ export function AutonomousProjectSetupForm({
                             .filter((candidate) => candidate.errorCode)
                             .map(
                               (candidate) =>
-                                `${role.role} · ${candidate.providerInstanceId} / ${candidate.model}: ${agentControlPreflightErrorMessage(candidate.errorCode!)}`,
+                                `${role.role} · ${candidate.providerInstanceId} / ${candidate.model}: ${agentControlPreflightCandidateMessage(candidate)}`,
                             ),
                         ),
                         ...(state.preflight.staticPreflight.ok

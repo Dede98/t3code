@@ -51,6 +51,8 @@ import {
   verificationCheckParams,
   verificationToolFailure,
 } from "../CodexVerificationChecks.ts";
+import { inspectVerificationChanges, VERIFICATION_INSPECTIONS } from "../VerificationInspection.ts";
+import { runVerificationSandboxCheck } from "../VerificationSandbox.ts";
 const decodeVerificationToolInput = Schema.decodeUnknownEffect(
   Schema.Struct({ check: Schema.String }),
   { onExcessProperty: "error" },
@@ -2030,6 +2032,8 @@ export const makeCodexSessionRuntime = (
         const check = authorization.execution.checks.find(
           (candidate) => candidate.id === args.check,
         );
+        if (!check && !VERIFICATION_INSPECTIONS.some((id) => id === args.check))
+          return verificationToolFailure("Verification check is not authorized.");
         const execute = Effect.scoped(
           Effect.gen(function* () {
             const temporaryDirectory = check?.allowTemporaryFiles
@@ -2041,6 +2045,29 @@ export const makeCodexSessionRuntime = (
                     Effect.promise(() => NodeFSP.rm(path, { recursive: true, force: true })),
                 )
               : undefined;
+            if (!check && VERIFICATION_INSPECTIONS.some((id) => id === args.check)) {
+              return yield* Effect.tryPromise(() =>
+                inspectVerificationChanges(
+                  options.cwd,
+                  authorization.execution.inspectionBase ?? "",
+                  args.check === "git-status"
+                    ? "git-status"
+                    : args.check === "git-diff-check"
+                      ? "git-diff-check"
+                      : "git-diff",
+                ),
+              );
+            }
+            if (check?.networkAccess === "loopback") {
+              return yield* Effect.tryPromise((signal) =>
+                runVerificationSandboxCheck({
+                  check,
+                  worktreePath: options.cwd,
+                  ...(temporaryDirectory ? { temporaryDirectory } : {}),
+                  signal,
+                }),
+              );
+            }
             const params = yield* verificationCheckParams(
               payload.arguments,
               options.cwd,
@@ -2070,9 +2097,7 @@ export const makeCodexSessionRuntime = (
             return yield* checkClient.request("command/exec", params);
           }),
         );
-        const result = check
-          ? yield* authorization.execution.runCheck(args.check, payload.turnId, execute)
-          : yield* execute;
+        const result = yield* authorization.execution.runCheck(args.check, payload.turnId, execute);
         return {
           success: result.exitCode === 0,
           contentItems: [

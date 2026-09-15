@@ -37,13 +37,14 @@ describe.skipIf(!enabled)("Epic final check executor with real Codex sandbox", (
     settings: ServerSettings,
     providerInstanceId = "codex",
     allowTemporaryFiles = false,
+    overrides: Partial<Pick<AgentControlVerificationCheck, "networkAccess" | "args">> = {},
   ) =>
     Effect.gen(function* () {
       const executor = yield* EpicCheckExecutor;
       return yield* executor.execute({
         cwd,
         providerInstanceId,
-        checks: [{ ...check, allowTemporaryFiles }],
+        checks: [{ ...check, allowTemporaryFiles, ...overrides }],
         checkId: check.id,
       });
     }).pipe(
@@ -128,6 +129,53 @@ describe.skipIf(!enabled)("Epic final check executor with real Codex sandbox", (
         );
         const result = yield* execute(decodeSettings({}), "codex", allowTemporaryFiles);
         expect(result.exitCode, result.stderr + result.stdout).toBe(0);
+        expect(NodeFS.readFileSync(NodePath.join(cwd, "protected.txt"), "utf8")).toBe(
+          "accepted common result",
+        );
+      }),
+  );
+
+  it.effect.each([false, true])(
+    "verifies native loopback HTTP with the shared executor and temporary fixtures enabled=%s",
+    (allowTemporaryFiles) =>
+      Effect.gen(function* () {
+        NodeFS.writeFileSync(
+          NodePath.join(cwd, "check.test.cjs"),
+          `
+      const fs = require('node:fs');
+      const http = require('node:http');
+      const assert = require('node:assert/strict');
+      const test = require('node:test');
+      test('accepted epic supports local HTTP without writable source', async () => {
+        assert.throws(() => fs.writeFileSync('protected.txt', 'changed'), /EPERM|EACCES/);
+        const fixture = require('node:path').join(require('node:os').tmpdir(), 'epic-http-fixture');
+        ${allowTemporaryFiles ? "fs.writeFileSync(fixture, 'private fixture'); assert.equal(fs.readFileSync(fixture, 'utf8'), 'private fixture');" : "assert.throws(() => fs.writeFileSync(fixture, 'unapproved'), /EPERM|EACCES/);"}
+        const server = http.createServer((request, response) => response.end('accepted common result'));
+        await new Promise((resolve, reject) => {
+          server.once('error', reject);
+          server.listen({ fd: Number(process.env.T3_VERIFICATION_LISTEN_FD) }, resolve);
+        });
+        try {
+          const address = server.address();
+          assert.equal(address.address, '127.0.0.1');
+          assert.equal(address.port, Number(process.env.T3_VERIFICATION_PORT));
+          const response = await fetch(process.env.T3_VERIFICATION_URL);
+          assert.equal(response.status, 200);
+          assert.equal(await response.text(), 'accepted common result');
+        } finally {
+          server.closeAllConnections();
+          await new Promise(resolve => server.close(resolve));
+        }
+      });
+    `,
+        );
+        const result = yield* execute(decodeSettings({}), "codex", allowTemporaryFiles, {
+          networkAccess: "loopback",
+          args: ["--test", "--test-isolation=none", "--test-reporter=tap", "check.test.cjs"],
+        });
+        expect(result.exitCode, result.stderr + result.stdout).toBe(0);
+        expect(result.stdout).toMatch(/^# pass 1$/m);
+        expect(result.stdout).toMatch(/^# fail 0$/m);
         expect(NodeFS.readFileSync(NodePath.join(cwd, "protected.txt"), "utf8")).toBe(
           "accepted common result",
         );

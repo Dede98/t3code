@@ -1,3 +1,4 @@
+import { AgentControlPolicyService } from "../../AgentControlPolicyService.ts";
 import { makeEpicQueue, mapEpicQueueError } from "../queue.ts";
 import { loadEnabledEpicQueue } from "../queueAuthority.ts";
 import { GithubIssueTrackerClientError } from "../../github/Services/GithubIssueTrackerClient.ts";
@@ -56,6 +57,7 @@ export const makeAgentControlEpic = Effect.gen(function* () {
   const client = yield* GithubIssueTrackerClient;
   const github = yield* AgentControlGithubStateRepository;
   const engine = yield* AgentControlEngine;
+  const policyService = yield* AgentControlPolicyService;
   const results = yield* AgentControlEpicResultHooks;
   const notifications = yield* AgentControlRunOnceReadNotifications;
   const changes = yield* PubSub.unbounded<ProjectId>();
@@ -171,6 +173,35 @@ export const makeAgentControlEpic = Effect.gen(function* () {
         issueNumber: null,
         message: "Configure at least one required verification check before starting an Epic.",
       });
+    const runtime = yield* policyService.preflightRuntime({ projectId: input.projectId });
+    if (!runtime.ok) {
+      const failures = runtime.roles.flatMap((role) =>
+        role.selectedCandidateIndex === null
+          ? role.candidates.flatMap((candidate) =>
+              candidate.verificationCheckError
+                ? [
+                    {
+                      code: "verification-checks-unavailable",
+                      issueNumber: null,
+                      message: `Check ${candidate.verificationCheckError.checkId}: ${candidate.verificationCheckError.message}`,
+                    },
+                  ]
+                : [],
+            )
+          : [],
+      );
+      blockers.push(
+        ...(failures.length
+          ? failures
+          : [
+              {
+                code: "runtime-policy-unavailable",
+                issueNumber: null,
+                message: "The configured providers are not ready for every required T3Auto role.",
+              },
+            ]),
+      );
+    }
     const fatal = new Set([
       "nested-sub-issues",
       "cross-repository",
@@ -178,6 +209,8 @@ export const makeAgentControlEpic = Effect.gen(function* () {
       "closed-epic",
       "intake-incomplete",
       "verification-checks-missing",
+      "verification-checks-unavailable",
+      "runtime-policy-unavailable",
       "epic-unavailable",
     ]);
     return {
@@ -676,13 +709,17 @@ export const makeAgentControlEpic = Effect.gen(function* () {
             const lastAccepted = state.members
               .toReversed()
               .find((member) => member.accepted?.commitSha === state!.acceptedCommitSha);
-            if (!lastAccepted || !state.acceptedCommitSha) {
+            const firstAccepted = state.members.find(
+              (member) =>
+                member.accepted && member.baseCommitSha === (state!.initialBase?.commitSha ?? null),
+            );
+            if (!firstAccepted || !lastAccepted || !state.acceptedCommitSha) {
               yield* block(state, [
                 {
                   code: "no-accepted-result",
                   issueNumber: null,
                   message:
-                    "All members were externally closed; T3 has no accepted result to verify.",
+                    "The original accepted member or final result is unavailable; T3 cannot verify the complete Epic.",
                 },
               ]);
               return;
@@ -694,6 +731,8 @@ export const makeAgentControlEpic = Effect.gen(function* () {
                 epicRunId: state.epicRunId,
                 projectId,
                 commitSha: state.acceptedCommitSha!,
+                initialBaseCommitSha: state.initialBase?.commitSha ?? null,
+                firstAccepted,
                 checks: state.checks,
                 lastAccepted,
                 attempt: state.verificationAttempt,

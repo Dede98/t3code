@@ -22,6 +22,8 @@ export interface AgentControlEpicVerifyInput {
   readonly epicRunId: string;
   readonly projectId: ProjectId;
   readonly commitSha: string;
+  readonly initialBaseCommitSha: string | null;
+  readonly firstAccepted: AgentControlEpicMemberView;
   readonly checks: AgentControlVerificationChecks;
   readonly lastAccepted: AgentControlEpicMemberView;
   /** A failed/incomplete attempt is retained; explicit resume creates a new identity. */

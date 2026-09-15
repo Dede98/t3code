@@ -10,11 +10,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as CodexSchema from "effect-codex-app-server/schema";
 
-const INSPECTIONS = {
-  "git-status": ["git", "--no-optional-locks", "status", "--short"],
-  "git-diff-check": ["git", "diff", "--no-ext-diff", "--no-textconv", "--check"],
-  "git-diff": ["git", "diff", "--no-ext-diff", "--no-textconv"],
-} as const;
+const INSPECTIONS = ["git-status", "git-diff-check", "git-diff"] as const;
 
 class VerificationCheckError extends Schema.TaggedError<VerificationCheckError>()(
   "VerificationCheckError",
@@ -31,10 +27,10 @@ export const createCodexVerificationTool = (checks: AgentControlVerificationChec
     type: "function" as const,
     name: "t3_verification_check",
     description:
-      "Run a preauthorized check in the controlled Verification worktree with no network. " +
+      "Run a preauthorized check in the controlled Verification worktree. Checks have no network unless explicitly configured for a sandboxed assigned loopback port. For loopback HTTP tests use T3_VERIFICATION_URL and start your server with server.listen({fd:Number(process.env.T3_VERIFICATION_LISTEN_FD)}); the controller prebinds this listener. Creating any other listener is forbidden. " +
       "The worktree is read-only; approved checks may write only to a controller-owned temporary directory. " +
-      `Project checks: ${JSON.stringify(checks.map(({ id, command, args, cwd, required }) => ({ id, command, args, cwd, required })))}. ` +
-      "Optional inspections: git-status, git-diff-check, git-diff. " +
+      `Project checks: ${JSON.stringify(checks.map(({ id, command, args, cwd, required, networkAccess }) => ({ id, command, args, cwd, required, networkAccess: networkAccess ?? "none" })))}. ` +
+      "Required inspection: git-diff (complete raw before/after changes against the fixed base, including staged and untracked files). Optional: git-status, git-diff-check. Incomplete, binary or oversized inspection is unavailable and cannot support acceptance. " +
       "Run every required project check yourself. Implementation reports are not verification evidence. " +
       "Use this tool instead of the shell. Report unavailable or failed checks; do not repair or escalate permissions.",
     inputSchema: {
@@ -42,7 +38,7 @@ export const createCodexVerificationTool = (checks: AgentControlVerificationChec
       properties: {
         check: {
           type: "string",
-          enum: [...checks.map((check) => check.id), ...Object.keys(INSPECTIONS)],
+          enum: [...checks.map((check) => check.id), ...INSPECTIONS],
         },
       },
       required: ["check"],
@@ -87,8 +83,7 @@ export const verificationCheckParams = Effect.fn("verificationCheckParams")(func
   const { check: id } = yield* decodeInput(args);
   const manifest = yield* decodeChecks(checks);
   const check = manifest.find((candidate) => candidate.id === id);
-  const inspection = Object.entries(INSPECTIONS).find(([key]) => key === id)?.[1];
-  if (!check && !inspection)
+  if (!check)
     return yield* new VerificationCheckError({ message: "Verification check is not authorized" });
   const paths = yield* Effect.tryPromise(async () => {
     const root = await NodeFSP.realpath(worktreePath);
@@ -111,7 +106,11 @@ export const verificationCheckParams = Effect.fn("verificationCheckParams")(func
     }
     return { cwd, temporary };
   });
-  const command = check ? [check.command, ...check.args] : inspection!;
+  if (check?.networkAccess === "loopback")
+    return yield* new VerificationCheckError({
+      message: "Loopback checks require the bounded local executor",
+    });
+  const command = [check.command, ...check.args];
   const timeoutMs = check?.timeoutMs ?? 60_000;
   if (paths.temporary) {
     return {
@@ -172,8 +171,20 @@ const decodeSuccessfulVitestReport = Schema.decodeUnknownOption(
 /** A nonzero exit alone cannot distinguish a broken runner from a failed assertion. */
 export const classifyVerificationCheckResult = (
   check: Pick<AgentControlVerificationCheck, "resultFormat">,
-  result: { readonly exitCode: number; readonly stdout: string; readonly stderr: string },
+  result: {
+    readonly exitCode: number;
+    readonly stdout: string;
+    readonly stderr: string;
+    readonly outputTruncated?: boolean;
+    readonly unavailableReason?: string | null;
+  },
 ): "passed" | "failed" | "unavailable" => {
+  if (
+    result.outputTruncated ||
+    result.unavailableReason ||
+    Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr) >= 32_768
+  )
+    return "unavailable";
   if (result.exitCode === 0) {
     if (check.resultFormat === "exit-code") return "passed";
     if (check.resultFormat === "node-test") {

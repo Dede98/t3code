@@ -90,6 +90,8 @@ export const AgentControlVerificationCheck = Schema.Struct({
   required: Schema.Boolean,
   timeoutMs: PositiveInt.check(Schema.isLessThanOrEqualTo(300_000)),
   allowTemporaryFiles: Schema.Boolean,
+  /** Missing means no network. Loopback grants only the assigned local test endpoint. */
+  networkAccess: Schema.optionalKey(Schema.Literals(["none", "loopback"])),
   resultFormat: Schema.Literals(["exit-code", "node-test", "vitest-json"]),
 });
 export type AgentControlVerificationCheck = typeof AgentControlVerificationCheck.Type;
@@ -235,6 +237,7 @@ export const AgentControlRuntimeErrorCode = Schema.Literals([
   "provider-unauthenticated",
   "provider-probe-timeout",
   "provider-probe-failed",
+  "verification-checks-unavailable",
   "model-unavailable",
   "driver-kind-mismatch",
   "provider-not-allowed",
@@ -251,6 +254,7 @@ export const AgentControlRuntimeCandidateErrorCode = Schema.Literals([
   "provider-unauthenticated",
   "provider-probe-timeout",
   "provider-probe-failed",
+  "verification-checks-unavailable",
   "model-unavailable",
   "driver-kind-mismatch",
   "provider-not-allowed",
@@ -284,6 +288,9 @@ export const AgentControlPreflightRuntimeCandidate = Schema.Struct({
   checkedAt: Schema.NullOr(IsoDateTime),
   runtimeReady: Schema.Boolean,
   errorCode: Schema.NullOr(AgentControlRuntimeCandidateErrorCode),
+  verificationCheckError: Schema.optionalKey(
+    Schema.Struct({ checkId: Schema.String, message: Schema.String }),
+  ),
 });
 export type AgentControlPreflightRuntimeCandidate =
   typeof AgentControlPreflightRuntimeCandidate.Type;

@@ -138,3 +138,29 @@ it.effect(
       assert.notEqual(second, yield* snapshotVerificationCode(parent));
     }).pipe(Effect.scoped),
 );
+
+it.effect(
+  "binds HEAD-tracked bytes even after removing the path from the index and ignoring it",
+  () =>
+    Effect.gen(function* () {
+      const cwd = yield* rawRepository;
+      yield* io(() => exec("git", ["rm", "--cached", "source.txt"], { cwd }));
+      yield* io(() =>
+        NodeFSP.writeFile(NodePath.join(cwd, ".gitignore"), "source.txt\nnode_modules/\n"),
+      );
+      const before = yield* snapshotVerificationCode(cwd);
+      const beforeDiff = yield* io(() => exec("git", ["diff", "HEAD"], { cwd }));
+      yield* io(() =>
+        NodeFSP.writeFile(NodePath.join(cwd, "source.txt"), "hidden raw modification\n"),
+      );
+      const afterDiff = yield* io(() => exec("git", ["diff", "HEAD"], { cwd }));
+      assert.equal(beforeDiff.stdout, afterDiff.stdout);
+      const modified = yield* snapshotVerificationCode(cwd);
+      assert.notEqual(before, modified);
+      yield* io(async () => {
+        await NodeFSP.mkdir(NodePath.join(cwd, "node_modules"));
+        await NodeFSP.writeFile(NodePath.join(cwd, "node_modules", "ignored.txt"), "dependency");
+      });
+      assert.equal(yield* snapshotVerificationCode(cwd), modified);
+    }).pipe(Effect.scoped),
+);

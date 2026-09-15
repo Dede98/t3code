@@ -239,24 +239,32 @@ const testWithRepo = <A, E>(
       }),
     );
   });
-const finalInput = (accepted: AgentControlEpicAcceptedResult): AgentControlEpicVerifyInput => ({
-  epicRunId: "epic-1",
-  projectId: ProjectId.make("project"),
-  commitSha: accepted.commitSha,
-  checks,
-  attempt: 1,
-  lastAccepted: {
+const finalInput = (
+  accepted: AgentControlEpicAcceptedResult,
+  initialBaseCommitSha: string | null,
+): AgentControlEpicVerifyInput => {
+  const member = {
     issueNodeId: "issue",
     issueNumber: 2,
     taskId: AgentControlTaskId.make("task"),
     childRunId: "child",
-    status: "accepted",
+    status: "accepted" as const,
     baseCommitSha: null,
     reservationId: "reservation",
     taskFinalizationEvidenceId: "task-proof",
     accepted,
-  },
-});
+  };
+  return {
+    epicRunId: "epic-1",
+    projectId: ProjectId.make("project"),
+    commitSha: accepted.commitSha,
+    initialBaseCommitSha,
+    firstAccepted: member,
+    lastAccepted: member,
+    checks,
+    attempt: 1,
+  };
+};
 
 const configureResultFilter = Effect.fn("configureResultFilter")(function* (
   repo: Repo,
@@ -441,7 +449,7 @@ describe("Epic accepted results and common verification", () => {
             }),
           );
           const accepted = yield* hooks.capture(captureInput);
-          const error = yield* hooks.verify(finalInput(accepted)).pipe(Effect.flip);
+          const error = yield* hooks.verify(finalInput(accepted, repo.base)).pipe(Effect.flip);
           expect(error.message).toContain("Git checkout would change the verified files");
           const sql = yield* SqlClient.SqlClient;
           expect(
@@ -628,7 +636,7 @@ else {
   it.effect(
     "propagates failed final manifest persistence and retries without duplicating checks",
     () =>
-      testWithRepo(() =>
+      testWithRepo((repo) =>
         Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
           let executions = 0;
@@ -643,13 +651,13 @@ else {
           );
           const accepted = yield* hooks.capture(captureInput);
           yield* sql`CREATE TRIGGER reject_final_manifest BEFORE INSERT ON agent_control_verification_check_manifests WHEN NEW.provider_delivery_id LIKE 'epic-final:%' BEGIN SELECT RAISE(ABORT,'manifest unavailable'); END`;
-          const error = yield* hooks.verify(finalInput(accepted)).pipe(Effect.flip);
+          const error = yield* hooks.verify(finalInput(accepted, repo.base)).pipe(Effect.flip);
           expect(error.code).toBe("epic-unavailable");
           expect(executions).toBe(0);
           yield* sql`DROP TRIGGER reject_final_manifest`;
-          const verified = yield* hooks.verify(finalInput(accepted));
+          const verified = yield* hooks.verify(finalInput(accepted, repo.base));
           expect(verified.status).toBe("passed");
-          expect(yield* hooks.verify(finalInput(accepted))).toEqual(verified);
+          expect(yield* hooks.verify(finalInput(accepted, repo.base))).toEqual(verified);
           expect(executions).toBe(1);
         }),
       ),
@@ -761,10 +769,82 @@ else {
     ),
   );
 
+  it.effect("reviews every child change against the initial Epic base in final verification", () =>
+    Effect.gen(function* () {
+      const original = yield* repository;
+      yield* io(() => NodeFSP.writeFile(NodePath.join(original.cwd, "source.txt"), "base\n"));
+      yield* io(() =>
+        NodeFSP.writeFile(NodePath.join(original.cwd, "earlier-child.txt"), "first child change\n"),
+      );
+      yield* git(original.cwd, ["add", "--all"]);
+      yield* git(original.cwd, [
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "first child",
+      ]);
+      const repo = { ...original, base: yield* git(original.cwd, ["rev-parse", "HEAD"]) };
+      yield* io(() =>
+        NodeFSP.writeFile(NodePath.join(repo.cwd, "source.txt"), "last child change\n"),
+      );
+      yield* session(
+        repo,
+        Effect.gen(function* () {
+          yield* initialize(repo);
+          const hooks = yield* makeEpicResults.pipe(
+            Effect.provideService(EpicCheckExecutor, {
+              execute: () => Effect.succeed(success),
+            }),
+            Effect.provide(
+              Layer.mock(AgentControlWorktreeController)({
+                useAcceptedWorktree: (input, callback) =>
+                  Effect.scoped(
+                    callback({
+                      ...reservation(repo),
+                      baseCommitSha:
+                        input.reservationId === "first-reservation" ? original.base : repo.base,
+                    }),
+                  ),
+              }),
+            ),
+          );
+          const accepted = yield* hooks.capture(captureInput);
+          for (const initialBaseCommitSha of [original.base, null]) {
+            const request = finalInput(accepted, initialBaseCommitSha);
+            const input = {
+              ...request,
+              attempt: initialBaseCommitSha === null ? 2 : 1,
+              firstAccepted: { ...request.firstAccepted, reservationId: "first-reservation" },
+            };
+            const final = yield* hooks.verify(input);
+            expect(final.status).toBe("passed");
+            expect(final.checks.find((check) => check.id === "git-diff")).toMatchObject({
+              status: "passed",
+              required: true,
+              output: expect.stringContaining("first child change"),
+            });
+            const sql = yield* SqlClient.SqlClient;
+            const rows = yield* sql<{
+              resultJson: string;
+            }>`SELECT result_json AS "resultJson" FROM agent_control_verification_check_results WHERE provider_delivery_id=${final.evidenceId} AND check_id='git-diff'`;
+            expect(rows).toHaveLength(1);
+            expect(rows[0]!.resultJson).toContain("first child change");
+            expect(rows[0]!.resultJson).toContain("last child change");
+            expect(rows[0]!.resultJson).toContain(original.base);
+            expect(yield* hooks.verify(input)).toEqual(final);
+          }
+        }),
+      );
+    }),
+  );
+
   it.effect(
     "green child checks cannot override a failing common check; repeats retain the same proof",
     () =>
-      testWithRepo(() =>
+      testWithRepo((repo) =>
         Effect.gen(function* () {
           let executions = 0;
           const hooks = yield* makeEpicResults.pipe(
@@ -777,7 +857,7 @@ else {
             }),
           );
           const accepted = yield* hooks.capture(captureInput);
-          const input = finalInput(accepted);
+          const input = finalInput(accepted, repo.base);
           const final = yield* hooks.verify(input);
           expect(final.status).toBe("failed");
           expect(final.commitSha).toBe(accepted.commitSha);
@@ -796,7 +876,7 @@ else {
   it.effect(
     "does not rerun an ambiguous final check after its durable start and interruption",
     () =>
-      testWithRepo(() =>
+      testWithRepo((repo) =>
         Effect.gen(function* () {
           const entered = yield* Deferred.make<void>();
           let executions = 0;
@@ -811,7 +891,7 @@ else {
             }),
           );
           const accepted = yield* hooks.capture(captureInput);
-          const input = finalInput(accepted);
+          const input = finalInput(accepted, repo.base);
           const fiber = yield* hooks.verify(input).pipe(Effect.forkChild);
           yield* Deferred.await(entered);
           yield* Fiber.interrupt(fiber);
@@ -830,7 +910,7 @@ else {
           expect(executions).toBe(1);
           const sql = yield* SqlClient.SqlClient;
           expect(
-            (yield* sql`SELECT * FROM agent_control_verification_check_starts WHERE provider_delivery_id=${final.evidenceId}`)
+            (yield* sql`SELECT * FROM agent_control_verification_check_starts WHERE provider_delivery_id=${final.evidenceId} AND check_id='tests'`)
               .length,
           ).toBe(1);
         }),
@@ -851,7 +931,7 @@ else {
           }),
         );
         const accepted = yield* hooks.capture(captureInput);
-        const input = finalInput(accepted);
+        const input = finalInput(accepted, repo.base);
         const noChecks = yield* hooks.verify({ ...input, checks: [] });
         expect(noChecks.status).toBe("blocked");
         const passed = yield* hooks.verify({ ...input, attempt: 2 });
@@ -884,7 +964,7 @@ describe("Epic handoff retained verification authority", () => {
               ...captureInput,
               previousCommitSha: queued ? repo.base : null,
             });
-            const finalRequest = finalInput(accepted);
+            const finalRequest = finalInput(accepted, repo.base);
             const lastAccepted = {
               ...finalRequest.lastAccepted,
               baseCommitSha: queued ? repo.base : null,

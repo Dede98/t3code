@@ -1,5 +1,6 @@
 import {
   AGENT_CONTROL_ROLES,
+  CodexSettings,
   AgentControlClearProjectPolicyInput,
   AgentControlGetPolicyInput,
   AgentControlPolicyCorruptError,
@@ -49,6 +50,11 @@ import {
 } from "../persistence/Services/AgentControlProjectPolicies.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import { verificationInspectionCapability } from "../provider/VerificationInspection.ts";
+import {
+  probeVerificationCheckCapabilities,
+  verificationSandboxCheckConfigurationError,
+} from "../provider/VerificationSandbox.ts";
 
 type PolicyOperation =
   | "get-policy"
@@ -81,6 +87,37 @@ type RuntimeProbeObservation = {
 export const AGENT_CONTROL_RUNTIME_PROBE_TIMEOUT_MS = 45_000;
 const AGENT_CONTROL_RUNTIME_PROBE_CONCURRENCY = 2;
 
+/** Checks capabilities without spending a provider turn; tests can replace the environment probe. */
+export const AgentControlVerificationCapabilityProbe = Context.Reference<{
+  readonly inspection: () => Effect.Effect<{
+    readonly supported: boolean;
+    readonly reason: string | null;
+  }>;
+  readonly probe: (input: {
+    readonly driverKind: string;
+    readonly networkAccess: "none" | "loopback";
+    readonly codexBinaryPath?: string;
+  }) => Effect.Effect<{ readonly supported: boolean; readonly reason: string | null }>;
+}>("t3/agentControl/VerificationCapabilityProbe", {
+  defaultValue: () => ({
+    inspection: () =>
+      Effect.tryPromise(() => verificationInspectionCapability()).pipe(
+        Effect.orElseSucceed(() => ({
+          supported: false,
+          reason: "Complete verification inspection is unavailable in this environment.",
+        })),
+      ),
+    probe: (input) =>
+      Effect.tryPromise(() => probeVerificationCheckCapabilities(input)).pipe(
+        Effect.orElseSucceed(() => ({
+          supported: false,
+          reason: "The verification sandbox capability probe could not complete.",
+        })),
+      ),
+  }),
+});
+
+const decodeCodexSettings = Schema.decodeOption(CodexSettings);
 const decodeGetPolicyInput = Schema.decodeUnknownEffect(AgentControlGetPolicyInput);
 const decodeSetProjectPolicyInput = Schema.decodeUnknownEffect(AgentControlSetProjectPolicyInput);
 const decodeClearProjectPolicyInput = Schema.decodeUnknownEffect(
@@ -358,6 +395,7 @@ const makeAgentControlPolicyService = Effect.gen(function* () {
   const repository = yield* AgentControlProjectPolicyRepository;
   const serverSettings = yield* ServerSettingsService;
   const providerRegistry = yield* ProviderInstanceRegistry;
+  const verificationCapabilities = yield* AgentControlVerificationCapabilityProbe;
 
   const loadResolutionContext = Effect.fn("AgentControlPolicyService.loadResolutionContext")(
     function* (operation: PolicyOperation) {
@@ -732,6 +770,62 @@ const makeAgentControlPolicyService = Effect.gen(function* () {
     const allowlist = resolution.policy.providerAllowlist
       ? new Set(resolution.policy.providerAllowlist)
       : undefined;
+    const projectPolicy =
+      input.projectPolicy === undefined
+        ? persistedProjectPolicy
+        : (input.projectPolicy ?? undefined);
+    const requiredChecks =
+      projectPolicy?.verificationChecks?.filter((check) => check.required) ?? [];
+    const capabilityResults = new Map<
+      string,
+      { readonly checkId: string; readonly message: string } | null
+    >();
+    const inspectionCapability = yield* verificationCapabilities.inspection();
+    for (const { candidate } of candidatesByRole.get("verifier") ?? []) {
+      const driverKind = observations.get(candidate.selection.instanceId)?.driverKind;
+      const instanceId = candidate.selection.instanceId;
+      if (!driverKind || capabilityResults.has(instanceId)) continue;
+      if (!inspectionCapability.supported) {
+        capabilityResults.set(instanceId, {
+          checkId: "git-diff",
+          message:
+            inspectionCapability.reason ??
+            "Complete verification inspection is unavailable in this environment.",
+        });
+        continue;
+      }
+      const config = decodeCodexSettings(
+        context.settings.providerInstances[instanceId]?.config ??
+          (instanceId === "codex" ? context.settings.providers.codex : {}),
+      );
+      let failure: { readonly checkId: string; readonly message: string } | null = null;
+      const checkedNetworks = new Set<string>();
+      for (const check of requiredChecks) {
+        const configurationError = verificationSandboxCheckConfigurationError(check);
+        if (configurationError) {
+          failure = { checkId: check.id, message: configurationError };
+          break;
+        }
+        const networkAccess = check.networkAccess ?? "none";
+        if (checkedNetworks.has(networkAccess)) continue;
+        checkedNetworks.add(networkAccess);
+        const capability = yield* verificationCapabilities.probe({
+          driverKind,
+          networkAccess,
+          ...(Option.isSome(config) ? { codexBinaryPath: config.value.binaryPath } : {}),
+        });
+        if (!capability.supported) {
+          failure = {
+            checkId: check.id,
+            message:
+              capability.reason ??
+              "The required verification check is unsupported in this environment.",
+          };
+          break;
+        }
+      }
+      capabilityResults.set(instanceId, failure);
+    }
     const roles = AGENT_CONTROL_ROLES.map((role) => {
       const route = resolution.policy.roleRoutes[role];
       const candidates = (candidatesByRole.get(role) ?? []).map(({ candidate }, candidateIndex) =>
@@ -750,6 +844,19 @@ const makeAgentControlPolicyService = Effect.gen(function* () {
             } satisfies RuntimeProbeObservation),
         }),
       );
+      if (role === "verifier") {
+        for (let index = 0; index < candidates.length; index++) {
+          const candidate = candidates[index]!;
+          const failure = capabilityResults.get(candidate.providerInstanceId);
+          if (candidate.runtimeReady && failure)
+            candidates[index] = {
+              ...candidate,
+              runtimeReady: false,
+              errorCode: "verification-checks-unavailable",
+              verificationCheckError: failure,
+            };
+        }
+      }
       const selectedCandidate = candidates.find((candidate) => candidate.runtimeReady);
       return {
         role,
