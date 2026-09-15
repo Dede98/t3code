@@ -601,6 +601,53 @@ describe("Epic service lifecycle", () => {
       assert.equal(missing.blockers[0]?.code, "missing-issue");
     }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
+  it.effect(
+    "pauses queued work without terminalizing it and re-arms the same run after restart",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* runMigrations({ toMigrationInclusive: 85 });
+        const service = yield* f.make();
+        const state = yield* service.start({
+          projectId,
+          commandId: CommandId.make("queued-pause-start"),
+          expectedRevision: 1,
+          epicNumber: 10,
+          expectedFingerprint: source.fingerprint,
+        });
+        const nextSource = {
+          ...source,
+          epic: { ...source.epic, issueNodeId: "next-epic", number: 11 },
+          fingerprint: "next-preview",
+        };
+        f.setSource(nextSource);
+        yield* service.changeQueue({
+          projectId,
+          commandId: CommandId.make("queued-pause-approve"),
+          expectedRevision: 0,
+          action: { kind: "approve", epicNumber: 11, expectedFingerprint: nextSource.fingerprint },
+        });
+        f.setSource(source);
+        const request = {
+          projectId,
+          epicRunId: state.epicRunId,
+          expectedRevision: state.revision,
+          commandId: CommandId.make("queued-pause"),
+        };
+        const paused = yield* service.stop(request);
+        assert.equal(paused.status, "running");
+        assert.equal((yield* service.stop(request)).revision, paused.revision);
+        yield* service.processProject(projectId);
+        assert.isNull((yield* service.get(projectId))?.activeTaskId);
+        f.setMode("armed");
+        const restarted = yield* f.make();
+        yield* restarted.processProject(projectId);
+        const continued = yield* restarted.get(projectId);
+        assert.equal(continued?.epicRunId, state.epicRunId);
+        assert.equal(continued?.activeTaskId, "task-2");
+        assert.lengthOf(yield* f.sql`SELECT epic_run_id FROM agent_control_epic_runs`, 1);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
   it.effect("clears only stopped scope with automation off and retains all prior history", () =>
     Effect.gen(function* () {
       const f = yield* fixture();

@@ -530,7 +530,7 @@ export function AutonomousEpicPanel({
                     disabled={!agentControlEpicControlAllowed(readiness, "stop")}
                     onPress={() => void execute("stop")}
                   >
-                    End Epic
+                    {queue ? "Pause Epic" : "End Epic"}
                   </Action>
                 </>
               ) : (
@@ -542,8 +542,9 @@ export function AutonomousEpicPanel({
                 </Action>
               )}
               <Text className="text-xs text-foreground-muted">
-                Automation off pauses new task starts. Ending retains evidence and prevents further
-                Epic work. Turn off automation before returning to ordinary tasks.
+                {queue
+                  ? "Pausing turns Armed off and preserves this Epic. Turn Armed back on to continue; resolve any blockers before resuming."
+                  : "Automation off pauses new task starts. Ending retains evidence and prevents further Epic work. Turn off automation before returning to ordinary tasks."}
               </Text>
             </>
           ) : null}

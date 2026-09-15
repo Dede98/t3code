@@ -405,6 +405,7 @@ export const makeAgentControlEpic = Effect.gen(function* () {
             yield* publish(input.projectId);
             return current;
           }
+          const queued = (yield* loadEpicQueue(sql, input.projectId)) !== null;
           const modeState = yield* engine.getProjectState({ projectId: input.projectId });
           const updated = yield* sql.withTransaction(
             Effect.gen(function* () {
@@ -412,7 +413,9 @@ export const makeAgentControlEpic = Effect.gen(function* () {
                 sql,
                 current,
                 kind === "stop"
-                  ? { status: "stopped" }
+                  ? queued
+                    ? {}
+                    : { status: "stopped" }
                   : {
                       status: "running",
                       blockers: [],

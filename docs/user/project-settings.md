@@ -140,8 +140,8 @@ fetch or repository-mapping errors retain the saved work and prevent starting on
 
 Turning Armed off prevents further starts; turning it back on resumes from the saved queue.
 An exhausted queue waits for more approvals instead of starting ordinary tasks. Completed runs,
-verification evidence and PR links remain available. A stopped or failed active Epic holds its place
-for human inspection; queue editing does not discard or retry its execution.
+verification evidence and PR links remain available. Pausing a queued Epic turns Armed off and preserves its execution for re-arm. A failed active Epic
+holds its place for human inspection; queue editing does not discard or retry its execution.
 
 ## Project icons
 
