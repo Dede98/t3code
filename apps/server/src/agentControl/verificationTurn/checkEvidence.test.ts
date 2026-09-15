@@ -16,12 +16,14 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { inspectVerificationChanges } from "../../provider/VerificationInspection.ts";
 import { evaluateCheckedVerificationResult } from "./checkedResult.ts";
+import Migration087 from "../../persistence/Migrations/087_AgentControlVerificationInspectionPages.ts";
 import Migration076 from "../../persistence/Migrations/076_AgentControlVerificationChecks.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import type { ProviderAdmissionPermit } from "../providerAdmission/model.ts";
 import {
   assessVerificationChecks,
   executeVerificationCheck,
+  executeVerificationInspection,
   VerificationCheckError,
   VerificationCheckAssessmentError,
   prepareVerificationCheckManifest,
@@ -30,6 +32,12 @@ import {
   type VerificationCheckCommandResult,
   type VerificationCheckManifest,
 } from "./checkEvidence.ts";
+
+import {
+  inspectionPageId,
+  readInspectionInventory,
+  inspectionProgress,
+} from "./inspectionPages.ts";
 
 const exec = NodeUtil.promisify(NodeChildProcess.execFile);
 const io = <A>(run: () => Promise<A>) =>
@@ -777,12 +785,14 @@ it.effect(
         };
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: repo.database })));
       yield* Effect.gen(function* () {
+        yield* Migration087;
         const sql = yield* SqlClient.SqlClient;
         const manifest = yield* prepareVerificationCheckManifest(sql, {
           permit: permit(),
           cwd: repo.cwd,
           checks,
           inspectionBase: base,
+          inspectionFormat: "paged",
         });
         assert.deepEqual(manifest, first.manifest);
         assert.deepEqual(
@@ -880,3 +890,191 @@ it.effect(
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
     }).pipe(Effect.scoped),
 );
+
+const pagedManifest = (sql: SqlClient.SqlClient, cwd: string, base: string) =>
+  prepareVerificationCheckManifest(sql, {
+    permit: permit(),
+    cwd,
+    checks,
+    inspectionBase: base,
+    inspectionFormat: "paged",
+  });
+const retrieve = (sql: SqlClient.SqlClient, manifest: VerificationCheckManifest, page?: number) =>
+  executeVerificationInspection(sql, {
+    manifest,
+    checkId: page === undefined ? "git-diff" : inspectionPageId(page),
+    providerTurnId: "turn-1",
+    authorize: Effect.void,
+  });
+
+it.effect("paged inspection survives restart and duplicates cannot replace missing coverage", () =>
+  Effect.gen(function* () {
+    const repo = yield* repository;
+    const base = yield* inspectionBase(repo.cwd);
+    yield* io(() =>
+      NodeFSP.writeFile(NodePath.join(repo.cwd, "source.txt"), "reviewable text\n".repeat(5000)),
+    );
+    const first = yield* Effect.gen(function* () {
+      yield* initialize;
+      yield* Migration087;
+      const sql = yield* SqlClient.SqlClient;
+      const manifest = yield* pagedManifest(sql, repo.cwd, base);
+      // A premature request must not burn the valid page's durable execution slot.
+      assert.equal((yield* retrieve(sql, manifest, 1)).exitCode, 125);
+      assert.deepEqual(
+        yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_starts`,
+        [{ count: 0 }],
+      );
+      yield* execute(sql, manifest);
+      const root = yield* retrieve(sql, manifest);
+      const inventory = readInspectionInventory(JSON.stringify(root));
+      assert.isNotNull(inventory);
+      assert.isAbove(inventory!.pageDigests.length, 2);
+      assert.equal((yield* retrieve(sql, manifest, 256)).exitCode, 125);
+      const page = yield* retrieve(sql, manifest, 1);
+      assert.equal(page.exitCode, 0);
+      assert.deepEqual(yield* retrieve(sql, manifest, 1), page);
+      assert.equal(
+        (yield* assessVerificationChecks(sql, claim(manifest))).code,
+        "verification-checks-missing",
+      );
+      assert.deepInclude(
+        yield* inspectionProgress(
+          sql,
+          manifest.providerDeliveryId,
+          manifest.manifestDigest,
+          manifest.codeDigest,
+          JSON.stringify(root),
+        ),
+        { status: "missing" },
+      );
+      // Merely caching every page is not complete inspection evidence.
+      assert.deepEqual(
+        yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_results`,
+        [{ count: 3 }],
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`UPDATE agent_control_verification_inspection_pages SET content='corrupt'`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(sql`DELETE FROM agent_control_verification_inspection_pages`),
+        ),
+      );
+      return { manifest, root, page, inventory: inventory! };
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: repo.database })));
+    const sealed = yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const manifest = yield* pagedManifest(sql, repo.cwd, base);
+      assert.deepEqual(manifest, first.manifest);
+      assert.deepEqual(yield* retrieve(sql, manifest), first.root);
+      assert.deepEqual(yield* retrieve(sql, manifest, 1), first.page);
+      for (let page = 2; page <= first.inventory.pageDigests.length; page++)
+        assert.equal((yield* retrieve(sql, manifest, page)).exitCode, 0);
+      const result = yield* sealVerificationCheckAssessment(sql, claim(manifest));
+      assert.isNull(result.code);
+      assert.deepInclude(
+        yield* inspectionProgress(
+          sql,
+          manifest.providerDeliveryId,
+          manifest.manifestDigest,
+          manifest.codeDigest,
+          JSON.stringify(first.root),
+        ),
+        { status: "passed" },
+      );
+      assert.deepEqual(
+        yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_starts`,
+        [{ count: first.inventory.pageDigests.length + 2 }],
+      );
+      return result;
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: repo.database })));
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepEqual(yield* sealVerificationCheckAssessment(sql, claim(first.manifest)), sealed);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: repo.database })));
+  }).pipe(Effect.scoped),
+);
+
+for (const fault of ["worktree", "authority", "page", "receipt"] as const) {
+  it.effect(`rejects inspection page after ${fault} changes`, () =>
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      const base = yield* inspectionBase(repo.cwd);
+      yield* io(() =>
+        NodeFSP.writeFile(NodePath.join(repo.cwd, "source.txt"), "large change\n".repeat(5000)),
+      );
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        yield* Migration087;
+        const sql = yield* SqlClient.SqlClient;
+        const manifest = yield* pagedManifest(sql, repo.cwd, base);
+        yield* execute(sql, manifest);
+        yield* retrieve(sql, manifest);
+        const firstPage = yield* retrieve(sql, manifest, 1);
+        if (fault === "worktree")
+          yield* io(() =>
+            NodeFSP.appendFile(NodePath.join(repo.cwd, "source.txt"), "changed after inventory"),
+          );
+        if (fault === "page") {
+          // Simulate corrupt storage, explicitly bypassing the production immutability guard.
+          yield* sql`DROP TRIGGER agent_control_verification_inspection_pages_no_update`;
+          yield* sql`UPDATE agent_control_verification_inspection_pages SET content='corrupt' WHERE page_number=2`;
+        }
+        if (fault === "receipt") {
+          // Even a valid receipt hash cannot substitute another page's content.
+          yield* executeVerificationCheck(sql, {
+            manifest,
+            checkId: inspectionPageId(2),
+            providerTurnId: "turn-1",
+            authorize: Effect.void,
+            execute: Effect.succeed(firstPage),
+          });
+          assert.equal(
+            (yield* assessVerificationChecks(sql, claim(manifest))).code,
+            "verification-checks-unavailable",
+          );
+          return;
+        }
+        let entries = 0;
+        const result = yield* executeVerificationInspection(sql, {
+          manifest,
+          checkId: inspectionPageId(2),
+          providerTurnId: "turn-1",
+          authorize: Effect.suspend(() => {
+            entries++;
+            return fault === "authority" && entries > 1
+              ? Effect.fail(
+                  new VerificationCheckError({ cause: "stage lease revoked during retrieval" }),
+                )
+              : Effect.void;
+          }),
+        });
+        assert.equal(result.exitCode, 125);
+        assert.equal(
+          (yield* assessVerificationChecks(sql, claim(manifest))).code,
+          fault === "worktree" ? "verification-checks-stale" : "verification-checks-unavailable",
+        );
+        if (fault === "authority") {
+          const revoked = yield* Effect.exit(
+            executeVerificationInspection(sql, {
+              manifest,
+              checkId: inspectionPageId(3),
+              providerTurnId: "turn-1",
+              authorize: Effect.fail(new VerificationCheckError({ cause: "revoked" })),
+            }),
+          );
+          assert.isTrue(Exit.isFailure(revoked));
+          assert.deepEqual(
+            yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_starts WHERE check_id='git-diff-page-3'`,
+            [{ count: 0 }],
+          );
+        }
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
+    }).pipe(Effect.scoped),
+  );
+}

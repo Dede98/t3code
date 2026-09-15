@@ -50,13 +50,13 @@ import {
   createCodexVerificationTool,
   verificationCheckParams,
   verificationToolFailure,
+  VerificationToolInput,
 } from "../CodexVerificationChecks.ts";
 import { inspectVerificationChanges, VERIFICATION_INSPECTIONS } from "../VerificationInspection.ts";
 import { runVerificationSandboxCheck } from "../VerificationSandbox.ts";
-const decodeVerificationToolInput = Schema.decodeUnknownEffect(
-  Schema.Struct({ check: Schema.String }),
-  { onExcessProperty: "error" },
-);
+const decodeVerificationToolInput = Schema.decodeUnknownEffect(VerificationToolInput, {
+  onExcessProperty: "error",
+});
 const decodeV2TurnStartResponse = Schema.decodeUnknownEffect(EffectCodexSchema.V2TurnStartResponse);
 
 const PROVIDER = ProviderDriverKind.make("codex");
@@ -2029,6 +2029,9 @@ export const makeCodexSessionRuntime = (
           return verificationToolFailure("Verification turn is no longer authorized.");
         }
         const args = yield* decodeVerificationToolInput(payload.arguments);
+        if (args.page !== undefined && args.check !== "git-diff")
+          return verificationToolFailure("A page may only be requested for git-diff.");
+        const checkId = args.page === undefined ? args.check : `git-diff-page-${args.page}`;
         const check = authorization.execution.checks.find(
           (candidate) => candidate.id === args.check,
         );
@@ -2097,7 +2100,7 @@ export const makeCodexSessionRuntime = (
             return yield* checkClient.request("command/exec", params);
           }),
         );
-        const result = yield* authorization.execution.runCheck(args.check, payload.turnId, execute);
+        const result = yield* authorization.execution.runCheck(checkId, payload.turnId, execute);
         return {
           success: result.exitCode === 0,
           contentItems: [

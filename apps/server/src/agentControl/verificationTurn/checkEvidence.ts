@@ -19,6 +19,16 @@ import {
   VERIFICATION_INSPECTIONS,
   decodeVerificationGitOutput,
 } from "../../provider/VerificationInspection.ts";
+import {
+  InspectionInventory,
+  readInspectionInventory,
+  inspectionPageId,
+  inspectionPageNumber,
+  pagedInspectionBase,
+  prepareInspectionInventory,
+  loadInspectionPage,
+} from "./inspectionPages.ts";
+import { inspectVerificationChanges } from "../../provider/VerificationInspection.ts";
 import { classifyVerificationCheckResult } from "../../provider/CodexVerificationChecks.ts";
 
 const decodeChecks = Schema.decodeUnknownEffect(AgentControlVerificationChecks);
@@ -152,21 +162,31 @@ export const snapshotVerificationCode = (cwd: string) =>
   });
 
 /** A versioned digest also binds the immutable review base without changing historical rows. */
-export const bindVerificationInspectionDigest = (base: string, digest: string) => {
+export const bindVerificationInspectionDigest = (
+  base: string,
+  digest: string,
+  format: "single" | "paged" = "single",
+) => {
   if (!/^[a-f0-9]{40,64}$/.test(base)) throw failure("Invalid verification inspection base");
-  return `review-v1:${base}:${digest}`;
+  return `review-v${format === "paged" ? 2 : 1}:${base}:${digest}`;
 };
 export const rawVerificationCodeDigest = (digest: string) =>
-  digest.replace(/^review-v1:[a-f0-9]{40,64}:/, "");
+  digest.replace(/^review-v[12]:[a-f0-9]{40,64}:/, "");
 export const verificationInspectionBase = (digest: string) =>
-  /^review-v1:([a-f0-9]{40,64}):/.exec(digest)?.[1];
+  /^review-v[12]:([a-f0-9]{40,64}):/.exec(digest)?.[1];
 export const snapshotVerificationManifestCode = (
   manifest: Pick<VerificationCheckManifest, "worktreePath" | "codeDigest">,
 ) =>
   snapshotVerificationCode(manifest.worktreePath).pipe(
     Effect.map((digest) => {
       const base = verificationInspectionBase(manifest.codeDigest);
-      return base ? bindVerificationInspectionDigest(base, digest) : digest;
+      return base
+        ? bindVerificationInspectionDigest(
+            base,
+            digest,
+            pagedInspectionBase(manifest.codeDigest) ? "paged" : "single",
+          )
+        : digest;
     }),
   );
 const inspectionCheck = { id: "git-diff", required: true, resultFormat: "exit-code" as const };
@@ -212,6 +232,7 @@ export const prepareVerificationCheckManifest = Effect.fn("prepareVerificationCh
       readonly cwd: string;
       readonly checks?: AgentControlVerificationChecks;
       readonly inspectionBase?: string;
+      readonly inspectionFormat?: "single" | "paged";
     },
   ) {
     const existing = yield* loadManifest(sql, input.permit.providerDeliveryId);
@@ -239,6 +260,7 @@ export const prepareVerificationCheckManifest = Effect.fn("prepareVerificationCh
         ? bindVerificationInspectionDigest(
             input.inspectionBase,
             yield* snapshotVerificationCode(input.cwd),
+            input.inspectionFormat,
           )
         : yield* snapshotVerificationCode(input.cwd),
       checksJson: canonicalJson(checks),
@@ -269,6 +291,7 @@ const ResultSchema = Schema.Struct({
   exitCode: Schema.Int,
   stdout: Schema.String,
   stderr: Schema.String,
+  inspection: Schema.optionalKey(InspectionInventory),
 });
 const decodeResultJson = Schema.decodeUnknownEffect(Schema.fromJsonString(ResultSchema));
 const unavailableResult = (message: string): VerificationCheckCommandResult => ({
@@ -294,12 +317,19 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
   const { manifest } = input;
   const checks = yield* decodeChecksJson(manifest.checksJson);
   const check =
-    VERIFICATION_INSPECTIONS.some((id) => id === input.checkId) &&
+    (VERIFICATION_INSPECTIONS.some((id) => id === input.checkId) ||
+      (pagedInspectionBase(manifest.codeDigest) && inspectionPageNumber(input.checkId) !== null)) &&
     verificationInspectionBase(manifest.codeDigest)
       ? { ...inspectionCheck, id: input.checkId }
       : checks.find((candidate) => candidate.id === input.checkId);
   if (!check) return yield* Effect.fail(failure("Unknown project check"));
   yield* input.authorize.pipe(Effect.mapError(failure));
+  const page = inspectionPageNumber(input.checkId);
+  if (page !== null) {
+    const inventory = yield* loadAuthorizedInspectionInventory(sql, manifest, input.providerTurnId);
+    if (!inventory || !inventory.pageDigests[page - 1])
+      return unavailableResult("Request git-diff first, then only pages listed in its inventory.");
+  }
   const prior =
     yield* sql<CheckResultRow>`SELECT check_id AS "checkId",provider_turn_id AS "providerTurnId",manifest_digest AS "manifestDigest",code_digest AS "codeDigest",status,result_json AS "resultJson",result_digest AS "resultDigest"
     FROM agent_control_verification_check_results WHERE provider_delivery_id=${manifest.providerDeliveryId} AND check_id=${input.checkId}`;
@@ -365,6 +395,77 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
     : result;
 });
 
+const loadAuthorizedInspectionInventory = Effect.fn("loadAuthorizedInspectionInventory")(function* (
+  sql: SqlClient.SqlClient,
+  manifest: VerificationCheckManifest,
+  providerTurnId: string,
+) {
+  const rows =
+    yield* sql<CheckResultRow>`SELECT check_id AS "checkId",provider_turn_id AS "providerTurnId",manifest_digest AS "manifestDigest",code_digest AS "codeDigest",status,result_json AS "resultJson",result_digest AS "resultDigest"
+    FROM agent_control_verification_check_results WHERE provider_delivery_id=${manifest.providerDeliveryId} AND check_id='git-diff'`;
+  const row = rows[0];
+  const inventory = row ? readInspectionInventory(row.resultJson) : null;
+  return row &&
+    row.status === "passed" &&
+    row.providerTurnId === providerTurnId &&
+    row.manifestDigest === manifest.manifestDigest &&
+    row.codeDigest === manifest.codeDigest &&
+    sha256Utf8(row.resultJson) === row.resultDigest &&
+    inventory?.baseCommit === pagedInspectionBase(manifest.codeDigest)
+    ? inventory
+    : null;
+});
+
+/** The controller owns all inspection contents; provider input selects only a listed page. */
+export const executeVerificationInspection = Effect.fn("executeVerificationInspection")(function* <
+  E,
+>(
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly manifest: VerificationCheckManifest;
+    readonly checkId: string;
+    readonly providerTurnId: string;
+    readonly authorize: Effect.Effect<void, E>;
+  },
+) {
+  const { manifest } = input;
+  const page = inspectionPageNumber(input.checkId);
+  const execute = Effect.gen(function* () {
+    if (pagedInspectionBase(manifest.codeDigest) && input.checkId === "git-diff")
+      return yield* prepareInspectionInventory(sql, manifest);
+    if (page !== null) {
+      const inventory = yield* loadAuthorizedInspectionInventory(
+        sql,
+        manifest,
+        input.providerTurnId,
+      );
+      if (!inventory) return unavailableResult("Inspection inventory is unavailable.");
+      return yield* loadInspectionPage(sql, manifest, inventory, page);
+    }
+    if (!VERIFICATION_INSPECTIONS.some((id) => id === input.checkId))
+      return unavailableResult("Unknown inspection.");
+    return yield* Effect.tryPromise(() =>
+      inspectVerificationChanges(
+        manifest.worktreePath,
+        verificationInspectionBase(manifest.codeDigest) ?? "",
+        input.checkId === "git-status"
+          ? "git-status"
+          : input.checkId === "git-diff-check"
+            ? "git-diff-check"
+            : "git-diff",
+      ),
+    );
+  });
+  return yield* executeVerificationCheck(sql, {
+    ...input,
+    execute: execute.pipe(
+      Effect.catchTag("InspectionPageError", (error) =>
+        Effect.succeed(unavailableResult(error.message.slice(0, 4096))),
+      ),
+    ),
+  });
+});
+
 export const assessVerificationChecks = Effect.fn("assessVerificationChecks")(function* (
   sql: SqlClient.SqlClient,
   claim: VerificationCheckClaim,
@@ -399,9 +500,20 @@ export const assessVerificationChecks = Effect.fn("assessVerificationChecks")(fu
   )
     return { code: "verification-checks-stale" as const, digest };
   const checks = yield* decodeChecksJson(manifest.checksJson);
+  const rootInspection = results.find((row) => row.checkId === "git-diff");
+  const inventory = rootInspection ? readInspectionInventory(rootInspection.resultJson) : null;
+  const paged = pagedInspectionBase(manifest.codeDigest);
+  if (paged && rootInspection && inventory?.baseCommit !== paged)
+    code = "verification-checks-unavailable";
   const required = [
     ...checks.filter((check) => check.required),
     ...(verificationInspectionBase(manifest.codeDigest) ? [inspectionCheck] : []),
+    ...(paged && inventory
+      ? inventory.pageDigests.map((_, index) => ({
+          ...inspectionCheck,
+          id: inspectionPageId(index + 1),
+        }))
+      : []),
   ];
   if (!checks.some((check) => check.required)) code = "verification-checks-missing";
   for (const check of required) {
@@ -422,6 +534,16 @@ export const assessVerificationChecks = Effect.fn("assessVerificationChecks")(fu
       break;
     }
     const output = yield* decodeResultJson(result.resultJson);
+    const page = inspectionPageNumber(check.id);
+    if (
+      page !== null &&
+      (!inventory ||
+        sha256Utf8(output.stdout) !== inventory.pageDigests[page - 1] ||
+        output.stderr !== "")
+    ) {
+      code = "verification-checks-unavailable";
+      continue;
+    }
     const classified = classifyVerificationCheckResult(check, output);
     if (result.status === "unavailable" || classified === "unavailable")
       code = "verification-checks-unavailable";

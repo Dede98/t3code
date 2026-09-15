@@ -5,7 +5,11 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
-import { inspectVerificationChanges } from "./VerificationInspection.ts";
+import * as NodeCrypto from "node:crypto";
+import {
+  inspectVerificationChanges,
+  prepareVerificationInspectionPages,
+} from "./VerificationInspection.ts";
 const exec = NodeUtil.promisify(NodeChildProcess.execFile);
 let root: string;
 let base: string;
@@ -194,5 +198,55 @@ describe("complete fixed-base verification inspection", () => {
     const largeBase = await git("rev-parse", "HEAD");
     expect((await inspectVerificationChanges(root, largeBase)).exitCode).toBe(0);
     expect((await inspectVerificationChanges(root, "--help")).exitCode).toBe(125);
+  });
+});
+
+describe("bounded paged inspection", () => {
+  it("losslessly pages a large UTF-8 file and retains deletions, renames and the fixed base", async () => {
+    const large = "👩🏽‍💻über\n".repeat(8000);
+    await NodeFSP.writeFile(NodePath.join(root, "source.txt"), large);
+    await git("mv", "rename.txt", "renamed.txt");
+    await NodeFSP.unlink(NodePath.join(root, "deleted.txt"));
+    await NodeFSP.writeFile(NodePath.join(root, "new.txt"), "new untracked HTTP test\n");
+    const result = await prepareVerificationInspectionPages(root, base);
+    expect(result.pages.length).toBeGreaterThan(5);
+    const document = result.pages
+      .map((page, i) => {
+        expect(Buffer.byteLength(page)).toBeLessThan(25000);
+        expect(page).not.toContain("\ufffd");
+        expect(NodeCrypto.createHash("sha256").update(page).digest("hex")).toBe(
+          result.pageDigests[i],
+        );
+        return page.slice(page.indexOf("\n") + 1);
+      })
+      .join("");
+    expect(Buffer.byteLength(document)).toBe(result.byteLength);
+    expect(NodeCrypto.createHash("sha256").update(document).digest("hex")).toBe(
+      result.documentDigest,
+    );
+    for (const text of [
+      large,
+      "original",
+      "deleted content",
+      "renamed.txt",
+      "new untracked HTTP test",
+      base,
+    ])
+      expect(document).toContain(text);
+    await git("add", ".");
+    expect(await prepareVerificationInspectionPages(root, base)).toEqual(result);
+  });
+  it("keeps binary, oversized files and oversized documents unavailable", async () => {
+    const path = NodePath.join(root, "new.txt");
+    await NodeFSP.writeFile(path, Buffer.from([0, 1, 2]));
+    await expect(prepareVerificationInspectionPages(root, base)).rejects.toThrow("Binary");
+    await NodeFSP.writeFile(path, "x".repeat(1024 * 1024 + 1));
+    await expect(prepareVerificationInspectionPages(root, base)).rejects.toThrow();
+    await NodeFSP.unlink(path);
+    for (let i = 0; i < 5; i++)
+      await NodeFSP.writeFile(NodePath.join(root, `large-${i}.txt`), "x".repeat(900000));
+    await expect(prepareVerificationInspectionPages(root, base)).rejects.toThrow(
+      "Complete inspection exceeds",
+    );
   });
 });

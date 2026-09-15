@@ -65,6 +65,7 @@ import {
   prepareVerificationCheckManifest,
   verificationInspectionBase,
   executeVerificationCheck,
+  executeVerificationInspection,
   VerificationCheckError,
   type VerificationCheckCommandResult,
 } from "../../agentControl/verificationTurn/checkEvidence.ts";
@@ -667,6 +668,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       permit,
       cwd,
       inspectionBase: bases[0]!.base,
+      inspectionFormat: "paged",
     }).pipe(
       Effect.mapError((cause) =>
         toValidationError(
@@ -699,13 +701,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       ) =>
         withProviderAdmissionEffectFence(
           permit.providerInstanceId,
-          executeVerificationCheck(sql, {
-            manifest,
-            checkId,
-            providerTurnId,
-            execute,
-            authorize: enterProviderAdmission(permit, "verification-check"),
-          }),
+          checkId.startsWith("git-")
+            ? executeVerificationInspection(sql, {
+                manifest,
+                checkId,
+                providerTurnId,
+                authorize: enterProviderAdmission(permit, "verification-check"),
+              })
+            : executeVerificationCheck(sql, {
+                manifest,
+                checkId,
+                providerTurnId,
+                execute,
+                authorize: enterProviderAdmission(permit, "verification-check"),
+              }),
         ).pipe(Effect.mapError((cause) => new VerificationCheckError({ cause }))),
     };
   });

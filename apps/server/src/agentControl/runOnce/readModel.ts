@@ -1,3 +1,4 @@
+import { inspectionProgress } from "../verificationTurn/inspectionPages.ts";
 import { VERIFICATION_INSPECTION_DISPLAY } from "../../provider/VerificationInspection.ts";
 import { verificationInspectionBase } from "../verificationTurn/checkEvidence.ts";
 import { loadEpicQueue } from "../epic/queueAuthority.ts";
@@ -247,6 +248,18 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
                   const result = evidence[0]?.resultJson
                     ? yield* decodeResult(evidence[0].resultJson)
                     : null;
+                  const progress =
+                    check.id === "git-diff" &&
+                    evidence[0]?.status === "passed" &&
+                    evidence[0]?.resultJson
+                      ? yield* inspectionProgress(
+                          sql,
+                          handoff.providerDeliveryId,
+                          manifests[0]!.manifestDigest,
+                          manifests[0]!.codeDigest,
+                          evidence[0].resultJson,
+                        )
+                      : null;
                   checkViews.push({
                     id: check.id,
                     command: check.command,
@@ -254,6 +267,7 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
                     cwd: check.cwd,
                     required: check.required,
                     status:
+                      progress?.status ??
                       evidence[0]?.status ??
                       (evidence.length &&
                       (stage.status === "running" ||
@@ -262,7 +276,12 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
                         ? ("running" as const)
                         : ("missing" as const)),
                     exitCode: result?.exitCode ?? null,
-                    output: result ? `${result.stdout}\n${result.stderr}`.slice(0, 8192) : null,
+                    output: result
+                      ? `${progress ? progress.detail + "\n" : ""}${result.stdout}\n${result.stderr}`.slice(
+                          0,
+                          8192,
+                        )
+                      : null,
                     completedAt: evidence[0]?.completedAt ?? null,
                   });
                 }

@@ -31,8 +31,15 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { AgentControlWorktreeController } from "../worktree/Services/AgentControlWorktreeController.ts";
 import { canonicalJson, sha256Utf8 } from "../initialPlanning/eventEvidence.ts";
 import {
+  readInspectionInventory,
+  inspectionPageId,
+  inspectionProgress,
+  pagedInspectionBase,
+} from "../verificationTurn/inspectionPages.ts";
+import {
   assessVerificationChecks,
   executeVerificationCheck,
+  executeVerificationInspection,
   bindVerificationInspectionDigest,
   rawVerificationCodeDigest,
   snapshotVerificationCode,
@@ -48,10 +55,7 @@ import {
 import { deriveProviderInstanceConfigMap } from "../../provider/Layers/ProviderInstanceRegistryHydration.ts";
 import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
-import {
-  inspectVerificationChanges,
-  VERIFICATION_INSPECTION_DISPLAY,
-} from "../../provider/VerificationInspection.ts";
+import { VERIFICATION_INSPECTION_DISPLAY } from "../../provider/VerificationInspection.ts";
 import { runVerificationSandboxCheck } from "../../provider/VerificationSandbox.ts";
 import { verificationCheckParams } from "../../provider/CodexVerificationChecks.ts";
 import { buildCodexInitializeParams } from "../../provider/Layers/CodexProvider.ts";
@@ -546,6 +550,7 @@ export const makeEpicResults = Effect.gen(function* () {
               codeDigest: bindVerificationInspectionDigest(
                 initialBaseCommitSha,
                 yield* snapshotVerificationCode(cwd),
+                documents[0] && !pagedInspectionBase(documents[0].codeDigest) ? "single" : "paged",
               ),
               checksJson: canonicalJson(input.checks),
             };
@@ -562,15 +567,24 @@ export const makeEpicResults = Effect.gen(function* () {
                 "The final verification attempt belongs to a different result or check configuration.",
               );
             yield* sql`INSERT INTO agent_control_verification_check_manifests(provider_delivery_id,handoff_id,fence_token,worktree_path,code_digest,checks_json,manifest_digest,created_at) VALUES (${evidenceId},${evidenceId},${input.attempt},${cwd},${manifest.codeDigest},${manifest.checksJson},${manifest.manifestDigest},${yield* now}) ON CONFLICT(provider_delivery_id) DO NOTHING`;
-            yield* executeVerificationCheck(sql, {
+            const inspection = yield* executeVerificationInspection(sql, {
               manifest,
               checkId: "git-diff",
               providerTurnId: evidenceId,
               authorize,
-              execute: Effect.tryPromise(() =>
-                inspectVerificationChanges(cwd, initialBaseCommitSha),
-              ),
             });
+            const inventory = readInspectionInventory(canonicalJson({ ...inspection }));
+            if (inspection.exitCode === 0 && inventory) {
+              for (let page = 1; page <= inventory.pageDigests.length; page++) {
+                const result = yield* executeVerificationInspection(sql, {
+                  manifest,
+                  checkId: inspectionPageId(page),
+                  providerTurnId: evidenceId,
+                  authorize,
+                });
+                if (result.exitCode !== 0) break;
+              }
+            }
             for (const check of input.checks) {
               yield* executeVerificationCheck(sql, {
                 manifest,
@@ -616,12 +630,22 @@ export const makeEpicResults = Effect.gen(function* () {
                         row.resultJson,
                       )
                     : null;
+                  const progress =
+                    check.id === "git-diff" && row?.status === "passed"
+                      ? yield* inspectionProgress(
+                          sql,
+                          evidenceId,
+                          manifest.manifestDigest,
+                          manifest.codeDigest,
+                          row.resultJson,
+                        )
+                      : null;
                   return {
                     ...check,
-                    status: row?.status ?? ("missing" as const),
+                    status: progress?.status ?? row?.status ?? ("missing" as const),
                     exitCode: result?.exitCode ?? null,
                     output: result
-                      ? [result.stdout, result.stderr].filter(Boolean).join("\n")
+                      ? [progress?.detail, result.stdout, result.stderr].filter(Boolean).join("\n")
                       : null,
                     completedAt: row?.completedAt ?? null,
                   };

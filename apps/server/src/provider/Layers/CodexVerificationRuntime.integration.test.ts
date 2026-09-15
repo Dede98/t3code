@@ -167,6 +167,38 @@ describe("Codex controlled Verification checks", () => {
       }),
   );
 
+  it.effect(
+    "dispatches a listed inspection page through the controlled authority without a shell",
+    () =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const result = yield* exercise({
+          request: {
+            ...toolCall,
+            params: { ...toolCall.params, arguments: { check: "git-diff", page: 2 } },
+          },
+          turnAuthorization: {
+            ...authorization,
+            runCheck: (checkId, turnId) =>
+              Effect.sync(() => {
+                expect(checkId).toBe("git-diff-page-2");
+                expect(turnId).toBe(nativeTurnId);
+                calls++;
+                return { exitCode: 0, stdout: "controlled page 2 content", stderr: "" };
+              }),
+          },
+        });
+        expect(calls).toBe(1);
+        expect(result.responses[0]?.result).toMatchObject({
+          success: true,
+          contentItems: [
+            { type: "inputText", text: expect.stringContaining("controlled page 2 content") },
+          ],
+        });
+        expect(result.requests.filter((r) => r.method === "command/exec")).toEqual([]);
+      }),
+  );
+
   it.effect.each([
     { threadId: "unrelated-native-thread" },
     { turnId: "stale-native-turn" },
@@ -175,6 +207,12 @@ describe("Codex controlled Verification checks", () => {
     { arguments: { check: "scoped-tests", command: ["python3", "-c", "print(1)"] } },
     { arguments: { check: "scoped-tests", cwd: "/" } },
     { arguments: { check: "scoped-tests; touch changed" } },
+    { arguments: { check: "scoped-tests", page: 1 } },
+    { arguments: { check: "git-status", page: 1 } },
+    { arguments: { check: "git-diff", page: 0 } },
+    { arguments: { check: "git-diff", page: 257 } },
+    { arguments: { check: "git-diff", page: 1.5 } },
+    { arguments: { check: "git-diff", page: "1" } },
   ])("rejects calls outside the exact tool contract: %j", (params) =>
     Effect.gen(function* () {
       const result = yield* exercise({

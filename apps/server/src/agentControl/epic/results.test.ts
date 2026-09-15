@@ -27,6 +27,7 @@ import * as Semaphore from "effect/Semaphore";
 import type * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import Migration087 from "../../persistence/Migrations/087_AgentControlVerificationInspectionPages.ts";
 import Migration076 from "../../persistence/Migrations/076_AgentControlVerificationChecks.ts";
 import Migration084 from "../../persistence/Migrations/084_AgentControlEpicResults.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
@@ -173,6 +174,7 @@ const initialize = (repo: Repo) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* Migration076;
+    yield* Migration087;
     yield* Migration084;
     yield* sql`CREATE TABLE agent_control_task_verification_finalization_evidence (task_finalization_evidence_id TEXT,task_id TEXT,project_id TEXT,verification_outcome TEXT,verification_evidence_id TEXT,finalized_at TEXT)`;
     yield* sql`CREATE TABLE agent_control_verification_finalization_evidence (finalization_evidence_id TEXT,provider_delivery_id TEXT,provider_turn_id TEXT,provider_instance_id TEXT,handoff_id TEXT,fence_token INTEGER)`;
@@ -824,12 +826,12 @@ else {
             expect(final.checks.find((check) => check.id === "git-diff")).toMatchObject({
               status: "passed",
               required: true,
-              output: expect.stringContaining("first child change"),
+              output: expect.stringContaining("Inspection pages: 1/1"),
             });
             const sql = yield* SqlClient.SqlClient;
             const rows = yield* sql<{
               resultJson: string;
-            }>`SELECT result_json AS "resultJson" FROM agent_control_verification_check_results WHERE provider_delivery_id=${final.evidenceId} AND check_id='git-diff'`;
+            }>`SELECT result_json AS "resultJson" FROM agent_control_verification_check_results WHERE provider_delivery_id=${final.evidenceId} AND check_id='git-diff-page-1'`;
             expect(rows).toHaveLength(1);
             expect(rows[0]!.resultJson).toContain("first child change");
             expect(rows[0]!.resultJson).toContain("last child change");

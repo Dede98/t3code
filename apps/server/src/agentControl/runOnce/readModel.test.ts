@@ -358,6 +358,51 @@ layer("Run-Once client read model", (it) => {
           [],
         );
 
+        const pagedCode = `review-v2:${"a".repeat(40)}:raw-v3:fixture-5`;
+        const inventory = encodeUnknownJson({
+          exitCode: 0,
+          stdout: "Inspection inventory",
+          stderr: "",
+          inspection: {
+            version: "paged-inspection-v1",
+            baseCommit: "a".repeat(40),
+            documentDigest: "b".repeat(64),
+            byteLength: 30000,
+            pageDigests: ["c".repeat(64), "d".repeat(64)],
+          },
+        });
+        yield* sql`UPDATE agent_control_verification_check_manifests SET code_digest=${pagedCode} WHERE provider_delivery_id='delivery-5'`;
+        yield* sql`UPDATE agent_control_verification_check_results SET result_json=${inventory} WHERE provider_delivery_id='delivery-5' AND check_id='git-diff'`;
+        for (let page = 0; page <= 2; page++) {
+          if (page > 0)
+            yield* insertFixture("agent_control_verification_check_results", {
+              provider_delivery_id: "delivery-5",
+              check_id: `git-diff-page-${page}`,
+              provider_turn_id: "turn-5",
+              manifest_digest: "manifest-5",
+              code_digest: pagedCode,
+              status: "passed",
+              result_json: encodeUnknownJson({ exitCode: 0, stdout: `page ${page}`, stderr: "" }),
+              completed_at: at,
+            });
+          const current = yield* read.getSnapshot({ projectId });
+          const check = current.runs[0]?.stages[4]?.verification?.checks.find(
+            (check) => check.id === "git-diff",
+          );
+          assert.equal(check?.status, page === 2 ? "passed" : "missing");
+          assert.include(check?.output, `Inspection pages: ${page}/2`);
+          // Page payloads are deliberately absent from the shared client snapshot.
+          assert.equal(current.runs[0]?.stages[4]?.verification?.checks.length, 2);
+        }
+
+        yield* sql`UPDATE agent_control_verification_check_results SET code_digest='changed' WHERE provider_delivery_id='delivery-5' AND check_id='git-diff-page-2'`;
+        const stalePage = (yield* read.getSnapshot({
+          projectId,
+        })).runs[0]?.stages[4]?.verification?.checks.find((check) => check.id === "git-diff");
+        assert.equal(stalePage?.status, "stale");
+        assert.include(stalePage?.output, "Inspection pages: 1/2");
+        yield* sql`UPDATE agent_control_verification_check_results SET code_digest=${pagedCode} WHERE provider_delivery_id='delivery-5' AND check_id='git-diff-page-2'`;
+
         const initial = yield* Deferred.make<void>();
         const changed = yield* Deferred.make<AgentControlRunOnceSnapshot>();
         const stream = yield* read.subscribe({ projectId });

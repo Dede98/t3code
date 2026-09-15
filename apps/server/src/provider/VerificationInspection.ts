@@ -101,10 +101,12 @@ export const openVerificationFile = async (root: string, name: string) => {
 };
 
 /** Fixed raw before/after inspection; Git filters, external diffs and textconv never execute. */
-export const inspectVerificationChanges = async (
+const collectVerificationChanges = async (
   worktree: string,
   baseCommit: string,
-  inspection: VerificationInspection = "git-diff",
+  inspection: VerificationInspection,
+  fileLimit: number,
+  outputLimit: number,
 ) => {
   try {
     if (!/^[a-f0-9]{40,64}$/.test(baseCommit)) throw new Error("Missing fixed verification base");
@@ -183,11 +185,10 @@ export const inspectVerificationChanges = async (
           for await (const chunk of file.createReadStream({ autoClose: false })) {
             size += chunk.length;
             hash.update(chunk);
-            if (size <= FILE_LIMIT) chunks.push(chunk);
+            if (size <= fileLimit) chunks.push(chunk);
           }
           if (previous?.oid === hash.digest("hex") && previous.mode === mode) continue;
-          if (size > FILE_LIMIT)
-            throw new Error(`Changed file exceeds ${FILE_LIMIT} bytes: ${name}`);
+          if (size > fileLimit) throw new Error(`Changed file exceeds ${fileLimit} bytes: ${name}`);
           after = Buffer.concat(chunks);
         } finally {
           await file.close();
@@ -196,14 +197,14 @@ export const inspectVerificationChanges = async (
       let before: Buffer | null = null;
       if (previous) {
         const size = Number((await git(["cat-file", "-s", previous.oid])).trim());
-        if (!Number.isSafeInteger(size) || size > FILE_LIMIT)
-          throw new Error(`Base file exceeds ${FILE_LIMIT} bytes: ${name}`);
+        if (!Number.isSafeInteger(size) || size > fileLimit)
+          throw new Error(`Base file exceeds ${fileLimit} bytes: ${name}`);
         before = (
           await exec("git", ["-c", "core.fsmonitor=false", "cat-file", "blob", previous.oid], {
             cwd: root,
             env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" },
             encoding: "buffer",
-            maxBuffer: FILE_LIMIT + 1,
+            maxBuffer: fileLimit + 1,
             timeout: 15_000,
           })
         ).stdout;
@@ -224,8 +225,8 @@ export const inspectVerificationChanges = async (
           ? header
           : `${header}\n--- BASE\n${before?.toString("utf8") ?? "[absent]"}\n+++ CANDIDATE\n${after?.toString("utf8") ?? "[absent]"}`;
       bytes += Buffer.byteLength(section);
-      if (bytes > OUTPUT_LIMIT)
-        throw new Error(`Complete inspection exceeds ${OUTPUT_LIMIT} output bytes`);
+      if (bytes > outputLimit)
+        throw new Error(`Complete inspection exceeds ${outputLimit} output bytes`);
       sections.push(section);
     }
     return {
@@ -240,4 +241,56 @@ export const inspectVerificationChanges = async (
       stderr: `T3_INSPECTION_INCOMPLETE: ${error instanceof Error ? error.message : String(error)}. No complete review evidence is available.`,
     };
   }
+};
+
+/** Retains the single-response format for historical manifests and optional inspections. */
+export const inspectVerificationChanges = (
+  worktree: string,
+  baseCommit: string,
+  inspection: VerificationInspection = "git-diff",
+) => collectVerificationChanges(worktree, baseCommit, inspection, FILE_LIMIT, OUTPUT_LIMIT);
+
+export const VERIFICATION_INSPECTION_PAGE_BYTES = 24_000;
+export const VERIFICATION_INSPECTION_MAX_PAGES = 256;
+const INSPECTION_DOCUMENT_LIMIT = 4 * 1024 * 1024;
+const INSPECTION_FILE_LIMIT = 1024 * 1024;
+const sha256 = (value: string) => NodeCrypto.createHash("sha256").update(value).digest("hex");
+
+/** Build once; callers persist these bounded pages before publishing their inventory receipt. */
+export const prepareVerificationInspectionPages = async (worktree: string, baseCommit: string) => {
+  const result = await collectVerificationChanges(
+    worktree,
+    baseCommit,
+    "git-diff",
+    INSPECTION_FILE_LIMIT,
+    INSPECTION_DOCUMENT_LIMIT,
+  );
+  if (result.exitCode !== 0) throw new Error(result.stderr);
+  const document = Buffer.from(result.stdout);
+  if (document.length > INSPECTION_DOCUMENT_LIMIT)
+    throw new Error(
+      "T3_INSPECTION_INCOMPLETE: Complete inspection exceeds the document byte limit",
+    );
+  const pieces: string[] = [];
+  for (let offset = 0; offset < document.length;) {
+    let end = Math.min(offset + VERIFICATION_INSPECTION_PAGE_BYTES, document.length);
+    // Never split a UTF-8 code point, including a long line without newlines.
+    while (end < document.length && (document[end]! & 0xc0) === 0x80) end--;
+    pieces.push(document.subarray(offset, end).toString("utf8"));
+    offset = end;
+  }
+  if (pieces.length > VERIFICATION_INSPECTION_MAX_PAGES)
+    throw new Error("Inspection exceeds the bounded page inventory");
+  const documentDigest = sha256(result.stdout);
+  const pages = pieces.map(
+    (piece, index) =>
+      `Inspection ${documentDigest}, page ${index + 1}/${pieces.length}. Consecutive pages continue the same complete raw document.\n${piece}`,
+  );
+  return {
+    baseCommit,
+    documentDigest,
+    byteLength: document.length,
+    pageDigests: pages.map(sha256),
+    pages,
+  };
 };

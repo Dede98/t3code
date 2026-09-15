@@ -17,6 +17,12 @@ class VerificationCheckError extends Schema.TaggedError<VerificationCheckError>(
   { message: Schema.String },
 ) {}
 
+export const VerificationToolInput = Schema.Struct({
+  check: Schema.String,
+  page: Schema.optionalKey(
+    Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(256)),
+  ),
+});
 const CheckInput = Schema.Struct({ check: Schema.String });
 const decodeInput = Schema.decodeUnknownEffect(CheckInput, { onExcessProperty: "error" });
 const decodeChecks = Schema.decodeUnknownEffect(AgentControlVerificationChecks);
@@ -30,7 +36,7 @@ export const createCodexVerificationTool = (checks: AgentControlVerificationChec
       "Run a preauthorized check in the controlled Verification worktree. Checks have no network unless explicitly configured for a sandboxed assigned loopback port. For loopback HTTP tests use T3_VERIFICATION_URL and start your server with server.listen({fd:Number(process.env.T3_VERIFICATION_LISTEN_FD)}); the controller prebinds this listener. Creating any other listener is forbidden. " +
       "The worktree is read-only; approved checks may write only to a controller-owned temporary directory. " +
       `Project checks: ${JSON.stringify(checks.map(({ id, command, args, cwd, required, networkAccess }) => ({ id, command, args, cwd, required, networkAccess: networkAccess ?? "none" })))}. ` +
-      "Required inspection: git-diff (complete raw before/after changes against the fixed base, including staged and untracked files). Optional: git-status, git-diff-check. Incomplete, binary or oversized inspection is unavailable and cannot support acceptance. " +
+      "Required inspection: git-diff (complete raw before/after changes against the fixed base, including staged and untracked files). Optional: git-status, git-diff-check. First call git-diff without page to get its fixed inventory. Then call git-diff with page: N for EVERY page 1 through the listed count, in order, and review all contents. Repeating a page does not cover another page. The inventory alone is not acceptance evidence. An existing historical inspection may instead return the complete content in one response; review that whole response. Missing, stale, binary or incomplete inspection is unavailable and cannot support acceptance. " +
       "Run every required project check yourself. Implementation reports are not verification evidence. " +
       "Use this tool instead of the shell. Report unavailable or failed checks; do not repair or escalate permissions.",
     inputSchema: {
@@ -39,6 +45,13 @@ export const createCodexVerificationTool = (checks: AgentControlVerificationChec
         check: {
           type: "string",
           enum: [...checks.map((check) => check.id), ...INSPECTIONS],
+        },
+        page: {
+          type: "integer",
+          minimum: 1,
+          maximum: 256,
+          description:
+            "Only for git-diff: a required page number from its inventory. Omit to request the inventory.",
         },
       },
       required: ["check"],
