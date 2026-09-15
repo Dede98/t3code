@@ -143,6 +143,13 @@ An exhausted queue waits for more approvals instead of starting ordinary tasks. 
 verification evidence and PR links remain available. Pausing a queued Epic turns Armed off and preserves its execution for re-arm. A failed active Epic
 holds its place for human inspection; queue editing does not discard or retry its execution.
 
+To return to ordinary tasks, turn Armed off, wait for active work to finish, remove waiting entries,
+and choose **Leave Epic queue**. This explicitly ends the selected Epic without claiming a merge;
+its run history, checks and PR association remain available. You can later approve an Epic to begin
+a new queue. During human review only the saved PR is polled; candidate eligibility is checked again
+before starting the next Epic. If every waiting Epic is blocked, the server rechecks dependencies
+every five minutes; editing the queue requests a fresh check.
+
 ## Project icons
 
 Choose an icon, emoji, or image from the project to make it easier to recognize. The choice applies

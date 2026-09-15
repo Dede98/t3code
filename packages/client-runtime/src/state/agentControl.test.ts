@@ -24,6 +24,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 
 import {
   agentControlEpicQueueChangeBlockers,
+  agentControlEpicQueueLeaveBlockers,
   agentControlEpicQueueApproveBlockers,
   agentControlEpicQueueChangeInput,
   agentControlEpicQueueMoveInput,
@@ -1365,6 +1366,66 @@ describe("Epic queue client state", () => {
       ).toBeGreaterThan(0);
     }
     expect(agentControlEpicQueueChangeBlockers(start)).toEqual([]);
+  });
+
+  it("requires fresh write authority, disarm and removal of waiting approvals before leaving", () => {
+    const finished = {
+      ...queued,
+      armed: { enabled: false },
+      runs: [],
+      epic: { ...epicRun, status: "succeeded" as const },
+      epicQueue: { ...queued.epicQueue!, entries: [{ ...entry, status: "merged" as const }] },
+    };
+    const ready = { ...start, snapshot: finished };
+    expect(agentControlEpicQueueLeaveBlockers(ready)).toEqual([]);
+    expect(agentControlEpicControlAllowed(ready, "clear")).toBe(false);
+    for (const overrides of [
+      { connected: false },
+      { pending: true },
+      { snapshot: null },
+      { modeChangeBlocker: "Checking permissions" },
+    ]) {
+      expect(agentControlEpicQueueLeaveBlockers({ ...ready, ...overrides }).length).toBeGreaterThan(
+        0,
+      );
+    }
+    expect(
+      agentControlEpicQueueLeaveBlockers({ ...ready, snapshot: queued }).length,
+    ).toBeGreaterThan(0);
+    expect(
+      agentControlEpicQueueLeaveBlockers({
+        ...ready,
+        snapshot: { ...finished, runs: [{ ...run, state: { ...run.state, status: "active" } }] },
+      }).length,
+    ).toBeGreaterThan(0);
+    expect(
+      agentControlEpicQueueLeaveBlockers({
+        ...ready,
+        snapshot: {
+          ...finished,
+          projectState: { ...finished.projectState, mode: "paused", pausedFromMode: "run-once" },
+        },
+      }).length,
+    ).toBeGreaterThan(0);
+    const disabled = {
+      ...finished,
+      epic: null,
+      epicQueue: { ...finished.epicQueue, enabled: false, entries: [] },
+    };
+    expect(agentControlEpicQueueView(disabled)).toBeNull();
+    expect(agentControlEpicStartBlockers({ ...ready, snapshot: disabled }, epicPreview)).toEqual(
+      [],
+    );
+    expect(
+      agentControlEpicQueueApproveBlockers({ ...ready, snapshot: disabled }, epicPreview),
+    ).toEqual([]);
+    expect(
+      agentControlEpicQueueChangeInput(disabled, {
+        kind: "approve",
+        epicNumber: epicPreview.source.epic.number,
+        expectedFingerprint: epicPreview.source.fingerprint,
+      }).expectedRevision,
+    ).toBe(finished.epicQueue.revision);
   });
 
   it("moves the complete pending order and never moves active or merged entries", () => {

@@ -2,6 +2,7 @@ import { useEffect, useEffectEvent, useRef, useState } from "react";
 import {
   agentControlCommandErrorMessage,
   agentControlEpicQueueChangeBlockers,
+  agentControlEpicQueueLeaveBlockers,
   agentControlEpicQueueApproveBlockers,
   agentControlEpicQueueChangeInput,
   agentControlEpicQueueMoveInput,
@@ -70,6 +71,7 @@ export function AgentControlEpicPanel({
   const clear = useAtomCommand(agentControlEnvironment.epicClear, { reportFailure: false });
   const changeQueue = useAtomCommand(agentControlEnvironment.epicQueueChange);
   const queue = agentControlEpicQueueView(readiness.snapshot);
+  const leaveBlockers = agentControlEpicQueueLeaveBlockers(readiness);
   const queueBlockers = agentControlEpicQueueChangeBlockers(readiness);
   const approvalBlockers = agentControlEpicQueueApproveBlockers(readiness, preview);
   const epic = readiness.snapshot?.epic;
@@ -97,27 +99,34 @@ export function AgentControlEpicPanel({
     Number.isSafeInteger(issueNumber) &&
     issueNumber > 0;
 
-  async function editQueue(action: "approve" | "remove" | "up" | "down", entryId?: string) {
+  async function editQueue(
+    action: "approve" | "remove" | "up" | "down" | "leave",
+    entryId?: string,
+  ) {
     const snapshot = readiness.snapshot;
     if (!snapshot || readOnly || inFlight.current || queueBlockers.length > 0) return;
     if (action === "approve" && (!preview || approvalBlockers.length > 0)) return;
+    if (action === "leave" && leaveBlockers.length > 0) return;
     if (
       action !== "approve" &&
+      action !== "leave" &&
       !queue?.entries.some((entry) => entry.entryId === entryId && entry.status === "pending")
     )
       return;
     const input =
-      action === "approve" && preview
-        ? agentControlEpicQueueChangeInput(snapshot, {
-            kind: "approve",
-            epicNumber: preview.source.epic.number,
-            expectedFingerprint: preview.source.fingerprint,
-          })
-        : action === "remove" && entryId
-          ? agentControlEpicQueueChangeInput(snapshot, { kind: "remove", entryId })
-          : entryId
-            ? agentControlEpicQueueMoveInput(snapshot, entryId, action === "up" ? -1 : 1)
-            : null;
+      action === "leave"
+        ? agentControlEpicQueueChangeInput(snapshot, { kind: "leave" })
+        : action === "approve" && preview
+          ? agentControlEpicQueueChangeInput(snapshot, {
+              kind: "approve",
+              epicNumber: preview.source.epic.number,
+              expectedFingerprint: preview.source.fingerprint,
+            })
+          : action === "remove" && entryId
+            ? agentControlEpicQueueChangeInput(snapshot, { kind: "remove", entryId })
+            : entryId
+              ? agentControlEpicQueueMoveInput(snapshot, entryId, action === "up" ? -1 : 1)
+              : null;
     if (!input) return;
     inFlight.current = true;
     setError(null);
@@ -276,6 +285,27 @@ export function AgentControlEpicPanel({
       {queue ? (
         <section className="space-y-2" aria-label="Approved Epic queue">
           <h3 className="text-sm font-medium">Approved Epic queue</h3>
+          {!readOnly ? (
+            <div className="space-y-1">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={leaveBlockers.length > 0}
+                onClick={() => void editQueue("leave")}
+              >
+                Leave Epic queue
+              </Button>
+              <p className="text-xs text-muted-foreground">
+                Leaving ends the selected Epic and returns to ordinary tasks. Run history,
+                verification and PR links are retained.
+              </p>
+              {leaveBlockers.map((message) => (
+                <p key={message} className="text-xs text-muted-foreground">
+                  {message}
+                </p>
+              ))}
+            </div>
+          ) : null}
           <p className="text-sm">
             Active:{" "}
             {queue.active
@@ -283,7 +313,7 @@ export function AgentControlEpicPanel({
               : "None"}
           </p>
           <p className="text-sm">
-            Next eligible:{" "}
+            Next candidate:{" "}
             {queue.next
               ? `#${queue.next.source.epic.number} ${queue.next.source.epic.title}`
               : "None"}
@@ -295,7 +325,8 @@ export function AgentControlEpicPanel({
           ) : null}
           {queue.nextCheckAt ? (
             <p className="text-xs text-muted-foreground">
-              While Armed, the server checks about once a minute.
+              While Armed, the server checks the PR about once a minute. Candidates are rechecked
+              before starting.
             </p>
           ) : null}
           {queue.entries.length === 0 ? (
@@ -318,7 +349,7 @@ export function AgentControlEpicPanel({
                     : entry.status === "active"
                       ? "Active"
                       : "Merged"}
-                  {queue.next?.entryId === entry.entryId ? " · Next eligible" : ""}
+                  {queue.next?.entryId === entry.entryId ? " · Next candidate" : ""}
                 </p>
                 {entry.blockers.map((blocker) => (
                   <p key={`${blocker.code}:${blocker.message}`} className="text-amber-600">

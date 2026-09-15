@@ -1,4 +1,4 @@
-import { loadEpicQueue } from "../../epic/queueAuthority.ts";
+import { loadEnabledEpicQueue } from "../../epic/queueAuthority.ts";
 import { loadSelectedEpic } from "../../epic/authority.ts";
 import { AgentControlEpicProgress } from "../../epic/Services/AgentControlEpicProgress.ts";
 import {
@@ -110,12 +110,18 @@ export const makeAgentControlArmedWorkScheduler = Effect.fn("makeAgentControlArm
         // transient retry is delayed, duplicate prompts must not erase either
         // its retry budget or deadline. A genuinely newer durable epoch is still
         // observed by the already scheduled authoritative rescan.
-        if (state.pending.has(projectId) || state.delayed.has(projectId)) {
+        if (
+          state.pending.has(projectId) ||
+          (state.delayed.has(projectId) && state.retries.has(projectId))
+        ) {
           return [false, state] as const;
         }
         const pending = new Set(state.pending);
+        const delayed = new Map(state.delayed);
+        // Durable edits supersede a routine review/dependency poll, not a failure retry.
+        delayed.delete(projectId);
         pending.add(projectId);
-        return [true, { ...state, pending }] as const;
+        return [true, { ...state, pending, delayed }] as const;
       }).pipe(
         Effect.flatMap((added) =>
           (added ? signal : Effect.void).pipe(Effect.andThen(signalRetryCoordinator)),
@@ -194,7 +200,7 @@ export const makeAgentControlArmedWorkScheduler = Effect.fn("makeAgentControlArm
           const delayed = new Map(state.delayed);
           running.delete(projectId);
           const changed = dirty.delete(projectId);
-          if (changed && delay === null) {
+          if (changed && !retry) {
             retries.delete(projectId);
             delayed.delete(projectId);
             pending.add(projectId);
@@ -411,7 +417,7 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
   const processProject: AgentControlArmedSchedulerShape["processProject"] = (projectId) =>
     Effect.gen(function* () {
       const selectedEpic = yield* loadSelectedEpic(sql, projectId);
-      if (selectedEpic !== null || (yield* loadEpicQueue(sql, projectId)) !== null)
+      if (selectedEpic !== null || (yield* loadEnabledEpicQueue(sql, projectId)) !== null)
         yield* epicProgress.processProject(projectId);
       const dispatch = yield* withAgentControlRunOnceProjectFence(
         projectId,
@@ -534,7 +540,7 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
         reportFailure,
         (projectId) =>
           Effect.gen(function* () {
-            const queue = yield* loadEpicQueue(sql, projectId);
+            const queue = yield* loadEnabledEpicQueue(sql, projectId);
             if (!queue) return null;
             const project = yield* projectEngine.getProjectState({ projectId });
             if (project.mode !== "armed" || project.pausedFromMode !== null) return null;

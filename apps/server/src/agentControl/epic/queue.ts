@@ -1,6 +1,7 @@
 import {
   AgentControlEpicRpcError,
   AgentControlProjectPolicy,
+  isAgentControlEpicQueueEnabled,
   type AgentControlEpicPreview,
   type AgentControlEpicQueue,
   type AgentControlEpicQueueChangeInput,
@@ -81,15 +82,18 @@ export const makeEpicQueue = Effect.gen(function* () {
             "revision-conflict",
             "The Epic queue changed. Reload before editing it.",
           );
+        const enabled = isAgentControlEpicQueueEnabled(previous);
+        if (!enabled && input.action.kind !== "approve")
+          return yield* epicError("queue-disabled", "Approve an Epic to enable the queue.");
         const selected = yield* loadSelectedEpic(sql, input.projectId);
-        if (!previous && selected?.status === "stopped")
+        if (!enabled && selected?.status === "stopped")
           return yield* epicError(
             "epic-stopped",
             "Clear the stopped Epic selection before enabling its project queue.",
           );
         const project = yield* engine.getProjectState({ projectId: input.projectId });
         if (
-          !previous &&
+          !enabled &&
           !selected &&
           (project.mode === "armed" ||
             project.mode === "run-once" ||
@@ -101,13 +105,57 @@ export const makeEpicQueue = Effect.gen(function* () {
           );
         const activeRuns =
           yield* sql`SELECT 1 FROM main.agent_control_run_once_states WHERE project_id=${input.projectId} AND status='active'`;
-        if (!previous && !selected && activeRuns.length)
+        if (!enabled && !selected && activeRuns.length)
           return yield* epicError(
             "project-busy",
             "Finish the active task before enabling the Epic queue.",
           );
-        let entries = [...(previous?.entries ?? (selected ? [entryForRun(selected)] : []))];
+        let entries = [...(enabled ? previous!.entries : selected ? [entryForRun(selected)] : [])];
         const action = input.action;
+        if (action.kind === "leave") {
+          const active = entries.find((entry) => entry.status === "active");
+          if (active && active.epicRunId !== selected?.epicRunId)
+            return yield* epicError(
+              "authority-conflict",
+              "The active queue entry lost its Epic selection.",
+            );
+          if (
+            project.mode === "armed" ||
+            project.mode === "run-once" ||
+            project.pausedFromMode === "run-once" ||
+            activeRuns.length
+          )
+            return yield* epicError(
+              "queue-busy",
+              "Turn Armed off and wait for active work to settle before leaving the queue.",
+            );
+          if (entries.some((entry) => entry.status === "pending"))
+            return yield* epicError(
+              "queue-has-pending",
+              "Remove waiting entries before leaving the queue. Their approval is not discarded automatically.",
+            );
+          if (selected) {
+            if (!entries.some((entry) => entry.epicRunId === selected.epicRunId))
+              return yield* epicError(
+                "authority-conflict",
+                "The selected Epic does not belong to this queue.",
+              );
+            if (selected.status !== "succeeded" && selected.status !== "stopped")
+              yield* saveEpicRun(sql, selected, { status: "stopped" });
+            yield* sql`DELETE FROM main.agent_control_epic_targets WHERE project_id=${input.projectId} AND epic_run_id=${selected.epicRunId}`;
+          }
+          const left = yield* saveEpicQueue(sql, previous, {
+            projectId: input.projectId,
+            revision: previous!.revision,
+            enabled: false,
+            entries: [],
+            nextEntryId: null,
+            waitReason: null,
+            nextCheckAt: null,
+          });
+          yield* sql`INSERT INTO main.agent_control_epic_queue_commands(command_id,request_digest,project_id) VALUES (${input.commandId},${epicDigest(input)},${input.projectId})`;
+          return left;
+        }
         if (action.kind === "approve") {
           if (!inspected) return yield* epicError("authority-conflict", "Epic preview is missing.");
           if (entries.filter((entry) => entry.status !== "merged").length >= 20)
@@ -166,6 +214,7 @@ export const makeEpicQueue = Effect.gen(function* () {
         }
         const queue = yield* saveEpicQueue(sql, previous, {
           projectId: input.projectId,
+          enabled: true,
           revision: previous?.revision ?? 0,
           entries,
           nextEntryId: null,
@@ -183,7 +232,7 @@ export const makeEpicQueue = Effect.gen(function* () {
     preview: (number: number) => Effect.Effect<AgentControlEpicPreview, AgentControlEpicRpcError>,
   ) {
     let queue = yield* loadEpicQueue(sql, projectId);
-    if (!queue) return false;
+    if (!queue || !isAgentControlEpicQueueEnabled(queue)) return false;
     const project = yield* engine.getProjectState({ projectId });
     if (project.mode !== "armed" || project.pausedFromMode !== null) return true;
     const now = yield* DateTime.now;
@@ -203,57 +252,19 @@ export const makeEpicQueue = Effect.gen(function* () {
         "The active queue entry lost its Epic selection.",
       );
     let entries = [...queue.entries];
-    let candidate: AgentControlEpicQueueEntry | undefined;
+    let candidate = entries.find(
+      (entry) =>
+        entry.status === "pending" &&
+        entry.blockers.length === 0 &&
+        entry.source.tasks.some((task) => task.issue.state === "open"),
+    );
     let candidatePreview: AgentControlEpicPreview | undefined;
-    // Pending scope is approved once; state, approval and dependencies are refreshed before each start.
-    for (const entry of entries.filter((entry) => entry.status === "pending")) {
-      const inspectedResult = yield* Effect.result(preview(entry.source.epic.number));
-      if (inspectedResult._tag === "Failure") {
-        const error = inspectedResult.failure;
-        if (
-          !["source-unavailable", "project-unavailable", "intake-incomplete"].includes(error.code)
-        )
-          return yield* error;
-        entries = entries.map((item) =>
-          item === entry
-            ? {
-                ...entry,
-                blockers: [
-                  {
-                    code: error.code,
-                    issueNumber: entry.source.epic.number,
-                    message: error.message,
-                  },
-                ],
-              }
-            : item,
-        );
-        continue;
-      }
-      const inspected = inspectedResult.success;
-      const blockers =
-        epicStructureDigest(inspected.source) === epicStructureDigest(entry.source)
-          ? inspected.blockers
-          : [
-              {
-                code: "scope-changed",
-                issueNumber: entry.source.epic.number,
-                message:
-                  "Epic membership or dependencies changed after approval. Remove this waiting entry and approve its current scope.",
-              },
-            ];
-      entries = entries.map((item) => (item === entry ? { ...entry, blockers } : item));
-      if (!candidate && inspected.canStart && blockers.length === 0) {
-        candidate = entry;
-        candidatePreview = inspected;
-      }
-    }
-    const wait = (reason: string, schedule = true) =>
+    const wait = (reason: string, schedule = true, checkAt = nextCheckAt) =>
       persist({
         entries,
         nextEntryId: candidate?.entryId ?? null,
         waitReason: reason,
-        nextCheckAt: schedule ? nextCheckAt : null,
+        nextCheckAt: schedule ? checkAt : null,
       });
     let previousRun = selected;
     if (active && selected) {
@@ -332,12 +343,73 @@ export const makeEpicQueue = Effect.gen(function* () {
         nextCheckAt: null,
       });
     }
+    // During execution/review the candidate is a saved hint. Refresh pending
+    // scopes only at an actual selection boundary, then stop after the first fit.
+    candidate = undefined;
+    // Pending scope is approved once; state, approval and dependencies are refreshed before each start.
+    for (const entry of entries.filter((entry) => entry.status === "pending")) {
+      const inspectedResult = yield* Effect.result(preview(entry.source.epic.number));
+      if (inspectedResult._tag === "Failure") {
+        const error = inspectedResult.failure;
+        if (
+          !["source-unavailable", "project-unavailable", "intake-incomplete"].includes(error.code)
+        )
+          return yield* error;
+        entries = entries.map((item) =>
+          item === entry
+            ? {
+                ...entry,
+                blockers: [
+                  {
+                    code: error.code,
+                    issueNumber: entry.source.epic.number,
+                    message: error.message,
+                  },
+                ],
+              }
+            : item,
+        );
+        continue;
+      }
+      const inspected = inspectedResult.success;
+      const blockers =
+        epicStructureDigest(inspected.source) === epicStructureDigest(entry.source)
+          ? [
+              ...inspected.blockers,
+              ...(!inspected.source.tasks.some((task) => task.issue.state === "open")
+                ? [
+                    {
+                      code: "no-open-tasks",
+                      issueNumber: entry.source.epic.number,
+                      message:
+                        "This Epic has no open child tasks to execute and cannot produce a verified pull request.",
+                    },
+                  ]
+                : []),
+            ]
+          : [
+              {
+                code: "scope-changed",
+                issueNumber: entry.source.epic.number,
+                message:
+                  "Epic membership or dependencies changed after approval. Remove this waiting entry and approve its current scope.",
+              },
+            ];
+      entries = entries.map((item) => (item === entry ? { ...entry, blockers } : item));
+      if (!candidate && inspected.canStart && blockers.length === 0) {
+        candidate = entry;
+        candidatePreview = inspected;
+        break;
+      }
+    }
     if (!candidate || !candidatePreview) {
       yield* wait(
         entries.some((entry) => entry.status === "pending")
           ? "No approved Epic currently satisfies its dependencies and execution requirements."
           : "All approved Epics are complete. Approve another Epic to continue.",
         entries.some((entry) => entry.status === "pending"),
+        // Dependency-only waits need full scope reads; poll less often than the saved PR.
+        DateTime.formatIso(DateTime.add(now, { minutes: 5 })),
       );
       return true;
     }

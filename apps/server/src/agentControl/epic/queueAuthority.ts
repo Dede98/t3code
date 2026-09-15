@@ -1,4 +1,8 @@
-import { AgentControlEpicQueue, type ProjectId } from "@t3tools/contracts";
+import {
+  AgentControlEpicQueue,
+  isAgentControlEpicQueueEnabled,
+  type ProjectId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -77,4 +81,12 @@ export const saveEpicQueue = Effect.fn("saveEpicQueue")(function* (
   }
   yield* sql`INSERT INTO main.agent_control_epic_queue_history(project_id,revision,state_json,state_digest) VALUES (${state.projectId},${state.revision},${json},${digest})`;
   return state;
+});
+
+export const loadEnabledEpicQueue = Effect.fn("loadEnabledEpicQueue")(function* (
+  sql: SqlClient.SqlClient,
+  projectId: ProjectId,
+) {
+  const queue = yield* loadEpicQueue(sql, projectId);
+  return isAgentControlEpicQueueEnabled(queue) ? queue : null;
 });

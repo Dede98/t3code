@@ -1,5 +1,5 @@
 import { makeEpicQueue, mapEpicQueueError } from "../queue.ts";
-import { loadEpicQueue } from "../queueAuthority.ts";
+import { loadEnabledEpicQueue } from "../queueAuthority.ts";
 import { GithubIssueTrackerClientError } from "../../github/Services/GithubIssueTrackerClient.ts";
 import { createEpicRun, insertEpicRun } from "../runState.ts";
 import {
@@ -272,7 +272,7 @@ export const makeAgentControlEpic = Effect.gen(function* () {
             yield* recoverModeIntent(replay);
             return replay;
           }
-          if (yield* loadEpicQueue(sql, input.projectId))
+          if (yield* loadEnabledEpicQueue(sql, input.projectId))
             return yield* epicError(
               "queue-enabled",
               "Approve this Epic through the project queue.",
@@ -366,10 +366,10 @@ export const makeAgentControlEpic = Effect.gen(function* () {
               "epic-terminal",
               "A completed or stopped Epic run cannot be resumed.",
             );
-          if (kind === "clear" && (yield* loadEpicQueue(sql, input.projectId)))
+          if (kind === "clear" && (yield* loadEnabledEpicQueue(sql, input.projectId)))
             return yield* epicError(
               "queue-entry-retained",
-              "Queued runs retain their selection until a confirmed merge advances the queue.",
+              "Use Leave Epic queue after turning Armed off and removing waiting entries.",
             );
           if (kind === "clear") {
             yield* sql.withTransaction(
@@ -405,7 +405,7 @@ export const makeAgentControlEpic = Effect.gen(function* () {
             yield* publish(input.projectId);
             return current;
           }
-          const queued = (yield* loadEpicQueue(sql, input.projectId)) !== null;
+          const queued = (yield* loadEnabledEpicQueue(sql, input.projectId)) !== null;
           const modeState = yield* engine.getProjectState({ projectId: input.projectId });
           const updated = yield* sql.withTransaction(
             Effect.gen(function* () {
@@ -458,9 +458,9 @@ export const makeAgentControlEpic = Effect.gen(function* () {
       .withPermit(
         projectId,
         Effect.gen(function* () {
-          const beforeQueue = yield* loadEpicQueue(sql, projectId);
+          const beforeQueue = yield* loadEnabledEpicQueue(sql, projectId);
           yield* queue.process(projectId, (epicNumber) => preview({ projectId, epicNumber }));
-          const afterQueue = yield* loadEpicQueue(sql, projectId);
+          const afterQueue = yield* loadEnabledEpicQueue(sql, projectId);
           if (beforeQueue?.revision !== afterQueue?.revision) yield* publish(projectId);
           let state = yield* get(projectId);
           if (state) yield* recoverModeIntent(state);
@@ -521,7 +521,7 @@ export const makeAgentControlEpic = Effect.gen(function* () {
                   code: "child-failed",
                   issueNumber: active.issueNumber,
                   message:
-                    "The child task failed or exhausted its bounded repair. Its changes were not accepted. Inspect its thread and evidence, then stop this Epic run.",
+                    "The child task failed or exhausted its bounded repair. Its changes were not accepted. Inspect its thread and evidence. For a queued run, disarm, remove waiting entries and leave the queue to return to ordinary tasks.",
                 },
               ]);
               return;
@@ -613,7 +613,7 @@ export const makeAgentControlEpic = Effect.gen(function* () {
                 code: "child-failed",
                 issueNumber: null,
                 message:
-                  "A failed child requires inspection. Stop this Epic before starting a new scope.",
+                  "A failed child requires inspection. For a queued run, disarm, remove waiting entries and leave the queue before starting a new scope.",
               },
             ]);
             return;

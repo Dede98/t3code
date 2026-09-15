@@ -15,6 +15,8 @@ export type AgentControlEpicQueueEntry = typeof AgentControlEpicQueueEntry.Type;
 /** Array order is execution order; active and completed entries cannot be edited. */
 export const AgentControlEpicQueue = Schema.Struct({
   projectId: ProjectId,
+  /** Missing on older queue states means enabled. Leaving retains its revision and history. */
+  enabled: Schema.optionalKey(Schema.Boolean),
   revision: NonNegativeInt,
   entries: Schema.Array(AgentControlEpicQueueEntry),
   nextEntryId: Schema.NullOr(Schema.String),
@@ -22,11 +24,14 @@ export const AgentControlEpicQueue = Schema.Struct({
   nextCheckAt: Schema.NullOr(IsoDateTime),
 });
 export type AgentControlEpicQueue = typeof AgentControlEpicQueue.Type;
+export const isAgentControlEpicQueueEnabled = (queue: AgentControlEpicQueue | null | undefined) =>
+  queue !== null && queue !== undefined && queue.enabled !== false;
 export const AgentControlEpicQueueChangeInput = Schema.Struct({
   projectId: ProjectId,
   commandId: CommandId,
   expectedRevision: NonNegativeInt,
   action: Schema.Union([
+    Schema.Struct({ kind: Schema.Literal("leave") }),
     Schema.Struct({
       kind: Schema.Literal("approve"),
       epicNumber: PositiveInt,

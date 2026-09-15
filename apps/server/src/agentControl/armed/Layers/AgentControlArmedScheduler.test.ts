@@ -31,6 +31,9 @@ import {
 } from "../../runOnce/authority.ts";
 import { deriveAgentControlRunOnceId, deriveRunOnceCommandId } from "../../runOnce/identity.ts";
 import { AgentControlTaskIntakeReactor } from "../../task/Services/AgentControlTaskIntakeReactor.ts";
+import { makeEpicQueue, mapEpicQueueError } from "../../epic/queue.ts";
+import { AgentControlEpicProgress } from "../../epic/Services/AgentControlEpicProgress.ts";
+import { loadEpicQueue, saveEpicQueue } from "../../epic/queueAuthority.ts";
 import { canonicalJson } from "../../initialPlanning/eventEvidence.ts";
 import { makeReactorStartupActivation } from "../../../reactorStartupActivation.ts";
 import { AgentControlRunOnceError } from "../../runOnce/model.ts";
@@ -720,6 +723,78 @@ layer("AgentControlArmedScheduler", (it) => {
     }),
   );
 
+  it.effect("restores ordinary Armed dispatch after explicitly leaving an empty queue", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const engine = yield* AgentControlEngine;
+      const id = ProjectId.make("armed-after-queue-exit");
+      yield* resetRunOnce(id);
+      yield* addProject(sql, id);
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make("queue-exit-observe"),
+        projectId: id,
+        expectedRevision: 0,
+        mode: "observe",
+      });
+      yield* seedSourceAndCandidate(sql, id);
+      yield* sql.withTransaction(
+        saveEpicQueue(sql, null, {
+          projectId: id,
+          revision: 0,
+          entries: [],
+          nextEntryId: null,
+          waitReason: null,
+          nextCheckAt: null,
+        }),
+      );
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make("queue-exit-arm"),
+        projectId: id,
+        expectedRevision: 1,
+        mode: "armed",
+      });
+      const queue = yield* makeEpicQueue;
+      const preview = () => Effect.die("An empty queue must not inspect GitHub");
+      const scheduler = yield* make().pipe(
+        Effect.provideService(AgentControlEpicProgress, {
+          processProject: (projectId) =>
+            queue
+              .process(projectId, preview)
+              .pipe(Effect.mapError(mapEpicQueueError), Effect.asVoid),
+        }),
+      );
+      yield* scheduler.processProject(id);
+      assert.equal(yield* getRunOnceCalls(id), 0);
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make("queue-exit-disarm"),
+        projectId: id,
+        expectedRevision: 2,
+        mode: "observe",
+      });
+      yield* queue.change(
+        {
+          projectId: id,
+          commandId: CommandId.make("queue-exit-leave"),
+          expectedRevision: (yield* loadEpicQueue(sql, id))!.revision,
+          action: { kind: "leave" },
+        },
+        () => Effect.die("Leaving must not inspect GitHub"),
+      );
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make("queue-exit-rearm"),
+        projectId: id,
+        expectedRevision: 3,
+        mode: "armed",
+      });
+      yield* scheduler.processProject(id);
+      assert.equal(yield* getRunOnceCalls(id), 1);
+      assert.deepEqual(
+        yield* sql`SELECT status FROM agent_control_armed_dispatch_states WHERE project_id=${id}`,
+        [{ status: "activated" }],
+      );
+    }),
+  );
+
   it.effect("catches up durable work after a lost intake wakeup before readiness", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -1401,3 +1476,39 @@ it.effect("successful review checks preserve the bounded failure retry budget", 
     assert.equal(yield* Ref.get(reported), 0);
   }),
 );
+
+for (const whileRunning of [false, true])
+  it.effect(
+    `durable wakeups supersede routine polling (${whileRunning ? "during work" : "during delay"}) without a duplicate timer run`,
+    () =>
+      Effect.gen(function* () {
+        const id = ProjectId.make(`queue-edit-wakeup-${whileRunning}`);
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const resumed = yield* Deferred.make<void>();
+        const calls = yield* Ref.make(0);
+        const schedule = yield* makeAgentControlArmedWorkScheduler(
+          () =>
+            Effect.gen(function* () {
+              const n = yield* Ref.updateAndGet(calls, (n) => n + 1);
+              if (n === 1) {
+                yield* Deferred.succeed(entered, undefined);
+                if (whileRunning) yield* Deferred.await(release);
+              } else yield* Deferred.succeed(resumed, undefined);
+            }),
+          Effect.void,
+          1,
+          () => Effect.void,
+          () => Ref.get(calls).pipe(Effect.map((n) => (n === 1 ? 300_000 : null))),
+        );
+        yield* schedule(id);
+        yield* Deferred.await(entered);
+        if (!whileRunning) yield* TestClock.adjust("1 second");
+        yield* schedule(id);
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(resumed);
+        assert.equal(yield* Ref.get(calls), 2);
+        yield* TestClock.adjust("1 hour");
+        assert.equal(yield* Ref.get(calls), 2);
+      }),
+  );

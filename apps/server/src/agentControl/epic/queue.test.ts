@@ -24,7 +24,7 @@ import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import { AgentControlEngine } from "../Services/AgentControlEngine.ts";
 import { epicJson, loadEpicRun, loadSelectedEpic, saveEpicRun } from "./authority.ts";
 import { makeEpicQueue } from "./queue.ts";
-import { loadEpicQueue } from "./queueAuthority.ts";
+import { loadEpicQueue, loadEnabledEpicQueue } from "./queueAuthority.ts";
 import { EpicHandoffRemote, EpicHandoffRemoteError, type EpicQueueBaseInput } from "./remote.ts";
 import { createEpicRun, insertEpicRun } from "./runState.ts";
 
@@ -86,7 +86,7 @@ const assertEpicError = (error: unknown, code: string) => {
 
 const fixture = Effect.fn("epicQueueFixture")(function* (id = projectId) {
   const sql = yield* SqlClient.SqlClient;
-  yield* runMigrations({ toMigrationInclusive: 85 });
+  yield* runMigrations({ toMigrationInclusive: 86 });
   yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,created_at,updated_at,scripts_json) VALUES (${id},'Queue test','/isolated/queue',${at},${at},'[]')`;
   yield* sql`INSERT INTO agent_control_project_policies(project_id,policy_json,revision,updated_at) VALUES (${id},${epicJson({ verificationChecks: [] })},1,${at})`;
   let project: AgentControlProjectState = {
@@ -119,6 +119,7 @@ const fixture = Effect.fn("epicQueueFixture")(function* (id = projectId) {
   let fetchGate = Effect.void;
   let reads = 0;
   const fetched: EpicQueueBaseInput[] = [];
+  const previewCalls: number[] = [];
   const previews = new Map<number, AgentControlEpicPreview>();
   const remote = EpicHandoffRemote.of({
     readPullRequest: (input) =>
@@ -139,15 +140,17 @@ const fixture = Effect.fn("epicQueueFixture")(function* (id = projectId) {
     publish: () => Effect.die("Queue must not publish pull requests"),
   });
   const preview = (number: number) =>
-    Effect.sync(
-      () =>
+    Effect.sync(() => {
+      previewCalls.push(number);
+      return (
         previews.get(number) ?? {
           projectId: id,
           source: source(number),
           canStart: true,
           blockers: [],
-        },
-    );
+        }
+      );
+    });
   const make = () =>
     makeEpicQueue.pipe(
       Effect.provideService(AgentControlEngine, engine),
@@ -202,6 +205,7 @@ const fixture = Effect.fn("epicQueueFixture")(function* (id = projectId) {
     make,
     preview,
     previews,
+    previewCalls,
     approve,
     change,
     succeed,
@@ -260,6 +264,157 @@ describe("durable Epic queue", () => {
         assert.equal((yield* f.selected())?.epicRunId, manual.epicRunId);
         assert.equal((yield* f.selected())?.status, "stopped");
         assert.equal((yield* f.runs()).length, 1);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect(
+    "leaves a failed queue explicitly after disarm and pending removal, preserving history and command authority",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.approve(10);
+        yield* f.approve(20);
+        f.setMode("armed");
+        yield* f.process();
+        const selected = (yield* f.selected())!;
+        const failed = yield* f.sql.withTransaction(
+          saveEpicRun(f.sql, selected, {
+            status: "blocked",
+            blockers: [{ code: "child-failed", issueNumber: 110, message: "Child failed." }],
+          }),
+        );
+        assertEpicError(yield* f.change({ kind: "leave" }).pipe(Effect.flip), "queue-busy");
+        f.setMode("observe");
+        assertEpicError(yield* f.change({ kind: "leave" }).pipe(Effect.flip), "queue-has-pending");
+        const pending = (yield* f.read())!.entries.find((entry) => entry.status === "pending")!;
+        const before = yield* f.change({ kind: "remove", entryId: pending.entryId });
+        const input = {
+          projectId,
+          commandId: CommandId.make("leave-failed"),
+          expectedRevision: before.revision,
+          action: { kind: "leave" as const },
+        };
+        const service = yield* f.make();
+        const left = yield* service.change(input, f.preview);
+        assert.isFalse(left.enabled);
+        assert.isNull(yield* f.selected());
+        assert.isNull(yield* loadEnabledEpicQueue(f.sql, projectId));
+        const retained = (yield* loadEpicRun(f.sql, selected.epicRunId))!;
+        assert.equal(retained.status, "stopped");
+        assert.deepEqual(retained.blockers, failed.blockers);
+        assert.deepEqual(yield* service.change(input, f.preview), left);
+        assert.equal((yield* f.runs()).length, 1);
+        assert.isFalse(yield* f.process());
+        assertEpicError(
+          yield* service
+            .change({ ...input, commandId: CommandId.make("stale-leave") }, f.preview)
+            .pipe(Effect.flip),
+          "revision-conflict",
+        );
+        const fresh = yield* f.approve(20);
+        assert.isTrue(fresh.enabled);
+        assert.isAbove(fresh.revision, left.revision);
+        assert.equal(fresh.entries.length, 1);
+        assert.equal(fresh.entries[0]?.source.epic.number, 20);
+        f.setMode("armed");
+        yield* f.process();
+        assert.equal((yield* f.runs()).length, 2);
+        assert.equal((yield* f.selected())?.source.epic.number, 20);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("does not hide a lost active selection when leaving", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* f.approve(10);
+      f.setMode("armed");
+      yield* f.process();
+      f.setMode("observe");
+      const before = yield* f.read();
+      yield* f.sql`DELETE FROM agent_control_epic_targets WHERE project_id=${projectId}`;
+      assertEpicError(yield* f.change({ kind: "leave" }).pipe(Effect.flip), "authority-conflict");
+      assert.deepEqual(yield* f.read(), before);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("bounds dependency scans and rechecks immediately after an explicit queue edit", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* f.approve(10);
+      f.previews.set(10, {
+        projectId,
+        source: source(10),
+        canStart: false,
+        blockers: [
+          { code: "missing-prerequisite", issueNumber: 10, message: "Wait for prerequisite." },
+        ],
+      });
+      f.previewCalls.length = 0;
+      f.setMode("armed");
+      yield* f.process();
+      assert.deepEqual(f.previewCalls, [10]);
+      yield* TestClock.adjust("60 seconds");
+      yield* f.process();
+      assert.deepEqual(f.previewCalls, [10]);
+      yield* TestClock.adjust("4 minutes");
+      yield* f.process();
+      assert.deepEqual(f.previewCalls, [10, 10]);
+      yield* f.approve(20);
+      yield* f.process();
+      assert.equal((yield* f.selected())?.source.epic.number, 20);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect(
+    "leaves after a confirmed merge while preserving the completed run and PR mapping",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.approve(10);
+        f.setMode("armed");
+        yield* f.process();
+        yield* f.succeed(true);
+        f.setObservation("merged");
+        yield* TestClock.adjust("60 seconds");
+        yield* f.process();
+        const completed = (yield* f.selected())!;
+        assert.equal((yield* f.read())!.entries[0]?.status, "merged");
+        f.setMode("observe");
+        yield* f.change({ kind: "leave" });
+        assert.isNull(yield* f.selected());
+        assert.deepEqual(yield* loadEpicRun(f.sql, completed.epicRunId), completed);
+        assert.isFalse(yield* f.process());
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect(
+    "skips an approved Epic whose children all closed and stops inspection at the first eligible successor",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.approve(10);
+        yield* f.approve(20);
+        yield* f.approve(30);
+        f.previews.set(10, {
+          projectId,
+          source: {
+            ...source(10),
+            tasks: source(10).tasks.map((task) => ({
+              ...task,
+              issue: { ...task.issue, state: "closed" },
+            })),
+          },
+          canStart: true,
+          blockers: [],
+        });
+        f.previewCalls.length = 0;
+        f.setMode("armed");
+        yield* f.process();
+        const queue = (yield* f.read())!;
+        assert.equal(queue.entries[0]?.status, "pending");
+        assert.equal(queue.entries[0]?.blockers[0]?.code, "no-open-tasks");
+        assert.equal((yield* f.selected())?.source.epic.number, 20);
+        assert.deepEqual(f.previewCalls, [10, 20]);
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
 
@@ -330,6 +485,7 @@ describe("durable Epic queue", () => {
         f.setMode("armed");
         yield* f.process();
         const a = (yield* f.selected())!;
+        const previewsAfterStart = f.previewCalls.length;
         assert.equal(a.source.epic.number, 10);
         assert.deepEqual(a.initialBase, { commitSha: initialSha, targetBranch: "main" });
         yield* f.process();
@@ -349,6 +505,7 @@ describe("durable Epic queue", () => {
         yield* TestClock.adjust("60 seconds");
         yield* f.process();
         assert.equal((yield* f.runs()).length, 1);
+        assert.equal(f.previewCalls.length, previewsAfterStart);
         f.setObservation("merged");
         yield* TestClock.adjust("60 seconds");
         yield* f.process();
