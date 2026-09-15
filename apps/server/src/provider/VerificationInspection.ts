@@ -185,7 +185,7 @@ export const inspectVerificationChanges = async (
         before = (
           await exec("git", ["-c", "core.fsmonitor=false", "cat-file", "blob", previous.oid], {
             cwd: root,
-            env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1" },
+            env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" },
             encoding: "buffer",
             maxBuffer: FILE_LIMIT + 1,
             timeout: 15_000,
