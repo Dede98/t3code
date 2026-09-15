@@ -21,6 +21,14 @@ export const VERIFICATION_INSPECTION_DISPLAY = {
   required: true,
 } as const;
 
+/** Git permits arbitrary filename bytes; never silently alias them to UTF-8 replacement characters. */
+export const decodeVerificationGitOutput = (output: Buffer) => {
+  const text = output.toString("utf8");
+  if (!Buffer.from(text).equals(output))
+    throw new Error("Non-UTF-8 Git paths require another review capability");
+  return text;
+};
+
 /** Check each ancestor without following links, including deleted tracked paths. */
 export const verificationFilePath = async (root: string, name: string) => {
   if (
@@ -102,20 +110,23 @@ export const inspectVerificationChanges = async (
     if (!/^[a-f0-9]{40,64}$/.test(baseCommit)) throw new Error("Missing fixed verification base");
     const root = await NodeFSP.realpath(worktree);
     const git = async (args: string[], maxBuffer = 2_000_000) =>
-      (
-        await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", ...args], {
-          cwd: root,
-          maxBuffer,
-          timeout: 15_000,
-          env: {
-            ...process.env,
-            GIT_OPTIONAL_LOCKS: "0",
-            GIT_NO_REPLACE_OBJECTS: "1",
-            GIT_NO_LAZY_FETCH: "1",
-            GIT_EXTERNAL_DIFF: "",
-          },
-        })
-      ).stdout;
+      decodeVerificationGitOutput(
+        (
+          await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", ...args], {
+            cwd: root,
+            encoding: "buffer",
+            maxBuffer,
+            timeout: 15_000,
+            env: {
+              ...process.env,
+              GIT_OPTIONAL_LOCKS: "0",
+              GIT_NO_REPLACE_OBJECTS: "1",
+              GIT_NO_LAZY_FETCH: "1",
+              GIT_EXTERNAL_DIFF: "",
+            },
+          })
+        ).stdout,
+      );
     const base = new Map<string, { mode: string; oid: string }>();
     for (const entry of (await git(["ls-tree", "-rz", "--full-tree", baseCommit]))
       .split("\0")
@@ -128,7 +139,10 @@ export const inspectVerificationChanges = async (
     const current = (await git(["ls-files", "--cached", "--others", "--exclude-standard", "-z"]))
       .split("\0")
       .filter(Boolean);
-    const names = [...new Set([...base.keys(), ...current])].sort();
+    // A committed candidate can remove a path from the index and ignore it while
+    // its raw bytes still participate in checks and the bound code snapshot.
+    const head = (await git(["ls-tree", "-rz", "--name-only", "HEAD"])).split("\0").filter(Boolean);
+    const names = [...new Set([...base.keys(), ...head, ...current])].sort();
     if (names.length > PATH_LIMIT) throw new Error("Inspection exceeds 10000 paths");
     const sections: string[] = [];
     let bytes = 0;
@@ -143,7 +157,10 @@ export const inspectVerificationChanges = async (
       let after: Buffer | null = null;
       let mode: string | null = null;
       if (stat?.isSymbolicLink()) {
-        const target = await NodeFSP.readlink(path);
+        after = await NodeFSP.readlink(path, { encoding: "buffer" });
+        const target = after.toString("utf8");
+        if (!Buffer.from(target).equals(after))
+          throw new Error(`Non-UTF-8 symlink target requires another review capability: ${name}`);
         const relative = NodePath.relative(root, NodePath.resolve(NodePath.dirname(path), target));
         if (
           relative === ".." ||
@@ -151,7 +168,6 @@ export const inspectVerificationChanges = async (
           NodePath.isAbsolute(relative)
         )
           throw new Error(`Symlink escapes verification root: ${name}`);
-        after = Buffer.from(target);
         mode = "120000";
       } else if (stat) {
         if (!stat.isFile()) throw new Error(`Unsupported file type: ${name}`);

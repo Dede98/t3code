@@ -71,6 +71,53 @@ describe("complete fixed-base verification inspection", () => {
     await NodeFSP.writeFile(NodePath.join(root, "source.txt"), "actual tested bytes\n");
     expect((await inspectVerificationChanges(root, base)).stdout).toContain("actual tested bytes");
   });
+  it("includes committed candidate files subsequently removed from the index and ignored", async () => {
+    await NodeFSP.writeFile(NodePath.join(root, "hidden.txt"), "candidate still used by checks\n");
+    await git("add", ".");
+    await git(
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "-qm",
+      "candidate",
+    );
+    await git("rm", "--cached", "hidden.txt");
+    await NodeFSP.appendFile(NodePath.join(root, ".gitignore"), "hidden.txt\n");
+    const result = await inspectVerificationChanges(root, base);
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stdout).toContain('added "hidden.txt"');
+    expect(result.stdout).toContain("candidate still used by checks");
+  });
+  it.each(["index", "base"])(
+    "rejects non-UTF-8 %s paths instead of aliasing a valid filename",
+    async (source) => {
+      await NodeFSP.writeFile(NodePath.join(root, "\ufffd"), "visible alias\n");
+      const oid = await git("rev-parse", `${base}:source.txt`);
+      const entry = Buffer.concat([
+        Buffer.from(`100644 ${source === "base" ? "blob " : ""}${oid}\t`),
+        Buffer.from([255, 0]),
+      ]);
+      let inspectionBase = base;
+      if (source === "index") {
+        NodeChildProcess.execFileSync("git", ["update-index", "-z", "--index-info"], {
+          cwd: root,
+          input: entry,
+        });
+      } else {
+        inspectionBase = NodeChildProcess.execFileSync("git", ["mktree", "-z"], {
+          cwd: root,
+          input: entry,
+          encoding: "utf8",
+        }).trim();
+      }
+      const result = await inspectVerificationChanges(root, inspectionBase);
+      expect(result.exitCode).toBe(125);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("Non-UTF-8 Git paths");
+    },
+  );
   it("ignores replacement refs and never invokes repository fsmonitor hooks", async () => {
     await NodeFSP.writeFile(NodePath.join(root, "source.txt"), "replacement base\n");
     await git("add", ".");
@@ -108,6 +155,13 @@ describe("complete fixed-base verification inspection", () => {
     const result = await inspectVerificationChanges(root, base);
     expect(result.exitCode).toBe(125);
     expect(result.stdout).toBe("");
+  });
+  it("rejects non-UTF-8 symlink targets rather than reviewing replacement characters", async () => {
+    await NodeFSP.symlink(Buffer.from([255]), NodePath.join(root, "link"));
+    const result = await inspectVerificationChanges(root, base);
+    expect(result.exitCode).toBe(125);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("Non-UTF-8 symlink target");
   });
   it.each(["binary", "large", "total"])(
     "fails closed for incomplete %s inspection",

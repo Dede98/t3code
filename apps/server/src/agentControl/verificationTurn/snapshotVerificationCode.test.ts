@@ -78,6 +78,40 @@ it.effect("binds tracked symlink targets, permissions and deletion", () =>
   }).pipe(Effect.scoped),
 );
 
+it.effect("rejects non-UTF-8 index paths rather than binding a different valid filename", () =>
+  Effect.gen(function* () {
+    const cwd = yield* rawRepository;
+    yield* io(async () => {
+      await NodeFSP.writeFile(NodePath.join(cwd, "\ufffd"), "visible alias\n");
+      const oid = (await exec("git", ["rev-parse", "HEAD:source.txt"], { cwd })).stdout.trim();
+      NodeChildProcess.execFileSync("git", ["update-index", "-z", "--index-info"], {
+        cwd,
+        input: Buffer.concat([Buffer.from(`100644 ${oid}\t`), Buffer.from([255, 0])]),
+      });
+    });
+    const error = yield* snapshotVerificationCode(cwd).pipe(Effect.flip);
+    assert.instanceOf(error.cause, Error);
+    assert.include(String(error.cause), "Non-UTF-8 Git paths");
+  }).pipe(Effect.scoped),
+);
+
+it.effect("binds raw non-UTF-8 symlink targets without replacement-character collisions", () =>
+  Effect.gen(function* () {
+    const cwd = yield* rawRepository;
+    const link = NodePath.join(cwd, "link");
+    yield* io(() => NodeFSP.symlink(Buffer.from([255]), link));
+    const first = yield* snapshotVerificationCode(cwd);
+    yield* io(() => NodeFSP.unlink(link));
+    yield* io(() => NodeFSP.symlink(Buffer.from([254]), link));
+    assert.notEqual(first, yield* snapshotVerificationCode(cwd));
+    yield* io(() => exec("git", ["add", "link"], { cwd }));
+    const tracked = yield* snapshotVerificationCode(cwd);
+    yield* io(() => NodeFSP.unlink(link));
+    yield* io(() => NodeFSP.symlink(Buffer.from([255]), link));
+    assert.notEqual(tracked, yield* snapshotVerificationCode(cwd));
+  }).pipe(Effect.scoped),
+);
+
 it.effect(
   "distinguishes successive tracked and untracked changes inside an already dirty submodule",
   () =>

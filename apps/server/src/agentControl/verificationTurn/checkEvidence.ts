@@ -17,6 +17,7 @@ import {
   verificationFilePath,
   openVerificationFile,
   VERIFICATION_INSPECTIONS,
+  decodeVerificationGitOutput,
 } from "../../provider/VerificationInspection.ts";
 import { classifyVerificationCheckResult } from "../../provider/CodexVerificationChecks.ts";
 
@@ -73,8 +74,9 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
     }
   };
   add(await git(["rev-parse", "HEAD"]));
-  const others = (await git(["ls-files", "--others", "--exclude-standard", "-z"]))
-    .toString("utf8")
+  const others = decodeVerificationGitOutput(
+    await git(["ls-files", "--others", "--exclude-standard", "-z"]),
+  )
     .split("\0")
     .filter(Boolean)
     .sort();
@@ -83,14 +85,15 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
     const stat = await NodeFSP.lstat(path);
     add(name);
     add(String(stat.mode));
-    if (stat.isSymbolicLink()) add(await NodeFSP.readlink(path));
+    if (stat.isSymbolicLink()) add(await NodeFSP.readlink(path, { encoding: "buffer" }));
     else await addFile(path, stat.size);
   }
-  const tracked = Buffer.concat([
-    await git(["ls-files", "--stage", "-z"]),
-    await git(["ls-tree", "-rz", "HEAD"]),
-  ])
-    .toString("utf8")
+  const tracked = decodeVerificationGitOutput(
+    Buffer.concat([
+      await git(["ls-files", "--stage", "-z"]),
+      await git(["ls-tree", "-rz", "HEAD"]),
+    ]),
+  )
     .split("\0")
     .filter(Boolean)
     .sort();
@@ -110,7 +113,7 @@ const readVerificationSnapshot = async (cwd: string, depth = 0): Promise<string>
       continue;
     }
     add(String(stat.mode));
-    if (stat.isSymbolicLink()) add(await NodeFSP.readlink(path));
+    if (stat.isSymbolicLink()) add(await NodeFSP.readlink(path, { encoding: "buffer" }));
     else if (stat.isFile()) await addFile(path, stat.size);
     else if (stat.isDirectory()) add("directory");
     else throw failure("Verification encountered an unsupported tracked file type.");
