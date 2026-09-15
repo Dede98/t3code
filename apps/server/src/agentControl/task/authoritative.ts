@@ -66,13 +66,13 @@ const numberKey = (state: AgentControlTaskState) =>
 
 /**
  * Reconstructs every task stream in global-sequence pages inside the caller's
- * SQLite snapshot, then compares the complete authoritative project history
- * with every projection row. Event-only, projection-only, malformed, gapped,
- * and competing task identities all fail closed.
+ * SQLite snapshot, then compares the complete authoritative histories of the
+ * selected projects with every corresponding projection row. Event-only,
+ * projection-only, malformed, gapped, and competing task identities all fail closed.
  */
-export const loadAuthoritativeTaskProjectHistory = Effect.fn("loadAuthoritativeTaskProjectHistory")(
+export const loadAuthoritativeTaskHistories = Effect.fn("loadAuthoritativeTaskHistories")(
   function* (
-    projectId: ProjectId,
+    projectIds: ReadonlyArray<ProjectId>,
     events: Pick<AgentControlTaskEventStoreShape, "readGlobal">,
     states: Pick<AgentControlTaskStateRepositoryShape, "listProject">,
   ): Effect.fn.Return<
@@ -104,8 +104,9 @@ export const loadAuthoritativeTaskProjectHistory = Effect.fn("loadAuthoritativeT
       }
     }
 
-    const authoritative = [...foldedByTask.values()].filter(
-      (state) => state.source.projectId === projectId,
+    const projects = new Set(projectIds);
+    const authoritative = [...foldedByTask.values()].filter((state) =>
+      projects.has(state.source.projectId),
     );
     for (const [aggregateId, state] of foldedByTask) {
       const expectedTaskId = yield* deriveAgentControlTaskId(state.source);
@@ -113,7 +114,9 @@ export const loadAuthoritativeTaskProjectHistory = Effect.fn("loadAuthoritativeT
         return yield* corrupt();
       }
     }
-    const projectedEntries = yield* states.listProject(projectId);
+    const projectedEntries = (yield* Effect.forEach([...projects], (projectId) =>
+      states.listProject(projectId),
+    )).flat();
     if (projectedEntries.some((entry) => entry._tag === "Corrupt")) return yield* corrupt();
     const projected = projectedEntries.flatMap((entry) =>
       entry._tag === "Valid" ? [entry.state] : [],
@@ -148,3 +151,9 @@ export const loadAuthoritativeTaskProjectHistory = Effect.fn("loadAuthoritativeT
     return authoritative;
   },
 );
+
+export const loadAuthoritativeTaskProjectHistory = (
+  projectId: ProjectId,
+  events: Pick<AgentControlTaskEventStoreShape, "readGlobal">,
+  states: Pick<AgentControlTaskStateRepositoryShape, "listProject">,
+) => loadAuthoritativeTaskHistories([projectId], events, states);

@@ -22306,6 +22306,95 @@ layer("Agent Control worktree materialization", (it) => {
     }),
   );
 
+  it.effect("reads task history once when reserving across multiple historical projects", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeIndependentControllerContexts();
+      const repo = yield* makeRepository();
+      for (let index = 0; index < 3; index++) {
+        const historical = yield* seedPrepared(
+          ProjectId.make(`issue-history-${index}`),
+          repo.cwd,
+          700 + index,
+        ).pipe(Effect.provide(harness.contextA));
+        const lease = yield* reserveLease(historical.stageRun).pipe(
+          Effect.provide(harness.contextA),
+        );
+        yield* reserveWorktreeOnly({
+          commandId: `issue-history-reserve-${index}`,
+          task: historical.task,
+          stageRun: historical.stageRun,
+          lease,
+          repositoryWorkspace: repo.cwd,
+          baseCommitSha: repo.baseCommitSha,
+        }).pipe(Effect.provide(harness.contextA));
+      }
+      const prepared = yield* seedPrepared(
+        ProjectId.make("issue-history-next"),
+        repo.cwd,
+        703,
+      ).pipe(Effect.provide(harness.contextA));
+      const lease = yield* reserveLease(prepared.stageRun).pipe(Effect.provide(harness.contextA));
+      const taskEvents = Context.get(harness.contextA, AgentControlTaskEventStore);
+      const replays = yield* Ref.make(0);
+      const countedEvents = AgentControlTaskEventStore.of({
+        ...taskEvents,
+        readGlobal: (after, limit) =>
+          (after === undefined || after === 0
+            ? Ref.update(replays, (count) => count + 1)
+            : Effect.void
+          ).pipe(Effect.andThen(taskEvents.readGlobal(after, limit))),
+      });
+      const engineContext = yield* Layer.buildWithScope(
+        Layer.fresh(AgentControlWorktreeEngineLive).pipe(
+          Layer.provide(
+            Layer.succeedContext(
+              Context.add(harness.contextA, AgentControlTaskEventStore, countedEvents),
+            ),
+          ),
+        ),
+        harness.scopeA,
+      );
+      const reservation = yield* reserveWorktreeOnly({
+        commandId: "issue-history-next-reserve",
+        task: prepared.task,
+        stageRun: prepared.stageRun,
+        lease,
+        repositoryWorkspace: repo.cwd,
+        baseCommitSha: repo.baseCommitSha,
+      }).pipe(Effect.provide(Context.merge(harness.contextA, engineContext)));
+      assert.equal(reservation.status, "reserved");
+      assert.equal(yield* Ref.get(replays), 1);
+      assert.equal(
+        (yield* harness.sqlA`SELECT reservation_id FROM agent_control_worktree_reservation_states`)
+          .length,
+        4,
+      );
+      const contender = yield* seedPrepared(
+        ProjectId.make("issue-history-corruption"),
+        repo.cwd,
+        704,
+      ).pipe(Effect.provide(harness.contextA));
+      const contenderLease = yield* reserveLease(contender.stageRun).pipe(
+        Effect.provide(harness.contextA),
+      );
+      yield* harness.sqlA`UPDATE agent_control_task_states SET revision = revision + 1
+        WHERE project_id = 'issue-history-2'`;
+      const blocked = yield* reserveWorktreeOnly({
+        commandId: "issue-history-corruption-reserve",
+        task: contender.task,
+        stageRun: contender.stageRun,
+        lease: contenderLease,
+        repositoryWorkspace: repo.cwd,
+        baseCommitSha: repo.baseCommitSha,
+      }).pipe(Effect.provide(Context.merge(harness.contextA, engineContext)), Effect.result);
+      assert.equal(blocked._tag, "Failure");
+      if (blocked._tag === "Failure") {
+        assert.propertyVal(blocked.failure, "code", "reservation-projection-corrupt");
+      }
+      assert.equal(yield* Ref.get(replays), 2);
+    }),
+  );
+
   it.effect(
     "locks reservation admission before another SQLite connection can observe a vacant issue",
     () =>

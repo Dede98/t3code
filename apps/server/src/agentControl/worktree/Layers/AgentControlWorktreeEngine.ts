@@ -39,7 +39,7 @@ import {
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 import { deriveAgentControlSourceIdentityFingerprint } from "../../stageRun/identity.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
-import { loadAuthoritativeTaskProjectHistory } from "../../task/authoritative.ts";
+import { loadAuthoritativeTaskHistories } from "../../task/authoritative.ts";
 import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTaskEventStore.ts";
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
 import { decideAgentControlWorktreeCommand } from "../decider.ts";
@@ -328,7 +328,8 @@ const make = Effect.gen(function* () {
             OR json_extract(CAST(payload_json AS TEXT), '$.repository.repositoryNodeId') = ${command.repository.repositoryNodeId})
           AND stream_id <> ${command.reservationId}
       `;
-      const histories = new Map<string, ReadonlyArray<AgentControlTaskState>>();
+      if (rows.length === 0) return;
+      const previousReservations: Array<AgentControlWorktreeReservationState> = [];
       for (const row of rows) {
         const reservationId = yield* decodeReservationId(row.reservationId);
         const record = yield* loadAuthoritativeWorktreeReservation(reservationId, events, states);
@@ -339,17 +340,19 @@ const make = Effect.gen(function* () {
         if (previous.branchName === command.branchName) {
           return yield* rpcError("reservation-conflict", command);
         }
-        let history = histories.get(previous.projectId);
-        if (history === undefined) {
-          history = yield* loadAuthoritativeTaskProjectHistory(
-            previous.projectId,
-            taskEvents,
-            taskStates,
-          );
-          histories.set(previous.projectId, history);
+        previousReservations.push(previous);
+      }
+      const history = yield* loadAuthoritativeTaskHistories(
+        previousReservations.map((previous) => previous.projectId),
+        taskEvents,
+        taskStates,
+      );
+      const tasksById = new Map(history.map((entry) => [entry.taskId, entry]));
+      for (const previous of previousReservations) {
+        const previousTask = tasksById.get(previous.taskId);
+        if (previousTask === undefined || previousTask.source.projectId !== previous.projectId) {
+          return yield* rpcError("task-projection-corrupt", command);
         }
-        const previousTask = history.find((entry) => entry.taskId === previous.taskId);
-        if (previousTask === undefined) return yield* rpcError("task-projection-corrupt", command);
         if (
           previousTask.source.issueNodeId !== task.source.issueNodeId &&
           previousTask.source.issueNumber !== task.source.issueNumber
