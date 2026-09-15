@@ -167,6 +167,8 @@ function makeRuntimeLayer(
       "probe"
     >;
     readonly inspectionProbe?: typeof AgentControlVerificationCapabilityProbe.Service.inspection;
+    readonly executorProbe?: typeof AgentControlVerificationCapabilityProbe.Service.executor;
+    readonly legacyCodexBinaryPath?: string;
   } = {},
 ) {
   const listedInstances = options.listedInstances ?? [
@@ -190,6 +192,9 @@ function makeRuntimeLayer(
   const settingsLayer = ServerSettings.ServerSettingsService.layerTest({
     textGenerationModelSelection: options.baseline ?? selection(BASE_INSTANCE),
     providerInstances,
+    ...(options.legacyCodexBinaryPath === undefined
+      ? {}
+      : { providers: { codex: { binaryPath: options.legacyCodexBinaryPath } } }),
     ...(options.appPolicy === undefined ? {} : { agentControlPolicy: options.appPolicy }),
   });
   const providerLayer = Layer.mock(ProviderInstanceRegistry)({
@@ -204,6 +209,8 @@ function makeRuntimeLayer(
     Layer.provide(providerLayer),
     Layer.provide(
       Layer.succeed(AgentControlVerificationCapabilityProbe, {
+        executor:
+          options.executorProbe ?? (() => Effect.succeed({ supported: true, reason: null })),
         inspection:
           options.inspectionProbe ?? (() => Effect.succeed({ supported: true, reason: null })),
         ...(options.verificationProbe ?? {
@@ -961,6 +968,54 @@ it.effect(
     ),
 );
 
+it.effect.each([[], [{ ...requiredHttpCheck, required: false }]])(
+  "mandatory inspection rejects unsupported verifiers without required project checks: %j",
+  (verificationChecks) =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("runtime-inspection-provider-capability");
+      yield* insertProject(projectId);
+      const service = yield* AgentControlPolicyService;
+      const result = yield* service.preflightRuntime({
+        projectId,
+        projectPolicy: {
+          verificationChecks,
+          roleRoutes: { verifier: route([selection(FIRST_INSTANCE)]) },
+        },
+      });
+      assert.isFalse(result.ok);
+      assert.isNull(roleResult(result, "verifier").selectedCandidateIndex);
+      assert.deepEqual(roleResult(result, "verifier").candidates[0]?.verificationCheckError, {
+        checkId: "git-diff",
+        message: "Complete verification inspection requires the Codex provider.",
+      });
+      const fallback = yield* service.preflightRuntime({
+        projectId,
+        projectPolicy: {
+          verificationChecks,
+          roleRoutes: {
+            verifier: route([selection(FIRST_INSTANCE), selection(BASE_INSTANCE)], {
+              strict: false,
+            }),
+          },
+        },
+      });
+      assert.isTrue(fallback.ok);
+      assert.equal(roleResult(fallback, "verifier").selectedCandidateIndex, 1);
+    }).pipe(
+      Effect.provide(
+        makeRuntimeLayer({
+          listedInstances: [
+            providerInstance({ instanceId: BASE_INSTANCE }),
+            providerInstance({ instanceId: FIRST_INSTANCE, driverKind: CLAUDE_DRIVER }),
+          ],
+          verificationProbe: {
+            probe: () => Effect.die("Optional project checks must not require a sandbox probe."),
+          },
+        }),
+      ),
+    ),
+);
+
 it.effect(
   "default checks require the network-free capability, optional checks do not block",
   () => {
@@ -1029,6 +1084,76 @@ it.effect(
       ),
     ),
 );
+
+it.effect(
+  "verification probes use explicit provider defaults instead of overridden legacy settings",
+  () => {
+    const binaries: Array<string | undefined> = [];
+    const instanceId = ProviderInstanceId.make("codex");
+    return Effect.gen(function* () {
+      const projectId = ProjectId.make("runtime-explicit-codex-defaults");
+      yield* insertProject(projectId);
+      const result = yield* (yield* AgentControlPolicyService).preflightRuntime({
+        projectId,
+        projectPolicy: { verificationChecks: [requiredHttpCheck] },
+      });
+      assert.isTrue(result.ok);
+      assert.deepEqual(binaries, ["codex"]);
+    }).pipe(
+      Effect.provide(
+        makeRuntimeLayer({
+          baseline: selection(instanceId),
+          listedInstances: [providerInstance({ instanceId })],
+          legacyCodexBinaryPath: "/old/provider/codex",
+          verificationProbe: {
+            probe: ({ codexBinaryPath }) =>
+              Effect.sync(() => {
+                binaries.push(codexBinaryPath);
+                return { supported: true, reason: null };
+              }),
+          },
+        }),
+      ),
+    );
+  },
+);
+
+it.effect("each required check probes its own executor before reusing network capability", () => {
+  const executors: string[] = [];
+  return Effect.gen(function* () {
+    const projectId = ProjectId.make("runtime-configured-loopback-executor");
+    yield* insertProject(projectId);
+    const service = yield* AgentControlPolicyService;
+    const result = yield* service.preflightRuntime({
+      projectId,
+      projectPolicy: {
+        verificationChecks: [
+          requiredHttpCheck,
+          { ...requiredHttpCheck, id: "missing-node", command: "/missing/node" },
+        ],
+      },
+    });
+    assert.isFalse(result.ok);
+    assert.deepEqual(executors, ["http", "missing-node"]);
+    assert.deepEqual(roleResult(result, "verifier").candidates[0]?.verificationCheckError, {
+      checkId: "missing-node",
+      message: "The configured Node executable is unavailable.",
+    });
+  }).pipe(
+    Effect.provide(
+      makeRuntimeLayer({
+        executorProbe: (check) =>
+          Effect.sync(() => {
+            executors.push(check.id);
+            return {
+              supported: check.command !== "/missing/node",
+              reason: "The configured Node executable is unavailable.",
+            };
+          }),
+      }),
+    ),
+  );
+});
 
 it.effect.each([
   { command: "npm", args: ["test"] },

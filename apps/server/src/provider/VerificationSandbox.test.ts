@@ -6,6 +6,7 @@ import type { AgentControlVerificationCheck } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import {
   probeVerificationCheckCapabilities,
+  probeVerificationCheckExecutor,
   runVerificationSandboxCheck,
   verificationSandboxCheckConfigurationError,
 } from "./VerificationSandbox.ts";
@@ -234,6 +235,55 @@ describe.skipIf(process.platform !== "darwin")("macOS verification sandbox", () 
     expect(result.supported).toBe(false);
     expect(result.reason).toContain("could not start");
   });
+
+  it("rejects an unavailable configured Node executable before evaluating product code", async () => {
+    const result = await probeVerificationCheckExecutor(
+      check("", { command: NodePath.join(root, "missing", "node"), networkAccess: "loopback" }),
+    );
+    expect(result.supported).toBe(false);
+    expect(result.reason).toContain("Node executable is unavailable");
+  });
+
+  it("probes actual Node features without requiring the future test file or cwd", async () => {
+    expect(
+      await probeVerificationCheckExecutor(
+        check("", {
+          args: ["--test", "--test-isolation=none", "future.test.cjs"],
+          cwd: "future-directory",
+          networkAccess: "loopback",
+        }),
+      ),
+    ).toEqual({ supported: true, reason: null });
+    const incompatible = NodePath.join(root, "node");
+    await NodeFSP.writeFile(
+      incompatible,
+      "#!/bin/sh\nprintf 'bad option: --test-isolation=none' >&2\nexit 9\n",
+      { mode: 0o700 },
+    );
+    const result = await probeVerificationCheckExecutor(
+      check("", {
+        command: incompatible,
+        args: ["--test", "--test-isolation=none", "future.test.cjs"],
+        networkAccess: "loopback",
+      }),
+    );
+    expect(result.supported).toBe(false);
+    expect(result.reason).toContain("lacks the required runtime capabilities");
+  });
+
+  it("rejects Node launcher shims that require subprocesses under the real loopback restrictions", async () => {
+    const launcher = NodePath.join(root, "node");
+    await NodeFSP.writeFile(
+      launcher,
+      `#!${process.execPath}\nconst result = require('node:child_process').spawnSync(process.execPath, process.argv.slice(2), {stdio:'inherit'}); if (result.error) console.error(result.error.code); process.exit(result.status ?? 125);\n`,
+      { mode: 0o700 },
+    );
+    const result = await probeVerificationCheckExecutor(
+      check("", { command: launcher, networkAccess: "loopback" }),
+    );
+    expect(result.supported).toBe(false);
+    expect(result.reason).toContain("EPERM");
+  });
 });
 
 it("explicitly rejects unsupported providers", async () => {
@@ -270,4 +320,17 @@ it("rejects incompatible local HTTP runners before execution", () => {
     ),
   ).toBeNull();
   expect(verificationSandboxCheckConfigurationError(check("", { command: "npm" }))).toBeNull();
+  expect(
+    verificationSandboxCheckConfigurationError(
+      check("", { command: "./node", networkAccess: "loopback" }),
+    ),
+  ).toContain("relative executables");
+  expect(
+    verificationSandboxCheckConfigurationError(
+      check("", {
+        args: ["--test", "--test-isolation=none", "--test-isolation=process", "test.cjs"],
+        networkAccess: "loopback",
+      }),
+    ),
+  ).toContain("--test-isolation=none");
 });

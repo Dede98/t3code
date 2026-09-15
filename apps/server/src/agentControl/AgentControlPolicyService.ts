@@ -21,6 +21,7 @@ import {
   type AgentControlAppPolicy,
   type AgentControlPreflightError,
   type AgentControlProjectPolicy,
+  type AgentControlVerificationCheck,
   type ProviderDriverKind,
   type ProviderInstanceId,
   type ServerProvider,
@@ -49,10 +50,12 @@ import {
   type SetAgentControlProjectPolicyError,
 } from "../persistence/Services/AgentControlProjectPolicies.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
+import { deriveProviderInstanceConfigMap } from "../provider/Layers/ProviderInstanceRegistryHydration.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import { verificationInspectionCapability } from "../provider/VerificationInspection.ts";
 import {
   probeVerificationCheckCapabilities,
+  probeVerificationCheckExecutor,
   verificationSandboxCheckConfigurationError,
 } from "../provider/VerificationSandbox.ts";
 
@@ -98,6 +101,10 @@ export const AgentControlVerificationCapabilityProbe = Context.Reference<{
     readonly networkAccess: "none" | "loopback";
     readonly codexBinaryPath?: string;
   }) => Effect.Effect<{ readonly supported: boolean; readonly reason: string | null }>;
+  readonly executor: (check: AgentControlVerificationCheck) => Effect.Effect<{
+    readonly supported: boolean;
+    readonly reason: string | null;
+  }>;
 }>("t3/agentControl/VerificationCapabilityProbe", {
   defaultValue: () => ({
     inspection: () =>
@@ -112,6 +119,13 @@ export const AgentControlVerificationCapabilityProbe = Context.Reference<{
         Effect.orElseSucceed(() => ({
           supported: false,
           reason: "The verification sandbox capability probe could not complete.",
+        })),
+      ),
+    executor: (check) =>
+      Effect.tryPromise(() => probeVerificationCheckExecutor(check)).pipe(
+        Effect.orElseSucceed(() => ({
+          supported: false,
+          reason: "The configured verification executor probe could not complete.",
         })),
       ),
   }),
@@ -781,10 +795,20 @@ const makeAgentControlPolicyService = Effect.gen(function* () {
       { readonly checkId: string; readonly message: string } | null
     >();
     const inspectionCapability = yield* verificationCapabilities.inspection();
+    const providerConfigs = deriveProviderInstanceConfigMap(context.settings);
     for (const { candidate } of candidatesByRole.get("verifier") ?? []) {
       const driverKind = observations.get(candidate.selection.instanceId)?.driverKind;
       const instanceId = candidate.selection.instanceId;
       if (!driverKind || capabilityResults.has(instanceId)) continue;
+      // The mandatory inspection tool is currently installed only by the Codex adapter,
+      // including when the project has no required executable checks.
+      if (driverKind !== "codex") {
+        capabilityResults.set(instanceId, {
+          checkId: "git-diff",
+          message: "Complete verification inspection requires the Codex provider.",
+        });
+        continue;
+      }
       if (!inspectionCapability.supported) {
         capabilityResults.set(instanceId, {
           checkId: "git-diff",
@@ -794,16 +818,22 @@ const makeAgentControlPolicyService = Effect.gen(function* () {
         });
         continue;
       }
-      const config = decodeCodexSettings(
-        context.settings.providerInstances[instanceId]?.config ??
-          (instanceId === "codex" ? context.settings.providers.codex : {}),
-      );
+      const config = decodeCodexSettings(providerConfigs[instanceId]?.config ?? {});
       let failure: { readonly checkId: string; readonly message: string } | null = null;
       const checkedNetworks = new Set<string>();
       for (const check of requiredChecks) {
         const configurationError = verificationSandboxCheckConfigurationError(check);
         if (configurationError) {
           failure = { checkId: check.id, message: configurationError };
+          break;
+        }
+        const executorCapability = yield* verificationCapabilities.executor(check);
+        if (!executorCapability.supported) {
+          failure = {
+            checkId: check.id,
+            message:
+              executorCapability.reason ?? "The configured verification executor is unavailable.",
+          };
           break;
         }
         const networkAccess = check.networkAccess ?? "none";

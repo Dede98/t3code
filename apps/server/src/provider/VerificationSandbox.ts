@@ -231,15 +231,96 @@ export const verificationSandboxCheckConfigurationError = (
   ) {
     return "Local HTTP checks require a direct Node executable; package runners and subprocesses are unavailable";
   }
+  if (!NodePath.isAbsolute(check.command) && NodePath.basename(check.command) !== check.command) {
+    return "Local HTTP checks require node on the environment PATH or an absolute Node executable path; relative executables cannot be verified before the worktree exists";
+  }
   const end = check.args.indexOf("--");
   const options = end === -1 ? check.args : check.args.slice(0, end);
   if (options.some((arg) => arg === "--run" || arg.startsWith("--run="))) {
     return "Local HTTP checks cannot use node --run; invoke the test file directly";
   }
-  if (options.includes("--test") && !options.includes("--test-isolation=none")) {
+  if (
+    options.includes("--test") &&
+    (!options.includes("--test-isolation=none") ||
+      options.some(
+        (arg) =>
+          arg === "--test-isolation" ||
+          (arg.startsWith("--test-isolation=") && arg !== "--test-isolation=none"),
+      ))
+  ) {
     return "Local HTTP node:test checks require --test-isolation=none to preserve the assigned listener and avoid subprocesses";
   }
   return null;
+};
+
+/** Probe the configured runtime with controller-owned code, never the future product test. */
+export const probeVerificationCheckExecutor = async (
+  check: AgentControlVerificationCheck,
+): Promise<{ supported: boolean; reason: string | null }> => {
+  if (check.networkAccess !== "loopback") return { supported: true, reason: null };
+  const configurationError = verificationSandboxCheckConfigurationError(check);
+  if (configurationError) return { supported: false, reason: configurationError };
+  if (hostPlatform !== "darwin")
+    return { supported: false, reason: "Local HTTP verification requires macOS Seatbelt" };
+  let directory: string | null = null;
+  let listener: LoopbackListener | null = null;
+  try {
+    const candidates = NodePath.isAbsolute(check.command)
+      ? [check.command]
+      : (process.env.PATH ?? "")
+          .split(NodePath.delimiter)
+          .map((path) => NodePath.join(path, check.command));
+    let command: string | null = null;
+    for (const candidate of candidates) {
+      if (!NodePath.isAbsolute(candidate))
+        throw new Error("Use an absolute Node executable path when PATH contains relative entries");
+      try {
+        await NodeFSP.access(candidate, NodeFSP.constants.X_OK);
+        if (!(await NodeFSP.stat(candidate)).isFile()) continue;
+        command = candidate;
+        break;
+      } catch {
+        // Continue searching PATH, just as execution would.
+      }
+    }
+    if (!command)
+      return {
+        supported: false,
+        reason: `The configured local HTTP Node executable is unavailable: ${check.command}`,
+      };
+    directory = await NodeFSP.realpath(
+      await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-verification-node-probe-")),
+    );
+    // Match the real executor's fork denial: launcher shims can otherwise pass
+    // an offline probe and fail only after Planning when they spawn Node.
+    listener = await reserveLoopbackListener();
+    const result = await execute({
+      command,
+      args: [
+        ...(check.args.includes("--test") ? ["--test-isolation=none"] : []),
+        "-e",
+        "if(process.release?.name !== 'node' || typeof fetch !== 'function') process.exit(125); process.stdout.write('T3_NODE_PROBE_OK')",
+      ],
+      cwd: directory,
+      temporary: null,
+      listener,
+      timeoutMs: 5_000,
+    });
+    return result.exitCode === 0 && result.stdout === "T3_NODE_PROBE_OK"
+      ? { supported: true, reason: null }
+      : {
+          supported: false,
+          reason: `The configured local HTTP Node executable lacks the required runtime capabilities: ${check.command}${result.stderr ? `: ${result.stderr.slice(0, 500)}` : ""}`,
+        };
+  } catch (error) {
+    return {
+      supported: false,
+      reason: `The configured local HTTP Node executable could not be verified: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  } finally {
+    listener?.release();
+    if (directory) await NodeFSP.rm(directory, { recursive: true, force: true });
+  }
 };
 
 /**
