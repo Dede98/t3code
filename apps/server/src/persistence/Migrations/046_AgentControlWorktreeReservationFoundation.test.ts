@@ -492,7 +492,7 @@ rollbackLayer("046_AgentControlWorktreeReservationFoundation rollback", (it) => 
       );
       assert.equal(
         (yield* sql<{ readonly count: number }>`
-          SELECT COUNT(*) AS count FROM effect_sql_migrations WHERE migration_id = 46
+          SELECT COUNT(*) AS count FROM effect_sql_agent_control_migrations WHERE migration_id = 46
         `)[0]!.count,
         0,
       );

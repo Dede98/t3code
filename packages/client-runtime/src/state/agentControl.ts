@@ -225,6 +225,7 @@ export function agentControlCommandErrorMessage(error: unknown): string {
   if (code === "command-previously-rejected") {
     return "The server previously rejected this request. Review the refreshed state and resolve any reported blocker before trying again.";
   }
+  if (code === "reservation-conflict") return agentControlErrorMessage(code);
   if (error instanceof Error && error.message.trim()) return error.message;
   return `The request failed${typeof code === "string" ? ` (${code})` : ""}. Check the refreshed state and your permissions in this environment before trying again.`;
 }
@@ -250,7 +251,8 @@ export function agentControlCanEndBlockedRun(run: AgentControlRunOnceView): bool
   return (
     run.state.status === "active" &&
     run.state.lastStep === "lease-reserved" &&
-    run.errorCode === "downstream-rejected: default-remote-ref-unavailable"
+    (run.errorCode === "downstream-rejected: default-remote-ref-unavailable" ||
+      run.errorCode === "downstream-rejected: reservation-conflict")
   );
 }
 
@@ -696,6 +698,9 @@ export type AgentControlStatusView = {
 };
 
 export function agentControlErrorMessage(code: string): string {
+  if (code === "reservation-conflict" || code === "downstream-rejected: reservation-conflict") {
+    return "Worktree reservation conflict. Another attempt still owns this issue or its worktree target. Review the other run in this environment and end this blocked run or disarm the project. This rejected attempt will not retry automatically.";
+  }
   const action =
     code.includes("capacity") || code.includes("slot")
       ? "Wait for a provider slot to become available."

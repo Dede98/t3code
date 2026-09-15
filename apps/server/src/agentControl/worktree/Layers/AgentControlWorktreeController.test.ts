@@ -226,6 +226,7 @@ import {
   type AgentControlWorktreeControllerHooksShape,
 } from "../Services/AgentControlWorktreeControllerHooks.ts";
 import { AgentControlWorktreeEngine } from "../Services/AgentControlWorktreeEngine.ts";
+import { AgentControlWorktreeEventStore } from "../Services/AgentControlWorktreeEventStore.ts";
 import { AgentControlWorktree } from "../Services/AgentControlWorktree.ts";
 import { layer as AgentControlWorktreeControllerLive } from "./AgentControlWorktreeController.ts";
 import { layer as AgentControlWorktreeEngineLive } from "./AgentControlWorktreeEngine.ts";
@@ -790,6 +791,7 @@ const seedPrepared = Effect.fn("seedAgentControlWorktreePrepared")(function* (
   projectId: ProjectId,
   workspace: string,
   issueNumber?: number,
+  repositoryNameWithOwner = repository.nameWithOwner,
 ) {
   const sql = yield* SqlClient.SqlClient;
   const github = yield* AgentControlGithubStateRepository;
@@ -842,7 +844,7 @@ const seedPrepared = Effect.fn("seedAgentControlWorktreePrepared")(function* (
           trustedLogins: ["trusted"],
           pollIntervalSeconds: 60,
         },
-        repository,
+        repository: { ...repository, nameWithOwner: repositoryNameWithOwner },
         revision: 1,
         sequence: 1,
         updatedAt: at,
@@ -21468,7 +21470,7 @@ layer("Agent Control worktree materialization", (it) => {
         assert.equal(first.status, "ready");
         assert.equal(first.baseCommitSha, baseCommitSha);
         assert.equal(first.headCommitSha, baseCommitSha);
-        assert.equal(first.branchName, "t3auto/issue-417-uber-reconnect-secret");
+        assert.match(first.branchName, /^t3auto\/issue-417-uber-reconnect-secret-[0-9a-f]{64}$/);
         assert.equal(
           (yield* git(first.internalWorktreePath, ["branch", "--show-current"])).stdout.trim(),
           first.branchName,
@@ -22304,7 +22306,266 @@ layer("Agent Control worktree materialization", (it) => {
     }),
   );
 
-  it.effect("rolls back a branch collision without a terminal infrastructure receipt", () =>
+  it.effect(
+    "locks reservation admission before another SQLite connection can observe a vacant issue",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeIndependentControllerContexts();
+        const repo = yield* makeRepository();
+        const prepared = yield* seedPrepared(
+          ProjectId.make("issue-reservation-write-lock"),
+          repo.cwd,
+        ).pipe(Effect.provide(harness.contextA));
+        const lease = yield* reserveLease(prepared.stageRun).pipe(Effect.provide(harness.contextA));
+        const events = Context.get(harness.contextA, AgentControlWorktreeEventStore);
+        const inspected = yield* Ref.make(false);
+        const guardedEvents = AgentControlWorktreeEventStore.of({
+          ...events,
+          readStreamSnapshot: (reservationId) =>
+            Effect.gen(function* () {
+              // Force the competing connection into the read-to-write admission window.
+              const competingWriter = yield* Effect.result(harness.sqlB`
+            UPDATE agent_control_worktree_reservation_states SET revision = revision WHERE 0`);
+              assert.equal(competingWriter._tag, "Failure");
+              if (competingWriter._tag === "Failure") {
+                assert.propertyVal(competingWriter.failure.reason.cause, "errcode", 5);
+              }
+              const blocked = yield* reserveWorktreeOnly({
+                commandId: "issue-reservation-competing-lock",
+                task: prepared.task,
+                stageRun: prepared.stageRun,
+                lease,
+                repositoryWorkspace: repo.cwd,
+                baseCommitSha: repo.baseCommitSha,
+              }).pipe(
+                Effect.provide(
+                  Context.add(harness.contextA, AgentControlWorktreeEngine, harness.engineB),
+                ),
+                Effect.result,
+              );
+              assert.equal(blocked._tag, "Failure");
+              if (blocked._tag === "Failure") {
+                assert.propertyVal(blocked.failure, "code", "repository-lock-unavailable");
+              }
+              yield* Ref.set(inspected, true);
+              return yield* events.readStreamSnapshot(reservationId);
+            }),
+        });
+        const guardedContext = Context.add(
+          harness.contextA,
+          AgentControlWorktreeEventStore,
+          guardedEvents,
+        );
+        const engineContext = yield* Layer.buildWithScope(
+          Layer.fresh(AgentControlWorktreeEngineLive).pipe(
+            Layer.provide(Layer.succeedContext(guardedContext)),
+          ),
+          harness.scopeA,
+        );
+        const reserved = yield* reserveWorktreeOnly({
+          commandId: "issue-reservation-write-lock-command",
+          task: prepared.task,
+          stageRun: prepared.stageRun,
+          lease,
+          repositoryWorkspace: repo.cwd,
+          baseCommitSha: repo.baseCommitSha,
+        }).pipe(Effect.provide(Context.merge(harness.contextA, engineContext)));
+        assert.equal(reserved.status, "reserved");
+        assert.equal(yield* Ref.get(inspected), true);
+        yield* harness.sqlB`UPDATE agent_control_worktree_reservation_states SET revision = revision WHERE 0`;
+      }),
+  );
+
+  for (const predecessor of ["event-only", "renamed-repository"] as const) {
+    it.effect(`protects an active ${predecessor} reservation`, () =>
+      Effect.gen(function* () {
+        const harness = yield* makeIndependentControllerContexts();
+        return yield* Effect.gen(function* () {
+          const { cwd } = yield* makeRepository();
+          const firstProject = ProjectId.make(`issue-owner-${predecessor}`);
+          const first = yield* seedPrepared(firstProject, cwd, 999);
+          yield* reserveLease(first.stageRun);
+          const controller = yield* AgentControlWorktreeController;
+          const ready = yield* controller.reserveAndMaterialize({
+            commandId: CommandId.make(`issue-owner-command-${predecessor}`),
+            projectId: firstProject,
+            taskId: first.task.taskId,
+          });
+          const secondRepo = yield* makeRepository();
+          const secondProject = ProjectId.make(`issue-contender-${predecessor}`);
+          if (predecessor === "renamed-repository") {
+            yield* git(secondRepo.cwd, [
+              "remote",
+              "set-url",
+              "origin",
+              "https://github.com/owner/renamed.git",
+            ]);
+          }
+          const second = yield* seedPrepared(
+            secondProject,
+            secondRepo.cwd,
+            999,
+            predecessor === "renamed-repository" ? "owner/renamed" : repository.nameWithOwner,
+          );
+          yield* reserveLease(second.stageRun);
+          const sql = yield* SqlClient.SqlClient;
+          const oldEvents = yield* (yield* AgentControlWorktreeEventStore).readStream(
+            ready.reservationId,
+          );
+          if (predecessor === "event-only") {
+            yield* sql`DELETE FROM agent_control_worktree_reservation_states
+          WHERE reservation_id = ${ready.reservationId}`;
+          }
+          const failure = yield* controller
+            .reserveAndMaterialize({
+              commandId: CommandId.make(`issue-contender-command-${predecessor}`),
+              projectId: secondProject,
+              taskId: second.task.taskId,
+            })
+            .pipe(Effect.flip);
+          assert.equal(
+            failure.code,
+            predecessor === "event-only"
+              ? "reservation-projection-corrupt"
+              : "reservation-conflict",
+          );
+          assert.deepEqual(
+            yield* (yield* AgentControlWorktreeEventStore).readStream(ready.reservationId),
+            oldEvents,
+          );
+          assert.equal(
+            (yield* git(ready.internalWorktreePath, ["rev-parse", "HEAD"])).stdout.trim(),
+            ready.headCommitSha,
+          );
+          assert.deepEqual(
+            yield* sql`SELECT reservation_id FROM agent_control_worktree_reservation_states
+        WHERE project_id = ${secondProject}`,
+            [],
+          );
+        }).pipe(Effect.provide(harness.contextA));
+      }),
+    );
+  }
+
+  for (const relationship of ["separate-clones", "shared-common-dir"] as const) {
+    it.effect(
+      `serializes competing issue starts across ${relationship} and retains the rejection`,
+      () =>
+        Effect.gen(function* () {
+          const harness = yield* makeIndependentControllerContexts();
+          const fs = yield* FileSystem.FileSystem;
+          const firstRepo = yield* makeRepository();
+          const secondParent = yield* fs.makeTempDirectoryScoped({
+            prefix: "issue-reservation-retry-",
+          });
+          const secondCwd = `${secondParent}/checkout`;
+          if (relationship === "shared-common-dir") {
+            yield* git(firstRepo.cwd, ["worktree", "add", "-b", "second-checkout", secondCwd]);
+          } else {
+            yield* git(firstRepo.cwd, ["clone", firstRepo.cwd, secondCwd]);
+            yield* git(secondCwd, [
+              "remote",
+              "set-url",
+              "origin",
+              "https://github.com/owner/repository.git",
+            ]);
+          }
+          const first = yield* seedPrepared(
+            ProjectId.make(`issue-race-first-${relationship}`),
+            firstRepo.cwd,
+            999,
+          ).pipe(Effect.provide(harness.contextA));
+          const second = yield* seedPrepared(
+            ProjectId.make(`issue-race-second-${relationship}`),
+            secondCwd,
+            999,
+          ).pipe(Effect.provide(harness.contextA));
+          const firstLease = yield* reserveLease(first.stageRun).pipe(
+            Effect.provide(harness.contextA),
+          );
+          const secondLease = yield* reserveLease(second.stageRun).pipe(
+            Effect.provide(harness.contextA),
+          );
+          const inputs = [first, second].map((entry) => ({
+            commandId: CommandId.make(`issue-race-${entry.task.source.projectId}`),
+            projectId: entry.task.source.projectId,
+            taskId: entry.task.taskId,
+          }));
+          const results = yield* Effect.all(
+            [
+              Effect.result(harness.controllerA.reserveAndMaterialize(inputs[0]!)),
+              Effect.result(harness.controllerB.reserveAndMaterialize(inputs[1]!)),
+            ],
+            { concurrency: "unbounded" },
+          );
+          const winnerIndex = results.findIndex((result) => result._tag === "Success");
+          assert.notEqual(winnerIndex, -1);
+          const loserIndex = 1 - winnerIndex;
+          const winner = results[winnerIndex]!;
+          const loser = results[loserIndex]!;
+          assert.equal(winner._tag, "Success");
+          assert.equal(loser._tag, "Failure");
+          if (winner._tag !== "Success" || loser._tag !== "Failure") return;
+          assert.equal(winner.success.status, "ready");
+          assert.equal(loser.failure.code, "reservation-conflict");
+          const owner = winner.success;
+          const before =
+            yield* harness.sqlA`SELECT * FROM agent_control_worktree_reservation_states`;
+          assert.equal(before.length, 1);
+          const markerPath = yield* ownershipMarkerPath(
+            owner.internalWorktreePath,
+            owner.gitCreatedGitDir!,
+          );
+          const markerBefore = yield* fs.readFileString(markerPath);
+          const replay = yield* harness.retryControllerB
+            .reserveAndMaterialize(inputs[loserIndex]!)
+            .pipe(Effect.flip);
+          assert.equal(replay.code, "reservation-conflict");
+          const ownerInput = inputs[winnerIndex]!;
+          const lease = [firstLease, secondLease][winnerIndex]!;
+          const stage = [first.stageRun, second.stageRun][winnerIndex]!;
+          const released = yield* Context.get(
+            harness.contextA,
+            AgentControlStageRunLeaseEngine,
+          ).dispatchController({
+            type: "agentControl.stageRunLease.releaseBeforeExecution",
+            commandId: CommandId.make(`issue-race-release-${relationship}`),
+            leaseId: lease.leaseId,
+            projectId: ownerInput.projectId,
+            taskId: ownerInput.taskId,
+            stageRunId: stage.stageRunId,
+            attemptId: stage.attemptId,
+            taskRevision: stage.taskRevision,
+            githubIntakeSequence: stage.githubIntakeSequence,
+            sourceIdentityFingerprint: stage.sourceIdentityFingerprint,
+            fenceToken: lease.fenceToken,
+            expectedRevision: lease.revision,
+          });
+          assert.equal(released._tag, "Accepted");
+          yield* harness.sqlA`UPDATE agent_control_project_states SET mode = 'manual'
+          WHERE project_id = ${ownerInput.projectId}`;
+          // A released intermediate lease and manual mode do not prove task completion.
+          const stillBlocked = yield* harness.controllerB
+            .reserveAndMaterialize({
+              ...inputs[loserIndex]!,
+              commandId: CommandId.make(`issue-race-new-command-${relationship}`),
+            })
+            .pipe(Effect.flip);
+          assert.equal(stillBlocked.code, "reservation-conflict");
+          assert.deepEqual(
+            yield* harness.sqlA`SELECT * FROM agent_control_worktree_reservation_states`,
+            before,
+          );
+          assert.equal(yield* fs.readFileString(markerPath), markerBefore);
+          assert.equal(
+            (yield* git(owner.internalWorktreePath, ["rev-parse", "HEAD"])).stdout.trim(),
+            owner.headCommitSha,
+          );
+        }),
+    );
+  }
+
+  it.effect("persists an active issue reservation conflict without changing the owner", () =>
     Effect.gen(function* () {
       const { cwd } = yield* makeRepository();
       const firstProject = ProjectId.make("worktree-collision-first");
@@ -22334,15 +22595,16 @@ layer("Agent Control worktree materialization", (it) => {
       );
       assert.equal(collision._tag, "Failure");
       if (collision._tag === "Failure") {
-        assert.equal(collision.failure.code, "internal-persistence-error");
+        assert.equal(collision.failure.code, "reservation-conflict");
       }
       const sql = yield* SqlClient.SqlClient;
       assert.equal(
         (yield* sql<{ readonly count: number }>`
-          SELECT COUNT(*) AS count FROM agent_control_command_receipts
-          WHERE command_id = ${secondCommandId}
+          SELECT COUNT(*) AS count FROM agent_control_worktree_controller_operations
+          WHERE command_id = ${secondCommandId} AND status = 'rejected'
+            AND rejection_code = 'reservation-conflict'
         `)[0]!.count,
-        0,
+        1,
       );
       yield* Effect.yieldNow;
       assert.equal(publication.pollUnsafe(), undefined);

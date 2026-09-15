@@ -66,15 +66,18 @@ export const sanitizeAgentControlWorktreeSlug = (
     : `task-${sha256FramedHex(["agent-control-worktree-slug-fallback-v1", taskId]).slice(0, 12)}`;
 };
 
+/** Omit reservationId only when reproducing the legacy branch format. New
+ * reservations bind the name to the attempt; recovery uses the persisted name. */
 export const deriveAgentControlWorktreeBranchName = (input: {
   readonly issueNumber: number;
   readonly title: string;
   readonly taskId: AgentControlTaskId;
+  readonly reservationId?: AgentControlWorktreeReservationId;
 }) =>
   `t3auto/issue-${input.issueNumber}-${sanitizeAgentControlWorktreeSlug(
     input.title,
     input.taskId,
-  )}`;
+  )}${input.reservationId === undefined ? "" : `-${sha256FramedHex(["agent-control-worktree-branch-v1", input.reservationId])}`}`;
 
 export const deriveAgentControlWorktreePathKeys = (input: {
   readonly projectId: ProjectId;

@@ -1,6 +1,7 @@
 import {
   type AgentControlRunOnceId,
   AgentControlWorktreeCommand,
+  AgentControlWorktreeReservationId,
   AgentControlWorktreeRpcError,
   AgentControlWorktreeRejectedCommandCode,
   EventId,
@@ -38,6 +39,9 @@ import {
 import { AgentControlGithubStateRepository } from "../../github/Services/AgentControlGithubStateRepository.ts";
 import { deriveAgentControlSourceIdentityFingerprint } from "../../stageRun/identity.ts";
 import { AgentControlCommandReceiptRepository } from "../../../persistence/Services/AgentControlCommandReceipts.ts";
+import { loadAuthoritativeTaskProjectHistory } from "../../task/authoritative.ts";
+import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTaskEventStore.ts";
+import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
 import { decideAgentControlWorktreeCommand } from "../decider.ts";
 import { loadAuthoritativeWorktreeReservation } from "../authoritative.ts";
 import { projectAgentControlWorktreeEvent } from "../projector.ts";
@@ -52,11 +56,19 @@ import { AgentControlWorktreeProjection } from "../Services/AgentControlWorktree
 import { AgentControlWorktreeStateRepository } from "../Services/AgentControlWorktreeStateRepository.ts";
 
 const decodeCommand = Schema.decodeUnknownEffect(AgentControlWorktreeCommand);
+const decodeReservationId = Schema.decodeUnknownEffect(AgentControlWorktreeReservationId);
 const encodeCommand = Schema.encodeUnknownEffect(
   Schema.fromJsonString(AgentControlWorktreeCommand),
 );
 const isRpcError = Schema.is(AgentControlWorktreeRpcError);
 const isWorktreeCode = Schema.is(AgentControlWorktreeRejectedCommandCode);
+// node:sqlite exposes errcode; Effect also supports drivers that expose errno.
+const isNativeSqliteError = Schema.is(
+  Schema.Struct({
+    code: Schema.Literal("ERR_SQLITE_ERROR"),
+    errcode: Schema.Int,
+  }),
+);
 const RECEIPTABLE = new Set<RejectionCode>([
   "validation",
   "project-unavailable",
@@ -152,6 +164,8 @@ const make = Effect.gen(function* () {
   const leaseEngine = yield* AgentControlStageRunLeaseEngine;
   const guard = yield* AgentControlTaskConsumerGuard;
   const github = yield* AgentControlGithubStateRepository;
+  const taskEvents = yield* AgentControlTaskEventStore;
+  const taskStates = yield* AgentControlTaskStateRepository;
   const runtimeHolderId = yield* leaseEngine.runtimeHolderId;
 
   yield* projection.bootstrap.pipe(
@@ -289,6 +303,90 @@ const make = Effect.gen(function* () {
     } satisfies AgentControlWorktreeDispatchOutcome);
   });
 
+  /** Branches retain history; only terminal tasks with released task leases allow
+   * another execution of the issue. Run mode and lease expiry grant no release.
+   * This runs inside the reservation transaction so separate SQLite connections
+   * cannot both pass admission before either reservation becomes visible. */
+  const ensureIssueAvailable = Effect.fn("AgentControlWorktreeEngine.ensureIssueAvailable")(
+    function* (
+      command: Extract<AgentControlWorktreeCommand, { type: "agentControl.worktree.reserve" }>,
+      task: AgentControlTaskState,
+    ) {
+      // Include event-only authority: a missing projection must fail closed, and
+      // repository renames must not hide an active reservation under the old key.
+      const rows = yield* sql<{ readonly reservationId: unknown }>`
+        SELECT reservation_id AS "reservationId"
+        FROM agent_control_worktree_reservation_states
+        WHERE (repository_canonical_key = ${command.repository.canonicalKey}
+            OR repository_node_id = ${command.repository.repositoryNodeId})
+          AND reservation_id <> ${command.reservationId}
+        UNION
+        SELECT stream_id AS "reservationId" FROM agent_control_events
+        WHERE aggregate_kind = 'worktree-reservation'
+          AND event_type = 'agentControl.worktree.reserved'
+          AND (json_extract(CAST(payload_json AS TEXT), '$.repository.canonicalKey') = ${command.repository.canonicalKey}
+            OR json_extract(CAST(payload_json AS TEXT), '$.repository.repositoryNodeId') = ${command.repository.repositoryNodeId})
+          AND stream_id <> ${command.reservationId}
+      `;
+      const histories = new Map<string, ReadonlyArray<AgentControlTaskState>>();
+      for (const row of rows) {
+        const reservationId = yield* decodeReservationId(row.reservationId);
+        const record = yield* loadAuthoritativeWorktreeReservation(reservationId, events, states);
+        if (Option.isNone(record))
+          return yield* rpcError("reservation-projection-corrupt", command);
+        const previous = record.value.state;
+        // Keep the existing global branch constraint, including legacy names.
+        if (previous.branchName === command.branchName) {
+          return yield* rpcError("reservation-conflict", command);
+        }
+        let history = histories.get(previous.projectId);
+        if (history === undefined) {
+          history = yield* loadAuthoritativeTaskProjectHistory(
+            previous.projectId,
+            taskEvents,
+            taskStates,
+          );
+          histories.set(previous.projectId, history);
+        }
+        const previousTask = history.find((entry) => entry.taskId === previous.taskId);
+        if (previousTask === undefined) return yield* rpcError("task-projection-corrupt", command);
+        if (
+          previousTask.source.issueNodeId !== task.source.issueNodeId &&
+          previousTask.source.issueNumber !== task.source.issueNumber
+        )
+          continue;
+        if (previousTask.status !== "succeeded" && previousTask.status !== "failed") {
+          return yield* rpcError("reservation-conflict", command);
+        }
+        const lease = yield* loadAuthoritativeLeaseState(
+          previous.leaseId,
+          leaseEvents,
+          leaseStates,
+        );
+        if (
+          Option.isNone(lease) ||
+          lease.value.state.projectId !== previous.projectId ||
+          lease.value.state.taskId !== previous.taskId ||
+          lease.value.state.status !== "released"
+        )
+          return yield* rpcError("reservation-conflict", command);
+      }
+    },
+    (effect, command) =>
+      effect.pipe(
+        Effect.mapError((cause) =>
+          isRpcError(cause)
+            ? cause
+            : rpcError(
+                cause._tag === "AgentControlPersistenceSqlError"
+                  ? "internal-persistence-error"
+                  : "reservation-projection-corrupt",
+                command,
+              ),
+        ),
+      ),
+  );
+
   const ensureAdmission = Effect.fn("AgentControlWorktreeEngine.ensureAdmission")(function* (
     command: AgentControlWorktreeCommand,
     current: AgentControlWorktreeReservationState | null,
@@ -407,6 +505,9 @@ const make = Effect.gen(function* () {
         if (expiresAt === null || expiresAt <= DateTime.toEpochMillis(now)) {
           return yield* rpcError("lease-expired", command);
         }
+        if (command.type === "agentControl.worktree.reserve") {
+          yield* ensureIssueAvailable(command, task);
+        }
         return task;
       });
     return yield* runId === null
@@ -431,6 +532,23 @@ const make = Effect.gen(function* () {
       const outcome = yield* sql
         .withTransaction(
           Effect.gen(function* () {
+            if (command.type === "agentControl.worktree.reserve") {
+              // BEGIN is deferred. Take the writer lock before the first read,
+              // so another connection cannot admit against the same snapshot.
+              yield* sql`UPDATE agent_control_worktree_reservation_states
+                SET revision = revision WHERE 0`.pipe(
+                Effect.mapError((cause) =>
+                  rpcError(
+                    cause.reason._tag === "LockTimeoutError" ||
+                      (isNativeSqliteError(cause.reason.cause) &&
+                        [5, 6].includes(cause.reason.cause.errcode & 0xff))
+                      ? "repository-lock-unavailable"
+                      : "internal-persistence-error",
+                    command,
+                  ),
+                ),
+              );
+            }
             const replay = yield* replayReceipt(command, commandFingerprint);
             if (Option.isSome(replay)) return replay.value;
             const occurredAt = DateTime.formatIso(yield* DateTime.now);

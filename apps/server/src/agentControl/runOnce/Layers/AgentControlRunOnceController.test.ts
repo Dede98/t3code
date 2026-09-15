@@ -71,7 +71,7 @@ import {
 const at = "2026-08-31T12:00:00.000Z";
 const projectId = ProjectId.make("run-once-controller-race");
 
-it("isolates Git availability rejections but preserves persistence and authority failures", () => {
+it("isolates Git availability and reservation conflicts but preserves persistence and authority failures", () => {
   const blocker = (cause: unknown) =>
     new AgentControlRunOnceError({
       projectId,
@@ -95,6 +95,7 @@ it("isolates Git availability rejections but preserves persistence and authority
         "default-remote-ref-unavailable",
         "repository-unavailable",
         "repository-lock-unavailable",
+        "reservation-conflict",
       ].includes(code),
       code,
     );
@@ -391,6 +392,52 @@ it.effect("fails defects closed without exhausting workers", () =>
         yield* Deferred.await(healthyCompleted);
         yield* TestClock.adjust(Duration.seconds(10));
         assert.equal(yield* Ref.get(defectAttempts), 1);
+      }),
+    );
+  }),
+);
+
+it.effect("keeps a reservation conflict blocked without retrying or occupying other workers", () =>
+  Effect.gen(function* () {
+    const blockedProject = ProjectId.make("run-once-reservation-conflict");
+    const healthyProject = ProjectId.make("run-once-after-reservation-conflict");
+    const attempts = yield* Ref.make(0);
+    const blockedEntered = yield* Deferred.make<void>();
+    const healthyCompleted = yield* Deferred.make<void>();
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const schedule = yield* makeAgentControlRunOnceWorkScheduler(
+          (projectId) =>
+            projectId === blockedProject
+              ? Ref.update(attempts, (attempt) => attempt + 1).pipe(
+                  Effect.andThen(Deferred.succeed(blockedEntered, undefined)),
+                  Effect.andThen(
+                    Effect.fail(
+                      new AgentControlRunOnceError({
+                        projectId,
+                        runId: AgentControlRunOnceId.make("reservation-conflict-run"),
+                        step: "worktree-ready",
+                        reason: "downstream-rejected",
+                        cause: new AgentControlWorktreeRpcError({
+                          code: "reservation-conflict",
+                          operation: "reserve",
+                          projectId,
+                          taskId: AgentControlTaskId.make("reservation-conflict-task"),
+                          reservationId: null,
+                        }),
+                      }),
+                    ),
+                  ),
+                )
+              : Deferred.succeed(healthyCompleted, undefined).pipe(Effect.asVoid),
+          Effect.void,
+        );
+        yield* schedule(blockedProject);
+        yield* Deferred.await(blockedEntered);
+        yield* schedule(healthyProject);
+        yield* Deferred.await(healthyCompleted);
+        yield* TestClock.adjust(Duration.seconds(10));
+        assert.equal(yield* Ref.get(attempts), 1);
       }),
     );
   }),

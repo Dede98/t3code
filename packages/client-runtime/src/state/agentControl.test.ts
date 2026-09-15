@@ -39,6 +39,7 @@ import {
   agentControlEpicPublishHandoffInput,
   agentControlEndPausedInput,
   agentControlCommandErrorMessage,
+  agentControlErrorMessage,
   agentControlSnapshotFresh,
   agentControlArmedStatus,
   agentControlArmBlockers,
@@ -276,7 +277,7 @@ describe("Run Once client state", () => {
     ).toEqual(command);
   });
 
-  it("only offers ending for the persisted pre-turn default-reference rejection", () => {
+  it("only offers ending for persisted pre-turn default-reference or reservation rejections", () => {
     const blocked = {
       ...run,
       state: { ...run.state, status: "active" as const, lastStep: "lease-reserved" as const },
@@ -298,6 +299,12 @@ describe("Run Once client state", () => {
     };
     expect(agentControlCanEndBlockedRun(supported)).toBe(true);
     expect(endInput(supported)?.mode).toBe("observe");
+    const reservationConflict = {
+      ...supported,
+      errorCode: "downstream-rejected: reservation-conflict",
+    };
+    expect(agentControlCanEndBlockedRun(reservationConflict)).toBe(true);
+    expect(endInput(reservationConflict)?.mode).toBe("observe");
     for (const lastStep of [
       "task-selected",
       "stage-prepared",
@@ -401,6 +408,23 @@ describe("Run Once client state", () => {
         snapshot: { ...snapshot, blockers: ["source-watermark-stale"] },
       }).join(" "),
     ).toContain("review the selected task's eligibility");
+  });
+
+  it("explains reservation conflicts in active and historical run results", () => {
+    for (const errorCode of ["reservation-conflict", "downstream-rejected: reservation-conflict"]) {
+      const message = agentControlErrorMessage(errorCode);
+      expect(message).toContain("Another attempt still owns this issue or its worktree target");
+      expect(message).toContain("will not retry automatically");
+      for (const status of ["active", "completed"] as const) {
+        const run = {
+          ...snapshot.runs[0]!,
+          state: { ...snapshot.runs[0]!.state, status },
+          errorCode,
+        };
+        expect(agentControlRunStatus(run).label).toContain(message);
+        expect(agentControlRunStatus(run).tone).toBe("warning");
+      }
+    }
   });
 
   it("keeps an ended run's rejection visible without reporting success or blocking a fresh task", () => {

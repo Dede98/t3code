@@ -333,11 +333,25 @@ it.live.each([
   { blockedMode: "armed", intakeRefreshes: 0, recoverMissing: true, sourceChange: "none" },
   { blockedMode: "armed", intakeRefreshes: 3, recoverMissing: false, sourceChange: "paused" },
   { blockedMode: "armed", intakeRefreshes: 3, recoverMissing: false, sourceChange: "replaced" },
+  {
+    blockedMode: "run-once",
+    intakeRefreshes: 0,
+    recoverMissing: false,
+    sourceChange: "terminal-retry",
+  },
+  {
+    blockedMode: "run-once",
+    intakeRefreshes: 0,
+    recoverMissing: false,
+    sourceChange: "terminal-retry-shared-git-dir",
+  },
 ] as const)(
   "isolates a persisted $blockedMode project blocker with $intakeRefreshes intake refreshes (recover missing: $recoverMissing, source change: $sourceChange) while independent tasks run and fresh authority resolves it",
   ({ blockedMode, intakeRefreshes, recoverMissing, sourceChange }) =>
     Effect.scoped(
       Effect.gen(function* () {
+        const terminalRetry =
+          sourceChange === "terminal-retry" || sourceChange === "terminal-retry-shared-git-dir";
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-armed-production-" });
@@ -1297,7 +1311,7 @@ it.live.each([
           }
 
           const resultEvidenceId = implementationFinalized.resultEvidenceId;
-          if (sourceChange !== "none") {
+          if (sourceChange === "paused" || sourceChange === "replaced") {
             const refreshedAt = DateTime.formatIso(yield* DateTime.now);
             const changedSource: AgentControlGithubIssueSnapshot =
               sourceChange === "paused"
@@ -1559,38 +1573,41 @@ it.live.each([
           const outputAt = DateTime.formatIso(yield* DateTime.now);
           const messageId = MessageId.make(`verification-output-${runOrdinal}`);
           const outputEventId = EventId.make(`verification-output-event-${runOrdinal}`);
-          yield* orchestrationEngine.dispatch({
-            type: "thread.verification-result.capture",
-            commandId: CommandId.make(`provider:${outputEventId}:verification-result:${messageId}`),
-            threadId: ThreadId.make(verificationDelivery!.threadId),
-            messageId,
-            turnId: TurnId.make(verificationDelivery!.providerTurnId),
-            fragment: makeBoundedVerificationResultCompletion(
-              encodeUnknownJson({
-                schemaVersion: AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_VERSION,
-                verdict: "passed",
-                report: "Required clean-diff check passed.",
-              }),
-              null,
-            ),
-            providerRuntimeMessage: {
-              runtimeEventId: outputEventId,
-              eventType: "item.completed",
-              providerInstanceId,
-              providerTurnId: TurnId.make(verificationDelivery!.providerTurnId),
-              providerItemId: null,
-            },
-            verificationResultCapture: {
-              schemaVersion: 1,
-              disposition: "authority",
-              handoffId: verificationHandoffId,
-              providerDeliveryId: permit.providerDeliveryId,
-              providerInstanceId,
-              providerTurnId: TurnId.make(verificationDelivery!.providerTurnId),
-              resultSchemaFingerprint: AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT,
-            },
-            createdAt: outputAt,
-          });
+          if (!terminalRetry)
+            yield* orchestrationEngine.dispatch({
+              type: "thread.verification-result.capture",
+              commandId: CommandId.make(
+                `provider:${outputEventId}:verification-result:${messageId}`,
+              ),
+              threadId: ThreadId.make(verificationDelivery!.threadId),
+              messageId,
+              turnId: TurnId.make(verificationDelivery!.providerTurnId),
+              fragment: makeBoundedVerificationResultCompletion(
+                encodeUnknownJson({
+                  schemaVersion: AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_VERSION,
+                  verdict: "passed",
+                  report: "Required clean-diff check passed.",
+                }),
+                null,
+              ),
+              providerRuntimeMessage: {
+                runtimeEventId: outputEventId,
+                eventType: "item.completed",
+                providerInstanceId,
+                providerTurnId: TurnId.make(verificationDelivery!.providerTurnId),
+                providerItemId: null,
+              },
+              verificationResultCapture: {
+                schemaVersion: 1,
+                disposition: "authority",
+                handoffId: verificationHandoffId,
+                providerDeliveryId: permit.providerDeliveryId,
+                providerInstanceId,
+                providerTurnId: TurnId.make(verificationDelivery!.providerTurnId),
+                resultSchemaFingerprint: AGENT_CONTROL_VERIFICATION_RESULT_SCHEMA_FINGERPRINT,
+              },
+              createdAt: outputAt,
+            });
           const verificationTerminal = yield* publishTerminal({
             prefix: `armed-production-verification-${runOrdinal}`,
             threadId: ThreadId.make(verificationDelivery!.threadId),
@@ -1645,6 +1662,132 @@ it.live.each([
         });
 
         yield* completeActiveTask(1);
+        if (terminalRetry) {
+          yield* controller.processProject(projectId);
+          assert.deepStrictEqual(
+            yield* sql`SELECT status FROM agent_control_task_states WHERE task_id=${firstTaskId}`,
+            [{ status: "failed" }],
+          );
+          assert.deepStrictEqual(
+            yield* sql`SELECT status, last_step AS step FROM agent_control_run_once_states
+              WHERE project_id=${projectId}`,
+            [{ status: "completed", step: "completed" }],
+          );
+          const oldReservations = yield* sql<{
+            status: string;
+            materialization_phase: string;
+            branch_name: string;
+            internal_worktree_path: string;
+            repository_common_dir: string;
+          }>`SELECT * FROM agent_control_worktree_reservation_states
+            WHERE project_id=${projectId}`;
+          assert.lengthOf(oldReservations, 1);
+          assert.equal(oldReservations[0]!.status, "ready");
+          assert.equal(oldReservations[0]!.materialization_phase, "ownership-marked");
+          const oldTaskEvents = yield* Context.get(context, AgentControlTaskEventStore).readStream(
+            firstTaskId,
+          );
+          const oldRunEvidence = yield* sql`SELECT * FROM agent_control_run_once_step_evidence
+            WHERE project_id=${projectId} ORDER BY run_id, ordinal`;
+          const oldVerificationEvidence =
+            yield* sql`SELECT * FROM agent_control_verification_check_results`;
+          const oldFinalization =
+            yield* sql`SELECT * FROM agent_control_verification_finalization_evidence
+            WHERE project_id=${projectId}`;
+          assert.equal(oldFinalization[0]!.terminal_cause, "verification-invalid-output");
+          assert.equal(oldFinalization[0]!.invalid_output_code, "missing-final-message");
+          const oldWorktreeHead = yield* git(oldReservations[0]!.internal_worktree_path, [
+            "rev-parse",
+            "HEAD",
+          ]).pipe(Effect.provide(gitLayer));
+          yield* engine.dispatchHuman({
+            commandId: CommandId.make("terminal-project-manual"),
+            projectId,
+            expectedRevision: (yield* engine.getProjectState({ projectId })).revision,
+            mode: "manual",
+          });
+          const retryProjectId = ProjectId.make("terminal-retry-second-checkout");
+          const sharedGitDir = sourceChange === "terminal-retry-shared-git-dir";
+          const retryRepository = sharedGitDir
+            ? {
+                cwd: yield* fs.makeTempDirectoryScoped({
+                  prefix: "t3-armed-production-linked-checkout-",
+                }),
+              }
+            : yield* makeRepository().pipe(Effect.provide(gitLayer));
+          if (sharedGitDir) {
+            yield* git(repository.cwd, [
+              "worktree",
+              "add",
+              "--detach",
+              retryRepository.cwd,
+              repository.baseCommitSha,
+            ]).pipe(Effect.provide(gitLayer));
+          }
+          yield* seedProject(retryProjectId, retryRepository, [issues[0]!], "run-once");
+          yield* controller.processProject(retryProjectId);
+          const retryReservations =
+            yield* sql`SELECT * FROM agent_control_worktree_reservation_states
+            WHERE project_id=${retryProjectId}`;
+          assert.lengthOf(retryReservations, 1);
+          assert.equal(retryReservations[0]!.status, "ready");
+          assert.notEqual(retryReservations[0]!.branch_name, oldReservations[0]!.branch_name);
+          assert.equal(
+            retryReservations[0]!.repository_common_dir ===
+              oldReservations[0]!.repository_common_dir,
+            sharedGitDir,
+          );
+          assert.notEqual(
+            retryReservations[0]!.internal_worktree_path,
+            oldReservations[0]!.internal_worktree_path,
+          );
+          const [retryHandoff] = yield* sql<{ handoffId: string }>`SELECT handoff_id AS "handoffId"
+            FROM agent_control_initial_planning_handoff_intents WHERE project_id=${retryProjectId}`;
+          assert.isDefined(retryHandoff);
+          yield* planningWakeupService.wake(retryHandoff!.handoffId);
+          yield* planningConsumerService.drain;
+          const turnsAfterRetry = fakeProvider.turnCount();
+          assert.equal(turnsAfterRetry, 4);
+          yield* controller.processProject(retryProjectId);
+          yield* restartRecovery();
+          yield* restartRecovery();
+          yield* planningConsumerService.drain;
+          assert.equal(fakeProvider.turnCount(), turnsAfterRetry);
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_worktree_reservation_states WHERE project_id=${retryProjectId}`,
+            retryReservations,
+          );
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_worktree_reservation_states WHERE project_id=${projectId}`,
+            oldReservations,
+          );
+          assert.deepStrictEqual(
+            yield* Context.get(context, AgentControlTaskEventStore).readStream(firstTaskId),
+            oldTaskEvents,
+          );
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_run_once_step_evidence
+              WHERE project_id=${projectId} ORDER BY run_id, ordinal`,
+            oldRunEvidence,
+          );
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_verification_check_results`,
+            oldVerificationEvidence,
+          );
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_verification_finalization_evidence WHERE project_id=${projectId}`,
+            oldFinalization,
+          );
+          assert.deepStrictEqual(
+            yield* git(oldReservations[0]!.internal_worktree_path, ["rev-parse", "HEAD"]).pipe(
+              Effect.provide(gitLayer),
+            ),
+            oldWorktreeHead,
+          );
+          assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+          assert.deepStrictEqual(yield* sql`PRAGMA integrity_check`, [{ integrity_check: "ok" }]);
+          return;
+        }
         if (sourceChange !== "none") return;
         yield* scheduler.processProject(projectId);
         assert.equal((yield* engine.getProjectState({ projectId })).mode, "armed");

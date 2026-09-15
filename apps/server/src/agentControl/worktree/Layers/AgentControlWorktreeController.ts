@@ -5734,10 +5734,24 @@ const make = Effect.gen(function* () {
                   return yield* materialize(claim, authoritative, claimOwner);
                 }
                 const repository = yield* resolveRepository(canonical, "reserve");
+                const reservationId = yield* deriveAgentControlWorktreeReservationId({
+                  projectId: input.projectId,
+                  taskId: input.taskId,
+                  stageRunId: canonical.stageRun.stageRunId,
+                  attemptId: canonical.stageRun.attemptId,
+                  leaseId: canonical.lease.leaseId,
+                  fenceToken: canonical.lease.fenceToken,
+                  repositoryIdentity: {
+                    repositoryNodeId: repository.repository.repositoryNodeId,
+                    canonicalKey: repository.repository.canonicalKey,
+                  },
+                  baseCommitSha: repository.baseCommitSha,
+                });
                 const branchName = deriveAgentControlWorktreeBranchName({
                   issueNumber: canonical.task.source.issueNumber,
                   title: canonical.task.sourceSnapshot.title,
                   taskId: canonical.task.taskId,
+                  reservationId,
                 });
                 const validBranch = yield* gitRun(
                   "AgentControlWorktree.branch.checkRefFormat",
@@ -5757,19 +5771,6 @@ const make = Effect.gen(function* () {
                     input.taskId,
                   );
                 }
-                const reservationId = yield* deriveAgentControlWorktreeReservationId({
-                  projectId: input.projectId,
-                  taskId: input.taskId,
-                  stageRunId: canonical.stageRun.stageRunId,
-                  attemptId: canonical.stageRun.attemptId,
-                  leaseId: canonical.lease.leaseId,
-                  fenceToken: canonical.lease.fenceToken,
-                  repositoryIdentity: {
-                    repositoryNodeId: repository.repository.repositoryNodeId,
-                    canonicalKey: repository.repository.canonicalKey,
-                  },
-                  baseCommitSha: repository.baseCommitSha,
-                });
                 if (preboundReservationId !== null && preboundReservationId !== reservationId) {
                   return yield* error(
                     "reservation-projection-corrupt",

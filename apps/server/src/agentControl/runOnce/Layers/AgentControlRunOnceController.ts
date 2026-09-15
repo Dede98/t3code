@@ -84,7 +84,7 @@ const RETRY_MAX_DELAY_MS = 1_000;
 const isRunOnceError = Schema.is(AgentControlRunOnceError);
 const isWorktreeError = Schema.is(AgentControlWorktreeRpcError);
 
-/** Only local Git availability failures may leave a run blocked during startup. */
+/** Expected worktree blockers remain local to their project during startup. */
 export const isRunOnceRecoveryProjectBlocker = (failure: AgentControlRunOnceError) =>
   failure.reason === "downstream-rejected" &&
   failure.step === "worktree-ready" &&
@@ -92,7 +92,8 @@ export const isRunOnceRecoveryProjectBlocker = (failure: AgentControlRunOnceErro
   failure.cause.projectId === failure.projectId &&
   (failure.cause.code === "default-remote-ref-unavailable" ||
     failure.cause.code === "repository-unavailable" ||
-    failure.cause.code === "repository-lock-unavailable");
+    failure.cause.code === "repository-lock-unavailable" ||
+    failure.cause.code === "reservation-conflict");
 
 interface PersistedRunState extends RunOnceStateBinding {
   readonly runId: AgentControlRunOnceId;
