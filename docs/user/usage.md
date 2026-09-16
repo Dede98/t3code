@@ -60,7 +60,9 @@ the bar show each account's quota, countdown, and credits. Tap a row to open its
 The same account signed in on more than one environment, or reported by a hub as well, counts once.
 Filter with the environment dropdown to see what a single machine has.
 
-If a window looks stale, refresh Limits to re-check every provider and hub.
+Opening Limits checks the selected connected environments automatically. Each client waits at
+least five minutes between automatic checks of an environment, including after a failed check.
+If a window still looks stale, refresh Limits to re-check every provider and hub.
 
 On web and desktop, the composer also shows the selected account’s remaining subscription quota.
 Open the meter to inspect or refresh that account’s limits and use available reset credits.
