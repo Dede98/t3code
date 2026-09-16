@@ -34,6 +34,7 @@ import {
   type ProviderDriverKind,
 } from "./providerInstance.ts";
 import { PullRequestMergeMethod } from "./pullRequest.ts";
+import { ResourceAdmissionSettings, ResourceAdmissionSettingsPatch } from "./resourceAdmission.ts";
 
 const EXTERNAL_MCP_SERVER_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 const HTTP_HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
@@ -1139,6 +1140,8 @@ export const ServerSettings = Schema.Struct({
   providerInstances: Schema.Record(ProviderInstanceId, ProviderInstanceConfig).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
+  /** Host-local provider and managed-process admission. Never synced between environments. */
+  resourceAdmission: ResourceAdmissionSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   agentControlPolicy: Schema.optionalKey(AgentControlAppPolicy),
   externalMcpServers: Schema.Record(ExternalMcpServerId, ExternalMcpServerConfig).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
@@ -1375,6 +1378,7 @@ export const ServerSettingsPatch = Schema.Struct({
   // patches risk leaving driver-specific config in a half-merged state.
   // The web UI sends a fully-formed map every time it edits this field.
   providerInstances: Schema.optionalKey(Schema.Record(ProviderInstanceId, ProviderInstanceConfig)),
+  resourceAdmission: Schema.optionalKey(ResourceAdmissionSettingsPatch),
   agentControlPolicy: Schema.optionalKey(AgentControlAppPolicy),
   // Whole-map replacement, matching providerInstances. Header secret GC and
   // redaction rely on seeing the complete desired map atomically.

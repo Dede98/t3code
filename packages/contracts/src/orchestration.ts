@@ -4,6 +4,7 @@ import * as SchemaIssue from "effect/SchemaIssue";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as Struct from "effect/Struct";
 import { ProviderOptionSelections } from "./model.ts";
+import { ResourceAdmissionWait } from "./resourceAdmission.ts";
 import { RepositoryIdentity, ThreadEnvMode } from "./environment.ts";
 import {
   AgentControlAttemptId,
@@ -536,6 +537,8 @@ export const OrchestrationSession = Schema.Struct({
   providerInstanceId: Schema.optional(ProviderInstanceId),
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   activeTurnId: Schema.NullOr(TurnId),
+  /** Present only while a requested turn is waiting for host admission. */
+  admissionWait: Schema.optionalKey(ResourceAdmissionWait),
   lastError: Schema.NullOr(TrimmedNonEmptyString),
   updatedAt: IsoDateTime,
 });

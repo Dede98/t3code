@@ -41,6 +41,7 @@ import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { formatTokens } from "@t3tools/shared/usageFormat";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import { ProviderResourceCoordinator } from "../../resourceAdmission/ProviderResourceCoordinator.ts";
 import type { ProviderRuntimeEventPublication } from "../../provider/Services/ProviderService.ts";
 import {
   makeDurablePrefixOutcomeTracker,
@@ -1011,6 +1012,7 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const providerResourceCoordinator = yield* Effect.serviceOption(ProviderResourceCoordinator);
   const projectionThreadMessages = yield* ProjectionThreadMessageRepository;
   const projectionThreadProposedPlans = yield* ProjectionThreadProposedPlanRepository;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
@@ -2198,8 +2200,18 @@ const make = Effect.gen(function* () {
           return true;
         }
         switch (event.type) {
-          case "session.exited":
-            return true;
+          case "session.exited": {
+            const sessionInstanceId = thread.session?.providerInstanceId;
+            return (
+              sessionInstanceId !== undefined &&
+              event.providerInstanceId === sessionInstanceId &&
+              (thread.session === null || event.createdAt >= thread.session.updatedAt) &&
+              !hasPendingTurnStart &&
+              activeTurnId === null &&
+              thread.session?.status !== "starting" &&
+              thread.session?.status !== "running"
+            );
+          }
           case "session.started":
           case "thread.started":
             return true;
@@ -2225,6 +2237,38 @@ const make = Effect.gen(function* () {
             return true;
         }
       })();
+      if (
+        Option.isSome(providerResourceCoordinator) &&
+        ((event.type === "session.exited" && shouldApplyThreadLifecycle) ||
+          (event.type === "turn.started" && shouldApplyThreadLifecycle) ||
+          (isTerminalTurn && shouldApplyThreadLifecycle))
+      ) {
+        const currentSession =
+          event.type === "turn.started"
+            ? yield* providerService.listSessions().pipe(
+                Effect.map((sessions) =>
+                  sessions.find(
+                    (session) =>
+                      session.threadId === event.threadId &&
+                      session.providerInstanceId === event.providerInstanceId &&
+                      session.activeTurnId === event.turnId &&
+                      session.status !== "closed",
+                  ),
+                ),
+                Effect.orElseSucceed(() => undefined),
+              )
+            : undefined;
+        yield* providerResourceCoordinator.value.observeRuntimeEvent(event, currentSession).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider resource admission event reconciliation failed", {
+              eventId: event.eventId,
+              eventType: event.type,
+              threadId: event.threadId,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
+      }
       const acceptedTurnStartedSourcePlan =
         event.type === "turn.started" && shouldApplyThreadLifecycle
           ? yield* getSourceProposedPlanReferenceForAcceptedTurnStart(thread.id, eventTurnId)
@@ -3209,6 +3253,16 @@ const make = Effect.gen(function* () {
 
   const start: ProviderRuntimeIngestionShape["start"] = (providerEvents, abortSignal) =>
     Effect.gen(function* () {
+      if (Option.isSome(providerResourceCoordinator)) {
+        yield* providerService.listSessions().pipe(
+          Effect.flatMap(providerResourceCoordinator.value.reconcile),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider resource admission startup reconciliation failed closed", {
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
+      }
       const prefixOutcome = yield* makeDurablePrefixOutcomeTracker;
       const worker = yield* makeDrainableWorker(
         (input: RuntimeIngestionInput) => processInputSafely(input, prefixOutcome),

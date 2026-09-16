@@ -24,6 +24,7 @@ import {
   type AgentControlEpicHandoffPublishInput,
   type EnvironmentId,
   type ProjectId,
+  type ResourceAdmissionWait,
 } from "@t3tools/contracts";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 
@@ -697,6 +698,32 @@ export type AgentControlStatusView = {
   tone: "neutral" | "running" | "success" | "danger" | "warning";
 };
 
+export type ResourceAdmissionWaitSummary = `Waiting${string}`;
+
+const RESOURCE_ADMISSION_WAIT_LABELS = {
+  "provider-limit": "Waiting for provider capacity",
+  "local-capacity": "Waiting for local check capacity",
+  "cpu-pressure": "Waiting for CPU pressure to fall",
+  "ram-pressure": "Waiting for available memory",
+  "gpu-pressure": "Waiting for GPU capacity",
+  "interactive-priority": "Waiting while interactive work has priority",
+  "telemetry-unavailable": "Waiting for host resource telemetry",
+  "unsupported-requirement": "Waiting: this host cannot satisfy a required resource",
+} as const satisfies Record<ResourceAdmissionWait["reason"], ResourceAdmissionWaitSummary>;
+
+export function resourceAdmissionWaitSummary(
+  wait: ResourceAdmissionWait,
+): ResourceAdmissionWaitSummary {
+  return RESOURCE_ADMISSION_WAIT_LABELS[wait.reason];
+}
+
+/** Presents only server-host observations; clients never substitute browser or phone resources. */
+export function resourceAdmissionWaitMessage(wait: ResourceAdmissionWait): string {
+  const host = wait.hostId ? ` on ${wait.hostId}` : " on the server host";
+  const detail = wait.detail ? ` ${wait.detail}` : "";
+  return `${resourceAdmissionWaitSummary(wait)}${host}.${detail}`;
+}
+
 export function agentControlErrorMessage(code: string): string {
   if (code === "reservation-conflict" || code === "downstream-rejected: reservation-conflict") {
     return "Worktree reservation conflict. Another attempt still owns this issue or its worktree target. Review the other run in this environment and end this blocked run or disarm the project. This rejected attempt will not retry automatically.";
@@ -781,6 +808,12 @@ export function agentControlRunStatus(run: AgentControlRunOnceView): AgentContro
     (a, b) => a.stageOrdinal - b.stageOrdinal || a.attemptOrdinal - b.attemptOrdinal,
   );
   const latest = stages.at(-1);
+  if (latest?.admissionWait) {
+    return {
+      label: resourceAdmissionWaitMessage(latest.admissionWait),
+      tone: "neutral",
+    };
+  }
   if (run.task.status === "succeeded") {
     return latest !== undefined && agentControlVerificationPassed(latest)
       ? { label: "Succeeded · verified", tone: "success" }

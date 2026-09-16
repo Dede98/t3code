@@ -55,10 +55,28 @@ import {
   agentControlStartBlockers,
   agentControlStartInput,
   agentControlVerificationPassed,
+  resourceAdmissionWaitMessage,
 } from "./agentControl.ts";
 
 const decodeSnapshot = Schema.decodeUnknownSync(AgentControlRunOnceSnapshot);
 const timestamp = "2026-09-10T10:00:00.000Z";
+
+describe("resource admission wait presentation", () => {
+  it("names every wait cause as a server-host observation", () => {
+    expect(
+      resourceAdmissionWaitMessage({
+        reason: "cpu-pressure",
+        hostId: "builder-01",
+        detail: "Observed CPU utilization is 91%; this is a scheduling threshold, not a quota.",
+      }),
+    ).toBe(
+      "Waiting for CPU pressure to fall on builder-01. Observed CPU utilization is 91%; this is a scheduling threshold, not a quota.",
+    );
+    expect(resourceAdmissionWaitMessage({ reason: "telemetry-unavailable" })).toBe(
+      "Waiting for host resource telemetry on the server host.",
+    );
+  });
+});
 const stage = Schema.decodeUnknownSync(AgentControlRunOnceStageView)({
   schemaVersion: 1,
   projectId: "project",
@@ -610,6 +628,31 @@ describe("Run Once client state", () => {
         stages: [repair],
       }),
     ).toEqual({ label: "Running · Repair", tone: "running" });
+  });
+
+  it("presents queued admission as waiting instead of provider-running", () => {
+    const waiting = {
+      ...stage,
+      status: "waiting" as const,
+      admissionWait: {
+        reason: "local-capacity" as const,
+        hostId: "builder-01",
+        detail: "One managed check is already running.",
+      },
+      verification: null,
+    };
+    expect(
+      agentControlRunStatus({
+        ...run,
+        task: { ...task, status: "running" },
+        state: { ...run.state, status: "active" },
+        stages: [waiting],
+      }),
+    ).toEqual({
+      label:
+        "Waiting for local check capacity on builder-01. One managed check is already running.",
+      tone: "neutral",
+    });
   });
 
   it("numbers verification stages separately even when both have attempt ordinal one", () => {

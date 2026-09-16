@@ -1,12 +1,14 @@
 import type { StatusTone } from "../../components/StatusPill";
 import type { OrchestrationLatestTurn, OrchestrationSession } from "@t3tools/contracts";
 import { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+import { resourceAdmissionWaitSummary } from "@t3tools/client-runtime/state/agent-control";
 
 export type ThreadStatusKind =
   | "pending-approval"
   | "awaiting-input"
   | "working"
   | "connecting"
+  | "admission-waiting"
   | "error"
   | "plan-ready";
 
@@ -58,6 +60,18 @@ export function resolveThreadStatus(
       textClassName: "text-foreground-secondary",
       iconColor: "#5e5ce6",
       iconBackground: "rgba(94,92,230,0.22)",
+      pulse: false,
+    };
+  }
+
+  if (thread.session?.admissionWait) {
+    return {
+      kind: "admission-waiting",
+      label: resourceAdmissionWaitSummary(thread.session.admissionWait),
+      pillClassName: "bg-primary/10",
+      textClassName: "text-foreground-secondary",
+      iconColor: "#8e8e93",
+      iconBackground: "rgba(142,142,147,0.18)",
       pulse: false,
     };
   }

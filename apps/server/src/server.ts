@@ -20,6 +20,7 @@ import * as Layer from "effect/Layer";
 import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 import * as Ref from "effect/Ref";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { FetchHttpClient, HttpRouter, HttpServer } from "effect/unstable/http";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
@@ -191,6 +192,9 @@ import * as NativeTelemetryClient from "./resourceTelemetry/NativeTelemetryClien
 import * as ResourceAttribution from "./resourceTelemetry/ResourceAttribution.ts";
 import * as ResourceMonitorBinary from "./resourceTelemetry/ResourceMonitorBinary.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
+import * as ResourcePressure from "./resourceAdmission/ResourcePressure.ts";
+import * as SharedResourceAdmission from "./resourceAdmission/ResourceAdmission.ts";
+import { layer as ProviderResourceCoordinatorLive } from "./resourceAdmission/ProviderResourceCoordinator.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as UsageService from "./usage/UsageService.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
@@ -338,6 +342,48 @@ const PlatformServicesLive = Layer.unwrap(
   }),
 );
 
+const SharedResourceAdmissionLayerLive = Layer.unwrap(
+  Effect.gen(function* () {
+    const serverSettings = yield* ServerSettings.ServerSettingsService;
+    const settings = (yield* serverSettings.getSettings).resourceAdmission;
+    const [{ tmpdir }, NodePath] = yield* Effect.all([
+      Effect.promise(() => import("node:os")),
+      Effect.promise(() => import("node:path")),
+    ]);
+    const owner = typeof process.getuid === "function" ? String(process.getuid()) : "default";
+    const configuredPath = process.env.T3_RESOURCE_ADMISSION_HOST_PATH?.trim();
+    const hostBudgetPath =
+      configuredPath && configuredPath.length > 0
+        ? configuredPath
+        : NodePath.join(tmpdir(), `t3code-resource-admission-${owner}`, "ledger.json");
+    const toHostSettings = (value: typeof settings) => ({
+      providerMaxConcurrent: value.providerMaxConcurrent,
+      interactiveReserve: value.interactiveReserve,
+      backgroundMaxGrantDelayMs: value.backgroundAgingSeconds * 1_000,
+      maxInteractiveGrantBurst: Math.max(1, value.backgroundGrantInterval - 1),
+      localCheckMaxConcurrent: value.localCheckMaxConcurrent,
+      cpuPauseUtilization: value.cpuPauseThreshold,
+      cpuResumeUtilization: value.cpuResumeThreshold,
+      availableMemoryPauseBytes: value.availableMemoryPauseBytes,
+      availableMemoryResumeBytes: value.availableMemoryResumeBytes,
+      gpuMaxConcurrent: value.gpuMaxConcurrent,
+      missingTelemetryPolicy: value.missingTelemetryPolicy,
+    });
+    return SharedResourceAdmission.layer({
+      hostBudgetPath,
+      settings: toHostSettings(settings),
+      readSettings: serverSettings.getSettings.pipe(
+        Effect.map((current) => toHostSettings(current.resourceAdmission)),
+        Effect.catch(() => Effect.succeed(toHostSettings(settings))),
+      ),
+    }).pipe(
+      Layer.provide(ResourcePressure.layer),
+      Layer.provide(HostResources.layer),
+      Layer.provide(PlatformServicesLive),
+    );
+  }),
+).pipe(Layer.provide(ServerSettingsLayerLive));
+
 const InitialPlanningWakeupLayerLive = AgentControlInitialPlanningWakeupLive;
 const InitialPlanningConsumerLayerLive = AgentControlInitialPlanningConsumerLive.pipe(
   Layer.provideMerge(AgentControlInitialPlanningHandoffStoreLive),
@@ -389,6 +435,12 @@ const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
 // NDJSON writers and is provided at the outer runtime layer so both
 // `ProviderService` and the per-instance drivers read the same logger pair.
 const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));
+const ResourceAdmissionWaitRecoveryLayerLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`DELETE FROM main.resource_admission_wait_status`;
+  }),
+).pipe(Layer.provide(PersistenceLayerLive));
 const ProviderAdmissionStoreLayerLive = ProviderAdmissionStoreLive.pipe(
   Layer.provide(PersistenceLayerLive),
 );
@@ -552,6 +604,12 @@ const ProviderAdmissionRuntimeLayerLive = ProviderAdmissionRuntimeLive.pipe(
   Layer.provideMerge(ImplementationTurnWakeupLayerLive),
   Layer.provide(VerificationTurnWakeupLayerLive),
 );
+const ProviderResourceCoordinatorLayerLive = ProviderResourceCoordinatorLive.pipe(
+  Layer.provideMerge(ProviderAdmissionRuntimeLayerLive),
+  Layer.provideMerge(SharedResourceAdmissionLayerLive),
+  Layer.provideMerge(ResourceAdmissionWaitRecoveryLayerLive),
+  Layer.provide(ServerSettingsLayerLive),
+);
 const ProviderAdmissionReleaseAuthorityLayerLive = ProviderAdmissionReleaseAuthorityLive.pipe(
   Layer.provideMerge(ProviderAdmissionStoreLayerLive),
   Layer.provide(ProviderAdmissionRuntimeLayerLive),
@@ -614,6 +672,8 @@ const RuntimeCoreDependenciesAdmissionLive = ReactorLayerLive.pipe(
   Layer.provideMerge(VcsLayerLive),
   Layer.provideMerge(ProviderRuntimeServicesLayerLive),
   Layer.provideMerge(ProviderAdmissionRuntimeLayerLive),
+  Layer.provideMerge(ProviderResourceCoordinatorLayerLive),
+  Layer.provideMerge(SharedResourceAdmissionLayerLive),
   Layer.provideMerge(ProviderAdmissionReleaseAuthorityLayerLive),
 );
 const RuntimeCoreDependenciesBaseLive = RuntimeCoreDependenciesAdmissionLive.pipe(

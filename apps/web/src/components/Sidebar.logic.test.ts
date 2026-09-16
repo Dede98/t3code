@@ -776,6 +776,20 @@ describe("resolveSidebarThreadStatus", () => {
     ).toBe("working");
   });
 
+  it("keeps a turn waiting for admission distinct from provider work", () => {
+    expect(
+      resolveSidebarThreadStatus({
+        ...idle,
+        session: {
+          ...session,
+          status: "starting" as const,
+          activeTurnId: null,
+          admissionWait: { reason: "provider-limit", hostId: "builder-01" },
+        },
+      }),
+    ).toBe("waiting");
+  });
+
   it("reports failed only while the session status is error", () => {
     expect(
       resolveSidebarThreadStatus({
@@ -1961,6 +1975,22 @@ describe("resolveThreadStatusPill", () => {
         thread: baseThread,
       }),
     ).toMatchObject({ label: "Working", pulse: true });
+  });
+
+  it("shows the admission cause instead of claiming provider work is running", () => {
+    expect(
+      resolveThreadStatusPill({
+        thread: {
+          ...baseThread,
+          session: {
+            ...baseThread.session,
+            status: "starting",
+            activeTurnId: null,
+            admissionWait: { reason: "ram-pressure", hostId: "builder-01" },
+          },
+        },
+      }),
+    ).toMatchObject({ label: "Waiting for available memory", pulse: false });
   });
 
   it("shows plan ready when a settled plan turn has a proposed plan ready for follow-up", () => {

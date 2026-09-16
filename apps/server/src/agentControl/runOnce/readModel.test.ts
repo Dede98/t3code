@@ -38,7 +38,7 @@ import { AgentControlRunOnceController } from "./Services/AgentControlRunOnceCon
 import { persistRunOnceDiagnostic, persistVerificationRunOnceDiagnostic } from "./diagnostics.ts";
 import { deriveRunOnceCommandId } from "./identity.ts";
 import { AgentControlRunOnceError } from "./model.ts";
-import { makeAgentControlRunOnceReadModel } from "./readModel.ts";
+import { makeAgentControlRunOnceReadModel, resolveVerificationCheckStatus } from "./readModel.ts";
 import {
   AgentControlRunOnceReadNotificationsLive,
   AgentControlRunOnceReadNotifications,
@@ -581,6 +581,26 @@ layer("Run-Once client read model", (it) => {
         assert.isNull((yield* read.getSnapshot({ projectId })).nextTaskId);
       }).pipe(Effect.scoped),
   );
+  it("keeps admission-waiting verification checks out of running state", () => {
+    assert.equal(
+      resolveVerificationCheckStatus({
+        evidenceStatus: null,
+        hasStartEvidence: true,
+        stageStatus: "running",
+        admissionWaiting: true,
+      }),
+      "missing",
+    );
+    assert.equal(
+      resolveVerificationCheckStatus({
+        evidenceStatus: null,
+        hasStartEvidence: true,
+        stageStatus: "running",
+        admissionWaiting: false,
+      }),
+      "running",
+    );
+  });
   it.effect("reads Armed authority before run publication, across resume and after takeover", () =>
     Effect.gen(function* () {
       yield* allowReadFixtures;

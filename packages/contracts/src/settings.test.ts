@@ -73,6 +73,34 @@ describe("ServerSettings usage price overrides", () => {
   });
 });
 
+describe("ServerSettings resource admission", () => {
+  it("materializes host-local defaults for older settings files", () => {
+    const settings = decodeServerSettings({});
+
+    expect(settings.resourceAdmission).toMatchObject({
+      providerMaxConcurrent: 4,
+      interactiveReserve: 1,
+      localCheckMaxConcurrent: 1,
+      cpuPauseThreshold: 0.85,
+      cpuResumeThreshold: 0.7,
+      gpuMaxConcurrent: 0,
+      missingTelemetryPolicy: "defer-background",
+      providerAccountScopes: {},
+    });
+  });
+
+  it("accepts additive partial admission updates without browser-local values", () => {
+    expect(
+      decodeServerSettingsPatch({
+        resourceAdmission: {
+          providerMaxConcurrent: 5,
+          localCheckMaxConcurrent: 2,
+        },
+      }).resourceAdmission,
+    ).toEqual({ providerMaxConcurrent: 5, localCheckMaxConcurrent: 2 });
+  });
+});
+
 describe("custom model settings", () => {
   const capabilities = {
     optionDescriptors: [

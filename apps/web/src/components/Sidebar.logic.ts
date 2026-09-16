@@ -8,6 +8,7 @@ import type { ContextMenuItem } from "@t3tools/contracts";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@t3tools/contracts/settings";
 import type { AsyncResult } from "effect/unstable/reactivity";
 import { planPinnedReorder } from "@t3tools/client-runtime/state/thread-sort";
+import { resourceAdmissionWaitSummary } from "@t3tools/client-runtime/state/agent-control";
 import {
   getThreadSortTimestamp,
   resolveSettledThreadTimestamp,
@@ -493,7 +494,8 @@ export interface ThreadStatusPill {
     | "Completed"
     | "Pending Approval"
     | "Awaiting Input"
-    | "Plan Ready";
+    | "Plan Ready"
+    | `Waiting${string}`;
   colorClass: string;
   dotClass: string;
   pulse: boolean;
@@ -502,7 +504,10 @@ export interface ThreadStatusPill {
 // Rollup order mirrors the per-thread resolver exactly: attention states,
 // then active work, then the actionable plan prompt, then passive
 // monitoring. A Monitoring sibling must never hide a Plan Ready thread.
-const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["label"], number> = {
+const THREAD_STATUS_PRIORITY: Record<
+  Exclude<ThreadStatusPill["label"], `Waiting${string}`>,
+  number
+> = {
   "Pending Approval": 6,
   "Awaiting Input": 5,
   Working: 4,
@@ -511,6 +516,21 @@ const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["label"], number> = {
   Monitoring: 2,
   Completed: 1,
 };
+
+function threadStatusPriority(label: ThreadStatusPill["label"]): number {
+  switch (label) {
+    case "Pending Approval":
+    case "Awaiting Input":
+    case "Working":
+    case "Connecting":
+    case "Plan Ready":
+    case "Monitoring":
+    case "Completed":
+      return THREAD_STATUS_PRIORITY[label];
+    default:
+      return 4;
+  }
+}
 
 type ThreadStatusInput = Pick<
   SidebarThreadSummary,
@@ -792,6 +812,7 @@ export type SidebarThreadStatus =
   | "input"
   | "working"
   | "monitoring"
+  | "waiting"
   | "failed"
   | "ready";
 
@@ -804,7 +825,12 @@ export function shouldRecedeSidebarThread(input: {
 }): boolean {
   if (input.isActive || input.isSelected) return false;
   if (input.status === "working" || input.status === "monitoring") return true;
-  if (input.status === "ready" || input.status === "approval" || input.status === "input") {
+  if (
+    input.status === "ready" ||
+    input.status === "approval" ||
+    input.status === "input" ||
+    input.status === "waiting"
+  ) {
     return !input.isUnread && !input.isWoke;
   }
   return false;
@@ -821,6 +847,9 @@ export function resolveSidebarThreadStatus(thread: SidebarThreadStatusInput): Si
   }
   if (thread.hasPendingUserInput) {
     return "input";
+  }
+  if (thread.session?.admissionWait) {
+    return "waiting";
   }
   if (thread.session?.status === "running" || thread.session?.status === "starting") {
     return "working";
@@ -985,6 +1014,15 @@ export function resolveThreadStatusPill(input: {
     };
   }
 
+  if (thread.session?.admissionWait) {
+    return {
+      label: resourceAdmissionWaitSummary(thread.session.admissionWait),
+      colorClass: "text-muted-foreground",
+      dotClass: "bg-muted-foreground",
+      pulse: false,
+    };
+  }
+
   if (thread.session?.status === "running") {
     return {
       label: "Working",
@@ -1062,7 +1100,7 @@ export function resolveProjectStatusIndicator(
     if (status === null) continue;
     if (
       highestPriorityStatus === null ||
-      THREAD_STATUS_PRIORITY[status.label] > THREAD_STATUS_PRIORITY[highestPriorityStatus.label]
+      threadStatusPriority(status.label) > threadStatusPriority(highestPriorityStatus.label)
     ) {
       highestPriorityStatus = status;
     }

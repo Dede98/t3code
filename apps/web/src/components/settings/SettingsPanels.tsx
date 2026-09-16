@@ -2016,6 +2016,39 @@ function LegacyFeaturesSection() {
   );
 }
 
+function AdmissionNumberControl(props: {
+  readonly label: string;
+  readonly ariaLabel: string;
+  readonly value: number;
+  readonly min: number;
+  readonly max: number;
+  readonly step: number;
+  readonly onValueChange: (value: number) => void;
+}) {
+  return (
+    <label className="flex min-w-24 flex-col gap-1 text-xs text-muted-foreground">
+      {props.label}
+      <NumberField
+        value={props.value}
+        min={props.min}
+        max={props.max}
+        step={props.step}
+        size="sm"
+        className="w-28"
+        onValueChange={(value) => {
+          if (value !== null) props.onValueChange(value);
+        }}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement aria-label={`Decrease ${props.ariaLabel}`} />
+          <NumberFieldInput aria-label={props.ariaLabel} />
+          <NumberFieldIncrement aria-label={`Increase ${props.ariaLabel}`} />
+        </NumberFieldGroup>
+      </NumberField>
+    </label>
+  );
+}
+
 export function GeneralSettingsPanel() {
   const settings = usePrimarySettings();
   const updateSettings = useUpdatePrimarySettings();
@@ -2197,6 +2230,354 @@ export function GeneralSettingsPanel() {
             ) : null}
           </>
         ) : null}
+      </SettingsSection>
+
+      <SettingsSection id="resource-admission" title="Host capacity">
+        <SettingsRow
+          serverScoped
+          {...searchableSetting("provider-capacity")}
+          description="Maximum provider turns admitted on this server host. One slot stays available for interactive work by default; queued automation still receives periodic grants. Running turns are not preempted."
+          resetAction={
+            settings.resourceAdmission.providerMaxConcurrent !==
+            DEFAULT_UNIFIED_SETTINGS.resourceAdmission.providerMaxConcurrent ? (
+              <SettingResetButton
+                label="provider capacity"
+                onClick={() =>
+                  updateSettings({
+                    resourceAdmission: {
+                      providerMaxConcurrent:
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.providerMaxConcurrent,
+                      interactiveReserve: Math.min(
+                        settings.resourceAdmission.interactiveReserve,
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.providerMaxConcurrent,
+                      ),
+                    },
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <NumberField
+              value={settings.resourceAdmission.providerMaxConcurrent}
+              min={Math.max(1, settings.resourceAdmission.interactiveReserve)}
+              max={64}
+              step={1}
+              size="sm"
+              className="w-28"
+              onValueChange={(value) => {
+                if (value !== null)
+                  updateSettings({ resourceAdmission: { providerMaxConcurrent: value } });
+              }}
+            >
+              <NumberFieldGroup>
+                <NumberFieldDecrement aria-label="Decrease provider capacity" />
+                <NumberFieldInput aria-label="Concurrent provider turns" />
+                <NumberFieldIncrement aria-label="Increase provider capacity" />
+              </NumberFieldGroup>
+            </NumberField>
+          }
+        />
+        <SettingsRow
+          serverScoped
+          title="Interactive priority"
+          description="Reserve capacity for manual turns. After automation has aged for the configured time, every grant interval gives the oldest eligible background request a chance. New priority never interrupts running work."
+          resetAction={
+            settings.resourceAdmission.interactiveReserve !==
+              DEFAULT_UNIFIED_SETTINGS.resourceAdmission.interactiveReserve ||
+            settings.resourceAdmission.backgroundAgingSeconds !==
+              DEFAULT_UNIFIED_SETTINGS.resourceAdmission.backgroundAgingSeconds ||
+            settings.resourceAdmission.backgroundGrantInterval !==
+              DEFAULT_UNIFIED_SETTINGS.resourceAdmission.backgroundGrantInterval ? (
+              <SettingResetButton
+                label="interactive priority"
+                onClick={() =>
+                  updateSettings({
+                    resourceAdmission: {
+                      interactiveReserve:
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.interactiveReserve,
+                      backgroundAgingSeconds:
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.backgroundAgingSeconds,
+                      backgroundGrantInterval:
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.backgroundGrantInterval,
+                    },
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <div className="flex flex-wrap justify-end gap-2">
+              <AdmissionNumberControl
+                label="Reserved slots"
+                ariaLabel="Interactive reserved provider slots"
+                value={settings.resourceAdmission.interactiveReserve}
+                min={0}
+                max={settings.resourceAdmission.providerMaxConcurrent}
+                step={1}
+                onValueChange={(interactiveReserve) =>
+                  updateSettings({ resourceAdmission: { interactiveReserve } })
+                }
+              />
+              <AdmissionNumberControl
+                label="Age after (seconds)"
+                ariaLabel="Background aging seconds"
+                value={settings.resourceAdmission.backgroundAgingSeconds}
+                min={1}
+                max={3_600}
+                step={1}
+                onValueChange={(backgroundAgingSeconds) =>
+                  updateSettings({ resourceAdmission: { backgroundAgingSeconds } })
+                }
+              />
+              <AdmissionNumberControl
+                label="Grant interval"
+                ariaLabel="Background grant interval"
+                value={settings.resourceAdmission.backgroundGrantInterval}
+                min={1}
+                max={100}
+                step={1}
+                onValueChange={(backgroundGrantInterval) =>
+                  updateSettings({ resourceAdmission: { backgroundGrantInterval } })
+                }
+              />
+            </div>
+          }
+        />
+        <SettingsRow
+          serverScoped
+          {...searchableSetting("local-check-capacity")}
+          description="Maximum T3-managed checks or builds admitted on this server host. CPU and memory telemetry can delay background starts, but measurement alone is not an operating-system quota."
+          resetAction={
+            settings.resourceAdmission.localCheckMaxConcurrent !==
+            DEFAULT_UNIFIED_SETTINGS.resourceAdmission.localCheckMaxConcurrent ? (
+              <SettingResetButton
+                label="local check capacity"
+                onClick={() =>
+                  updateSettings({
+                    resourceAdmission: {
+                      localCheckMaxConcurrent:
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.localCheckMaxConcurrent,
+                    },
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <NumberField
+              value={settings.resourceAdmission.localCheckMaxConcurrent}
+              min={1}
+              max={64}
+              step={1}
+              size="sm"
+              className="w-28"
+              onValueChange={(value) => {
+                if (value !== null)
+                  updateSettings({ resourceAdmission: { localCheckMaxConcurrent: value } });
+              }}
+            >
+              <NumberFieldGroup>
+                <NumberFieldDecrement aria-label="Decrease local check capacity" />
+                <NumberFieldInput aria-label="Concurrent local checks and builds" />
+                <NumberFieldIncrement aria-label="Increase local check capacity" />
+              </NumberFieldGroup>
+            </NumberField>
+          }
+        />
+        <SettingsRow
+          serverScoped
+          title="CPU pressure hysteresis"
+          description="Pause new background checks at the high threshold and resume only below the low threshold. These observed host values delay starts; they are not CPU quotas."
+          resetAction={
+            settings.resourceAdmission.cpuPauseThreshold !==
+              DEFAULT_UNIFIED_SETTINGS.resourceAdmission.cpuPauseThreshold ||
+            settings.resourceAdmission.cpuResumeThreshold !==
+              DEFAULT_UNIFIED_SETTINGS.resourceAdmission.cpuResumeThreshold ? (
+              <SettingResetButton
+                label="CPU thresholds"
+                onClick={() =>
+                  updateSettings({
+                    resourceAdmission: {
+                      cpuPauseThreshold:
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.cpuPauseThreshold,
+                      cpuResumeThreshold:
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.cpuResumeThreshold,
+                    },
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <div className="flex flex-wrap justify-end gap-2">
+              <AdmissionNumberControl
+                label="Pause at (%)"
+                ariaLabel="CPU pause threshold percent"
+                value={Math.round(settings.resourceAdmission.cpuPauseThreshold * 100)}
+                min={Math.floor(settings.resourceAdmission.cpuResumeThreshold * 100) + 1}
+                max={100}
+                step={1}
+                onValueChange={(value) =>
+                  updateSettings({ resourceAdmission: { cpuPauseThreshold: value / 100 } })
+                }
+              />
+              <AdmissionNumberControl
+                label="Resume below (%)"
+                ariaLabel="CPU resume threshold percent"
+                value={Math.round(settings.resourceAdmission.cpuResumeThreshold * 100)}
+                min={0}
+                max={Math.ceil(settings.resourceAdmission.cpuPauseThreshold * 100) - 1}
+                step={1}
+                onValueChange={(value) =>
+                  updateSettings({ resourceAdmission: { cpuResumeThreshold: value / 100 } })
+                }
+              />
+            </div>
+          }
+        />
+        <SettingsRow
+          serverScoped
+          title="Available memory hysteresis"
+          description="Pause new background checks below the low watermark and resume above the high watermark. External processes affect the observed host value when telemetry is available."
+          resetAction={
+            settings.resourceAdmission.availableMemoryPauseBytes !==
+              DEFAULT_UNIFIED_SETTINGS.resourceAdmission.availableMemoryPauseBytes ||
+            settings.resourceAdmission.availableMemoryResumeBytes !==
+              DEFAULT_UNIFIED_SETTINGS.resourceAdmission.availableMemoryResumeBytes ? (
+              <SettingResetButton
+                label="memory thresholds"
+                onClick={() =>
+                  updateSettings({
+                    resourceAdmission: {
+                      availableMemoryPauseBytes:
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.availableMemoryPauseBytes,
+                      availableMemoryResumeBytes:
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.availableMemoryResumeBytes,
+                    },
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <div className="flex flex-wrap justify-end gap-2">
+              <AdmissionNumberControl
+                label="Pause below (GiB)"
+                ariaLabel="Available memory pause threshold in GiB"
+                value={settings.resourceAdmission.availableMemoryPauseBytes / 1024 ** 3}
+                min={0.25}
+                max={settings.resourceAdmission.availableMemoryResumeBytes / 1024 ** 3 - 0.25}
+                step={0.25}
+                onValueChange={(value) =>
+                  updateSettings({
+                    resourceAdmission: {
+                      availableMemoryPauseBytes: Math.round(value * 1024 ** 3),
+                    },
+                  })
+                }
+              />
+              <AdmissionNumberControl
+                label="Resume above (GiB)"
+                ariaLabel="Available memory resume threshold in GiB"
+                value={settings.resourceAdmission.availableMemoryResumeBytes / 1024 ** 3}
+                min={settings.resourceAdmission.availableMemoryPauseBytes / 1024 ** 3 + 0.25}
+                max={256}
+                step={0.25}
+                onValueChange={(value) =>
+                  updateSettings({
+                    resourceAdmission: {
+                      availableMemoryResumeBytes: Math.round(value * 1024 ** 3),
+                    },
+                  })
+                }
+              />
+            </div>
+          }
+        />
+        <SettingsRow
+          serverScoped
+          title="GPU capacity"
+          description="Managed jobs that require a GPU start only when this host can report reliable capacity. Zero keeps GPU admission unavailable. Slots coordinate starts; they do not isolate GPU memory or compute."
+          resetAction={
+            settings.resourceAdmission.gpuMaxConcurrent !==
+            DEFAULT_UNIFIED_SETTINGS.resourceAdmission.gpuMaxConcurrent ? (
+              <SettingResetButton
+                label="GPU capacity"
+                onClick={() =>
+                  updateSettings({
+                    resourceAdmission: {
+                      gpuMaxConcurrent: DEFAULT_UNIFIED_SETTINGS.resourceAdmission.gpuMaxConcurrent,
+                    },
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <AdmissionNumberControl
+              label="GPU jobs"
+              ariaLabel="Concurrent GPU jobs"
+              value={settings.resourceAdmission.gpuMaxConcurrent}
+              min={0}
+              max={64}
+              step={1}
+              onValueChange={(gpuMaxConcurrent) =>
+                updateSettings({ resourceAdmission: { gpuMaxConcurrent } })
+              }
+            />
+          }
+        />
+        <SettingsRow
+          serverScoped
+          title="Missing host telemetry"
+          description="Choose whether background work waits when CPU or memory telemetry is unavailable. Required resources that cannot be verified still fail closed."
+          resetAction={
+            settings.resourceAdmission.missingTelemetryPolicy !==
+            DEFAULT_UNIFIED_SETTINGS.resourceAdmission.missingTelemetryPolicy ? (
+              <SettingResetButton
+                label="missing telemetry policy"
+                onClick={() =>
+                  updateSettings({
+                    resourceAdmission: {
+                      missingTelemetryPolicy:
+                        DEFAULT_UNIFIED_SETTINGS.resourceAdmission.missingTelemetryPolicy,
+                    },
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Select
+              value={settings.resourceAdmission.missingTelemetryPolicy}
+              onValueChange={(missingTelemetryPolicy) => {
+                if (
+                  missingTelemetryPolicy === "defer-background" ||
+                  missingTelemetryPolicy === "allow"
+                )
+                  updateSettings({ resourceAdmission: { missingTelemetryPolicy } });
+              }}
+            >
+              <SelectTrigger size="sm" className="w-48" aria-label="Missing host telemetry policy">
+                <SelectValue>
+                  {settings.resourceAdmission.missingTelemetryPolicy === "defer-background"
+                    ? "Wait for telemetry"
+                    : "Allow background starts"}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                <SelectItem value="defer-background">Wait for telemetry</SelectItem>
+                <SelectItem value="allow">Allow background starts</SelectItem>
+              </SelectPopup>
+            </Select>
+          }
+        />
+        <SettingsRow
+          serverScoped
+          title="Enforcement boundary"
+          description={`These values are this environment's contribution to a machine-wide budget. When several local T3 environments share the host, the scheduler enforces the conservative combination, so effective capacity can be lower than the values shown here. CPU and RAM are measured admission thresholds, not hard operating-system limits. Shell commands and child processes started inside an agent turn can influence telemetry but are not independently capped. Provider instances with the same detected account share a budget; ${Object.keys(settings.resourceAdmission.providerAccountScopes).length} explicit account scope override${Object.keys(settings.resourceAdmission.providerAccountScopes).length === 1 ? " is" : "s are"} configured.`}
+        />
       </SettingsSection>
 
       <SettingsSection id="behavior" title="Behavior">

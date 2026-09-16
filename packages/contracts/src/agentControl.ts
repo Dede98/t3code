@@ -92,6 +92,8 @@ export const AgentControlVerificationCheck = Schema.Struct({
   allowTemporaryFiles: Schema.Boolean,
   /** Missing means no network. Loopback grants only the assigned local test endpoint. */
   networkAccess: Schema.optionalKey(Schema.Literals(["none", "loopback"])),
+  /** Fails closed when this host cannot report reliable managed GPU capacity. */
+  gpuRequired: Schema.optionalKey(Schema.Boolean),
   resultFormat: Schema.Literals(["exit-code", "node-test", "vitest-json"]),
 });
 export type AgentControlVerificationCheck = typeof AgentControlVerificationCheck.Type;

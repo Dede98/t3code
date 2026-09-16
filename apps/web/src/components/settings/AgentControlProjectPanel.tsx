@@ -21,6 +21,7 @@ import {
   agentControlStartInput,
   agentControlStageHeading,
   agentControlVerificationPassed,
+  resourceAdmissionWaitMessage,
 } from "@t3tools/client-runtime/state/agent-control";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
@@ -671,6 +672,11 @@ function AgentControlProjectPanelContent({
                     {stage.providerInstanceId ?? "Provider not recorded"} /{" "}
                     {stage.model ?? "Model not recorded"}
                   </p>
+                  {stage.admissionWait ? (
+                    <p role="status" className="text-sm text-muted-foreground">
+                      {resourceAdmissionWaitMessage(stage.admissionWait)}
+                    </p>
+                  ) : null}
                   {stage.errorCode ? (
                     <p className="text-sm text-destructive">
                       {stage.errorCode}. Open the thread to inspect the failure and any pending

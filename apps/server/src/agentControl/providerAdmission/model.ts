@@ -4,6 +4,97 @@ import { canonicalJson, sha256Utf8, type JsonValue } from "../initialPlanning/ev
 
 export type ProviderAdmissionStage = "initial-planning" | "implementation" | "verification";
 
+export type ProviderResourceAdmissionClass = "interactive" | "background";
+export type ProviderResourceAdmissionWaitReason =
+  | "provider-limit"
+  | "provider-usage"
+  | "provider-recovery"
+  | "interactive-priority";
+
+export interface ProviderResourceAdmissionLimits {
+  readonly maxConcurrent: number;
+  readonly interactiveReserve: number;
+  readonly backgroundAgingMs: number;
+  readonly maxInteractiveBurst: number;
+}
+
+export const DEFAULT_PROVIDER_RESOURCE_ADMISSION_LIMITS: ProviderResourceAdmissionLimits = {
+  maxConcurrent: 4,
+  interactiveReserve: 1,
+  backgroundAgingMs: 30_000,
+  maxInteractiveBurst: 3,
+};
+
+export interface ProviderResourceAdmissionRequest {
+  /** Stable per logical turn. Replays with different contents fail closed. */
+  readonly idempotencyKey: string;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly threadId: string;
+  /** Stable credential/account identity. Callers must not derive this from a display instance name. */
+  readonly accountScope: string;
+  readonly workloadClass: ProviderResourceAdmissionClass;
+  readonly source: "manual" | "automatic";
+  readonly requestedAt: string;
+  readonly stage?: ProviderAdmissionStage;
+  readonly handoffId?: string;
+}
+
+export interface ProviderResourceAdmissionPermit {
+  readonly requestId: string;
+  readonly idempotencyKey: string;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly threadId: string;
+  readonly accountScope: string;
+  readonly workloadClass: ProviderResourceAdmissionClass;
+  readonly source: "manual" | "automatic";
+  readonly requestedAt: string;
+  readonly stage: ProviderAdmissionStage | null;
+  readonly handoffId: string | null;
+  readonly ownerId: string;
+  readonly leaseExpiresAt: string;
+  readonly fenceToken: number;
+}
+
+export interface ProviderResourceAdmissionActive {
+  readonly requestId: string;
+  readonly idempotencyKey: string;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly threadId: string;
+  readonly providerTurnId: string | null;
+  readonly accountScope: string;
+  readonly workloadClass: ProviderResourceAdmissionClass;
+  readonly source: "manual" | "automatic";
+  readonly stage: ProviderAdmissionStage | null;
+  readonly handoffId: string | null;
+  readonly status: "waiting" | "admitted" | "entered";
+  readonly waitReason: ProviderResourceAdmissionWaitReason | null;
+  readonly requestedAt: string;
+  readonly lastObservedActivity: "active" | "inactive" | "unknown" | null;
+  readonly lastObservedAt: string | null;
+  readonly permit: ProviderResourceAdmissionPermit | null;
+}
+
+export type ProviderResourceAdmissionDecision =
+  | {
+      readonly _tag: "Waiting";
+      readonly requestId: string;
+      readonly reason: ProviderResourceAdmissionWaitReason;
+      readonly retryAt: string | null;
+    }
+  | { readonly _tag: "Admitted"; readonly permit: ProviderResourceAdmissionPermit }
+  | { readonly _tag: "Cancelled"; readonly requestId: string };
+
+export const providerResourceAdmissionRequestId = (
+  request: ProviderResourceAdmissionRequest,
+): string =>
+  `provider-resource-admission:${sha256Utf8(
+    canonicalJson([
+      request.idempotencyKey,
+      String(request.providerInstanceId),
+      request.accountScope,
+    ]),
+  )}`;
+
 export type ProviderAdmissionUsageStatus =
   | "allowed"
   | "warning"
@@ -61,6 +152,21 @@ export interface ProviderAdmissionPermit {
   readonly modelSelectionFingerprint: string;
   readonly usageEvidenceFingerprint: string;
 }
+
+export const automaticProviderResourceAdmissionRequest = (
+  request: ProviderAdmissionRequest,
+  accountScope: string,
+): ProviderResourceAdmissionRequest => ({
+  idempotencyKey: `automatic:${request.providerDeliveryId}`,
+  providerInstanceId: request.providerInstanceId,
+  threadId: request.threadId,
+  accountScope,
+  workloadClass: "background",
+  source: "automatic",
+  requestedAt: request.requestedAt,
+  stage: request.stage,
+  handoffId: request.handoffId,
+});
 
 export type ProviderAdmissionDecision =
   | { readonly _tag: "Waiting"; readonly admissionId: string; readonly retryAt: string | null }

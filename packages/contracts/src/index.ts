@@ -12,6 +12,7 @@ export * from "./agentControlStageRun.ts";
 export * from "./agentControlStageRunLease.ts";
 export * from "./agentControlWorktree.ts";
 export * from "./agentControlControlledThreadReservation.ts";
+export * from "./resourceAdmission.ts";
 export * from "./assistantCitations.ts";
 export * from "./background.ts";
 export * from "./auth.ts";

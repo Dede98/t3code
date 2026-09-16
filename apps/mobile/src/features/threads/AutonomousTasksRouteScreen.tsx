@@ -20,6 +20,7 @@ import {
   agentControlSnapshotFresh,
   agentControlStageHeading,
   agentControlVerificationPassed,
+  resourceAdmissionWaitMessage,
   agentControlStartBlockers,
   agentControlStartInput,
   agentControlArmedStatus,
@@ -126,6 +127,11 @@ function RunResult(props: {
             Provider: {stage.providerInstanceId ?? "Unavailable"} · Model:{" "}
             {stage.model ?? "Unavailable"}
           </Text>
+          {stage.admissionWait ? (
+            <Text accessibilityRole="summary" className="text-sm text-foreground-muted">
+              {resourceAdmissionWaitMessage(stage.admissionWait)}
+            </Text>
+          ) : null}
           {stage.errorCode ? (
             <Text selectable className="text-sm text-destructive">
               {stage.errorCode}
@@ -428,6 +434,40 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
             Run one eligible task or enable automatic tasks for this project and environment.
             Worktree files remain on this environment; mobile can copy the path and open changes.
           </Text>
+          {serverConfig ? (
+            <View className="gap-1">
+              <Text className="text-xs text-foreground-muted">
+                Host limits: {serverConfig.settings.resourceAdmission.providerMaxConcurrent}{" "}
+                provider turns ({serverConfig.settings.resourceAdmission.interactiveReserve}{" "}
+                interactive reserved) ·{" "}
+                {serverConfig.settings.resourceAdmission.localCheckMaxConcurrent} local checks ·{" "}
+                {serverConfig.settings.resourceAdmission.gpuMaxConcurrent} GPU jobs
+              </Text>
+              <Text className="text-xs text-foreground-muted">
+                Background fairness: age after{" "}
+                {serverConfig.settings.resourceAdmission.backgroundAgingSeconds}s · grant interval{" "}
+                {serverConfig.settings.resourceAdmission.backgroundGrantInterval}. CPU pause/resume{" "}
+                {Math.round(serverConfig.settings.resourceAdmission.cpuPauseThreshold * 100)}%/
+                {Math.round(serverConfig.settings.resourceAdmission.cpuResumeThreshold * 100)}%;
+                available RAM pause/resume{" "}
+                {serverConfig.settings.resourceAdmission.availableMemoryPauseBytes / 1024 ** 3}/
+                {serverConfig.settings.resourceAdmission.availableMemoryResumeBytes / 1024 ** 3}{" "}
+                GiB.
+              </Text>
+              <Text className="text-xs text-foreground-muted">
+                Missing telemetry:{" "}
+                {serverConfig.settings.resourceAdmission.missingTelemetryPolicy ===
+                "defer-background"
+                  ? "background waits"
+                  : "background may start"}
+                . These are this server host&apos;s admission settings. CPU/RAM readings delay new
+                starts; they are not OS quotas, and shell child processes started by an agent are
+                not independently capped.{" "}
+                {Object.keys(serverConfig.settings.resourceAdmission.providerAccountScopes).length}{" "}
+                explicit provider account scope overrides are configured.
+              </Text>
+            </View>
+          ) : null}
         </View>
         {!connected ? (
           <Text className="text-sm text-warning-foreground">

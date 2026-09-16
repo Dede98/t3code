@@ -42,6 +42,7 @@ import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as ProviderService from "./provider/Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDirectory.ts";
 import * as ProviderSessionReaper from "./provider/Services/ProviderSessionReaper.ts";
+import { ProviderResourceCoordinator } from "./resourceAdmission/ProviderResourceCoordinator.ts";
 import { makeReactorStartupAttempt } from "./reactorStartupActivation.ts";
 import { forkParked } from "./serverActivation.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
@@ -549,6 +550,7 @@ export const reconcileProviderSessions = Effect.gen(function* () {
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
   const providerService = yield* ProviderService.ProviderService;
+  const providerResourceCoordinator = yield* Effect.serviceOption(ProviderResourceCoordinator);
   const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const settings = yield* ServerSettings.ServerSettingsService;
   const continueAfterRestart = yield* settings.getSettings.pipe(
@@ -560,9 +562,11 @@ export const reconcileProviderSessions = Effect.gen(function* () {
     ),
   );
 
-  const liveThreadIds = new Set(
-    (yield* providerService.listSessions()).map((session) => session.threadId),
-  );
+  const providerSessions = yield* providerService.listSessions();
+  if (Option.isSome(providerResourceCoordinator)) {
+    yield* providerResourceCoordinator.value.reconcile(providerSessions);
+  }
+  const liveThreadIds = new Set(providerSessions.map((session) => session.threadId));
   const { threads } = yield* query.getCommandReadModel();
   // Provider startup can report ready before the continuation is submitted.
   // Find those markers in one read rather than querying every idle thread.
@@ -683,12 +687,13 @@ export const reconcileProviderSessions = Effect.gen(function* () {
 
         yield* Effect.gen(function* () {
           const reconciledAt = DateTime.formatIso(yield* DateTime.now);
+          const { admissionWait: _admissionWait, ...sessionWithoutAdmissionWait } = session;
           yield* orchestrationEngine.dispatch({
             type: "thread.session.set",
             commandId: CommandId.make(yield* crypto.randomUUIDv4),
             threadId: thread.id,
             session: {
-              ...session,
+              ...sessionWithoutAdmissionWait,
               status: "error",
               activeTurnId: null,
               lastError,
@@ -730,12 +735,13 @@ export const reconcileProviderSessions = Effect.gen(function* () {
           },
         });
         const resumedAt = DateTime.formatIso(yield* DateTime.now);
+        const { admissionWait: _admissionWait, ...sessionWithoutAdmissionWait } = session;
         yield* orchestrationEngine.dispatch({
           type: "thread.session.set",
           commandId: CommandId.make(yield* crypto.randomUUIDv4),
           threadId: thread.id,
           session: {
-            ...session,
+            ...sessionWithoutAdmissionWait,
             status: "starting",
             activeTurnId: null,
             lastError: null,
@@ -766,13 +772,56 @@ export const reconcileProviderSessions = Effect.gen(function* () {
               });
             }
             const capabilities = yield* providerService.getCapabilities(providerInstanceId);
-            yield* providerService.sendTurn({
+            const input = {
               threadId: thread.id,
               ...(capabilities.promptlessTurnContinuation === true
                 ? { continuation: true }
                 : { input: SERVER_UPDATE_CONTINUATION_PROMPT }),
               interactionMode: thread.interactionMode,
+            } as const;
+            if (Option.isNone(providerResourceCoordinator)) {
+              yield* providerService.sendTurn(input);
+              return;
+            }
+            const coordinator = providerResourceCoordinator.value;
+            const instanceInfo = yield* providerService.getInstanceInfo(providerInstanceId);
+            const setAdmissionWait = (admissionWait: typeof session.admissionWait) =>
+              Effect.gen(function* () {
+                const updatedAt = DateTime.formatIso(yield* DateTime.now);
+                const { admissionWait: _admissionWait, ...sessionWithoutAdmissionWait } = session;
+                yield* orchestrationEngine.dispatch({
+                  type: "thread.session.set",
+                  commandId: CommandId.make(yield* crypto.randomUUIDv4),
+                  threadId: thread.id,
+                  session: {
+                    ...sessionWithoutAdmissionWait,
+                    status: "starting",
+                    activeTurnId: null,
+                    ...(admissionWait === undefined ? {} : { admissionWait }),
+                    lastError: null,
+                    updatedAt,
+                  },
+                  createdAt: updatedAt,
+                });
+              });
+            const permit = yield* coordinator.acquire({
+              idempotencyKey: `startup-continuation:${thread.id}:${continuationTurnId ?? session.activeTurnId ?? "prepared"}`,
+              providerInstanceId,
+              continuationKey: String(instanceInfo.driverKind),
+              threadId: String(thread.id),
+              // The request fingerprint must survive repeated restarts while
+              // the same continuation marker remains durable.
+              requestedAt: thread.createdAt,
+              workloadClass: "interactive",
+              source: "manual",
+              onWait: (wait) => setAdmissionWait(wait).pipe(Effect.ignore),
             });
+            yield* setAdmissionWait(undefined);
+            yield* coordinator.enter(permit);
+            // After the entered fence a failed invocation may still have
+            // reached the provider. Keep the reservation until reconciliation.
+            const turn = yield* providerService.sendTurn(input);
+            yield* coordinator.enter(permit, String(turn.turnId));
           });
           const continuationExit = yield* Effect.exit(continuation);
           if (Exit.isSuccess(continuationExit) || Cause.hasInterrupts(continuationExit.cause)) {

@@ -48,6 +48,34 @@ const decodeResult = Schema.decodeUnknownEffect(
   ),
 );
 
+type VerificationCheckStatus =
+  | "passed"
+  | "failed"
+  | "unavailable"
+  | "stale"
+  | "missing"
+  | "running";
+
+export function resolveVerificationCheckStatus(input: {
+  readonly progressStatus?: VerificationCheckStatus;
+  readonly evidenceStatus?: VerificationCheckStatus | null;
+  readonly hasStartEvidence: boolean;
+  readonly stageStatus: (typeof AgentControlStageRunState.Type)["status"];
+  readonly admissionWaiting: boolean;
+}): VerificationCheckStatus {
+  return (
+    input.progressStatus ??
+    input.evidenceStatus ??
+    (!input.admissionWaiting &&
+    input.hasStartEvidence &&
+    (input.stageStatus === "running" ||
+      input.stageStatus === "queued" ||
+      input.stageStatus === "prepared")
+      ? "running"
+      : "missing")
+  );
+}
+
 /** Reads only durable projections/evidence, bounded to one selected run. */
 export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -202,6 +230,34 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
                 [input.projectId, state.taskId, stage.stageRunId],
               ).unprepared;
               const handoff = handoffs[0];
+              const admissionWait = handoff
+                ? (yield* sql<{
+                    reason:
+                      | "provider-limit"
+                      | "local-capacity"
+                      | "cpu-pressure"
+                      | "ram-pressure"
+                      | "gpu-pressure"
+                      | "interactive-priority"
+                      | "telemetry-unavailable"
+                      | "unsupported-requirement";
+                    detail: string | null;
+                    observedAt: string;
+                  }>`
+                      SELECT reason,detail,updated_at AS "observedAt"
+                      FROM main.resource_admission_wait_status
+                      WHERE handoff_id=${handoff.handoffId}
+                      UNION ALL
+                      SELECT CASE WHEN wait_reason='interactive-priority'
+                        THEN 'interactive-priority' ELSE 'provider-limit' END AS reason,
+                        CASE WHEN wait_reason='provider-usage'
+                          THEN 'Provider usage limits are not ready.' ELSE NULL END AS detail,
+                        updated_at AS "observedAt"
+                      FROM main.resource_admission_provider_requests
+                      WHERE handoff_id=${handoff.handoffId} AND status='waiting'
+                      ORDER BY "observedAt" DESC LIMIT 1
+                    `)[0]
+                : undefined;
               let verification: AgentControlRunOnceStageView["verification"] = null;
               if (stage.stageKind === "verification" && handoff) {
                 const evaluations = yield* sql<{
@@ -266,15 +322,17 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
                     args: check.args,
                     cwd: check.cwd,
                     required: check.required,
-                    status:
-                      progress?.status ??
-                      evidence[0]?.status ??
-                      (evidence.length &&
-                      (stage.status === "running" ||
-                        stage.status === "queued" ||
-                        stage.status === "prepared")
-                        ? ("running" as const)
-                        : ("missing" as const)),
+                    status: resolveVerificationCheckStatus({
+                      ...(progress?.status === undefined
+                        ? {}
+                        : { progressStatus: progress.status }),
+                      ...(evidence[0]?.status === undefined
+                        ? {}
+                        : { evidenceStatus: evidence[0].status }),
+                      hasStartEvidence: evidence.length > 0,
+                      stageStatus: stage.status,
+                      admissionWaiting: admissionWait !== undefined,
+                    }),
                     exitCode: result?.exitCode ?? null,
                     output: result
                       ? `${progress ? progress.detail + "\n" : ""}${result.stdout}\n${result.stderr}`.slice(
@@ -304,6 +362,15 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
                 providerInstanceId: handoff?.providerInstanceId ?? null,
                 model: handoff?.model ?? null,
                 errorCode: handoff?.errorCode ?? null,
+                ...(admissionWait === undefined
+                  ? {}
+                  : {
+                      admissionWait: {
+                        reason: admissionWait.reason,
+                        observedAt: admissionWait.observedAt,
+                        ...(admissionWait.detail === null ? {} : { detail: admissionWait.detail }),
+                      },
+                    }),
                 verification,
               });
             }

@@ -21,10 +21,12 @@ import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
@@ -44,6 +46,10 @@ import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import { ProviderAuthService } from "../../provider/Services/ProviderAuthService.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import {
+  type CoordinatedProviderPermit,
+  ProviderResourceCoordinator,
+} from "../../resourceAdmission/ProviderResourceCoordinator.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "../../agentControl/initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningHandoffStore } from "../../agentControl/initialPlanning/Services/AgentControlInitialPlanningHandoffStore.ts";
 import { ProviderTurnRequestExecutorLive } from "./ProviderTurnRequestExecutor.ts";
@@ -328,6 +334,7 @@ const make = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerAuthService = yield* ProviderAuthService;
   const providerService = yield* ProviderService;
+  const providerResourceCoordinator = yield* Effect.serviceOption(ProviderResourceCoordinator);
   const providerRegistry = yield* ProviderRegistry;
   const turnRequestExecutor = yield* ProviderTurnRequestExecutor;
   const initialPlanningStore = yield* AgentControlInitialPlanningHandoffStore;
@@ -357,6 +364,9 @@ const make = Effect.gen(function* () {
   const threadModelSelections = new Map<string, ModelSelection>();
   const compactingThreadIds = new Set<ThreadId>();
   const stoppingThreadIds = new Set<ThreadId>();
+  const pendingManualStarts = new Map<string, Fiber.Fiber<void, never>>();
+  const pendingManualPermits = new Map<string, CoordinatedProviderPermit>();
+  const enteredManualPermits = new Set<string>();
 
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -450,15 +460,16 @@ const make = Effect.gen(function* () {
       (session.activeTurnId !== null ||
         session.status === "starting" ||
         session.status === "running");
+    const { admissionWait: _admissionWait, ...sessionWithoutAdmissionWait } = session ?? {
+      threadId: input.threadId,
+      providerName: null,
+      providerInstanceId: thread.modelSelection.instanceId,
+      runtimeMode: thread.runtimeMode,
+    };
     yield* setThreadSession({
       threadId: input.threadId,
       session: {
-        ...(session ?? {
-          threadId: input.threadId,
-          providerName: null,
-          providerInstanceId: thread.modelSelection.instanceId,
-          runtimeMode: thread.runtimeMode,
-        }),
+        ...sessionWithoutAdmissionWait,
         status: sessionIsBusy
           ? session.status
           : session?.status === "stopped"
@@ -493,7 +504,10 @@ const make = Effect.gen(function* () {
     yield* setThreadSession({
       threadId,
       session: {
-        ...thread.session,
+        ...(() => {
+          const { admissionWait: _admissionWait, ...session } = thread.session;
+          return session;
+        })(),
         status: "ready",
         activeTurnId: null,
         lastError: null,
@@ -1453,16 +1467,18 @@ const make = Effect.gen(function* () {
       );
     };
     const recoverCompactionFailure = (cause: Cause.Cause<unknown>) =>
-      handleCompactionFailure(cause).pipe(
-        Effect.catchCause((recoveryCause) =>
-          Effect.logWarning("provider command reactor failed to recover compaction failure", {
-            eventType: event.type,
-            threadId: event.payload.threadId,
-            cause: Cause.pretty(recoveryCause),
-            originalCause: Cause.pretty(cause),
-          }),
-        ),
-      );
+      Cause.hasInterrupts(cause)
+        ? Effect.void
+        : handleCompactionFailure(cause).pipe(
+            Effect.catchCause((recoveryCause) =>
+              Effect.logWarning("provider command reactor failed to recover compaction failure", {
+                eventType: event.type,
+                threadId: event.payload.threadId,
+                cause: Cause.pretty(recoveryCause),
+                originalCause: Cause.pretty(cause),
+              }),
+            ),
+          );
     if (isCompactCommand) {
       if (!hasOtherUserMessages) {
         return yield* appendTurnStartFailure(
@@ -1483,7 +1499,7 @@ const make = Effect.gen(function* () {
         return;
       }
       compactingThreadIds.add(event.payload.threadId);
-      yield* Effect.gen(function* () {
+      const compactStart = Effect.gen(function* () {
         yield* ensureSessionForThread(
           event.payload.threadId,
           event.payload.createdAt,
@@ -1495,17 +1511,92 @@ const make = Effect.gen(function* () {
         if (event.payload.modelSelection !== undefined) {
           threadModelSelections.set(event.payload.threadId, event.payload.modelSelection);
         }
-        yield* providerService.compactThread(
+        const compact = providerService.compactThread(
           event.payload.threadId,
           event.payload.modelSelection,
           event.payload.messageId,
         );
+        if (Option.isNone(providerResourceCoordinator)) {
+          yield* compact;
+          return;
+        }
+        const coordinator = providerResourceCoordinator.value;
+        const instanceId =
+          event.payload.modelSelection?.instanceId ??
+          thread.session?.providerInstanceId ??
+          thread.modelSelection.instanceId;
+        const instanceInfo = yield* providerService.getInstanceInfo(instanceId);
+        const setAdmissionWait = (admissionWait: OrchestrationSession["admissionWait"]) =>
+          Effect.gen(function* () {
+            const latest = yield* resolveThreadShell(event.payload.threadId);
+            const current = latest?.session;
+            yield* setThreadSession({
+              threadId: event.payload.threadId,
+              session: {
+                threadId: event.payload.threadId,
+                status: "starting",
+                providerName: current?.providerName ?? instanceInfo.driverKind,
+                providerInstanceId: instanceId,
+                runtimeMode: current?.runtimeMode ?? thread.runtimeMode,
+                activeTurnId: null,
+                ...(admissionWait === undefined ? {} : { admissionWait }),
+                lastError: null,
+                updatedAt: event.payload.createdAt,
+              },
+              createdAt: event.payload.createdAt,
+            });
+          });
+        const permit = yield* Effect.uninterruptibleMask((restore) =>
+          Effect.flatMap(
+            restore(
+              coordinator.acquire({
+                idempotencyKey: `manual-compact:${key}`,
+                providerInstanceId: instanceId,
+                continuationKey: String(instanceInfo.driverKind),
+                threadId: String(event.payload.threadId),
+                requestedAt: event.payload.createdAt,
+                workloadClass: "interactive",
+                source: "manual",
+                onWait: (wait) => setAdmissionWait(wait).pipe(Effect.ignore),
+              }),
+            ),
+            (acquired) =>
+              Effect.sync(() => pendingManualPermits.set(event.payload.threadId, acquired)).pipe(
+                Effect.as(acquired),
+              ),
+          ),
+        );
+        yield* setAdmissionWait(undefined);
+        yield* coordinator.enter(permit);
+        enteredManualPermits.add(event.payload.threadId);
+        // Failure after this entered fence is ambiguous, so only a successful
+        // compaction or a later terminal event releases the reservation.
+        yield* compact.pipe(Effect.tap(() => coordinator.release(permit)));
       }).pipe(
         Effect.andThen(restoreCompaction(event.payload.threadId, true)),
+        Effect.onInterrupt(() => {
+          const permit = pendingManualPermits.get(event.payload.threadId);
+          if (permit === undefined || enteredManualPermits.has(event.payload.threadId))
+            return Effect.void;
+          return resourceCoordinator.release(permit).pipe(Effect.ignore);
+        }),
         Effect.catchCause(recoverCompactionFailure),
-        Effect.ensuring(Effect.sync(() => void compactingThreadIds.delete(event.payload.threadId))),
+        Effect.ensuring(
+          Effect.sync(() => {
+            compactingThreadIds.delete(event.payload.threadId);
+            pendingManualStarts.delete(event.payload.threadId);
+            pendingManualPermits.delete(event.payload.threadId);
+            enteredManualPermits.delete(event.payload.threadId);
+          }),
+        ),
+      );
+      const gate = yield* Deferred.make<void>();
+      const fiber = yield* Deferred.await(gate).pipe(
+        Effect.andThen(compactStart),
         Effect.forkScoped,
       );
+      pendingManualStarts.set(event.payload.threadId, fiber);
+      yield* Deferred.succeed(gate, undefined);
       return;
     }
     if (compactingThreadIds.has(event.payload.threadId)) {
@@ -1531,10 +1622,107 @@ const make = Effect.gen(function* () {
     if (Option.isNone(sendTurnRequest)) {
       return;
     }
-
-    yield* providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
+    const request = sendTurnRequest.value;
+    if (Option.isNone(providerResourceCoordinator)) {
+      yield* providerService
+        .sendTurn(request)
+        .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
+      return;
+    }
+    const resourceCoordinator = providerResourceCoordinator.value;
+    const instanceId =
+      request.modelSelection?.instanceId ??
+      thread.session?.providerInstanceId ??
+      thread.modelSelection.instanceId;
+    const instanceInfo = yield* providerService.getInstanceInfo(instanceId).pipe(
+      Effect.map(Option.some),
+      Effect.catchCause((cause) => recoverTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
+    );
+    if (Option.isNone(instanceInfo)) return;
+    const setAdmissionWait = (admissionWait: OrchestrationSession["admissionWait"]) =>
+      Effect.gen(function* () {
+        const latest = yield* resolveThreadShell(event.payload.threadId);
+        const session = latest?.session;
+        yield* setThreadSession({
+          threadId: event.payload.threadId,
+          session: {
+            threadId: event.payload.threadId,
+            status: "starting",
+            providerName: session?.providerName ?? instanceInfo.value.driverKind,
+            providerInstanceId: instanceId,
+            runtimeMode: session?.runtimeMode ?? thread.runtimeMode,
+            activeTurnId: null,
+            ...(admissionWait === undefined ? {} : { admissionWait }),
+            lastError: null,
+            updatedAt: event.payload.createdAt,
+          },
+          createdAt: event.payload.createdAt,
+        });
+      });
+    const start = Effect.gen(function* () {
+      const permit = yield* Effect.uninterruptibleMask((restore) =>
+        Effect.flatMap(
+          restore(
+            resourceCoordinator.acquire({
+              idempotencyKey: `manual:${key}`,
+              providerInstanceId: instanceId,
+              // Provider instances are not assumed to be separate paid accounts.
+              // Settings may explicitly split or join these conservative driver scopes.
+              continuationKey: String(instanceInfo.value.driverKind),
+              threadId: String(event.payload.threadId),
+              requestedAt: event.payload.createdAt,
+              workloadClass: "interactive",
+              source: "manual",
+              onWait: (wait) => setAdmissionWait(wait).pipe(Effect.ignore),
+            }),
+          ),
+          (acquired) =>
+            Effect.sync(() => pendingManualPermits.set(event.payload.threadId, acquired)).pipe(
+              Effect.as(acquired),
+            ),
+        ),
+      );
+      yield* setAdmissionWait(undefined);
+      yield* resourceCoordinator.enter(permit);
+      enteredManualPermits.add(event.payload.threadId);
+      // Once invocation crossed the durable entered fence, one missing
+      // session snapshot cannot prove that the provider did not start.
+      const result = yield* providerService.sendTurn(request);
+      yield* resourceCoordinator.enter(permit, String(result.turnId));
+    }).pipe(
+      Effect.onInterrupt(() =>
+        providerService.listSessions().pipe(
+          Effect.flatMap((sessions) => {
+            const active = sessions.find(
+              (candidate) => candidate.threadId === event.payload.threadId,
+            );
+            const pending = pendingManualPermits.get(event.payload.threadId);
+            if (pending === undefined) return Effect.void;
+            if (active?.activeTurnId !== undefined)
+              return resourceCoordinator
+                .enter(pending, String(active.activeTurnId))
+                .pipe(Effect.ignore);
+            return enteredManualPermits.has(event.payload.threadId)
+              ? Effect.void
+              : resourceCoordinator.release(pending).pipe(Effect.ignore);
+          }),
+          Effect.catch(() => Effect.void),
+        ),
+      ),
+      Effect.asVoid,
+      Effect.catchCause(recoverTurnStartFailure),
+      Effect.ensuring(
+        Effect.sync(() => {
+          pendingManualStarts.delete(event.payload.threadId);
+          pendingManualPermits.delete(event.payload.threadId);
+          enteredManualPermits.delete(event.payload.threadId);
+        }),
+      ),
+    );
+    const gate = yield* Deferred.make<void>();
+    const fiber = yield* Deferred.await(gate).pipe(Effect.andThen(start), Effect.forkScoped);
+    pendingManualStarts.set(event.payload.threadId, fiber);
+    yield* Deferred.succeed(gate, undefined);
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
@@ -1554,6 +1742,33 @@ const make = Effect.gen(function* () {
         turnId: event.payload.turnId ?? null,
         createdAt: event.payload.createdAt,
       });
+    }
+
+    const pendingStart = pendingManualStarts.get(event.payload.threadId);
+    if (pendingStart !== undefined) {
+      pendingManualStarts.delete(event.payload.threadId);
+      yield* Fiber.interrupt(pendingStart);
+      const active = yield* providerService.listSessions().pipe(
+        Effect.map((sessions) =>
+          sessions.find((candidate) => candidate.threadId === event.payload.threadId),
+        ),
+        Effect.catch(() => Effect.succeed(undefined)),
+      );
+      if (active?.activeTurnId === undefined && active?.status !== "running") {
+        const { admissionWait: _admissionWait, ...sessionWithoutAdmissionWait } = session;
+        yield* setThreadSession({
+          threadId: event.payload.threadId,
+          session: {
+            ...sessionWithoutAdmissionWait,
+            status: "ready",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: event.payload.createdAt,
+          },
+          createdAt: event.payload.createdAt,
+        });
+        return;
+      }
     }
 
     const recoverInterruptFailure = (cause: Cause.Cause<unknown>) => {

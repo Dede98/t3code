@@ -10,6 +10,7 @@ import {
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
@@ -19,6 +20,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { decodeCanonicalUtf8Bytes } from "../../agentControl/initialPlanning/eventEvidence.ts";
+import { AgentControlRunOnceReadNotifications } from "../../agentControl/runOnce/readNotifications.ts";
 import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
@@ -28,6 +30,7 @@ import {
   type ProviderSessionAttestation,
 } from "../../provider/Services/ProviderAdapter.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import { ProviderResourceCoordinator } from "../../resourceAdmission/ProviderResourceCoordinator.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   ProviderTurnRequestExecutor,
@@ -142,6 +145,8 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const providerResourceCoordinator = yield* Effect.serviceOption(ProviderResourceCoordinator);
+  const runOnceNotifications = yield* Effect.serviceOption(AgentControlRunOnceReadNotifications);
   const providerRegistry = yield* ProviderRegistry;
   const sql = yield* SqlClient.SqlClient;
   const threadModelSelections = new Map<string, ModelSelection>();
@@ -994,6 +999,77 @@ const make = Effect.gen(function* () {
           externalOperationStarted: false,
           adapterReturned: false,
         };
+        const resourceCoordinator = Option.getOrUndefined(providerResourceCoordinator);
+        const resourcePermit =
+          resourceCoordinator === undefined
+            ? undefined
+            : yield* Effect.gen(function* () {
+                const instanceInfo = yield* providerService.getInstanceInfo(
+                  attestation.providerInstanceId,
+                );
+                const publishAdmissionWait = (
+                  admissionWait: OrchestrationSession["admissionWait"],
+                ) =>
+                  Effect.gen(function* () {
+                    const observedAt = DateTime.formatIso(yield* DateTime.now);
+                    const waitRequestId = `provider-host:${providerAdmissionPermit.providerDeliveryId}`;
+                    if (admissionWait === undefined) {
+                      yield* sql`DELETE FROM main.resource_admission_wait_status
+                        WHERE request_id=${waitRequestId}`;
+                    } else {
+                      yield* sql`INSERT INTO main.resource_admission_wait_status(
+                        request_id,handoff_id,reason,detail,updated_at
+                      ) VALUES (${waitRequestId},${providerAdmissionPermit.handoffId},
+                        ${admissionWait.reason},${admissionWait.detail ?? null},${observedAt})
+                      ON CONFLICT(request_id) DO UPDATE SET reason=excluded.reason,
+                        detail=excluded.detail,updated_at=excluded.updated_at`;
+                    }
+                    const sessions = yield* providerService.listSessions();
+                    const session = sessions.find(
+                      (candidate) => candidate.threadId === prepared.input.threadId,
+                    );
+                    if (session !== undefined) {
+                      yield* setThreadSession({
+                        threadId: prepared.input.threadId,
+                        session: {
+                          threadId: prepared.input.threadId,
+                          status: "starting",
+                          providerName: session.provider,
+                          providerInstanceId: attestation.providerInstanceId,
+                          runtimeMode: session.runtimeMode,
+                          activeTurnId: null,
+                          ...(admissionWait === undefined ? {} : { admissionWait }),
+                          lastError: null,
+                          updatedAt: observedAt,
+                        },
+                        createdAt: observedAt,
+                      });
+                    }
+                    if (Option.isSome(runOnceNotifications)) {
+                      yield* runOnceNotifications.value.publish(providerAdmissionPermit.handoffId);
+                    }
+                  }).pipe(Effect.ignore);
+                const permit = yield* resourceCoordinator
+                  .acquire({
+                    idempotencyKey: `automatic:${providerAdmissionPermit.providerDeliveryId}`,
+                    providerInstanceId: attestation.providerInstanceId,
+                    continuationKey: String(instanceInfo.driverKind),
+                    threadId: String(prepared.input.threadId),
+                    requestedAt: prepared.sessionEvidenceRecordedAt ?? attestation.sessionCreatedAt,
+                    workloadClass: "background",
+                    source: "automatic",
+                    stage: providerAdmissionPermit.stage,
+                    handoffId: providerAdmissionPermit.handoffId,
+                    onWait: publishAdmissionWait,
+                  })
+                  .pipe(Effect.ensuring(publishAdmissionWait(undefined)));
+                yield* resourceCoordinator.enter(permit);
+                return permit;
+              }).pipe(
+                Effect.mapError(
+                  (cause) => new ProviderTurnDeliveryError({ certainty: "not-attempted", cause }),
+                ),
+              );
         const result = yield* sendAtBoundary(prepared.input, {
           expected: attestation,
           providerAdmissionPermit,
@@ -1084,14 +1160,31 @@ const make = Effect.gen(function* () {
             }),
           ),
           Effect.catchCause((cause) =>
-            Effect.failCause(
-              mapProviderTurnDeliveryCause(
-                cause,
-                entryState.externalOperationStarted ? "acceptance-unknown" : "not-attempted",
+            (entryState.externalOperationStarted || resourcePermit === undefined
+              ? Effect.void
+              : resourceCoordinator!.release(resourcePermit).pipe(Effect.ignore)
+            ).pipe(
+              Effect.andThen(
+                Effect.failCause(
+                  mapProviderTurnDeliveryCause(
+                    cause,
+                    entryState.externalOperationStarted ? "acceptance-unknown" : "not-attempted",
+                  ),
+                ),
               ),
             ),
           ),
         );
+        if (resourcePermit !== undefined && resourceCoordinator !== undefined) {
+          yield* resourceCoordinator
+            .enter(resourcePermit, String(result.turnId))
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderTurnDeliveryError({ certainty: "acceptance-unknown", cause }),
+              ),
+            );
+        }
         return { certainty: "accepted", result };
       },
     );

@@ -248,6 +248,22 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "provider-capacity",
+    title: "Provider capacity",
+    to: "/settings/general",
+    searchTerms: [
+      "resource admission concurrent turns interactive reserve automation fairness aging grant interval host account scope",
+    ],
+  },
+  {
+    id: "local-check-capacity",
+    title: "Local check capacity",
+    to: "/settings/general",
+    searchTerms: [
+      "resource admission concurrent tests builds verification host cpu ram memory gpu telemetry pressure hysteresis quota shell process",
+    ],
+  },
+  {
     id: "new-threads",
     title: "New threads",
     to: "/settings/projects",

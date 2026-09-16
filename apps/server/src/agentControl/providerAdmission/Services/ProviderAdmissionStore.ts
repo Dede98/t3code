@@ -8,6 +8,11 @@ import type {
   ProviderAdmissionRequest,
   ProviderAdmissionStage,
   ProviderAdmissionUsageEvidence,
+  ProviderResourceAdmissionDecision,
+  ProviderResourceAdmissionActive,
+  ProviderResourceAdmissionLimits,
+  ProviderResourceAdmissionPermit,
+  ProviderResourceAdmissionRequest,
 } from "../model.ts";
 
 export class ProviderAdmissionError extends Schema.TaggedError<ProviderAdmissionError>()(
@@ -40,7 +45,79 @@ export interface ProviderAdmissionDeadlineWakeup extends ProviderAdmissionWakeup
   readonly deadlineKind: "usage" | "lease";
 }
 
+export interface ProviderResourceAdmissionDeadline {
+  readonly requestId: string;
+  readonly providerInstanceId: string;
+  readonly accountScope: string;
+  readonly deadlineAt: string;
+  readonly deadlineKind: "aging" | "usage" | "lease";
+}
+
 export interface ProviderAdmissionStoreShape {
+  readonly requestResource?: (input: {
+    readonly request: ProviderResourceAdmissionRequest;
+    readonly usage: ProviderAdmissionUsageEvidence;
+    readonly limits: ProviderResourceAdmissionLimits;
+    readonly ownerId: string;
+    readonly leaseExpiresAt: string;
+    readonly now: string;
+  }) => Effect.Effect<
+    {
+      readonly decision: ProviderResourceAdmissionDecision;
+      readonly wakeups: ReadonlyArray<ProviderAdmissionWakeup>;
+      readonly capacityChanged: boolean;
+    },
+    ProviderAdmissionError
+  >;
+  readonly enterResource?: (input: {
+    readonly permit: ProviderResourceAdmissionPermit;
+    readonly enteredAt: string;
+    readonly providerTurnId?: string;
+  }) => Effect.Effect<void, ProviderAdmissionError>;
+  readonly releaseResource?: (input: {
+    readonly permit: ProviderResourceAdmissionPermit;
+    readonly releasedAt: string;
+  }) => Effect.Effect<ReadonlyArray<ProviderAdmissionWakeup>, ProviderAdmissionError>;
+  readonly deferResource?: (input: {
+    readonly permit: ProviderResourceAdmissionPermit;
+    readonly deferredAt: string;
+  }) => Effect.Effect<ReadonlyArray<ProviderAdmissionWakeup>, ProviderAdmissionError>;
+  readonly cancelResource?: (input: {
+    readonly request: ProviderResourceAdmissionRequest;
+    readonly cancelledAt: string;
+  }) => Effect.Effect<ReadonlyArray<ProviderAdmissionWakeup>, ProviderAdmissionError>;
+  readonly configureResourceScope?: (input: {
+    readonly accountScope: string;
+    readonly limits: ProviderResourceAdmissionLimits;
+    readonly updatedAt: string;
+  }) => Effect.Effect<void, ProviderAdmissionError>;
+  readonly listResourceActive?: Effect.Effect<
+    ReadonlyArray<ProviderResourceAdmissionActive>,
+    ProviderAdmissionError
+  >;
+  readonly reconcileResource?: (input: {
+    readonly requestId: string;
+    readonly observedActivity: "active" | "inactive" | "unknown";
+    readonly ownerId: string;
+    readonly leaseExpiresAt: string;
+    readonly observedAt: string;
+  }) => Effect.Effect<ProviderResourceAdmissionPermit | null, ProviderAdmissionError>;
+  readonly minimumResourceDeadline?: Effect.Effect<string | null, ProviderAdmissionError>;
+  readonly minimumResourceDeadlineAfter?: (
+    after: string,
+  ) => Effect.Effect<string | null, ProviderAdmissionError>;
+  readonly listDueResourceDeadlines?: (
+    now: string,
+  ) => Effect.Effect<ReadonlyArray<ProviderResourceAdmissionDeadline>, ProviderAdmissionError>;
+  readonly advanceResourceScope?: (input: {
+    readonly accountScope: string;
+    readonly ownerId: string;
+    readonly leaseExpiresAt: string;
+    readonly now: string;
+  }) => Effect.Effect<
+    { readonly wakeups: ReadonlyArray<ProviderAdmissionWakeup>; readonly capacityChanged: boolean },
+    ProviderAdmissionError
+  >;
   readonly resume: (input: {
     readonly request: ProviderAdmissionRequest;
     readonly ownerId: string;

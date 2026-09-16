@@ -12,13 +12,17 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { inspectVerificationChanges } from "../../provider/VerificationInspection.ts";
 import { evaluateCheckedVerificationResult } from "./checkedResult.ts";
 import Migration087 from "../../persistence/Migrations/087_AgentControlVerificationInspectionPages.ts";
+import Migration088 from "../../persistence/Migrations/088_SharedProviderResourceAdmission.ts";
 import Migration076 from "../../persistence/Migrations/076_AgentControlVerificationChecks.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
+import { ResourceAdmission } from "../../resourceAdmission/ResourceAdmission.ts";
+import type { ResourceReservationAuthority } from "../../resourceAdmission/model.ts";
 import type { ProviderAdmissionPermit } from "../providerAdmission/model.ts";
 import {
   assessVerificationChecks,
@@ -106,6 +110,7 @@ const claim = (manifest: VerificationCheckManifest, turn = "turn-1"): Verificati
 const initialize = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* Migration076;
+  yield* Migration088;
   yield* sql`CREATE TABLE agent_control_project_policies (project_id TEXT PRIMARY KEY, policy_json TEXT NOT NULL)`;
   yield* sql`INSERT INTO agent_control_project_policies VALUES ('project', '{}')`;
 });
@@ -244,6 +249,166 @@ it.effect("never retries a persisted start whose completion was lost at restart"
       );
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: repo.database })));
   }).pipe(Effect.scoped),
+);
+
+it.effect("holds production verification execution behind local resource admission", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      const admitted = yield* Deferred.make<void>();
+      const requested = yield* Deferred.make<void>();
+      const acquiring = yield* Deferred.make<void>();
+      const authority: ResourceReservationAuthority = {
+        reservationId: "verification:verification-1:scoped-test",
+        ownerId: "local-process:test",
+        ownerFenceToken: 3,
+        reservationFenceToken: 9,
+      };
+      const events: string[] = [];
+      const resource = ResourceAdmission.of({
+        request: () =>
+          Deferred.succeed(requested, undefined).pipe(
+            Effect.as({
+              result: {
+                _tag: "Waiting",
+                requestId: authority.reservationId,
+                reason: "local-check-limit",
+              } as const,
+              newlyAdmitted: [],
+              ledgerRevision: 1,
+              pressureSampledAtMs: 1,
+            }),
+          ),
+        acquire: () =>
+          Deferred.succeed(acquiring, undefined).pipe(
+            Effect.andThen(Deferred.await(admitted)),
+            Effect.as({ _tag: "Admitted", authority, accounted: true } as const),
+          ),
+        adoptActive: () => Effect.succeed(authority),
+        cancelWaiting: () => Effect.die("unused"),
+        release: () => Effect.die("unused"),
+        defer: () => Effect.die("unused"),
+        observeActivity: (_authority, activity) =>
+          Effect.sync(() => {
+            events.push(activity);
+            return {
+              result: true,
+              newlyAdmitted: [],
+              ledgerRevision: 2,
+              pressureSampledAtMs: 1,
+            };
+          }),
+        refresh: Effect.succeed([]),
+        snapshot: Effect.die("unused"),
+      });
+      const database = NodeSqliteClient.layer({ filename: repo.database });
+      const layer = Layer.merge(database, Layer.succeed(ResourceAdmission, resource));
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const sql = yield* SqlClient.SqlClient;
+        const manifest = yield* prepareVerificationCheckManifest(sql, {
+          permit: permit(),
+          cwd: repo.cwd,
+          checks,
+        });
+        const execution = yield* executeVerificationCheck(sql, {
+          manifest,
+          checkId: "scoped-test",
+          providerTurnId: "turn-1",
+          authorize: Effect.void,
+          execute: Effect.sync(() => {
+            events.push("execute");
+            return success;
+          }),
+        }).pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(requested);
+        yield* Deferred.await(acquiring);
+        assert.deepStrictEqual(events, []);
+        assert.deepStrictEqual(yield* sql`SELECT reason FROM resource_admission_wait_status`, [
+          { reason: "local-capacity" },
+        ]);
+        assert.deepStrictEqual(
+          yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_starts`,
+          [{ count: 0 }],
+        );
+        yield* Deferred.succeed(admitted, undefined);
+        assert.equal((yield* Fiber.join(execution)).exitCode, 0);
+        assert.deepStrictEqual(events, ["active", "execute", "inactive"]);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM resource_admission_wait_status`, []);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("releases local capacity when check-start persistence fails before execution", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      const authority: ResourceReservationAuthority = {
+        reservationId: "verification:verification-1:scoped-test",
+        ownerId: "local-process:test",
+        ownerFenceToken: 3,
+        reservationFenceToken: 9,
+      };
+      const activities: string[] = [];
+      const resource = ResourceAdmission.of({
+        request: () =>
+          Effect.succeed({
+            result: { _tag: "Admitted", authority, accounted: true } as const,
+            newlyAdmitted: [],
+            ledgerRevision: 1,
+            pressureSampledAtMs: 1,
+          }),
+        acquire: () => Effect.succeed({ _tag: "Admitted", authority, accounted: true } as const),
+        adoptActive: () => Effect.succeed(authority),
+        cancelWaiting: () => Effect.die("unused"),
+        release: () => Effect.die("unused"),
+        defer: () => Effect.die("unused"),
+        observeActivity: (_authority, activity) =>
+          Effect.sync(() => {
+            activities.push(activity);
+            return {
+              result: true,
+              newlyAdmitted: [],
+              ledgerRevision: 2,
+              pressureSampledAtMs: 1,
+            };
+          }),
+        refresh: Effect.succeed([]),
+        snapshot: Effect.die("unused"),
+      });
+      const layer = Layer.merge(
+        NodeSqliteClient.layer({ filename: repo.database }),
+        Layer.succeed(ResourceAdmission, resource),
+      );
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const sql = yield* SqlClient.SqlClient;
+        const manifest = yield* prepareVerificationCheckManifest(sql, {
+          permit: permit(),
+          cwd: repo.cwd,
+          checks,
+        });
+        yield* sql`CREATE TRIGGER reject_check_start BEFORE INSERT ON agent_control_verification_check_starts BEGIN SELECT RAISE(ABORT, 'reject start'); END`;
+        let executions = 0;
+        assert.equal(
+          (yield* executeVerificationCheck(sql, {
+            manifest,
+            checkId: "scoped-test",
+            providerTurnId: "turn-1",
+            authorize: Effect.void,
+            execute: Effect.sync(() => {
+              executions += 1;
+              return success;
+            }),
+          }).pipe(Effect.exit))._tag,
+          "Failure",
+        );
+        assert.equal(executions, 0);
+        assert.deepStrictEqual(activities, ["inactive"]);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
 );
 
 it.effect(

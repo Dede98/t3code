@@ -8,6 +8,7 @@ import * as NodeUtil from "node:util";
 import { AgentControlVerificationChecks, AgentControlProjectPolicy } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { isSqlError } from "effect/unstable/sql/SqlError";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -30,6 +31,7 @@ import {
 } from "./inspectionPages.ts";
 import { inspectVerificationChanges } from "../../provider/VerificationInspection.ts";
 import { classifyVerificationCheckResult } from "../../provider/CodexVerificationChecks.ts";
+import { ResourceAdmission } from "../../resourceAdmission/ResourceAdmission.ts";
 
 const decodeChecks = Schema.decodeUnknownEffect(AgentControlVerificationChecks);
 const decodeChecksJson = Schema.decodeUnknownEffect(
@@ -349,28 +351,117 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
       return unavailableResult("Verification check was unavailable.");
     return yield* decodeResultJson(prior[0].resultJson);
   }
-  const inserted = yield* sql`INSERT INTO agent_control_verification_check_starts
-    (provider_delivery_id,check_id,provider_turn_id,manifest_digest,started_at)
-    VALUES (${manifest.providerDeliveryId},${input.checkId},${input.providerTurnId},${manifest.manifestDigest},${yield* now})
-    ON CONFLICT(provider_delivery_id,check_id) DO NOTHING RETURNING check_id`;
-  if (!inserted.length)
+  const readNotifications = yield* AgentControlRunOnceReadNotifications;
+  const localAdmission = Option.getOrNull(yield* Effect.serviceOption(ResourceAdmission));
+  const acquireAdmission =
+    localAdmission === null
+      ? Effect.succeed(null)
+      : Effect.gen(function* () {
+          const request = {
+            requestId: `verification:${manifest.providerDeliveryId}:${input.checkId}`,
+            kind: "localCheck" as const,
+            priority: "background" as const,
+            ownerId: `local-process:${process.pid}:${manifest.handoffId}`,
+            ownerFenceToken: manifest.fenceToken,
+            executionKey: `verification:${manifest.providerDeliveryId}:${input.checkId}:${input.providerTurnId}`,
+            gpuRequired: "gpuRequired" in check && check.gpuRequired === true,
+          };
+          const initial = yield* localAdmission.request(request);
+          if (initial.result._tag === "Waiting") {
+            const reason =
+              initial.result.reason === "local-check-limit"
+                ? "local-capacity"
+                : initial.result.reason === "memory-pressure"
+                  ? "ram-pressure"
+                  : initial.result.reason === "gpu-capacity"
+                    ? "gpu-pressure"
+                    : initial.result.reason === "recovery-capacity"
+                      ? "local-capacity"
+                      : initial.result.reason;
+            const detail =
+              initial.result.reason === "recovery-capacity"
+                ? "A previous managed local process has an unknown outcome and still holds capacity."
+                : null;
+            yield* sql`INSERT INTO main.resource_admission_wait_status(
+            request_id,handoff_id,reason,detail,updated_at
+          ) VALUES (${request.requestId},${manifest.handoffId},${reason},${detail},${yield* now})
+          ON CONFLICT(request_id) DO UPDATE SET reason=excluded.reason,
+            detail=excluded.detail,updated_at=excluded.updated_at`;
+            yield* readNotifications.publish(manifest.handoffId);
+          }
+          const clearWait = sql`DELETE FROM main.resource_admission_wait_status
+          WHERE request_id=${request.requestId}`.pipe(
+            Effect.andThen(readNotifications.publish(manifest.handoffId)),
+            Effect.ignore,
+          );
+          return yield* localAdmission.acquire(request).pipe(Effect.ensuring(clearWait));
+        });
+
+  // Waiting alone is not execution evidence. Persist the start only after the
+  // local slot is granted (or definitively rejected), immediately before the
+  // managed command may cross its process boundary. The restored wait remains
+  // interruptible, while grant-to-start persistence is an atomic bracket. A DB
+  // failure before the start record releases the provisional local authority.
+  const { admission, inserted } = yield* Effect.uninterruptibleMask((restore) =>
+    restore(acquireAdmission).pipe(
+      Effect.flatMap((admission) =>
+        now.pipe(
+          Effect.flatMap(
+            (startedAt) => sql`INSERT INTO agent_control_verification_check_starts
+              (provider_delivery_id,check_id,provider_turn_id,manifest_digest,started_at)
+              VALUES (${manifest.providerDeliveryId},${input.checkId},${input.providerTurnId},${manifest.manifestDigest},${startedAt})
+              ON CONFLICT(provider_delivery_id,check_id) DO NOTHING RETURNING check_id`,
+          ),
+          Effect.flatMap((inserted) =>
+            !inserted.length && admission?._tag === "Admitted" && localAdmission !== null
+              ? localAdmission
+                  .observeActivity(admission.authority, "inactive")
+                  .pipe(Effect.ignore, Effect.as({ admission, inserted }))
+              : Effect.succeed({ admission, inserted }),
+          ),
+          Effect.onError(() =>
+            admission?._tag === "Admitted" && localAdmission !== null
+              ? localAdmission.observeActivity(admission.authority, "inactive").pipe(Effect.ignore)
+              : Effect.void,
+          ),
+        ),
+      ),
+    ),
+  );
+  if (!inserted.length) {
     return unavailableResult(
       "Verification check execution is incomplete; automatic duplicate execution is forbidden.",
     );
-  const readNotifications = yield* AgentControlRunOnceReadNotifications;
+  }
   yield* readNotifications.publish(manifest.handoffId);
   const before = yield* snapshotVerificationManifestCode(manifest).pipe(
     Effect.catch(() => Effect.succeed(null)),
   );
+  if (before !== manifest.codeDigest && admission?._tag === "Admitted" && localAdmission !== null)
+    yield* localAdmission.observeActivity(admission.authority, "inactive").pipe(Effect.ignore);
+  const execute = input.execute.pipe(
+    Effect.mapError(failure),
+    Effect.catch(() => Effect.succeed(unavailableResult("Verification check could not execute."))),
+  );
   const result =
     before !== manifest.codeDigest
       ? unavailableResult("Verification code state changed before the check.")
-      : yield* input.execute.pipe(
-          Effect.mapError(failure),
-          Effect.catch(() =>
-            Effect.succeed(unavailableResult("Verification check could not execute.")),
-          ),
-        );
+      : admission?._tag === "Rejected"
+        ? unavailableResult(admission.message)
+        : admission === null
+          ? yield* execute
+          : yield* Effect.gen(function* () {
+              if (localAdmission === null)
+                return yield* Effect.die("admitted local resource without admission service");
+              yield* localAdmission.observeActivity(admission.authority, "active");
+              return yield* execute.pipe(
+                Effect.ensuring(
+                  localAdmission
+                    .observeActivity(admission.authority, "inactive")
+                    .pipe(Effect.ignore),
+                ),
+              );
+            });
   const after = yield* snapshotVerificationManifestCode(manifest).pipe(
     Effect.catch(() => Effect.succeed(null)),
   );

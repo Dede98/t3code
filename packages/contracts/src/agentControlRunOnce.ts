@@ -7,6 +7,7 @@ import * as Schema from "effect/Schema";
 import { AgentControlStageRunState } from "./agentControlStageRun.ts";
 import { AgentControlTaskSummary } from "./agentControlTask.ts";
 import { AgentControlProjectState } from "./agentControlRuntime.ts";
+import { ResourceAdmissionWait } from "./resourceAdmission.ts";
 
 import {
   AgentControlControlledThreadReservationId,
@@ -143,6 +144,8 @@ export const AgentControlRunOnceStageView = Schema.Struct({
   worktreePath: Schema.NullOr(Schema.String),
   branch: Schema.NullOr(Schema.String),
   errorCode: Schema.NullOr(Schema.String),
+  /** Present while the stage has not started and is queued by host admission. */
+  admissionWait: Schema.optionalKey(ResourceAdmissionWait),
   verification: Schema.NullOr(AgentControlRunOnceVerificationView),
 });
 export type AgentControlRunOnceStageView = typeof AgentControlRunOnceStageView.Type;

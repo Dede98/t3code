@@ -971,6 +971,47 @@ describe("ProviderRuntimeIngestion", () => {
     });
   });
 
+  it("does not let an unfenced session exit close a running replacement on the same instance", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const activeTurnId = asTurnId("turn-replacement");
+
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-running-replacement-session"),
+      threadId,
+      session: {
+        threadId,
+        status: "running",
+        providerName: ProviderDriverKind.make("codex"),
+        providerInstanceId: CODEX_INSTANCE_ID,
+        runtimeMode: "approval-required",
+        activeTurnId,
+        lastError: null,
+        updatedAt: "2026-01-01T00:01:00.000Z",
+      },
+      createdAt: "2026-01-01T00:01:00.000Z",
+    });
+
+    harness.emit({
+      type: "session.exited",
+      eventId: asEventId("evt-old-owner-exited-after-takeover"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: CODEX_INSTANCE_ID,
+      threadId,
+      createdAt: "2026-01-01T00:02:00.000Z",
+      payload: { reason: "old owner stopped" },
+    });
+    await harness.drain();
+
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.session).toMatchObject({
+      status: "running",
+      providerInstanceId: CODEX_INSTANCE_ID,
+      activeTurnId,
+    });
+  });
+
   it.each([
     { delivery: "buffered", enableLegacyTokenStreaming: false },
     { delivery: "streamed", enableLegacyTokenStreaming: true },

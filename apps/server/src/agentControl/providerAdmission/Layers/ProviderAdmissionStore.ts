@@ -16,6 +16,8 @@ import {
   PROVIDER_PRE_INVOKE_DEADLINES_SQL,
 } from "../preInvokeRecovery.ts";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -35,11 +37,17 @@ import {
   fingerprintProviderAdmissionDocument,
   providerAdmissionAuthorityId,
   providerAdmissionId,
+  providerResourceAdmissionRequestId,
   type ProviderAdmissionDecision,
   type ProviderAdmissionPermit,
   type ProviderAdmissionRequest,
   type ProviderAdmissionStage,
   type ProviderAdmissionUsageEvidence,
+  type ProviderResourceAdmissionDecision,
+  type ProviderResourceAdmissionActive,
+  type ProviderResourceAdmissionLimits,
+  type ProviderResourceAdmissionPermit,
+  type ProviderResourceAdmissionRequest,
   usageAllowsAdmission,
 } from "../model.ts";
 import {
@@ -48,6 +56,7 @@ import {
   type ProviderAdmissionDeadlineWakeup,
   type ProviderAdmissionStoreShape,
   type ProviderAdmissionWakeup,
+  type ProviderResourceAdmissionDeadline,
 } from "../Services/ProviderAdmissionStore.ts";
 
 const decodeRecoverySnapshot = Schema.decodeUnknownEffect(ProviderAdmissionPreInvokeRecovery);
@@ -215,6 +224,40 @@ interface ClaimRow {
   readonly claimFingerprint: string;
 }
 
+interface ResourceAdmissionRow {
+  readonly requestId: string;
+  readonly idempotencyKey: string;
+  readonly requestFingerprint: string;
+  readonly providerInstanceId: string;
+  readonly threadId: string;
+  readonly accountScope: string;
+  readonly workloadClass: "interactive" | "background";
+  readonly source: "manual" | "automatic";
+  readonly stage: ProviderAdmissionStage | null;
+  readonly handoffId: string | null;
+  readonly status: "waiting" | "admitted" | "entered" | "released" | "cancelled";
+  readonly waitReason: "provider-limit" | "provider-usage" | "interactive-priority" | null;
+  readonly usageStatus: ProviderAdmissionUsageEvidence["status"];
+  readonly requestedAt: string;
+  readonly nextDeadlineAt: string | null;
+  readonly ownerId: string | null;
+  readonly leaseExpiresAt: string | null;
+  readonly fenceToken: number | null;
+  readonly providerTurnId: string | null;
+  readonly lastObservedActivity: "active" | "inactive" | "unknown" | null;
+  readonly lastObservedAt: string | null;
+}
+
+interface ResourceScopeRow {
+  readonly accountScope: string;
+  readonly maxConcurrent: number;
+  readonly interactiveReserve: number;
+  readonly backgroundAgingMs: number;
+  readonly maxInteractiveBurst: number;
+  readonly consecutiveInteractiveGrants: number;
+  readonly lastFenceToken: number;
+}
+
 interface FinalizationRow {
   readonly handoffId: string;
   readonly projectId: string;
@@ -342,8 +385,39 @@ const authorityDocument = (input: {
     ...input.details,
   }) as JsonValue;
 
+const resourceRequestDocument = (request: ProviderResourceAdmissionRequest) =>
+  ({
+    accountScope: request.accountScope,
+    handoffId: request.handoffId ?? null,
+    idempotencyKey: request.idempotencyKey,
+    providerInstanceId: String(request.providerInstanceId),
+    threadId: request.threadId,
+    requestedAt: request.requestedAt,
+    schemaVersion: 1,
+    source: request.source,
+    stage: request.stage ?? null,
+    workloadClass: request.workloadClass,
+  }) as const;
+
+const resourceAgingDeadline = (
+  requestedAt: string,
+  limits: ProviderResourceAdmissionLimits,
+): string | null =>
+  limits.backgroundAgingMs === 0
+    ? requestedAt
+    : DateTime.formatIso(
+        DateTime.addDuration(
+          DateTime.makeUnsafe(requestedAt),
+          Duration.millis(limits.backgroundAgingMs),
+        ),
+      );
+
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const sharedResourceMigration = yield* sql<{ count: number }>`SELECT count(*) AS count
+    FROM main.effect_sql_agent_control_migrations
+    WHERE migration_id=88 AND name='SharedProviderResourceAdmission'`;
+  const hasSharedResourceAdmission = sharedResourceMigration[0]?.count === 1;
   const preparedRecoveryMigration = yield* sql<{ count: number }>`SELECT count(*) AS count
     FROM main.effect_sql_agent_control_migrations
     WHERE migration_id=72 AND name='AgentControlArchivedPreparationCapacityRecovery'`;
@@ -724,6 +798,666 @@ const make = Effect.gen(function* () {
       deliveryAttestationAbsent: true,
     });
   });
+
+  const ensureResourceScope = Effect.fn("ProviderAdmissionStore.ensureResourceScope")(function* (
+    accountScope: string,
+    limits: ProviderResourceAdmissionLimits,
+    now: string,
+  ) {
+    if (
+      limits.maxConcurrent < 1 ||
+      limits.maxConcurrent > 64 ||
+      limits.interactiveReserve < 0 ||
+      limits.interactiveReserve > limits.maxConcurrent ||
+      limits.backgroundAgingMs < 0 ||
+      limits.backgroundAgingMs > 86_400_000 ||
+      limits.maxInteractiveBurst < 1
+    ) {
+      return yield* fail("resource-scope-limits", "authority-divergent");
+    }
+    yield* sql`
+      INSERT INTO main.resource_admission_provider_scopes (
+        account_scope,max_concurrent,interactive_reserve,background_aging_ms,
+        max_interactive_burst,consecutive_interactive_grants,last_fence_token,revision,updated_at
+      ) VALUES (${accountScope},${limits.maxConcurrent},${limits.interactiveReserve},
+        ${limits.backgroundAgingMs},${limits.maxInteractiveBurst},0,0,1,${now})
+      ON CONFLICT(account_scope) DO UPDATE SET
+        max_concurrent=excluded.max_concurrent,
+        interactive_reserve=excluded.interactive_reserve,
+        background_aging_ms=excluded.background_aging_ms,
+        max_interactive_burst=excluded.max_interactive_burst,
+        revision=resource_admission_provider_scopes.revision+1,
+        updated_at=excluded.updated_at
+    `;
+    yield* sql`
+      UPDATE main.resource_admission_provider_requests SET
+        aging_deadline_at=strftime('%Y-%m-%dT%H:%M:%fZ',requested_at,
+          (${limits.backgroundAgingMs} / 1000.0) || ' seconds'),
+        revision=revision+1,updated_at=${now}
+      WHERE account_scope=${accountScope} AND status='waiting' AND workload_class='background'
+    `;
+  });
+
+  const readResourceScope = (accountScope: string) =>
+    sql<ResourceScopeRow>`
+      SELECT account_scope AS "accountScope",max_concurrent AS "maxConcurrent",
+        interactive_reserve AS "interactiveReserve",background_aging_ms AS "backgroundAgingMs",
+        max_interactive_burst AS "maxInteractiveBurst",
+        consecutive_interactive_grants AS "consecutiveInteractiveGrants",
+        last_fence_token AS "lastFenceToken"
+      FROM main.resource_admission_provider_scopes WHERE account_scope=${accountScope}
+    `.pipe(Effect.map((rows) => rows[0]));
+
+  const readResourceRequest = (requestId: string) =>
+    sql<ResourceAdmissionRow>`
+      SELECT request_id AS "requestId",idempotency_key AS "idempotencyKey",
+        request_fingerprint AS "requestFingerprint",provider_instance_id AS "providerInstanceId",
+        thread_id AS "threadId",
+        account_scope AS "accountScope",workload_class AS "workloadClass",source,stage,
+        handoff_id AS "handoffId",status,wait_reason AS "waitReason",usage_status AS "usageStatus",
+        requested_at AS "requestedAt",next_deadline_at AS "nextDeadlineAt",owner_id AS "ownerId",
+        lease_expires_at AS "leaseExpiresAt",fence_token AS "fenceToken",provider_turn_id AS "providerTurnId",
+        last_observed_activity AS "lastObservedActivity",last_observed_at AS "lastObservedAt"
+      FROM main.resource_admission_provider_requests WHERE request_id=${requestId}
+    `.pipe(Effect.map((rows) => rows[0]));
+
+  const resourcePermit = (
+    row: ResourceAdmissionRow,
+  ): ProviderResourceAdmissionPermit | undefined =>
+    (row.status !== "admitted" && row.status !== "entered") ||
+    row.ownerId === null ||
+    row.leaseExpiresAt === null ||
+    row.fenceToken === null
+      ? undefined
+      : {
+          requestId: row.requestId,
+          idempotencyKey: row.idempotencyKey,
+          providerInstanceId: ProviderInstanceId.make(row.providerInstanceId),
+          threadId: row.threadId,
+          accountScope: row.accountScope,
+          workloadClass: row.workloadClass,
+          source: row.source,
+          requestedAt: row.requestedAt,
+          stage: row.stage,
+          handoffId: row.handoffId,
+          ownerId: row.ownerId,
+          leaseExpiresAt: row.leaseExpiresAt,
+          fenceToken: row.fenceToken,
+        };
+
+  const resourceWakeups = (accountScope: string) =>
+    sql<ProviderAdmissionWakeup>`
+      SELECT stage,handoff_id AS "handoffId",provider_instance_id AS "providerInstanceId"
+      FROM main.resource_admission_provider_requests
+      WHERE account_scope=${accountScope} AND source='automatic' AND status IN ('waiting','admitted')
+        AND stage IS NOT NULL AND handoff_id IS NOT NULL
+      ORDER BY requested_at,request_id
+    `;
+
+  const grantResourceCapacity = Effect.fn("ProviderAdmissionStore.grantResourceCapacity")(
+    function* (accountScope: string, ownerId: string, leaseExpiresAt: string, now: string) {
+      // Expiry only reclaims work which never crossed the external-effect boundary.
+      // Entered work remains capacity-bearing until its exact fenced permit releases it.
+      yield* sql`
+      UPDATE main.resource_admission_provider_requests SET status='released',
+        wait_reason=NULL,completed_at=${now},revision=revision+1,updated_at=${now}
+      WHERE account_scope=${accountScope} AND status='admitted' AND lease_expires_at<=${now}
+    `;
+      const scope = yield* readResourceScope(accountScope);
+      if (scope === undefined) return yield* fail("resource-grant-scope", "authority-missing");
+      const counts = yield* sql<{ active: number; background: number }>`
+      SELECT count(*) AS active,
+        COALESCE(sum(CASE WHEN workload_class='background' THEN 1 ELSE 0 END),0) AS background
+      FROM main.resource_admission_provider_requests
+      WHERE account_scope=${accountScope} AND status IN ('admitted','entered')
+    `;
+      let active = counts[0]?.active ?? 0;
+      let background = counts[0]?.background ?? 0;
+      let fence = scope.lastFenceToken;
+      let streak = scope.consecutiveInteractiveGrants;
+      let grants = 0;
+      const backgroundLimit = Math.max(0, scope.maxConcurrent - scope.interactiveReserve);
+      const agedBefore = DateTime.formatIso(
+        DateTime.subtractDuration(
+          DateTime.makeUnsafe(now),
+          Duration.millis(scope.backgroundAgingMs),
+        ),
+      );
+      while (active < scope.maxConcurrent) {
+        const [interactive] = yield* sql<ResourceAdmissionRow>`
+        SELECT request_id AS "requestId",idempotency_key AS "idempotencyKey",
+          request_fingerprint AS "requestFingerprint",provider_instance_id AS "providerInstanceId",
+          thread_id AS "threadId",
+          account_scope AS "accountScope",workload_class AS "workloadClass",source,stage,
+          handoff_id AS "handoffId",status,wait_reason AS "waitReason",usage_status AS "usageStatus",
+          requested_at AS "requestedAt",next_deadline_at AS "nextDeadlineAt",owner_id AS "ownerId",
+          lease_expires_at AS "leaseExpiresAt",fence_token AS "fenceToken",provider_turn_id AS "providerTurnId",
+          last_observed_activity AS "lastObservedActivity",last_observed_at AS "lastObservedAt"
+        FROM main.resource_admission_provider_requests
+        WHERE account_scope=${accountScope} AND status='waiting' AND workload_class='interactive'
+          AND usage_status IN ('allowed','warning','unsupported')
+        ORDER BY requested_at,request_id LIMIT 1
+      `;
+        const [queuedBackground] = yield* sql<ResourceAdmissionRow>`
+        SELECT request_id AS "requestId",idempotency_key AS "idempotencyKey",
+          request_fingerprint AS "requestFingerprint",provider_instance_id AS "providerInstanceId",
+          thread_id AS "threadId",
+          account_scope AS "accountScope",workload_class AS "workloadClass",source,stage,
+          handoff_id AS "handoffId",status,wait_reason AS "waitReason",usage_status AS "usageStatus",
+          requested_at AS "requestedAt",next_deadline_at AS "nextDeadlineAt",owner_id AS "ownerId",
+          lease_expires_at AS "leaseExpiresAt",fence_token AS "fenceToken",provider_turn_id AS "providerTurnId",
+          last_observed_activity AS "lastObservedActivity",last_observed_at AS "lastObservedAt"
+        FROM main.resource_admission_provider_requests
+        WHERE account_scope=${accountScope} AND status='waiting' AND workload_class='background'
+          AND usage_status IN ('allowed','warning','unsupported')
+        ORDER BY requested_at,request_id LIMIT 1
+      `;
+        const backgroundDue =
+          queuedBackground !== undefined &&
+          (queuedBackground.requestedAt <= agedBefore || streak >= scope.maxInteractiveBurst);
+        const mayUseBackgroundSlot =
+          background < backgroundLimit || (backgroundDue && active < scope.maxConcurrent);
+        const candidate =
+          backgroundDue && mayUseBackgroundSlot
+            ? queuedBackground
+            : (interactive ?? (mayUseBackgroundSlot ? queuedBackground : undefined));
+        if (candidate === undefined) break;
+        fence += 1;
+        const updated = yield* sql<{ requestId: string }>`
+        UPDATE main.resource_admission_provider_requests SET status='admitted',wait_reason=NULL,
+          owner_id=${ownerId},lease_expires_at=${leaseExpiresAt},fence_token=${fence},
+          revision=revision+1,updated_at=${now}
+        WHERE request_id=${candidate.requestId} AND status='waiting'
+        RETURNING request_id AS "requestId"
+      `;
+        if (updated.length !== 1)
+          return yield* fail("resource-grant-cas", "stale-owner", candidate.requestId);
+        active += 1;
+        grants += 1;
+        if (candidate.workloadClass === "background") {
+          background += 1;
+          streak = 0;
+        } else {
+          streak += 1;
+        }
+      }
+      yield* sql`
+      UPDATE main.resource_admission_provider_scopes SET last_fence_token=${fence},
+        consecutive_interactive_grants=${streak},revision=revision+1,updated_at=${now}
+      WHERE account_scope=${accountScope}
+    `;
+      const capacity = yield* sql<{ active: number; background: number }>`
+      SELECT count(*) AS active,
+        COALESCE(sum(CASE WHEN workload_class='background' THEN 1 ELSE 0 END),0) AS background
+      FROM main.resource_admission_provider_requests
+      WHERE account_scope=${accountScope} AND status IN ('admitted','entered')
+    `;
+      const available = (capacity[0]?.active ?? 0) < scope.maxConcurrent;
+      const backgroundAvailable = (capacity[0]?.background ?? 0) < backgroundLimit;
+      yield* sql`
+      UPDATE main.resource_admission_provider_requests SET
+        wait_reason=CASE
+          WHEN usage_status NOT IN ('allowed','warning','unsupported') THEN 'provider-usage'
+          WHEN EXISTS (
+            SELECT 1 FROM main.resource_admission_provider_requests uncertain
+            WHERE uncertain.account_scope=${accountScope} AND uncertain.status='entered'
+              AND uncertain.last_observed_activity='unknown'
+          ) THEN 'provider-recovery'
+          WHEN workload_class='background' AND ${available ? 1 : 0}=1 AND ${backgroundAvailable ? 1 : 0}=0
+            THEN 'interactive-priority'
+          ELSE 'provider-limit' END,
+        revision=revision+1,updated_at=${now}
+      WHERE account_scope=${accountScope} AND status='waiting'
+    `;
+      return grants;
+    },
+  );
+
+  const requestResource: NonNullable<ProviderAdmissionStoreShape["requestResource"]> = Effect.fn(
+    "ProviderAdmissionStore.requestResource",
+  )(function* (input) {
+    if (!hasSharedResourceAdmission) return yield* fail("resource-request", "authority-missing");
+    const requestId = providerResourceAdmissionRequestId(input.request);
+    const fingerprint = sha256Utf8(canonicalJson(resourceRequestDocument(input.request)));
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* ensureResourceScope(input.request.accountScope, input.limits, input.now);
+          const existing = yield* readResourceRequest(requestId);
+          if (existing === undefined) {
+            yield* sql`
+              INSERT INTO main.resource_admission_provider_requests (
+                request_id,idempotency_key,request_fingerprint,provider_instance_id,thread_id,account_scope,
+                workload_class,source,stage,handoff_id,status,wait_reason,usage_status,requested_at,
+                aging_deadline_at,next_deadline_at,owner_id,lease_expires_at,fence_token,entered_at,provider_turn_id,
+                completed_at,revision,updated_at
+              ) VALUES (${requestId},${input.request.idempotencyKey},${fingerprint},
+                ${String(input.request.providerInstanceId)},${input.request.threadId},${input.request.accountScope},
+                ${input.request.workloadClass},${input.request.source},${input.request.stage ?? null},
+                ${input.request.handoffId ?? null},'waiting','provider-limit',${input.usage.status},
+                ${input.request.requestedAt},${input.request.workloadClass === "background" ? resourceAgingDeadline(input.request.requestedAt, input.limits) : null},
+                ${input.usage.nextRelevantAt},NULL,NULL,NULL,NULL,NULL,NULL,1,${input.now})
+            `;
+          } else if (
+            existing.requestFingerprint !== fingerprint ||
+            existing.idempotencyKey !== input.request.idempotencyKey
+          ) {
+            return yield* fail("resource-request-replay", "authority-divergent", requestId);
+          } else if (existing.status === "cancelled" || existing.status === "released") {
+            return {
+              decision: { _tag: "Cancelled", requestId } as const,
+              wakeups: yield* resourceWakeups(input.request.accountScope),
+              capacityChanged: false,
+            };
+          } else if (
+            existing.status === "admitted" &&
+            existing.ownerId !== input.ownerId &&
+            existing.leaseExpiresAt !== null &&
+            existing.leaseExpiresAt > input.now
+          ) {
+            return {
+              decision: {
+                _tag: "Waiting",
+                requestId,
+                reason: "provider-limit",
+                retryAt: existing.leaseExpiresAt,
+              } as const,
+              wakeups: [],
+              capacityChanged: false,
+            };
+          }
+          yield* sql`
+            UPDATE main.resource_admission_provider_requests SET usage_status=${input.usage.status},
+              next_deadline_at=${input.usage.nextRelevantAt},revision=revision+1,updated_at=${input.now}
+            WHERE request_id=${requestId} AND status='waiting'
+          `;
+          const grants = yield* grantResourceCapacity(
+            input.request.accountScope,
+            input.ownerId,
+            input.leaseExpiresAt,
+            input.now,
+          );
+          const row = yield* readResourceRequest(requestId);
+          if (row === undefined)
+            return yield* fail("resource-request-commit", "authority-missing", requestId);
+          const permit = resourcePermit(row);
+          const decision: ProviderResourceAdmissionDecision =
+            permit === undefined
+              ? row.status === "cancelled" || row.status === "released"
+                ? { _tag: "Cancelled", requestId }
+                : {
+                    _tag: "Waiting",
+                    requestId,
+                    reason: row.waitReason ?? "provider-limit",
+                    retryAt: row.nextDeadlineAt,
+                  }
+              : { _tag: "Admitted", permit };
+          return {
+            decision,
+            wakeups: yield* resourceWakeups(input.request.accountScope),
+            capacityChanged: grants > 0,
+          };
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          isProviderAdmissionError(cause)
+            ? cause
+            : fail("resource-request", "persistence", requestId, cause),
+        ),
+      );
+  });
+
+  const enterResource: NonNullable<ProviderAdmissionStoreShape["enterResource"]> = Effect.fn(
+    "ProviderAdmissionStore.enterResource",
+  )(function* (input) {
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const row = yield* readResourceRequest(input.permit.requestId);
+          const exact =
+            row !== undefined &&
+            (row.status === "admitted" || row.status === "entered") &&
+            row.idempotencyKey === input.permit.idempotencyKey &&
+            row.providerInstanceId === String(input.permit.providerInstanceId) &&
+            row.accountScope === input.permit.accountScope &&
+            row.ownerId === input.permit.ownerId &&
+            row.leaseExpiresAt === input.permit.leaseExpiresAt &&
+            row.fenceToken === input.permit.fenceToken;
+          if (!exact) return yield* fail("resource-enter", "stale-owner", input.permit.requestId);
+          if (row.status === "entered") {
+            if (input.providerTurnId !== undefined) {
+              if (row.providerTurnId === null) {
+                yield* sql`
+                  UPDATE main.resource_admission_provider_requests
+                  SET provider_turn_id=${input.providerTurnId},revision=revision+1,
+                    updated_at=${input.enteredAt}
+                  WHERE request_id=${input.permit.requestId} AND status='entered'
+                    AND provider_turn_id IS NULL
+                `;
+              } else if (row.providerTurnId !== input.providerTurnId) {
+                return yield* fail(
+                  "resource-enter-turn",
+                  "authority-divergent",
+                  input.permit.requestId,
+                );
+              }
+            }
+            return;
+          }
+          if (row.leaseExpiresAt! <= input.enteredAt)
+            return yield* fail("resource-enter-expired", "stale-owner", input.permit.requestId);
+          yield* sql`
+            UPDATE main.resource_admission_provider_requests SET status='entered',entered_at=${input.enteredAt},
+              provider_turn_id=${input.providerTurnId ?? null},
+              revision=revision+1,updated_at=${input.enteredAt}
+            WHERE request_id=${input.permit.requestId} AND status='admitted'
+          `;
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          isProviderAdmissionError(cause)
+            ? cause
+            : fail("resource-enter", "persistence", input.permit.requestId, cause),
+        ),
+      );
+  });
+
+  const releaseResource: NonNullable<ProviderAdmissionStoreShape["releaseResource"]> = Effect.fn(
+    "ProviderAdmissionStore.releaseResource",
+  )(function* (input) {
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const row = yield* readResourceRequest(input.permit.requestId);
+          if (
+            row === undefined ||
+            row.ownerId !== input.permit.ownerId ||
+            row.fenceToken !== input.permit.fenceToken ||
+            row.leaseExpiresAt !== input.permit.leaseExpiresAt
+          )
+            return yield* fail("resource-release", "stale-owner", input.permit.requestId);
+          if (row.status === "released") return yield* resourceWakeups(row.accountScope);
+          if (row.status !== "admitted" && row.status !== "entered")
+            return yield* fail("resource-release-state", "stale-owner", input.permit.requestId);
+          yield* sql`
+            UPDATE main.resource_admission_provider_requests SET status='released',wait_reason=NULL,
+              completed_at=${input.releasedAt},revision=revision+1,updated_at=${input.releasedAt}
+            WHERE request_id=${input.permit.requestId} AND owner_id=${input.permit.ownerId}
+              AND fence_token=${input.permit.fenceToken} AND status IN ('admitted','entered')
+          `;
+          return yield* resourceWakeups(row.accountScope);
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          isProviderAdmissionError(cause)
+            ? cause
+            : fail("resource-release", "persistence", input.permit.requestId, cause),
+        ),
+      );
+  });
+
+  const cancelResource: NonNullable<ProviderAdmissionStoreShape["cancelResource"]> = Effect.fn(
+    "ProviderAdmissionStore.cancelResource",
+  )(function* (input) {
+    const requestId = providerResourceAdmissionRequestId(input.request);
+    const fingerprint = sha256Utf8(canonicalJson(resourceRequestDocument(input.request)));
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const row = yield* readResourceRequest(requestId);
+          if (row === undefined || row.requestFingerprint !== fingerprint)
+            return yield* fail("resource-cancel", "authority-divergent", requestId);
+          if (row.status === "cancelled") return yield* resourceWakeups(row.accountScope);
+          if (row.status !== "waiting")
+            return yield* fail("resource-cancel-started", "stale-owner", requestId);
+          yield* sql`
+            UPDATE main.resource_admission_provider_requests SET status='cancelled',wait_reason=NULL,
+              completed_at=${input.cancelledAt},revision=revision+1,updated_at=${input.cancelledAt}
+            WHERE request_id=${requestId} AND status='waiting'
+          `;
+          return yield* resourceWakeups(row.accountScope);
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          isProviderAdmissionError(cause)
+            ? cause
+            : fail("resource-cancel", "persistence", requestId, cause),
+        ),
+      );
+  });
+
+  const configureResourceScope: NonNullable<ProviderAdmissionStoreShape["configureResourceScope"]> =
+    Effect.fn("ProviderAdmissionStore.configureResourceScope")(function* (input) {
+      if (!hasSharedResourceAdmission)
+        return yield* fail("resource-configure", "authority-missing");
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* ensureResourceScope(input.accountScope, input.limits, input.updatedAt);
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            isProviderAdmissionError(cause)
+              ? cause
+              : fail("resource-configure", "persistence", undefined, cause),
+          ),
+        );
+    });
+
+  const resourceDeadlineQuery = (comparison: "" | "> ?" | "<= ?") => `
+    SELECT request_id AS "requestId",provider_instance_id AS "providerInstanceId",
+      account_scope AS "accountScope",aging_deadline_at AS "deadlineAt",'aging' AS "deadlineKind"
+    FROM main.resource_admission_provider_requests
+    WHERE status='waiting' AND workload_class='background' AND aging_deadline_at IS NOT NULL
+      ${comparison === "" ? "" : `AND aging_deadline_at ${comparison}`}
+    UNION ALL
+    SELECT request_id,provider_instance_id,account_scope,next_deadline_at,'usage'
+    FROM main.resource_admission_provider_requests
+    WHERE status='waiting' AND next_deadline_at IS NOT NULL
+      ${comparison === "" ? "" : `AND next_deadline_at ${comparison}`}
+    UNION ALL
+    SELECT request_id,provider_instance_id,account_scope,lease_expires_at,'lease'
+    FROM main.resource_admission_provider_requests
+    WHERE status='admitted' AND lease_expires_at IS NOT NULL
+      ${comparison === "" ? "" : `AND lease_expires_at ${comparison}`}
+  `;
+
+  const minimumResourceDeadline: NonNullable<
+    ProviderAdmissionStoreShape["minimumResourceDeadline"]
+  > = hasSharedResourceAdmission
+    ? sql.unsafe<ProviderResourceAdmissionDeadline>(resourceDeadlineQuery(""), []).pipe(
+        Effect.map((rows) => rows.map((row) => row.deadlineAt).sort()[0] ?? null),
+        Effect.mapError((cause) =>
+          fail("resource-minimum-deadline", "persistence", undefined, cause),
+        ),
+      )
+    : Effect.succeed(null);
+
+  const minimumResourceDeadlineAfter: NonNullable<
+    ProviderAdmissionStoreShape["minimumResourceDeadlineAfter"]
+  > = (after) =>
+    hasSharedResourceAdmission
+      ? sql
+          .unsafe<ProviderResourceAdmissionDeadline>(resourceDeadlineQuery("> ?"), [
+            after,
+            after,
+            after,
+          ])
+          .pipe(
+            Effect.map((rows) => rows.map((row) => row.deadlineAt).sort()[0] ?? null),
+            Effect.mapError((cause) =>
+              fail("resource-minimum-deadline-after", "persistence", undefined, cause),
+            ),
+          )
+      : Effect.succeed(null);
+
+  const listDueResourceDeadlines: NonNullable<
+    ProviderAdmissionStoreShape["listDueResourceDeadlines"]
+  > = (now) =>
+    hasSharedResourceAdmission
+      ? sql
+          .unsafe<ProviderResourceAdmissionDeadline>(resourceDeadlineQuery("<= ?"), [now, now, now])
+          .pipe(
+            Effect.map((rows) =>
+              [...rows].sort(
+                (left, right) =>
+                  left.deadlineAt.localeCompare(right.deadlineAt) ||
+                  left.requestId.localeCompare(right.requestId),
+              ),
+            ),
+            Effect.mapError((cause) =>
+              fail("resource-list-due-deadlines", "persistence", undefined, cause),
+            ),
+          )
+      : Effect.succeed([]);
+
+  const advanceResourceScope: NonNullable<ProviderAdmissionStoreShape["advanceResourceScope"]> =
+    Effect.fn("ProviderAdmissionStore.advanceResourceScope")(function* (input) {
+      if (!hasSharedResourceAdmission) return yield* fail("resource-advance", "authority-missing");
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const grants = yield* grantResourceCapacity(
+              input.accountScope,
+              input.ownerId,
+              input.leaseExpiresAt,
+              input.now,
+            );
+            return {
+              wakeups: yield* resourceWakeups(input.accountScope),
+              capacityChanged: grants > 0,
+            };
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            isProviderAdmissionError(cause)
+              ? cause
+              : fail("resource-advance", "persistence", undefined, cause),
+          ),
+        );
+    });
+
+  const listResourceActive: NonNullable<ProviderAdmissionStoreShape["listResourceActive"]> =
+    !hasSharedResourceAdmission
+      ? Effect.succeed([])
+      : sql<ResourceAdmissionRow>`
+        SELECT request_id AS "requestId",idempotency_key AS "idempotencyKey",
+          request_fingerprint AS "requestFingerprint",provider_instance_id AS "providerInstanceId",
+          thread_id AS "threadId",
+          account_scope AS "accountScope",workload_class AS "workloadClass",source,stage,
+          handoff_id AS "handoffId",status,wait_reason AS "waitReason",usage_status AS "usageStatus",
+          requested_at AS "requestedAt",next_deadline_at AS "nextDeadlineAt",owner_id AS "ownerId",
+          lease_expires_at AS "leaseExpiresAt",fence_token AS "fenceToken",provider_turn_id AS "providerTurnId",
+          last_observed_activity AS "lastObservedActivity",last_observed_at AS "lastObservedAt"
+        FROM main.resource_admission_provider_requests
+        WHERE status IN ('waiting','admitted','entered')
+        ORDER BY account_scope,requested_at,request_id
+      `.pipe(
+          Effect.map((rows) =>
+            rows.map((row): ProviderResourceAdmissionActive => ({
+              requestId: row.requestId,
+              idempotencyKey: row.idempotencyKey,
+              providerInstanceId: ProviderInstanceId.make(row.providerInstanceId),
+              threadId: row.threadId,
+              providerTurnId: row.providerTurnId,
+              accountScope: row.accountScope,
+              workloadClass: row.workloadClass,
+              source: row.source,
+              stage: row.stage,
+              handoffId: row.handoffId,
+              status: row.status as ProviderResourceAdmissionActive["status"],
+              waitReason: row.waitReason,
+              requestedAt: row.requestedAt,
+              lastObservedActivity: row.lastObservedActivity,
+              lastObservedAt: row.lastObservedAt,
+              permit: resourcePermit(row) ?? null,
+            })),
+          ),
+          Effect.mapError((cause) => fail("resource-list-active", "persistence", undefined, cause)),
+        );
+
+  const reconcileResource: NonNullable<ProviderAdmissionStoreShape["reconcileResource"]> =
+    Effect.fn("ProviderAdmissionStore.reconcileResource")(function* (input) {
+      if (!hasSharedResourceAdmission)
+        return yield* fail("resource-reconcile", "authority-missing", input.requestId);
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const row = yield* readResourceRequest(input.requestId);
+            if (row === undefined)
+              return yield* fail("resource-reconcile", "authority-missing", input.requestId);
+            if (row.status === "released" || row.status === "cancelled") {
+              if (input.observedActivity === "active")
+                return yield* fail(
+                  "resource-reconcile-terminal",
+                  "authority-divergent",
+                  input.requestId,
+                );
+              return null;
+            }
+            if (input.observedActivity === "unknown") {
+              yield* sql`
+              UPDATE main.resource_admission_provider_requests SET last_observed_activity='unknown',
+                last_observed_at=${input.observedAt},revision=revision+1,updated_at=${input.observedAt}
+              WHERE request_id=${input.requestId}
+            `;
+              yield* sql`
+              UPDATE main.resource_admission_provider_requests SET wait_reason='provider-recovery',
+                revision=revision+1,updated_at=${input.observedAt}
+              WHERE account_scope=${row.accountScope} AND status='waiting'
+            `;
+              return null;
+            }
+            if (input.observedActivity === "inactive") {
+              yield* sql`
+              UPDATE main.resource_admission_provider_requests SET status='released',wait_reason=NULL,
+                completed_at=${input.observedAt},last_observed_activity='inactive',
+                last_observed_at=${input.observedAt},revision=revision+1,updated_at=${input.observedAt}
+              WHERE request_id=${input.requestId} AND status IN ('waiting','admitted','entered')
+            `;
+              return null;
+            }
+            const scope = yield* readResourceScope(row.accountScope);
+            if (scope === undefined)
+              return yield* fail("resource-reconcile-scope", "authority-missing", input.requestId);
+            const fence = scope.lastFenceToken + 1;
+            yield* sql`
+            UPDATE main.resource_admission_provider_scopes SET last_fence_token=${fence},
+              revision=revision+1,updated_at=${input.observedAt}
+            WHERE account_scope=${row.accountScope}
+          `;
+            yield* sql`
+            UPDATE main.resource_admission_provider_requests SET status='entered',wait_reason=NULL,
+              owner_id=${input.ownerId},lease_expires_at=${input.leaseExpiresAt},fence_token=${fence},
+              entered_at=COALESCE(entered_at,${input.observedAt}),last_observed_activity='active',
+              last_observed_at=${input.observedAt},revision=revision+1,updated_at=${input.observedAt}
+            WHERE request_id=${input.requestId} AND status IN ('waiting','admitted','entered')
+          `;
+            const adopted = yield* readResourceRequest(input.requestId);
+            const permit = adopted === undefined ? undefined : resourcePermit(adopted);
+            if (permit === undefined)
+              return yield* fail(
+                "resource-reconcile-adopt",
+                "authority-divergent",
+                input.requestId,
+              );
+            return permit;
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            isProviderAdmissionError(cause)
+              ? cause
+              : fail("resource-reconcile", "persistence", input.requestId, cause),
+          ),
+        );
+    });
 
   const requestInternal = Effect.fn("ProviderAdmissionStore.requestInternal")(function* (
     input: ProviderAdmissionAttemptInput,
@@ -1525,9 +2259,19 @@ const make = Effect.gen(function* () {
               next_deadline_at=${evidence.nextRelevantAt},revision=revision+1,
               updated_at=${evidence.observedAt}
             WHERE admission_id=${row.admissionId}
-          `;
+            `;
           }
-          return yield* sql<ProviderAdmissionWakeup>`
+          if (hasSharedResourceAdmission) {
+            yield* sql`
+              UPDATE main.resource_admission_provider_requests SET usage_status=${evidence.status},
+                next_deadline_at=${evidence.nextRelevantAt},
+                wait_reason=CASE WHEN ${usageAllowsAdmission(evidence.status) ? 1 : 0}=1
+                  THEN wait_reason ELSE 'provider-usage' END,
+                revision=revision+1,updated_at=${evidence.observedAt}
+              WHERE provider_instance_id=${providerInstanceId} AND status='waiting'
+            `;
+          }
+          const legacyWakeups = yield* sql<ProviderAdmissionWakeup>`
           SELECT stage,handoff_id AS "handoffId",provider_instance_id AS "providerInstanceId"
           FROM main.agent_control_provider_admission_current
           INDEXED BY idx_agent_control_provider_admission_queue
@@ -1537,6 +2281,16 @@ const make = Effect.gen(function* () {
             AND typeof(admission_id)='text'
           ORDER BY requested_at,admission_id
         `;
+          if (!hasSharedResourceAdmission) return legacyWakeups;
+          const resourceRows = yield* sql<{ accountScope: string }>`
+            SELECT DISTINCT account_scope AS "accountScope"
+            FROM main.resource_admission_provider_requests
+            WHERE provider_instance_id=${providerInstanceId} AND status='waiting'
+          `;
+          const resourcePublications = yield* Effect.forEach(resourceRows, (row) =>
+            resourceWakeups(row.accountScope),
+          );
+          return [...legacyWakeups, ...resourcePublications.flat()];
         }),
       )
       .pipe(
@@ -1561,6 +2315,48 @@ const make = Effect.gen(function* () {
       : PROVIDER_PRE_INVOKE_DEADLINES_SQL,
     [],
   );
+
+  const deferResource: NonNullable<ProviderAdmissionStoreShape["deferResource"]> = Effect.fn(
+    "ProviderAdmissionStore.deferResource",
+  )(function* (input) {
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const row = yield* readResourceRequest(input.permit.requestId);
+          if (
+            row === undefined ||
+            row.status !== "admitted" ||
+            row.ownerId !== input.permit.ownerId ||
+            row.fenceToken !== input.permit.fenceToken ||
+            row.leaseExpiresAt !== input.permit.leaseExpiresAt
+          )
+            return yield* fail("resource-defer", "stale-owner", input.permit.requestId);
+          // rejected temporarily removes the row from the grant candidates.
+          // Its next request refreshes usage before it can be admitted again.
+          yield* sql`
+            UPDATE main.resource_admission_provider_requests SET status='waiting',
+              wait_reason='provider-limit',usage_status='rejected',owner_id=NULL,
+              lease_expires_at=NULL,fence_token=NULL,revision=revision+1,updated_at=${input.deferredAt}
+            WHERE request_id=${input.permit.requestId} AND status='admitted'
+              AND owner_id=${input.permit.ownerId} AND fence_token=${input.permit.fenceToken}
+          `;
+          yield* grantResourceCapacity(
+            row.accountScope,
+            input.permit.ownerId,
+            input.permit.leaseExpiresAt,
+            input.deferredAt,
+          );
+          return yield* resourceWakeups(row.accountScope);
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          isProviderAdmissionError(cause)
+            ? cause
+            : fail("resource-defer", "persistence", input.permit.requestId, cause),
+        ),
+      );
+  });
 
   const listDueDeadlines: ProviderAdmissionStoreShape["listDueDeadlines"] = (now) =>
     Effect.all([
@@ -2650,6 +3446,18 @@ const make = Effect.gen(function* () {
   yield* auditStartupAuthority();
 
   return ProviderAdmissionStore.of({
+    requestResource,
+    enterResource,
+    releaseResource,
+    deferResource,
+    cancelResource,
+    configureResourceScope,
+    minimumResourceDeadline,
+    minimumResourceDeadlineAfter,
+    listDueResourceDeadlines,
+    advanceResourceScope,
+    listResourceActive,
+    reconcileResource,
     resume,
     request,
     admitOldest,

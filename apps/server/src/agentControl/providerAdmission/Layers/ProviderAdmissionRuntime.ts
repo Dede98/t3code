@@ -13,7 +13,12 @@ import { AgentControlImplementationTurnWakeup } from "../../implementationTurn/S
 import { AgentControlInitialPlanningWakeup } from "../../initialPlanning/Services/AgentControlInitialPlanningWakeup.ts";
 import { AgentControlVerificationTurnWakeup } from "../../verificationTurn/Services/AgentControlVerificationTurnWakeup.ts";
 import { ProviderUsage } from "../../../provider/Services/ProviderUsage.ts";
-import { providerAdmissionUsageEvidence, type ProviderAdmissionUsageEvidence } from "../model.ts";
+import {
+  DEFAULT_PROVIDER_RESOURCE_ADMISSION_LIMITS,
+  providerAdmissionUsageEvidence,
+  type ProviderAdmissionUsageEvidence,
+  type ProviderResourceAdmissionPermit,
+} from "../model.ts";
 import {
   ProviderAdmissionRuntime,
   type ProviderAdmissionRuntimeShape,
@@ -25,6 +30,7 @@ import {
 } from "../Services/ProviderAdmissionStore.ts";
 
 const CLAIM_DURATION = Duration.minutes(2);
+const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 const nextRelevantAt = (snapshot: ProviderUsageSnapshot): string | null => {
   const deadlines = [
@@ -66,7 +72,9 @@ const make = Effect.gen(function* () {
   const verificationWakeup = yield* AgentControlVerificationTurnWakeup;
   const runtimeScope = yield* Effect.scope;
   const providerSignals = yield* PubSub.unbounded<string>();
+  const resourceSignals = yield* PubSub.unbounded<void>();
   const deadlineSignals = yield* PubSub.unbounded<void>();
+  const resourceDeadlineSignals = yield* PubSub.unbounded<void>();
   const runtimeFailure = yield* Deferred.make<never, ProviderAdmissionError>();
   const ownerId = yield* crypto.randomUUIDv4.pipe(
     Effect.orDie,
@@ -137,7 +145,10 @@ const make = Effect.gen(function* () {
   const usageChanged: ProviderAdmissionRuntimeShape["usageChanged"] = Effect.fn(
     "ProviderAdmissionRuntime.usageChanged",
   )(function* (providerInstanceId, evidence) {
-    yield* store.recordUsage(providerInstanceId, evidence);
+    const wakeups = yield* store.recordUsage(providerInstanceId, evidence);
+    yield* Effect.forEach(wakeups, wake, { discard: true });
+    yield* PubSub.publish(resourceSignals, undefined);
+    yield* PubSub.publish(resourceDeadlineSignals, undefined);
     yield* advanceProvider(providerInstanceId);
   });
 
@@ -178,6 +189,151 @@ const make = Effect.gen(function* () {
   const capacityReleased: ProviderAdmissionRuntimeShape["capacityReleased"] = (
     providerInstanceId,
   ) => PubSub.publish(providerSignals, providerInstanceId).pipe(Effect.asVoid);
+
+  const resourceSettingsChanged = Effect.all(
+    [
+      PubSub.publish(resourceSignals, undefined),
+      PubSub.publish(resourceDeadlineSignals, undefined),
+    ],
+    { discard: true },
+  );
+
+  const wakeAll = (wakeups: ReadonlyArray<ProviderAdmissionWakeup>) =>
+    Effect.forEach(wakeups, wake, { discard: true });
+
+  const requestResource: NonNullable<ProviderAdmissionRuntimeShape["requestResource"]> = Effect.fn(
+    "ProviderAdmissionRuntime.requestResource",
+  )(function* (resourceRequest, limits = DEFAULT_PROVIDER_RESOURCE_ADMISSION_LIMITS) {
+    const now = yield* DateTime.now;
+    const result = yield* store.requestResource!({
+      request: resourceRequest,
+      usage: yield* inspect(resourceRequest.providerInstanceId),
+      limits,
+      ownerId,
+      now: DateTime.formatIso(now),
+      leaseExpiresAt: DateTime.formatIso(DateTime.addDuration(now, CLAIM_DURATION)),
+    });
+    yield* wakeAll(result.wakeups);
+    if (result.capacityChanged) yield* PubSub.publish(resourceSignals, undefined);
+    yield* PubSub.publish(resourceDeadlineSignals, undefined);
+    return result.decision;
+  });
+
+  const acquireResource: NonNullable<ProviderAdmissionRuntimeShape["acquireResource"]> = Effect.fn(
+    "ProviderAdmissionRuntime.acquireResource",
+  )(function* (resourceRequest, limits = DEFAULT_PROVIDER_RESOURCE_ADMISSION_LIMITS, readLimits) {
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        const subscription = yield* PubSub.subscribe(resourceSignals);
+        return yield* Effect.uninterruptibleMask((restore) => {
+          const loop: Effect.Effect<ProviderResourceAdmissionPermit, ProviderAdmissionError> =
+            Effect.suspend(() =>
+              (readLimits ?? Effect.succeed(limits)).pipe(
+                Effect.flatMap((currentLimits) => requestResource(resourceRequest, currentLimits)),
+                Effect.flatMap((decision) => {
+                  if (decision._tag === "Admitted") return Effect.succeed(decision.permit);
+                  if (decision._tag === "Cancelled")
+                    return Effect.fail(
+                      new ProviderAdmissionError({
+                        operation: "resource-acquire-cancelled",
+                        reason: "stale-owner",
+                        admissionId: decision.requestId,
+                      }),
+                    );
+                  return restore(PubSub.take(subscription)).pipe(Effect.andThen(loop));
+                }),
+              ),
+            );
+          return loop.pipe(
+            Effect.onInterrupt(() =>
+              cancelResource(resourceRequest).pipe(
+                Effect.catchTag("ProviderAdmissionError", (error) =>
+                  error.reason === "stale-owner" ? Effect.void : Effect.fail(error),
+                ),
+              ),
+            ),
+          );
+        });
+      }),
+    );
+  });
+
+  const enterResource: NonNullable<ProviderAdmissionRuntimeShape["enterResource"]> = Effect.fn(
+    "ProviderAdmissionRuntime.enterResource",
+  )(function* (permit, providerTurnId) {
+    yield* store.enterResource!({
+      permit,
+      enteredAt: yield* nowIso,
+      ...(providerTurnId === undefined ? {} : { providerTurnId }),
+    });
+    yield* PubSub.publish(resourceDeadlineSignals, undefined);
+  });
+
+  const releaseResource: NonNullable<ProviderAdmissionRuntimeShape["releaseResource"]> = Effect.fn(
+    "ProviderAdmissionRuntime.releaseResource",
+  )(function* (permit) {
+    const wakeups = yield* store.releaseResource!({
+      permit,
+      releasedAt: DateTime.formatIso(yield* DateTime.now),
+    });
+    yield* wakeAll(wakeups);
+    yield* PubSub.publish(resourceSignals, undefined);
+    yield* PubSub.publish(resourceDeadlineSignals, undefined);
+  });
+
+  const cancelResource: NonNullable<ProviderAdmissionRuntimeShape["cancelResource"]> = Effect.fn(
+    "ProviderAdmissionRuntime.cancelResource",
+  )(function* (resourceRequest) {
+    const wakeups = yield* store.cancelResource!({
+      request: resourceRequest,
+      cancelledAt: DateTime.formatIso(yield* DateTime.now),
+    });
+    yield* wakeAll(wakeups);
+    yield* PubSub.publish(resourceSignals, undefined);
+    yield* PubSub.publish(resourceDeadlineSignals, undefined);
+  });
+
+  const configureResourceScope: NonNullable<
+    ProviderAdmissionRuntimeShape["configureResourceScope"]
+  > = (accountScope, limits) =>
+    nowIso.pipe(
+      Effect.flatMap((updatedAt) =>
+        store.configureResourceScope!({ accountScope, limits, updatedAt }),
+      ),
+      Effect.tap(() => PubSub.publish(resourceSignals, undefined)),
+      Effect.tap(() => PubSub.publish(resourceDeadlineSignals, undefined)),
+    );
+
+  const reconcileResource: NonNullable<ProviderAdmissionRuntimeShape["reconcileResource"]> =
+    Effect.fn("ProviderAdmissionRuntime.reconcileResource")(
+      function* (requestId, observedActivity) {
+        const now = yield* DateTime.now;
+        const permit = yield* store.reconcileResource!({
+          requestId,
+          observedActivity,
+          ownerId,
+          observedAt: DateTime.formatIso(now),
+          leaseExpiresAt: DateTime.formatIso(DateTime.addDuration(now, CLAIM_DURATION)),
+        });
+        yield* PubSub.publish(resourceSignals, undefined);
+        yield* PubSub.publish(resourceDeadlineSignals, undefined);
+        const active = yield* store.listResourceActive!;
+        yield* wakeAll(
+          active.flatMap((row) =>
+            row.source === "automatic" && row.stage !== null && row.handoffId !== null
+              ? [
+                  {
+                    stage: row.stage,
+                    handoffId: row.handoffId,
+                    providerInstanceId: String(row.providerInstanceId),
+                  },
+                ]
+              : [],
+          ),
+        );
+        return permit;
+      },
+    );
 
   const providerSubscription = yield* PubSub.subscribe(providerSignals);
   yield* Effect.gen(function* () {
@@ -280,9 +436,124 @@ const make = Effect.gen(function* () {
     }
   }).pipe((pump) => forkPump("deadline-pump", pump));
 
+  if (
+    store.minimumResourceDeadline !== undefined &&
+    store.minimumResourceDeadlineAfter !== undefined &&
+    store.listDueResourceDeadlines !== undefined &&
+    store.advanceResourceScope !== undefined
+  ) {
+    const minimumResourceDeadline = store.minimumResourceDeadline;
+    const minimumResourceDeadlineAfter = store.minimumResourceDeadlineAfter;
+    const listDueResourceDeadlines = store.listDueResourceDeadlines;
+    const advanceResourceScope = store.advanceResourceScope;
+    const resourceDeadlineSubscription = yield* PubSub.subscribe(resourceDeadlineSignals);
+    yield* Effect.gen(function* () {
+      const firedDeadlineKeys = new Set<string>();
+      const waitUntilResourceDeadline = Effect.fn(
+        "ProviderAdmissionRuntime.waitUntilResourceDeadline",
+      )(function* (deadline: string) {
+        const delay = Math.max(
+          0,
+          DateTime.toEpochMillis(DateTime.makeUnsafe(deadline)) - (yield* Clock.currentTimeMillis),
+        );
+        if (delay === 0) return "deadline" as const;
+        return yield* Effect.raceFirst(
+          Effect.sleep(Duration.millis(delay)).pipe(Effect.as("deadline" as const)),
+          PubSub.take(resourceDeadlineSubscription).pipe(Effect.as("changed" as const)),
+        );
+      });
+      while (true) {
+        const deadline = yield* minimumResourceDeadline;
+        if (deadline === null) {
+          firedDeadlineKeys.clear();
+          yield* PubSub.take(resourceDeadlineSubscription);
+          continue;
+        }
+        if ((yield* waitUntilResourceDeadline(deadline)) === "changed") {
+          firedDeadlineKeys.clear();
+          continue;
+        }
+        const nowValue = yield* DateTime.now;
+        const now = DateTime.formatIso(nowValue);
+        const due = yield* listDueResourceDeadlines(now);
+        const dueKeys = new Set(
+          due.map(
+            (publication) =>
+              `${publication.deadlineKind}:${publication.requestId}:${publication.deadlineAt}`,
+          ),
+        );
+        for (const key of firedDeadlineKeys) {
+          if (!dueKeys.has(key)) firedDeadlineKeys.delete(key);
+        }
+        const unfired = due.filter((publication) => {
+          const key = `${publication.deadlineKind}:${publication.requestId}:${publication.deadlineAt}`;
+          if (firedDeadlineKeys.has(key)) return false;
+          firedDeadlineKeys.add(key);
+          return true;
+        });
+        if (unfired.length === 0) {
+          const futureDeadline = yield* minimumResourceDeadlineAfter(now);
+          if (futureDeadline === null) {
+            yield* PubSub.take(resourceDeadlineSubscription);
+            firedDeadlineKeys.clear();
+            continue;
+          }
+          if ((yield* waitUntilResourceDeadline(futureDeadline)) === "changed")
+            firedDeadlineKeys.clear();
+          continue;
+        }
+        const usageProviders = Array.from(
+          new Set(
+            unfired
+              .filter((publication) => publication.deadlineKind === "usage")
+              .map((publication) => publication.providerInstanceId),
+          ),
+        );
+        yield* Effect.forEach(
+          usageProviders,
+          (providerInstanceId) =>
+            inspect(ProviderInstanceId.make(providerInstanceId)).pipe(
+              Effect.flatMap((evidence) => usageChanged(providerInstanceId, evidence)),
+            ),
+          { discard: true },
+        );
+        const scopes = Array.from(new Set(unfired.map((publication) => publication.accountScope)));
+        yield* Effect.forEach(
+          scopes,
+          (accountScope) =>
+            advanceResourceScope({
+              accountScope,
+              ownerId,
+              now,
+              leaseExpiresAt: DateTime.formatIso(DateTime.addDuration(nowValue, CLAIM_DURATION)),
+            }).pipe(
+              Effect.tap((result) => wakeAll(result.wakeups)),
+              Effect.tap((result) =>
+                result.capacityChanged ? PubSub.publish(resourceSignals, undefined) : Effect.void,
+              ),
+              Effect.asVoid,
+            ),
+          { discard: true },
+        );
+      }
+    }).pipe((pump) => forkPump("resource-deadline-pump", pump));
+  }
+
   const waitingProviders = Array.from(
     new Set((yield* store.listWaiting).map((publication) => publication.providerInstanceId)),
   );
+
+  const deferResource: NonNullable<ProviderAdmissionRuntimeShape["deferResource"]> = Effect.fn(
+    "ProviderAdmissionRuntime.deferResource",
+  )(function* (permit) {
+    const wakeups = yield* store.deferResource!({
+      permit,
+      deferredAt: DateTime.formatIso(yield* DateTime.now),
+    });
+    yield* wakeAll(wakeups);
+    yield* PubSub.publish(resourceSignals, undefined);
+    yield* PubSub.publish(resourceDeadlineSignals, undefined);
+  });
   yield* Effect.forEach(waitingProviders, advanceProvider, { discard: true });
 
   return ProviderAdmissionRuntime.of({
@@ -290,6 +561,16 @@ const make = Effect.gen(function* () {
     request,
     usageChanged,
     capacityReleased,
+    resourceSettingsChanged,
+    requestResource,
+    acquireResource,
+    enterResource,
+    releaseResource,
+    deferResource,
+    cancelResource,
+    configureResourceScope,
+    listResourceActive: store.listResourceActive!,
+    reconcileResource,
   });
 });
 
