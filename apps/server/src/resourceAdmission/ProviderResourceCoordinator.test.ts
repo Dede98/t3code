@@ -1,4 +1,10 @@
-import { EventId, ProviderDriverKind, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  EventId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -41,7 +47,9 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
       reservationFenceToken: 11,
     };
     const calls: string[] = [];
+    let currentProviderPermit = providerPermit;
     let activeRows: ReadonlyArray<ProviderResourceAdmissionActive> = [];
+    let hostActivityAllowed = true;
     const provider = ProviderAdmissionRuntime.of({
       awaitFailure: Effect.never,
       request: () => Effect.die("unused"),
@@ -60,7 +68,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
       acquireResource: () =>
         Effect.sync(() => {
           calls.push("provider-acquire");
-          return providerPermit;
+          return currentProviderPermit;
         }),
       enterResource: (_permit, turnId) =>
         Effect.sync(() => calls.push(`provider-enter:${turnId ?? "pending"}`)),
@@ -72,7 +80,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
       reconcileResource: (_requestId, activity) =>
         Effect.sync(() => {
           calls.push(`provider-reconcile:${activity}`);
-          return activity === "active" ? providerPermit : null;
+          return activity === "active" ? currentProviderPermit : null;
         }),
     });
     const host = ResourceAdmission.of({
@@ -118,7 +126,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
         Effect.sync(() => {
           calls.push(`host-${activity}`);
           return {
-            result: true,
+            result: hostActivityAllowed,
             newlyAdmitted: [],
             ledgerRevision: 2,
             pressureSampledAtMs: 1,
@@ -150,7 +158,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
       provider: ProviderDriverKind.make("codex"),
       providerInstanceId: instanceId,
       threadId: ThreadId.make("thread-1"),
-      turnId: "old-turn",
+      turnId: TurnId.make("old-turn"),
       createdAt: "2026-09-16T10:00:01.000Z",
       payload: { state: "completed" },
     });
@@ -161,7 +169,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
         provider: ProviderDriverKind.make("codex"),
         providerInstanceId: instanceId,
         threadId: ThreadId.make("thread-1"),
-        turnId: "old-turn",
+        turnId: TurnId.make("old-turn"),
         createdAt: "2026-09-16T10:00:02.000Z",
         payload: {},
       },
@@ -171,7 +179,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
         status: "running",
         runtimeMode: "approval-required",
         threadId: ThreadId.make("thread-1"),
-        activeTurnId: "turn-1",
+        activeTurnId: TurnId.make("turn-1"),
         createdAt: "2026-09-16T10:00:00.000Z",
         updatedAt: "2026-09-16T10:00:02.000Z",
       },
@@ -184,7 +192,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
         provider: ProviderDriverKind.make("codex"),
         providerInstanceId: instanceId,
         threadId: ThreadId.make("thread-1"),
-        turnId: "turn-1",
+        turnId: TurnId.make("turn-1"),
         createdAt: "2026-09-16T10:00:01.000Z",
         payload: {},
       },
@@ -194,7 +202,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
         status: "running",
         runtimeMode: "approval-required",
         threadId: ThreadId.make("thread-1"),
-        activeTurnId: "turn-1",
+        activeTurnId: TurnId.make("turn-1"),
         createdAt: "2026-09-16T10:00:00.000Z",
         updatedAt: "2026-09-16T10:00:01.000Z",
       },
@@ -210,7 +218,19 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
       createdAt: "2026-09-16T10:01:00.000Z",
       payload: {},
     });
-    yield* coordinator.release(permit);
+    yield* coordinator.observeRuntimeEvent({
+      type: "turn.completed",
+      eventId: EventId.make("current-turn-terminal"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: instanceId,
+      threadId: ThreadId.make("thread-1"),
+      turnId: TurnId.make("turn-1"),
+      createdAt: "2026-09-16T10:01:01.000Z",
+      payload: { state: "completed" },
+    });
+    // The provider call may return only after ingestion has already observed
+    // both start and terminal. This late bind is idempotent.
+    yield* coordinator.enter(permit, "turn-1");
     assert.deepStrictEqual(calls, [
       "host-request",
       "provider-request",
@@ -226,15 +246,20 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
     ]);
 
     calls.length = 0;
+    currentProviderPermit = {
+      ...providerPermit,
+      requestId: "provider-recovery-request",
+      idempotencyKey: "recovery:provider-request",
+    };
     activeRows = [
       {
-        ...providerPermit,
+        ...currentProviderPermit,
         providerTurnId: null,
         status: "entered",
         waitReason: null,
         lastObservedActivity: "unknown",
         lastObservedAt: "2026-09-16T10:02:00.000Z",
-        permit: providerPermit,
+        permit: currentProviderPermit,
       },
     ];
     yield* coordinator.reconcile([]);
@@ -248,7 +273,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
         status: "running",
         runtimeMode: "approval-required",
         threadId: ThreadId.make("thread-1"),
-        activeTurnId: "turn-after-restart",
+        activeTurnId: TurnId.make("turn-after-restart"),
         createdAt: "2026-09-16T10:00:00.000Z",
         updatedAt: "2026-09-16T10:03:00.000Z",
       },
@@ -259,7 +284,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
       provider: ProviderDriverKind.make("codex"),
       providerInstanceId: instanceId,
       threadId: ThreadId.make("thread-1"),
-      turnId: "turn-after-restart",
+      turnId: TurnId.make("turn-after-restart"),
       createdAt: "2026-09-16T10:04:00.000Z",
       payload: { state: "completed" },
     });
@@ -279,7 +304,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
       provider: ProviderDriverKind.make("codex"),
       providerInstanceId: instanceId,
       threadId: ThreadId.make("thread-1"),
-      turnId: "turn-whose-start-was-lost",
+      turnId: TurnId.make("turn-whose-start-was-lost"),
       createdAt: "2026-09-16T10:07:00.000Z",
       payload: { state: "completed" },
     });
@@ -291,7 +316,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
         provider: ProviderDriverKind.make("codex"),
         providerInstanceId: instanceId,
         threadId: ThreadId.make("thread-1"),
-        turnId: "turn-whose-start-was-lost",
+        turnId: TurnId.make("turn-whose-start-was-lost"),
         createdAt: "2026-09-16T10:08:00.000Z",
         payload: {},
       },
@@ -301,7 +326,7 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
         status: "running",
         runtimeMode: "approval-required",
         threadId: ThreadId.make("thread-1"),
-        activeTurnId: "turn-whose-start-was-lost",
+        activeTurnId: TurnId.make("turn-whose-start-was-lost"),
         createdAt: "2026-09-16T10:00:00.000Z",
         updatedAt: "2026-09-16T10:08:00.000Z",
       },
@@ -309,5 +334,10 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
     // Persisted unbound rows are never adopted from an event alone. They need
     // startup reconciliation with an active session snapshot.
     assert.deepStrictEqual(calls, []);
+
+    hostActivityAllowed = false;
+    const staleHostEnter = yield* coordinator.enter(permit).pipe(Effect.exit);
+    assert.equal(staleHostEnter._tag, "Failure");
+    assert.deepStrictEqual(calls, ["host-active", "provider-release", "host-release"]);
   }),
 );

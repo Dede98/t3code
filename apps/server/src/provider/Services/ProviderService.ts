@@ -84,6 +84,10 @@ export interface ProviderRuntimeEventSourceActivation {
   readonly awaitAbort: Effect.Effect<never>;
 }
 
+export interface ProviderInvocationBoundary {
+  readonly onInvocationStarted: () => void;
+}
+
 /**
  * ProviderServiceShape - Service API for provider session and turn orchestration.
  */
@@ -102,6 +106,16 @@ export interface ProviderServiceShape {
    */
   readonly sendTurn: (
     input: ProviderSendTurnInput,
+  ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
+
+  /**
+   * Manual-admission variant. The callback runs atomically with launching the
+   * adapter effect, so interruption before it is safe to release and
+   * interruption after it must remain fail-closed.
+   */
+  readonly sendTurnWithInvocationBoundary?: (
+    input: ProviderSendTurnInput,
+    boundary: ProviderInvocationBoundary,
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
 
   readonly sendTurnAtPreInvokeBoundary?: (
@@ -140,6 +154,7 @@ export interface ProviderServiceShape {
     threadId: ThreadId,
     modelSelection?: ProviderSendTurnInput["modelSelection"],
     requestId?: MessageId,
+    invocationBoundary?: ProviderInvocationBoundary,
   ) => Effect.Effect<void, ProviderServiceError>;
 
   /**

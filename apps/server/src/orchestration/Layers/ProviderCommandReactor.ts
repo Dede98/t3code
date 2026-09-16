@@ -366,7 +366,6 @@ const make = Effect.gen(function* () {
   const stoppingThreadIds = new Set<ThreadId>();
   const pendingManualStarts = new Map<string, Fiber.Fiber<void, never>>();
   const pendingManualPermits = new Map<string, CoordinatedProviderPermit>();
-  const enteredManualPermits = new Set<string>();
 
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -1499,6 +1498,7 @@ const make = Effect.gen(function* () {
         return;
       }
       compactingThreadIds.add(event.payload.threadId);
+      let providerInvocationStarted = false;
       const compactStart = Effect.gen(function* () {
         yield* ensureSessionForThread(
           event.payload.threadId,
@@ -1511,13 +1511,12 @@ const make = Effect.gen(function* () {
         if (event.payload.modelSelection !== undefined) {
           threadModelSelections.set(event.payload.threadId, event.payload.modelSelection);
         }
-        const compact = providerService.compactThread(
-          event.payload.threadId,
-          event.payload.modelSelection,
-          event.payload.messageId,
-        );
         if (Option.isNone(providerResourceCoordinator)) {
-          yield* compact;
+          yield* providerService.compactThread(
+            event.payload.threadId,
+            event.payload.modelSelection,
+            event.payload.messageId,
+          );
           return;
         }
         const coordinator = providerResourceCoordinator.value;
@@ -1568,17 +1567,39 @@ const make = Effect.gen(function* () {
         );
         yield* setAdmissionWait(undefined);
         yield* coordinator.enter(permit);
-        enteredManualPermits.add(event.payload.threadId);
-        // Failure after this entered fence is ambiguous, so only a successful
-        // compaction or a later terminal event releases the reservation.
-        yield* compact.pipe(Effect.tap(() => coordinator.release(permit)));
+        yield* providerService
+          .compactThread(
+            event.payload.threadId,
+            event.payload.modelSelection,
+            event.payload.messageId,
+            {
+              onInvocationStarted: () => {
+                providerInvocationStarted = true;
+              },
+            },
+          )
+          .pipe(Effect.tap(() => coordinator.release(permit)));
       }).pipe(
         Effect.andThen(restoreCompaction(event.payload.threadId, true)),
+        Effect.onError(() => {
+          const permit = pendingManualPermits.get(event.payload.threadId);
+          if (
+            permit === undefined ||
+            providerInvocationStarted ||
+            Option.isNone(providerResourceCoordinator)
+          )
+            return Effect.void;
+          return providerResourceCoordinator.value.release(permit).pipe(Effect.ignore);
+        }),
         Effect.onInterrupt(() => {
           const permit = pendingManualPermits.get(event.payload.threadId);
-          if (permit === undefined || enteredManualPermits.has(event.payload.threadId))
+          if (
+            permit === undefined ||
+            providerInvocationStarted ||
+            Option.isNone(providerResourceCoordinator)
+          )
             return Effect.void;
-          return resourceCoordinator.release(permit).pipe(Effect.ignore);
+          return providerResourceCoordinator.value.release(permit).pipe(Effect.ignore);
         }),
         Effect.catchCause(recoverCompactionFailure),
         Effect.ensuring(
@@ -1586,7 +1607,6 @@ const make = Effect.gen(function* () {
             compactingThreadIds.delete(event.payload.threadId);
             pendingManualStarts.delete(event.payload.threadId);
             pendingManualPermits.delete(event.payload.threadId);
-            enteredManualPermits.delete(event.payload.threadId);
           }),
         ),
       );
@@ -1659,6 +1679,7 @@ const make = Effect.gen(function* () {
           createdAt: event.payload.createdAt,
         });
       });
+    let providerInvocationStarted = false;
     const start = Effect.gen(function* () {
       const permit = yield* Effect.uninterruptibleMask((restore) =>
         Effect.flatMap(
@@ -1684,12 +1705,26 @@ const make = Effect.gen(function* () {
       );
       yield* setAdmissionWait(undefined);
       yield* resourceCoordinator.enter(permit);
-      enteredManualPermits.add(event.payload.threadId);
-      // Once invocation crossed the durable entered fence, one missing
-      // session snapshot cannot prove that the provider did not start.
-      const result = yield* providerService.sendTurn(request);
+      const sendTurnWithInvocationBoundary = providerService.sendTurnWithInvocationBoundary;
+      const result = yield* sendTurnWithInvocationBoundary === undefined
+        ? Effect.sync(() => {
+            // Older injected services cannot expose the boundary. Preserve
+            // fail-closed behavior for those implementations.
+            providerInvocationStarted = true;
+            return providerService.sendTurn(request);
+          }).pipe(Effect.flatten)
+        : sendTurnWithInvocationBoundary(request, {
+            onInvocationStarted: () => {
+              providerInvocationStarted = true;
+            },
+          });
       yield* resourceCoordinator.enter(permit, String(result.turnId));
     }).pipe(
+      Effect.onError(() => {
+        const permit = pendingManualPermits.get(event.payload.threadId);
+        if (permit === undefined || providerInvocationStarted) return Effect.void;
+        return resourceCoordinator.release(permit).pipe(Effect.ignore);
+      }),
       Effect.onInterrupt(() =>
         providerService.listSessions().pipe(
           Effect.flatMap((sessions) => {
@@ -1702,7 +1737,7 @@ const make = Effect.gen(function* () {
               return resourceCoordinator
                 .enter(pending, String(active.activeTurnId))
                 .pipe(Effect.ignore);
-            return enteredManualPermits.has(event.payload.threadId)
+            return providerInvocationStarted
               ? Effect.void
               : resourceCoordinator.release(pending).pipe(Effect.ignore);
           }),
@@ -1715,7 +1750,6 @@ const make = Effect.gen(function* () {
         Effect.sync(() => {
           pendingManualStarts.delete(event.payload.threadId);
           pendingManualPermits.delete(event.payload.threadId);
-          enteredManualPermits.delete(event.payload.threadId);
         }),
       ),
     );

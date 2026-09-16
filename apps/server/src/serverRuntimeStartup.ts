@@ -804,23 +804,57 @@ export const reconcileProviderSessions = Effect.gen(function* () {
                   createdAt: updatedAt,
                 });
               });
-            const permit = yield* coordinator.acquire({
-              idempotencyKey: `startup-continuation:${thread.id}:${continuationTurnId ?? session.activeTurnId ?? "prepared"}`,
-              providerInstanceId,
-              continuationKey: String(instanceInfo.driverKind),
-              threadId: String(thread.id),
-              // The request fingerprint must survive repeated restarts while
-              // the same continuation marker remains durable.
-              requestedAt: thread.createdAt,
-              workloadClass: "interactive",
-              source: "manual",
-              onWait: (wait) => setAdmissionWait(wait).pipe(Effect.ignore),
-            });
-            yield* setAdmissionWait(undefined);
-            yield* coordinator.enter(permit);
-            // After the entered fence a failed invocation may still have
-            // reached the provider. Keep the reservation until reconciliation.
-            const turn = yield* providerService.sendTurn(input);
+            let providerInvocationStarted = false;
+            const permit = yield* Effect.uninterruptibleMask((restore) =>
+              Effect.flatMap(
+                restore(
+                  coordinator.acquire({
+                    idempotencyKey: `startup-continuation:${thread.id}:${continuationTurnId ?? session.activeTurnId ?? "prepared"}`,
+                    providerInstanceId,
+                    continuationKey: String(instanceInfo.driverKind),
+                    threadId: String(thread.id),
+                    // The request fingerprint must survive repeated restarts while
+                    // the same continuation marker remains durable.
+                    requestedAt: thread.createdAt,
+                    workloadClass: "interactive",
+                    source: "manual",
+                    onWait: (wait) => setAdmissionWait(wait).pipe(Effect.ignore),
+                  }),
+                ),
+                (acquired) =>
+                  setAdmissionWait(undefined).pipe(
+                    Effect.andThen(coordinator.enter(acquired)),
+                    Effect.as(acquired),
+                    Effect.onError(() => coordinator.release(acquired).pipe(Effect.ignore)),
+                  ),
+              ),
+            );
+            const sendTurnWithInvocationBoundary = providerService.sendTurnWithInvocationBoundary;
+            const turn = yield* (
+              sendTurnWithInvocationBoundary === undefined
+                ? Effect.sync(() => {
+                    // Preserve fail-closed behavior for older injected services
+                    // which cannot report the external invocation boundary.
+                    providerInvocationStarted = true;
+                    return providerService.sendTurn(input);
+                  }).pipe(Effect.flatten)
+                : sendTurnWithInvocationBoundary(input, {
+                    onInvocationStarted: () => {
+                      providerInvocationStarted = true;
+                    },
+                  })
+            ).pipe(
+              Effect.onError(() =>
+                providerInvocationStarted
+                  ? Effect.void
+                  : coordinator.release(permit).pipe(Effect.ignore),
+              ),
+              Effect.onInterrupt(() =>
+                providerInvocationStarted
+                  ? Effect.void
+                  : coordinator.release(permit).pipe(Effect.ignore),
+              ),
+            );
             yield* coordinator.enter(permit, String(turn.turnId));
           });
           const continuationExit = yield* Effect.exit(continuation);

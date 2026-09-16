@@ -389,6 +389,9 @@ type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["S
 type SendTurnPreInvokeBoundary = Parameters<
   NonNullable<ProviderService.ProviderService["Service"]["sendTurnAtPreInvokeBoundary"]>
 >[1];
+type ProviderInvocationBoundary = Parameters<
+  NonNullable<ProviderService.ProviderService["Service"]["sendTurnWithInvocationBoundary"]>
+>[1];
 
 type ProviderRuntimeEventWithInstance = ProviderRuntimeEvent & {
   readonly providerInstanceId: ProviderInstanceId;
@@ -2302,6 +2305,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     parsed: ProviderSendTurnInput,
     boundary?: SendTurnPreInvokeBoundary,
     preResolvedRoute?: ProviderSendRoute,
+    invocationBoundary?: ProviderInvocationBoundary,
   ) {
     const attachments = parsed.attachments ?? [];
     if (!parsed.input && attachments.length === 0 && parsed.continuation !== true) {
@@ -2497,8 +2501,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             interactionMode: input.interactionMode,
             runtimeMode: routed.runtimeMode,
           }),
-          (metadata) =>
-            routed.adapter.sendTurn(input).pipe(
+          (metadata) => {
+            const invoke = routed.adapter.sendTurn(input).pipe(
               Effect.tap((turn) =>
                 associateTurnAnalytics({
                   providerInstanceId: routed.instanceId,
@@ -2507,7 +2511,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   metadata,
                 }),
               ),
-            ),
+            );
+            return invocationBoundary === undefined
+              ? invoke
+              : Effect.uninterruptibleMask((restore) =>
+                  Effect.gen(function* () {
+                    const fiber = yield* invoke.pipe(
+                      Effect.forkChild({ startImmediately: true, uninterruptible: false }),
+                    );
+                    invocationBoundary.onInvocationStarted();
+                    return yield* restore(Fiber.join(fiber));
+                  }),
+                );
+          },
           (metadata) =>
             clearPendingTurnAnalytics({
               providerInstanceId: routed.instanceId,
@@ -2639,6 +2655,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadOperationLock.withLock(input.threadId, sendTurnUnlocked(input)),
       ),
     );
+  const sendTurnWithInvocationBoundary: NonNullable<
+    ProviderService.ProviderService["Service"]["sendTurnWithInvocationBoundary"]
+  > = (rawInput, invocationBoundary) =>
+    decodeInputOrValidationError({
+      operation: "ProviderService.sendTurn",
+      schema: ProviderSendTurnInput,
+      payload: rawInput,
+    }).pipe(
+      Effect.flatMap((input) =>
+        threadOperationLock.withLock(
+          input.threadId,
+          sendTurnUnlocked(input, undefined, undefined, invocationBoundary),
+        ),
+      ),
+    );
   const sendTurnAtPreInvokeBoundary: NonNullable<
     ProviderService.ProviderService["Service"]["sendTurnAtPreInvokeBoundary"]
   > = (rawInput, boundary) =>
@@ -2669,7 +2700,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   > = (threadId) => Effect.sync(() => sessionAttestations.get(threadId));
 
   const compactThread: ProviderServiceMethod<"compactThread"> = Effect.fn("compactThread")(
-    function* (threadId, modelSelection, requestId) {
+    function* (threadId, modelSelection, requestId, invocationBoundary) {
       const routed = yield* resolveRoutableSession({
         threadId,
         operation: "ProviderService.compactThread",
@@ -2758,13 +2789,30 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
       const terminal = yield* (
         compaction.type === "native"
-          ? awaitNativeCompaction(compaction.start(routed.threadId, modelSelection))
+          ? awaitNativeCompaction(
+              invocationBoundary === undefined
+                ? compaction.start(routed.threadId, modelSelection)
+                : Effect.uninterruptibleMask((restore) =>
+                    Effect.gen(function* () {
+                      const fiber = yield* compaction
+                        .start(routed.threadId, modelSelection)
+                        .pipe(Effect.forkChild({ startImmediately: true, uninterruptible: false }));
+                      invocationBoundary.onInvocationStarted();
+                      return yield* restore(Fiber.join(fiber));
+                    }),
+                  ),
+            )
           : Effect.gen(function* () {
-              const turn = yield* sendTurn({
+              const request = {
                 threadId,
                 input: compaction.command,
                 ...(modelSelection !== undefined ? { modelSelection } : {}),
-              }).pipe(
+              };
+              const turn = yield* (
+                invocationBoundary === undefined
+                  ? sendTurn(request)
+                  : sendTurnWithInvocationBoundary(request, invocationBoundary)
+              ).pipe(
                 Effect.onError(() =>
                   Effect.forEach(pending.earlyEvents.splice(0), publishRuntimeEvent, {
                     discard: true,
@@ -3286,14 +3334,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     startSession: (threadId, input, authority) =>
       rebuildBarrier.withOperation(startSession(threadId, input, authority)),
     sendTurn: (input) => rebuildBarrier.withOperation(sendTurn(input)),
+    sendTurnWithInvocationBoundary: (input, boundary) =>
+      rebuildBarrier.withOperation(sendTurnWithInvocationBoundary(input, boundary)),
     sendTurnAtPreInvokeBoundary: (input, boundary) =>
       rebuildBarrier.withOperation(sendTurnAtPreInvokeBoundary(input, boundary)),
     quarantineAdmissionIfEntered: (permit) =>
       rebuildBarrier.withOperation(quarantineAdmissionIfEntered(permit)),
     readStoppedTurn: (input) => rebuildBarrier.withOperation(readStoppedTurn(input)),
     getSessionAttestation,
-    compactThread: (threadId, modelSelection, requestId) =>
-      rebuildBarrier.withOperation(compactThread(threadId, modelSelection, requestId)),
+    compactThread: (threadId, modelSelection, requestId, invocationBoundary) =>
+      rebuildBarrier.withOperation(
+        compactThread(threadId, modelSelection, requestId, invocationBoundary),
+      ),
     interruptTurn: (input) => rebuildBarrier.withOperation(interruptTurn(input)),
     respondToRequest: (input) => rebuildBarrier.withOperation(respondToRequest(input)),
     respondToUserInput: (input) => rebuildBarrier.withOperation(respondToUserInput(input)),

@@ -6,6 +6,7 @@ import {
   ModelSelection,
   ProviderRuntimeEvent,
   ProviderSession,
+  ProviderTurnStartResult,
   ProviderDriverKind,
   ProviderInstanceId,
   ApprovalRequestId,
@@ -43,8 +44,14 @@ import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import {
   ProviderService,
+  type ProviderInvocationBoundary,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import {
+  type CoordinatedProviderPermit,
+  ProviderResourceCoordinator,
+  type ProviderResourceCoordinatorShape,
+} from "../../resourceAdmission/ProviderResourceCoordinator.ts";
 import { makeProviderRegistryLayer } from "../../provider/testUtils/providerRegistryMock.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
@@ -88,6 +95,30 @@ const asTurnId = (value: string): TurnId => TurnId.make(value);
 const CODEX_INSTANCE_ID = ProviderInstanceId.make("codex");
 
 const CLAUDE_INSTANCE_ID = ProviderInstanceId.make("claudeAgent");
+
+const manualPermit: CoordinatedProviderPermit = {
+  provider: {
+    requestId: "provider-request-manual-boundary",
+    idempotencyKey: "manual-boundary",
+    providerInstanceId: CODEX_INSTANCE_ID,
+    threadId: "thread-1",
+    accountScope: "codex:test",
+    workloadClass: "interactive",
+    source: "manual",
+    requestedAt: "2026-01-01T00:00:00.000Z",
+    stage: null,
+    handoffId: null,
+    ownerId: "provider-owner",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+    fenceToken: 1,
+  },
+  host: {
+    reservationId: "host-provider-request-manual-boundary",
+    ownerId: "host-owner",
+    ownerFenceToken: 1,
+    reservationFenceToken: 1,
+  },
+};
 
 const assistantQuoteText = "Retain the reconnect backoff.";
 
@@ -246,6 +277,10 @@ describe("ProviderCommandReactor", () => {
     readonly serverActivation?: Effect.Effect<void>;
     readonly beforeReadySessionDispatch?: () => Effect.Effect<void>;
     readonly compactThreadEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
+    readonly sendTurnWithInvocationBoundaryEffect?: (
+      boundary: ProviderInvocationBoundary,
+    ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
+    readonly providerResourceCoordinator?: ProviderResourceCoordinatorShape;
     readonly interruptTurnEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly stopSessionEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly startSessionEffect?: (
@@ -333,11 +368,28 @@ describe("ProviderCommandReactor", () => {
         ),
       );
     });
-    const sendTurn = vi.fn((_: unknown) =>
-      Effect.succeed({
+    const sendTurn = vi.fn((request: unknown) => {
+      void request;
+      return Effect.succeed({
         threadId: ThreadId.make("thread-1"),
         turnId: asTurnId("turn-1"),
-      }),
+      });
+    });
+    const sendTurnWithInvocationBoundary = vi.fn(
+      (request: unknown, boundary: ProviderInvocationBoundary) => {
+        void request;
+        return (
+          input?.sendTurnWithInvocationBoundaryEffect?.(boundary) ??
+          Effect.sync(() => boundary.onInvocationStarted()).pipe(
+            Effect.andThen(
+              Effect.succeed({
+                threadId: ThreadId.make("thread-1"),
+                turnId: asTurnId("turn-1"),
+              }),
+            ),
+          )
+        );
+      },
     );
     const compactThread = vi.fn((_: ThreadId) => input?.compactThreadEffect?.() ?? Effect.void);
     const interruptTurn = vi.fn((_: unknown) => input?.interruptTurnEffect?.() ?? Effect.void);
@@ -425,6 +477,9 @@ describe("ProviderCommandReactor", () => {
     const service: ProviderServiceShape = {
       startSession: startSession as ProviderServiceShape["startSession"],
       sendTurn: sendTurn as ProviderServiceShape["sendTurn"],
+      sendTurnWithInvocationBoundary: sendTurnWithInvocationBoundary as NonNullable<
+        ProviderServiceShape["sendTurnWithInvocationBoundary"]
+      >,
       compactThread,
       interruptTurn: interruptTurn as ProviderServiceShape["interruptTurn"],
       respondToRequest: respondToRequest as ProviderServiceShape["respondToRequest"],
@@ -523,6 +578,11 @@ describe("ProviderCommandReactor", () => {
       Layer.provideMerge(reactorOrchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, service)),
+      Layer.provideMerge(
+        input?.providerResourceCoordinator === undefined
+          ? Layer.empty
+          : Layer.succeed(ProviderResourceCoordinator, input.providerResourceCoordinator),
+      ),
       Layer.provide(Layer.mock(ProviderAuthService, { tryHandlePromptCommand })),
       Layer.provideMerge(makeProviderRegistryLayer(providerSnapshots as never)),
       Layer.provideMerge(
@@ -681,6 +741,7 @@ describe("ProviderCommandReactor", () => {
       tryHandlePromptCommand,
       startSession,
       sendTurn,
+      sendTurnWithInvocationBoundary,
       compactThread,
       interruptTurn,
       respondToRequest,
@@ -1470,6 +1531,100 @@ describe("ProviderCommandReactor", () => {
 
       yield* Deferred.succeed(releaseStart, undefined);
       yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 1));
+    }),
+  );
+
+  effectIt.effect("releases manual admission when interrupted before provider invocation", () =>
+    Effect.gen(function* () {
+      const reachedBoundary = yield* Deferred.make<void>();
+      const released = yield* Deferred.make<void>();
+      const release = vi.fn(() => Deferred.succeed(released, undefined));
+      const coordinator: ProviderResourceCoordinatorShape = {
+        acquire: () => Effect.succeed(manualPermit),
+        enter: () => Effect.void,
+        release,
+        observeRuntimeEvent: () => Effect.void,
+        reconcile: () => Effect.void,
+      };
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          providerResourceCoordinator: coordinator,
+          sendTurnWithInvocationBoundaryEffect: () =>
+            Deferred.succeed(reachedBoundary, undefined).pipe(Effect.andThen(Effect.never)),
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-manual-before-invoke"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("message-manual-before-invoke"),
+          role: "user",
+          text: "wait before invoke",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      });
+      yield* Deferred.await(reachedBoundary);
+      yield* harness.engine.dispatch({
+        type: "thread.turn.interrupt",
+        commandId: CommandId.make("cmd-interrupt-manual-before-invoke"),
+        threadId: ThreadId.make("thread-1"),
+        createdAt: now,
+      });
+      yield* Deferred.await(released);
+      assert.equal(release.mock.calls.length, 1);
+    }),
+  );
+
+  effectIt.effect("retains manual admission when interrupted after provider invocation", () =>
+    Effect.gen(function* () {
+      const invocationStarted = yield* Deferred.make<void>();
+      const release = vi.fn(() => Effect.void);
+      const coordinator: ProviderResourceCoordinatorShape = {
+        acquire: () => Effect.succeed(manualPermit),
+        enter: () => Effect.void,
+        release,
+        observeRuntimeEvent: () => Effect.void,
+        reconcile: () => Effect.void,
+      };
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          providerResourceCoordinator: coordinator,
+          sendTurnWithInvocationBoundaryEffect: (boundary) =>
+            Effect.sync(() => boundary.onInvocationStarted()).pipe(
+              Effect.andThen(Deferred.succeed(invocationStarted, undefined)),
+              Effect.andThen(Effect.never),
+            ),
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-manual-after-invoke"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("message-manual-after-invoke"),
+          role: "user",
+          text: "wait after invoke",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      });
+      yield* Deferred.await(invocationStarted);
+      yield* harness.engine.dispatch({
+        type: "thread.turn.interrupt",
+        commandId: CommandId.make("cmd-interrupt-manual-after-invoke"),
+        threadId: ThreadId.make("thread-1"),
+        createdAt: now,
+      });
+      yield* Effect.promise(() => harness.drain());
+      assert.equal(release.mock.calls.length, 0);
     }),
   );
 

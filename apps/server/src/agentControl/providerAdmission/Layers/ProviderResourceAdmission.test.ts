@@ -156,6 +156,15 @@ it.effect("cancellation is terminal and an entered lease is never reclaimed by t
       enteredAt: "2026-09-16T10:00:01.000Z",
       providerTurnId: "provider-turn-one",
     });
+    const enteredReplay = yield* admit(store, request("one", "interactive"), "owner-a");
+    assert.equal(enteredReplay.decision._tag, "Waiting");
+    if (enteredReplay.decision._tag === "Waiting")
+      assert.equal(enteredReplay.decision.reason, "provider-recovery");
+    assert.equal(
+      (yield* admit(store, request("one", "interactive"), "new-owner", "2026-09-16T10:03:00.000Z"))
+        .decision._tag,
+      "Waiting",
+    );
     yield* admit(
       store,
       request("after-expiry", "interactive"),

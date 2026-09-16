@@ -600,6 +600,24 @@ export const make = Effect.fn("resourceAdmission.make")(function* (options: {
           };
         }
         if (
+          existing.state === "admitted" &&
+          existing.activity !== "possible" &&
+          existing.ownerId === request.ownerId &&
+          existing.ownerFenceToken === request.ownerFenceToken
+        ) {
+          return {
+            state,
+            value: {
+              result: {
+                _tag: "Waiting",
+                requestId: request.requestId,
+                reason: "recovery-capacity",
+              },
+              newlyAdmitted: [],
+            } satisfies PendingUpdate<ResourceAdmissionDecision>,
+          };
+        }
+        if (
           existing.ownerId !== request.ownerId ||
           existing.ownerFenceToken !== request.ownerFenceToken
         ) {
@@ -612,6 +630,21 @@ export const make = Effect.fn("resourceAdmission.make")(function* (options: {
                   requestId: request.requestId,
                   reason: "ownership-conflict",
                   message: "A current or newer owner already controls this resource request.",
+                },
+                newlyAdmitted: [],
+              } satisfies PendingUpdate<ResourceAdmissionDecision>,
+            };
+          }
+          if (existing.state === "admitted" && existing.activity !== "possible") {
+            return {
+              state,
+              value: {
+                result: {
+                  _tag: "Rejected",
+                  requestId: request.requestId,
+                  reason: "ownership-conflict",
+                  message:
+                    "An active or uncertain execution can only be taken over through explicit reconciliation.",
                 },
                 newlyAdmitted: [],
               } satisfies PendingUpdate<ResourceAdmissionDecision>,

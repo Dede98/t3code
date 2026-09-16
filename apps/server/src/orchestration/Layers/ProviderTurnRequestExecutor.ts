@@ -1049,22 +1049,28 @@ const make = Effect.gen(function* () {
                       yield* runOnceNotifications.value.publish(providerAdmissionPermit.handoffId);
                     }
                   }).pipe(Effect.ignore);
-                const permit = yield* resourceCoordinator
-                  .acquire({
-                    idempotencyKey: `automatic:${providerAdmissionPermit.providerDeliveryId}`,
-                    providerInstanceId: attestation.providerInstanceId,
-                    continuationKey: String(instanceInfo.driverKind),
-                    threadId: String(prepared.input.threadId),
-                    requestedAt: prepared.sessionEvidenceRecordedAt ?? attestation.sessionCreatedAt,
-                    workloadClass: "background",
-                    source: "automatic",
-                    stage: providerAdmissionPermit.stage,
-                    handoffId: providerAdmissionPermit.handoffId,
-                    onWait: publishAdmissionWait,
-                  })
-                  .pipe(Effect.ensuring(publishAdmissionWait(undefined)));
-                yield* resourceCoordinator.enter(permit);
-                return permit;
+                return yield* Effect.uninterruptibleMask((restore) =>
+                  Effect.flatMap(
+                    restore(
+                      resourceCoordinator
+                        .acquire({
+                          idempotencyKey: `automatic:${providerAdmissionPermit.providerDeliveryId}`,
+                          providerInstanceId: attestation.providerInstanceId,
+                          continuationKey: String(instanceInfo.driverKind),
+                          threadId: String(prepared.input.threadId),
+                          requestedAt:
+                            prepared.sessionEvidenceRecordedAt ?? attestation.sessionCreatedAt,
+                          workloadClass: "background",
+                          source: "automatic",
+                          stage: providerAdmissionPermit.stage,
+                          handoffId: providerAdmissionPermit.handoffId,
+                          onWait: publishAdmissionWait,
+                        })
+                        .pipe(Effect.ensuring(publishAdmissionWait(undefined))),
+                    ),
+                    (permit) => resourceCoordinator.enter(permit).pipe(Effect.as(permit)),
+                  ),
+                );
               }).pipe(
                 Effect.mapError(
                   (cause) => new ProviderTurnDeliveryError({ certainty: "not-attempted", cause }),

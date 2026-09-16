@@ -437,9 +437,9 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
           {serverConfig ? (
             <View className="gap-1">
               <Text className="text-xs text-foreground-muted">
-                Host limits: {serverConfig.settings.resourceAdmission.providerMaxConcurrent}{" "}
-                provider turns ({serverConfig.settings.resourceAdmission.interactiveReserve}{" "}
-                interactive reserved) ·{" "}
+                This environment contributes:{" "}
+                {serverConfig.settings.resourceAdmission.providerMaxConcurrent} provider turns (
+                {serverConfig.settings.resourceAdmission.interactiveReserve} interactive reserved) ·{" "}
                 {serverConfig.settings.resourceAdmission.localCheckMaxConcurrent} local checks ·{" "}
                 {serverConfig.settings.resourceAdmission.gpuMaxConcurrent} GPU jobs
               </Text>
@@ -460,9 +460,10 @@ function AutonomousTasksProjectScreen({ environmentId, projectId }: AutonomousTa
                 "defer-background"
                   ? "background waits"
                   : "background may start"}
-                . These are this server host&apos;s admission settings. CPU/RAM readings delay new
-                starts; they are not OS quotas, and shell child processes started by an agent are
-                not independently capped.{" "}
+                . These values contribute to the shared server-host budget; effective capacity can
+                be lower when another local environment contributes stricter values. CPU/RAM
+                readings delay new starts; they are not OS quotas, and shell child processes started
+                by an agent are not independently capped.{" "}
                 {Object.keys(serverConfig.settings.resourceAdmission.providerAccountScopes).length}{" "}
                 explicit provider account scope overrides are configured.
               </Text>

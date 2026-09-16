@@ -148,6 +148,7 @@ const requiredProviderMethod = <K extends keyof ProviderAdmissionRuntimeShape>(
 };
 
 let lastCoordinatorOwnerFenceToken = 0;
+const MAX_RUNTIME_TOMBSTONES = 4_096;
 
 function nextCoordinatorOwnerFenceToken(nowMs: number): number {
   // Wall-clock ordering makes a replacement process newer in the normal case;
@@ -165,6 +166,8 @@ const make = Effect.gen(function* () {
   const pendingByThread = new Map<string, Map<string, CoordinatedProviderPermit>>();
   const activeByTurn = new Map<string, CoordinatedProviderPermit>();
   const earlyTerminals = new Set<string>();
+  const boundTurnByRequest = new Map<string, string>();
+  const terminalTurnByRequest = new Map<string, string>();
   const hostOwnerFenceToken = nextCoordinatorOwnerFenceToken(yield* Clock.currentTimeMillis);
   const hostOwnerId = `provider-coordinator:${process.pid}:${hostOwnerFenceToken}`;
 
@@ -177,6 +180,20 @@ const make = Effect.gen(function* () {
   ).pipe(Effect.forkIn(coordinatorScope, { startImmediately: true }));
   const turnKey = (instanceId: ProviderInstanceId, threadId: string, turnId: string) =>
     `${instanceId}:${threadId}:${turnId}`;
+  const rememberBounded = <K, V>(map: Map<K, V>, key: K, value: V) => {
+    map.delete(key);
+    map.set(key, value);
+    if (map.size <= MAX_RUNTIME_TOMBSTONES) return;
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  };
+  const rememberEarlyTerminal = (key: string) => {
+    earlyTerminals.delete(key);
+    earlyTerminals.add(key);
+    if (earlyTerminals.size <= MAX_RUNTIME_TOMBSTONES) return;
+    const oldest = earlyTerminals.values().next().value;
+    if (oldest !== undefined) earlyTerminals.delete(oldest);
+  };
   const removePermit = (permit: CoordinatedProviderPermit) => {
     const pending = pendingByThread.get(permit.provider.threadId);
     pending?.delete(permit.provider.requestId);
@@ -184,6 +201,7 @@ const make = Effect.gen(function* () {
     for (const [key, active] of activeByTurn) {
       if (active.provider.requestId === permit.provider.requestId) activeByTurn.delete(key);
     }
+    boundTurnByRequest.delete(permit.provider.requestId);
   };
   const hostRequestFor = (
     request: Pick<
@@ -347,36 +365,52 @@ const make = Effect.gen(function* () {
   )(
     function* (permit, providerTurnId) {
       const enterResource = requiredProviderMethod(providerAdmission, "enterResource");
+      const key =
+        providerTurnId === undefined
+          ? undefined
+          : turnKey(permit.provider.providerInstanceId, permit.provider.threadId, providerTurnId);
+      if (key !== undefined && terminalTurnByRequest.get(permit.provider.requestId) === key) return;
+      const existingBinding = boundTurnByRequest.get(permit.provider.requestId);
+      if (key !== undefined && existingBinding !== undefined) {
+        if (existingBinding === key) return;
+        return yield* new ProviderResourceCoordinatorError({
+          operation: "enter",
+          message: "The provider reservation is already bound to a different turn.",
+        });
+      }
       // These authorities cannot share a transaction. Mark the host side
       // first so a crash can only fail closed by retaining capacity; startup
       // reconciliation adopts a host reservation for every entered provider
       // row to close the inverse half-written state from older versions.
-      yield* hostAdmission
-        .observeActivity(permit.host, "active")
-        .pipe(Effect.asVoid, Effect.andThen(enterResource(permit.provider, providerTurnId)))
-        .pipe(
-          Effect.catchCause((cause) =>
-            (providerTurnId === undefined
-              ? releasePermit(permit).pipe(Effect.ignore)
-              : Effect.void
-            ).pipe(Effect.andThen(Effect.failCause(cause))),
-          ),
-        );
+      yield* Effect.gen(function* () {
+        const hostActivation = yield* hostAdmission.observeActivity(permit.host, "active");
+        if (!hostActivation.result)
+          return yield* new ProviderResourceCoordinatorError({
+            operation: "enter-host",
+            message: "Host resource authority was lost before provider start.",
+          });
+        yield* enterResource(permit.provider, providerTurnId);
+      }).pipe(
+        Effect.catchCause((cause) =>
+          (providerTurnId === undefined
+            ? releasePermit(permit).pipe(Effect.ignore)
+            : Effect.void
+          ).pipe(Effect.andThen(Effect.failCause(cause))),
+        ),
+      );
       if (providerTurnId === undefined) {
         const pending = pendingByThread.get(permit.provider.threadId) ?? new Map();
         pending.set(permit.provider.requestId, permit);
         pendingByThread.set(permit.provider.threadId, pending);
         return;
       }
-      const key = turnKey(
-        permit.provider.providerInstanceId,
-        permit.provider.threadId,
-        providerTurnId,
-      );
+      if (key === undefined) return;
       pendingByThread.get(permit.provider.threadId)?.delete(permit.provider.requestId);
+      boundTurnByRequest.set(permit.provider.requestId, key);
       activeByTurn.set(key, permit);
       if (earlyTerminals.delete(key)) {
         yield* releasePermit(permit);
+        rememberBounded(terminalTurnByRequest, permit.provider.requestId, key);
       }
     },
     Effect.mapError(
@@ -393,7 +427,9 @@ const make = Effect.gen(function* () {
     "ProviderResourceCoordinator.release",
   )(
     function* (permit) {
+      const key = boundTurnByRequest.get(permit.provider.requestId);
       yield* releasePermit(permit);
+      if (key !== undefined) rememberBounded(terminalTurnByRequest, permit.provider.requestId, key);
     },
     Effect.mapError(
       (cause) =>
@@ -425,10 +461,13 @@ const make = Effect.gen(function* () {
     pendingByThread.set(providerPermit.threadId, pending);
     if (row.providerTurnId !== null) {
       pending.delete(providerPermit.requestId);
-      activeByTurn.set(
-        turnKey(providerPermit.providerInstanceId, providerPermit.threadId, row.providerTurnId),
-        permit,
+      const key = turnKey(
+        providerPermit.providerInstanceId,
+        providerPermit.threadId,
+        row.providerTurnId,
       );
+      boundTurnByRequest.set(providerPermit.requestId, key);
+      activeByTurn.set(key, permit);
     }
     return permit;
   });
@@ -491,7 +530,7 @@ const make = Effect.gen(function* () {
           // timestamps are receipt times, so a delayed terminal from an old
           // turn could otherwise free a newer turn. Keep it as an early
           // terminal; a later fenced turn.started binding will consume it.
-          earlyTerminals.add(key);
+          rememberEarlyTerminal(key);
           return;
         }
         yield* release(permit);

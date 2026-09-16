@@ -332,6 +332,48 @@ it.effect("fences takeover so late old-owner feedback cannot release the reserva
   }),
 );
 
+it.effect("requires explicit reconciliation to take over active or orphaned work", () =>
+  Effect.gen(function* () {
+    const settings = {
+      ...defaultResourceAdmissionSettings,
+      providerMaxConcurrent: 1,
+      interactiveReserve: 0,
+    };
+    const { ledger, pressure, service } = yield* makeHarness({ settings });
+    const originalRequest = request("active-takeover", {
+      ownerId: "provider-coordinator:2147483647:old",
+      ownerFenceToken: 2,
+    });
+    const original = yield* admitted(service, originalRequest);
+    yield* service.observeActivity(original.authority, "active");
+    const activeReplay = yield* service.request(originalRequest);
+    assert.equal(activeReplay.result._tag, "Waiting");
+    if (activeReplay.result._tag === "Waiting")
+      assert.equal(activeReplay.result.reason, "recovery-capacity");
+    const newerRequest = {
+      ...originalRequest,
+      ownerId: `provider-coordinator:${process.pid}:new`,
+      ownerFenceToken: 3,
+    };
+    const activeTakeover = yield* service.request(newerRequest);
+    assert.equal(activeTakeover.result._tag, "Rejected");
+    if (activeTakeover.result._tag === "Rejected")
+      assert.equal(activeTakeover.result.reason, "ownership-conflict");
+
+    const restarted = yield* make({ ledger, settings }).pipe(
+      Effect.provideService(ResourcePressure, pressure),
+    );
+    assert.equal(
+      (yield* restarted.snapshot).entries.find((entry) => entry.requestId === "active-takeover")
+        ?.activity,
+      "orphaned-active",
+    );
+    const orphanedTakeover = yield* restarted.request(newerRequest);
+    assert.equal(orphanedTakeover.result._tag, "Rejected");
+    assert.isNotNull(yield* restarted.adoptActive(newerRequest));
+  }),
+);
+
 it.effect("does not free possible activity merely because time passes", () =>
   Effect.gen(function* () {
     const { service } = yield* makeHarness({

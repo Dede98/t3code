@@ -340,6 +340,193 @@ it.effect("holds production verification execution behind local resource admissi
   ),
 );
 
+it.effect("gives concurrent duplicate checks distinct owners without releasing the winner", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      const executing = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const winnerAcquiring = yield* Deferred.make<void>();
+      const allowWinnerAdmission = yield* Deferred.make<void>();
+      const ownerIds: string[] = [];
+      const activities: string[] = [];
+      let winningOwner: string | undefined;
+      const decision = (input: {
+        readonly requestId: string;
+        readonly ownerId: string;
+        readonly ownerFenceToken: number;
+      }) => {
+        ownerIds.push(input.ownerId);
+        winningOwner ??= input.ownerId;
+        if (input.ownerId !== winningOwner)
+          return {
+            _tag: "Rejected",
+            requestId: input.requestId,
+            reason: "ownership-conflict",
+            message: "another owner won",
+          } as const;
+        return {
+          _tag: "Admitted",
+          authority: {
+            reservationId: input.requestId,
+            ownerId: input.ownerId,
+            ownerFenceToken: input.ownerFenceToken,
+            reservationFenceToken: 9,
+          },
+          accounted: true,
+        } as const;
+      };
+      const resource = ResourceAdmission.of({
+        request: (input) =>
+          Effect.succeed({
+            result: decision(input),
+            newlyAdmitted: [],
+            ledgerRevision: 1,
+            pressureSampledAtMs: 1,
+          }),
+        acquire: (input) => {
+          const result = decision(input);
+          return result._tag === "Admitted"
+            ? Deferred.succeed(winnerAcquiring, undefined).pipe(
+                Effect.andThen(Deferred.await(allowWinnerAdmission)),
+                Effect.as(result),
+              )
+            : Effect.succeed(result);
+        },
+        adoptActive: () => Effect.die("unused"),
+        cancelWaiting: () => Effect.die("unused"),
+        release: () => Effect.die("unused"),
+        defer: () => Effect.die("unused"),
+        observeActivity: (_authority, activity) =>
+          Effect.sync(() => {
+            activities.push(activity);
+            return {
+              result: true,
+              newlyAdmitted: [],
+              ledgerRevision: 2,
+              pressureSampledAtMs: 1,
+            };
+          }),
+        refresh: Effect.succeed([]),
+        snapshot: Effect.die("unused"),
+      });
+      const layer = Layer.merge(
+        NodeSqliteClient.layer({ filename: repo.database }),
+        Layer.succeed(ResourceAdmission, resource),
+      );
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const sql = yield* SqlClient.SqlClient;
+        const manifest = yield* prepareVerificationCheckManifest(sql, {
+          permit: permit(),
+          cwd: repo.cwd,
+          checks,
+        });
+        let executions = 0;
+        const first = yield* executeVerificationCheck(sql, {
+          manifest,
+          checkId: "scoped-test",
+          providerTurnId: "turn-1",
+          authorize: Effect.void,
+          execute: Effect.gen(function* () {
+            executions += 1;
+            yield* Deferred.succeed(executing, undefined);
+            yield* Deferred.await(finish);
+            return success;
+          }),
+        }).pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(winnerAcquiring);
+        const duplicate = yield* executeVerificationCheck(sql, {
+          manifest,
+          checkId: "scoped-test",
+          providerTurnId: "turn-1",
+          authorize: Effect.void,
+          execute: Effect.sync(() => {
+            executions += 1;
+            return success;
+          }),
+        });
+        assert.equal(duplicate.exitCode, 125);
+        assert.deepStrictEqual(
+          yield* sql`SELECT count(*) AS count FROM agent_control_verification_check_starts`,
+          [{ count: 0 }],
+        );
+        yield* Deferred.succeed(allowWinnerAdmission, undefined);
+        yield* Deferred.await(executing);
+        assert.equal(executions, 1);
+        assert.deepStrictEqual(activities, ["active"]);
+        assert.isAbove(new Set(ownerIds).size, 1);
+        yield* Deferred.succeed(finish, undefined);
+        assert.equal((yield* Fiber.join(first)).exitCode, 0);
+        assert.deepStrictEqual(activities, ["active", "inactive"]);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect("does not execute after losing the local activation fence", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      const authority: ResourceReservationAuthority = {
+        reservationId: "verification:verification-1:scoped-test",
+        ownerId: "local-process:test",
+        ownerFenceToken: 3,
+        reservationFenceToken: 9,
+      };
+      const resource = ResourceAdmission.of({
+        request: () =>
+          Effect.succeed({
+            result: { _tag: "Admitted", authority, accounted: true } as const,
+            newlyAdmitted: [],
+            ledgerRevision: 1,
+            pressureSampledAtMs: 1,
+          }),
+        acquire: () => Effect.succeed({ _tag: "Admitted", authority, accounted: true } as const),
+        adoptActive: () => Effect.die("unused"),
+        cancelWaiting: () => Effect.die("unused"),
+        release: () => Effect.die("unused"),
+        defer: () => Effect.die("unused"),
+        observeActivity: () =>
+          Effect.succeed({
+            result: false,
+            newlyAdmitted: [],
+            ledgerRevision: 2,
+            pressureSampledAtMs: 1,
+          }),
+        refresh: Effect.succeed([]),
+        snapshot: Effect.die("unused"),
+      });
+      const layer = Layer.merge(
+        NodeSqliteClient.layer({ filename: repo.database }),
+        Layer.succeed(ResourceAdmission, resource),
+      );
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const sql = yield* SqlClient.SqlClient;
+        const manifest = yield* prepareVerificationCheckManifest(sql, {
+          permit: permit(),
+          cwd: repo.cwd,
+          checks,
+        });
+        let executions = 0;
+        const result = yield* executeVerificationCheck(sql, {
+          manifest,
+          checkId: "scoped-test",
+          providerTurnId: "turn-1",
+          authorize: Effect.void,
+          execute: Effect.sync(() => {
+            executions += 1;
+            return success;
+          }),
+        });
+        assert.equal(result.exitCode, 125);
+        assert.equal(executions, 0);
+      }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
 it.effect("releases local capacity when check-start persistence fails before execution", () =>
   Effect.scoped(
     Effect.gen(function* () {

@@ -1049,6 +1049,20 @@ const make = Effect.gen(function* () {
               wakeups: yield* resourceWakeups(input.request.accountScope),
               capacityChanged: false,
             };
+          } else if (existing.status === "entered") {
+            // A normal request replay is not runtime evidence. Once the
+            // provider boundary may have been crossed, only explicit startup
+            // reconciliation may adopt this reservation under a new fence.
+            return {
+              decision: {
+                _tag: "Waiting",
+                requestId,
+                reason: "provider-recovery",
+                retryAt: null,
+              } as const,
+              wakeups: [],
+              capacityChanged: false,
+            };
           } else if (
             existing.status === "admitted" &&
             existing.ownerId !== input.ownerId &&

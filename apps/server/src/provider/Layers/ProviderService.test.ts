@@ -2355,8 +2355,14 @@ declaredCompaction.layer("ProviderService declared compaction", (it) => {
         Effect.forkChild({ startImmediately: true }),
       );
       yield* advanceTestClock(50);
-      yield* provider.compactThread(threadId, undefined, requestId);
+      let invocationStarted = false;
+      yield* provider.compactThread(threadId, undefined, requestId, {
+        onInvocationStarted: () => {
+          invocationStarted = true;
+        },
+      });
       const compacted = Option.getOrThrow(yield* Fiber.join(compactedEventFiber));
+      assert.isTrue(invocationStarted);
       assert.equal(compacted.requestId, String(requestId));
       assert.equal(customNativeCompaction.compactThread.mock.calls.length, 1);
       assert.equal(customNativeCompaction.sendTurn.mock.calls.length, 0);
@@ -2382,8 +2388,13 @@ declaredCompaction.layer("ProviderService declared compaction", (it) => {
         Stream.runHead,
         Effect.forkChild({ startImmediately: true }),
       );
+      let invocationStarted = false;
       const compactFiber = yield* provider
-        .compactThread(threadId, modelSelection, requestId)
+        .compactThread(threadId, modelSelection, requestId, {
+          onInvocationStarted: () => {
+            invocationStarted = true;
+          },
+        })
         .pipe(Effect.forkChild);
       yield* advanceTestClock(50);
       customSlashCompaction.emit({
@@ -2396,6 +2407,7 @@ declaredCompaction.layer("ProviderService declared compaction", (it) => {
         payload: { state: "completed" },
       });
       yield* Fiber.join(compactFiber);
+      assert.isTrue(invocationStarted);
       const compacted = Option.getOrThrow(yield* Fiber.join(compactedEventFiber));
       assert.equal(compacted.requestId, String(requestId));
       assert.equal(customSlashCompaction.compactThread.mock.calls.length, 0);
@@ -3095,6 +3107,60 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("reports the exact manual adapter invocation boundary under interruption", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-manual-invocation-boundary");
+      const modelSelection = createModelSelection(codexInstanceId, "gpt-5.4");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("manual-invocation-boundary"),
+        modelSelection,
+        runtimeMode: "approval-required",
+      });
+      const adapterInvoked = yield* Deferred.make<void>();
+      const releaseAdapter = yield* Deferred.make<void>();
+      const callsBefore = routing.codex.sendTurn.mock.calls.length;
+      routing.codex.sendTurn.mockImplementationOnce((input) =>
+        Deferred.succeed(adapterInvoked, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseAdapter)),
+          Effect.as({ threadId: input.threadId, turnId: asTurnId("turn-manual-boundary") }),
+        ),
+      );
+      let firstInvocationStarted = false;
+      const first = yield* provider.sendTurnWithInvocationBoundary!(
+        { threadId, input: "first", modelSelection },
+        {
+          onInvocationStarted: () => {
+            firstInvocationStarted = true;
+          },
+        },
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(adapterInvoked);
+      yield* Effect.yieldNow;
+      assert.isTrue(firstInvocationStarted);
+
+      let queuedInvocationStarted = false;
+      const queued = yield* provider.sendTurnWithInvocationBoundary!(
+        { threadId, input: "queued", modelSelection },
+        {
+          onInvocationStarted: () => {
+            queuedInvocationStarted = true;
+          },
+        },
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(queued);
+      assert.isFalse(queuedInvocationStarted);
+      assert.equal(routing.codex.sendTurn.mock.calls.length, callsBefore + 1);
+
+      yield* Fiber.interrupt(first);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
   it.effect("admits turn options that are configured at turn start rather than session start", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

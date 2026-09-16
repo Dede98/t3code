@@ -43,6 +43,7 @@ const decodePolicyJson = Schema.decodeUnknownEffect(
 
 const exec = NodeUtil.promisify(NodeChildProcess.execFile);
 const now = Effect.map(DateTime.now, DateTime.formatIso);
+let nextLocalCheckOwnerSequence = 1;
 export class VerificationCheckError extends Schema.TaggedError<VerificationCheckError>()(
   "VerificationCheckError",
   { cause: Schema.Unknown },
@@ -361,7 +362,7 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
             requestId: `verification:${manifest.providerDeliveryId}:${input.checkId}`,
             kind: "localCheck" as const,
             priority: "background" as const,
-            ownerId: `local-process:${process.pid}:${manifest.handoffId}`,
+            ownerId: `local-process:${process.pid}:${manifest.handoffId}:${nextLocalCheckOwnerSequence++}`,
             ownerFenceToken: manifest.fenceToken,
             executionKey: `verification:${manifest.providerDeliveryId}:${input.checkId}:${input.providerTurnId}`,
             gpuRequired: "gpuRequired" in check && check.gpuRequired === true,
@@ -402,32 +403,39 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
   // managed command may cross its process boundary. The restored wait remains
   // interruptible, while grant-to-start persistence is an atomic bracket. A DB
   // failure before the start record releases the provisional local authority.
-  const { admission, inserted } = yield* Effect.uninterruptibleMask((restore) =>
+  const claim = yield* Effect.uninterruptibleMask((restore) =>
     restore(acquireAdmission).pipe(
       Effect.flatMap((admission) =>
-        now.pipe(
-          Effect.flatMap(
-            (startedAt) => sql`INSERT INTO agent_control_verification_check_starts
+        admission?._tag === "Rejected" && admission.reason === "ownership-conflict"
+          ? Effect.succeed({ _tag: "ownership-conflict" } as const)
+          : now.pipe(
+              Effect.flatMap(
+                (startedAt) => sql`INSERT INTO agent_control_verification_check_starts
               (provider_delivery_id,check_id,provider_turn_id,manifest_digest,started_at)
               VALUES (${manifest.providerDeliveryId},${input.checkId},${input.providerTurnId},${manifest.manifestDigest},${startedAt})
               ON CONFLICT(provider_delivery_id,check_id) DO NOTHING RETURNING check_id`,
-          ),
-          Effect.flatMap((inserted) =>
-            !inserted.length && admission?._tag === "Admitted" && localAdmission !== null
-              ? localAdmission
-                  .observeActivity(admission.authority, "inactive")
-                  .pipe(Effect.ignore, Effect.as({ admission, inserted }))
-              : Effect.succeed({ admission, inserted }),
-          ),
-          Effect.onError(() =>
-            admission?._tag === "Admitted" && localAdmission !== null
-              ? localAdmission.observeActivity(admission.authority, "inactive").pipe(Effect.ignore)
-              : Effect.void,
-          ),
-        ),
+              ),
+              Effect.map((inserted) => ({ _tag: "claimed" as const, admission, inserted })),
+              Effect.onError(() =>
+                admission?._tag === "Admitted" && localAdmission !== null
+                  ? localAdmission
+                      .observeActivity(admission.authority, "inactive")
+                      .pipe(Effect.ignore)
+                  : Effect.void,
+              ),
+            ),
       ),
     ),
   );
+  // A competing invocation can observe the stable request while its admitted
+  // owner has not persisted the execution claim yet. The fenced loser must
+  // never race that owner for the durable start row.
+  if (claim._tag === "ownership-conflict") {
+    return unavailableResult(
+      "Verification check execution is incomplete; automatic duplicate execution is forbidden.",
+    );
+  }
+  const { admission, inserted } = claim;
   if (!inserted.length) {
     return unavailableResult(
       "Verification check execution is incomplete; automatic duplicate execution is forbidden.",
@@ -453,7 +461,14 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
           : yield* Effect.gen(function* () {
               if (localAdmission === null)
                 return yield* Effect.die("admitted local resource without admission service");
-              yield* localAdmission.observeActivity(admission.authority, "active");
+              const activation = yield* localAdmission.observeActivity(
+                admission.authority,
+                "active",
+              );
+              if (!activation.result)
+                return unavailableResult(
+                  "Verification check lost local resource authority before process start.",
+                );
               return yield* execute.pipe(
                 Effect.ensuring(
                   localAdmission
