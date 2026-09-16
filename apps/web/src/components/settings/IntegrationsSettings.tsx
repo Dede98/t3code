@@ -118,6 +118,7 @@ import {
 import { searchableSetting } from "./settingsSearch";
 import { ProjectDefaultsSettings } from "./ProjectDefaultsSettings";
 import { useSettingsScope } from "./SettingsScopeContext";
+import { settingsScopeEnvironmentLabel } from "./settingsScopeAxis";
 import { BrowserImportWizard, type WizardTarget } from "./BrowserImportWizard";
 import type { ImportOutcome } from "./browserImportWizard.logic";
 
@@ -783,14 +784,29 @@ function BrowserAutoShowFloatingPreviewSetting({ disabled }: { readonly disabled
 }
 
 function ExternalMcpServersSettings() {
-  const { scope, connectedEnvironments } = useSettingsScope();
+  const { scope, connectedEnvironments, selectScope } = useSettingsScope();
   const environment = connectedEnvironments.length === 1 ? connectedEnvironments[0] : undefined;
   if (!environment || scope.kind === "project" || scope.kind === "checkout") {
     return (
       <SettingsSection id="external-mcp-servers" title="External MCP servers">
         <p className="px-3 text-sm text-muted-foreground sm:px-4">
-          Select one connected environment to configure its MCP servers.
+          {connectedEnvironments.length === 0
+            ? "Connect to an environment to configure its MCP servers."
+            : "Select an environment to configure its MCP servers. These settings apply to all projects on that environment."}
         </p>
+        <div className="flex flex-wrap gap-2 px-3 sm:px-4">
+          {connectedEnvironments.map((candidate) => (
+            <Button
+              key={candidate.environmentId}
+              size="sm-multiline"
+              variant="outline"
+              className="max-w-full break-all text-left"
+              onClick={() => selectScope({ machine: candidate.environmentId })}
+            >
+              {settingsScopeEnvironmentLabel(candidate, connectedEnvironments)}
+            </Button>
+          ))}
+        </div>
       </SettingsSection>
     );
   }
