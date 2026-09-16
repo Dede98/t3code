@@ -1,7 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off - exercises the real host filesystem coordinator.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -73,6 +75,166 @@ it.effect("serializes transactions from independent environment ledgers without 
       const state = yield* first.read;
       assert.equal(state.nextSequence, 21);
       assert.equal(state.revision, 20);
+    }),
+  ),
+);
+
+it.effect("releases the machine mutex when its native owner disappears mid-transaction", () =>
+  withTemporaryDirectory((directory) =>
+    Effect.gen(function* () {
+      const path = NodePath.join(directory, "host-budget.json");
+      const owner = new NodeSqlite.DatabaseSync(`${path}.mutex.sqlite`);
+      owner.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE");
+      const transaction = yield* makeFileHostBudgetLedger(path)
+        .transact((state) => ({
+          state: { ...state, nextSequence: state.nextSequence + 1 },
+          value: undefined,
+        }))
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.isUndefined(transaction.pollUnsafe());
+
+      // Closing a native handle with an open transaction models process loss:
+      // SQLite rolls it back and releases the OS lock without PID-file repair.
+      owner.close();
+      assert.equal((yield* Fiber.join(transaction)).revision, 1);
+    }),
+  ),
+);
+
+it.effect("releases the machine mutex after the owning process crashes", () =>
+  withTemporaryDirectory((directory) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() =>
+        NodeChildProcess.spawn(
+          process.execPath,
+          [
+            "--no-warnings",
+            "-e",
+            [
+              'const { DatabaseSync } = require("node:sqlite")',
+              "const database = new DatabaseSync(process.argv[1])",
+              'database.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE")',
+              "globalThis.__database = database",
+              'process.stdout.write("locked\\n")',
+              "setInterval(() => undefined, 60_000)",
+            ].join(";"),
+            NodePath.join(directory, "host-budget.json.mutex.sqlite"),
+          ],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        ),
+      ),
+      (owner) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve, reject) => {
+                const onData = (chunk: Buffer) => {
+                  if (!chunk.toString().includes("locked")) return;
+                  owner.stdout.off("data", onData);
+                  owner.off("exit", onExit);
+                  resolve();
+                };
+                const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+                  owner.stdout.off("data", onData);
+                  reject(
+                    new Error(`SQLite lock owner exited before readiness (${code ?? signal}).`),
+                  );
+                };
+                owner.stdout.on("data", onData);
+                owner.once("exit", onExit);
+              }),
+          );
+          const path = NodePath.join(directory, "host-budget.json");
+          const transaction = yield* makeFileHostBudgetLedger(path)
+            .transact((state) => ({
+              state: { ...state, nextSequence: state.nextSequence + 1 },
+              value: undefined,
+            }))
+            .pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          assert.isUndefined(transaction.pollUnsafe());
+
+          const exited = new Promise<void>((resolve) => owner.once("exit", () => resolve()));
+          assert.isTrue(owner.kill("SIGKILL"));
+          yield* Effect.promise(() => exited);
+          assert.equal((yield* Fiber.join(transaction)).revision, 1);
+        }),
+      (owner) =>
+        Effect.sync(() => {
+          if (owner.exitCode === null && owner.signalCode === null) owner.kill("SIGKILL");
+        }),
+    ),
+  ),
+);
+
+it.effect("serializes two contenders queued at the lock-release boundary", () =>
+  withTemporaryDirectory((directory) =>
+    Effect.gen(function* () {
+      const path = NodePath.join(directory, "host-budget.json");
+      const owner = new NodeSqlite.DatabaseSync(`${path}.mutex.sqlite`);
+      owner.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE");
+      const ledgers = [makeFileHostBudgetLedger(path), makeFileHostBudgetLedger(path)];
+      const contenders = yield* Effect.forEach(ledgers, (ledger) =>
+        ledger
+          .transact((state) => ({
+            state: { ...state, nextSequence: state.nextSequence + 1 },
+            value: undefined,
+          }))
+          .pipe(Effect.forkChild),
+      );
+      yield* Effect.yieldNow;
+      assert.isTrue(contenders.every((fiber) => fiber.pollUnsafe() === undefined));
+
+      owner.exec("ROLLBACK");
+      owner.close();
+      const results = yield* Effect.forEach(contenders, Fiber.join);
+      assert.deepEqual(results.map((result) => result.revision).sort(), [1, 2]);
+      assert.equal((yield* ledgers[0]!.read).nextSequence, 3);
+    }),
+  ),
+);
+
+it.effect("does not run an interrupted mutex waiter after capacity is released", () =>
+  withTemporaryDirectory((directory) =>
+    Effect.gen(function* () {
+      const path = NodePath.join(directory, "host-budget.json");
+      const owner = new NodeSqlite.DatabaseSync(`${path}.mutex.sqlite`);
+      owner.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE");
+      const waiter = yield* makeFileHostBudgetLedger(path)
+        .transact((state) => ({
+          state: { ...state, nextSequence: state.nextSequence + 1 },
+          value: undefined,
+        }))
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(waiter);
+
+      owner.exec("ROLLBACK");
+      owner.close();
+      const state = yield* makeFileHostBudgetLedger(path).read;
+      assert.equal(state.nextSequence, 1);
+      assert.equal(state.revision, 0);
+    }),
+  ),
+);
+
+it.effect("keeps a repeated waiting request revision and ledger file unchanged", () =>
+  withTemporaryDirectory((directory) =>
+    Effect.gen(function* () {
+      const path = NodePath.join(directory, "host-budget.json");
+      const service = yield* makeService(path);
+      assert.equal((yield* service.request(request("active"))).result._tag, "Admitted");
+      const firstWaiting = yield* service.request(request("waiting"));
+      assert.equal(firstWaiting.result._tag, "Waiting");
+      const before = yield* Effect.promise(() => NodeFSP.readFile(path, "utf8"));
+
+      const retried = yield* service.request(request("waiting"));
+      const after = yield* Effect.promise(() => NodeFSP.readFile(path, "utf8"));
+
+      assert.equal(retried.result._tag, "Waiting");
+      assert.equal(retried.ledgerRevision, firstWaiting.ledgerRevision);
+      assert.equal(after, before);
     }),
   ),
 );

@@ -1,8 +1,11 @@
-// @effect-diagnostics nodeBuiltinImport:off - host-wide locking needs fs.watch, hard links, fsync, and PID liveness.
+// @effect-diagnostics nodeBuiltinImport:off - host-wide locking needs node:sqlite, fs.watch, and fsync.
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
+import * as NodeTimersPromises from "node:timers/promises";
+import * as NodeUtil from "node:util";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Schema from "effect/Schema";
@@ -51,158 +54,43 @@ function compactTerminalReservations(
   return { ...state, reservations };
 }
 
-interface ProcessPathLock {
-  readonly done: Promise<void>;
-  readonly release: () => void;
+function isSqliteBusy(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "errcode" in error && error.errcode === 5;
 }
 
-const processPathLocks = new Map<string, ProcessPathLock>();
-
-async function withProcessPathLock<A>(path: string, use: () => Promise<A>): Promise<A> {
-  const previous = processPathLocks.get(path);
-  let release: () => void = () => undefined;
-  const current: ProcessPathLock = {
-    done: new Promise<void>((resolve) => {
-      release = resolve;
-    }),
-    release: () => release(),
-  };
-  processPathLocks.set(path, current);
-  if (previous !== undefined) await previous.done;
-  try {
-    return await use();
-  } finally {
-    current.release();
-    if (processPathLocks.get(path) === current) processPathLocks.delete(path);
-  }
-}
-
-function processCanStillExist(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return true;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return !(
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      error.code === "ESRCH"
-    );
-  }
-}
-
-async function waitForLockChange(lockPath: string, signal: AbortSignal): Promise<void> {
-  const directory = NodePath.dirname(lockPath);
-  const basename = NodePath.basename(lockPath);
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    let watcher: NodeFS.FSWatcher | undefined;
-    const finish = (error?: unknown) => {
-      if (settled) return;
-      settled = true;
-      watcher?.close();
-      signal.removeEventListener("abort", onAbort);
-      if (error !== undefined) reject(error);
-      else resolve();
-    };
-    const onAbort = () => finish(signal.reason ?? new Error("Lock wait aborted"));
-    watcher = NodeFS.watch(directory, (_event, filename) => {
-      if (filename === null || filename.toString() === basename) finish();
-    });
-    watcher.once("error", finish);
-    signal.addEventListener("abort", onAbort, { once: true });
-    void NodeFSP.access(lockPath).catch(() => finish());
-  });
-}
-
-async function removeDeadOwnerLock(lockPath: string): Promise<boolean> {
-  let contents: string;
-  try {
-    contents = await NodeFSP.readFile(lockPath, "utf8");
-  } catch (error) {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
-      return true;
-    }
-    return false;
-  }
-  let owner: { readonly pid?: unknown };
-  try {
-    owner = JSON.parse(contents) as { readonly pid?: unknown };
-  } catch {
-    return false;
-  }
-  if (typeof owner.pid !== "number" || processCanStillExist(owner.pid)) return false;
-  const tombstone = `${lockPath}.dead-${NodeCrypto.randomUUID()}`;
-  try {
-    await NodeFSP.rename(lockPath, tombstone);
-    await NodeFSP.unlink(tombstone);
-    return true;
-  } catch (error) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      (error.code === "ENOENT" || error.code === "EEXIST")
-    ) {
-      return true;
-    }
-    return false;
-  }
-}
-
-async function acquireLock(lockPath: string, signal: AbortSignal): Promise<string> {
-  const token = NodeCrypto.randomUUID();
-  const candidatePath = `${lockPath}.candidate-${process.pid}-${token}`;
-  const candidate = await NodeFSP.open(candidatePath, "wx", 0o600);
-  try {
-    await candidate.writeFile(JSON.stringify({ pid: process.pid, token }), "utf8");
-    await candidate.sync();
-  } finally {
-    await candidate.close();
-  }
+async function beginImmediate(
+  database: NodeSqlite.DatabaseSync,
+  signal: AbortSignal,
+): Promise<void> {
   while (true) {
+    signal.throwIfAborted();
     try {
-      signal.throwIfAborted();
+      database.exec("BEGIN IMMEDIATE");
+      return;
     } catch (error) {
-      await NodeFSP.unlink(candidatePath).catch(() => undefined);
-      throw error;
-    }
-    try {
-      await NodeFSP.link(candidatePath, lockPath);
-      await NodeFSP.unlink(candidatePath);
-      return token;
-    } catch (error) {
-      if (
-        !(typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST")
-      ) {
-        await NodeFSP.unlink(candidatePath).catch(() => undefined);
-        throw error;
-      }
-      if (await removeDeadOwnerLock(lockPath)) continue;
-      try {
-        await waitForLockChange(lockPath, signal);
-      } catch (waitError) {
-        await NodeFSP.unlink(candidatePath).catch(() => undefined);
-        throw waitError;
-      }
+      if (!isSqliteBusy(error)) throw error;
+      // node:sqlite is synchronous. A zero busy timeout plus an abortable,
+      // bounded retry keeps cancellation responsive without blocking the
+      // server event loop inside SQLite.
+      await NodeTimersPromises.setTimeout(25, undefined, { signal });
     }
   }
 }
 
-async function releaseLock(lockPath: string, token: string): Promise<void> {
-  try {
-    const owner = JSON.parse(await NodeFSP.readFile(lockPath, "utf8")) as {
-      readonly token?: unknown;
-    };
-    if (owner.token !== token) return;
-    await NodeFSP.unlink(lockPath);
-  } catch (error) {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
-      return;
-    }
-    throw error;
-  }
+function samePersistedState(
+  previous: ResourceAdmissionLedgerState,
+  candidate: ResourceAdmissionLedgerState,
+): boolean {
+  return NodeUtil.isDeepStrictEqual(previous, {
+    ...candidate,
+    revision: previous.revision,
+    pressure: {
+      ...candidate.pressure,
+      // Sampling alone is not a capacity change. Persist the timestamp when a
+      // pressure gate changes, but do not turn every retry into a wakeup.
+      sampledAtMs: previous.pressure.sampledAtMs,
+    },
+  });
 }
 
 async function readLedgerFile(path: string): Promise<ResourceAdmissionLedgerState> {
@@ -267,7 +155,7 @@ async function writeLedgerFile(path: string, state: ResourceAdmissionLedgerState
  * host path. Slots are never inferred from a per-environment database.
  */
 export function makeFileHostBudgetLedger(path: string): HostBudgetLedger {
-  const lockPath = `${path}.lock`;
+  const mutexPath = `${path}.mutex.sqlite`;
 
   const run = <A>(
     operation: string,
@@ -275,15 +163,28 @@ export function makeFileHostBudgetLedger(path: string): HostBudgetLedger {
   ): Effect.Effect<A, HostBudgetLedgerError> =>
     Effect.tryPromise({
       try: async (signal) => {
-        return await withProcessPathLock(path, async () => {
-          await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true, mode: 0o700 });
-          const token = await acquireLock(lockPath, signal);
-          try {
-            return await use(await readLedgerFile(path));
-          } finally {
-            await releaseLock(lockPath, token);
+        await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true, mode: 0o700 });
+        const database = new NodeSqlite.DatabaseSync(mutexPath);
+        let transactionOpen = false;
+        try {
+          database.exec("PRAGMA busy_timeout = 0");
+          await beginImmediate(database, signal);
+          transactionOpen = true;
+          const result = await use(await readLedgerFile(path));
+          database.exec("COMMIT");
+          transactionOpen = false;
+          return result;
+        } finally {
+          if (transactionOpen) {
+            try {
+              database.exec("ROLLBACK");
+            } catch {
+              // Closing the native handle below releases the OS lock even if
+              // SQLite has already rolled the transaction back.
+            }
           }
-        });
+          database.close();
+        }
       },
       catch: (cause) => new HostBudgetLedgerError({ operation, cause }),
     });
@@ -292,10 +193,14 @@ export function makeFileHostBudgetLedger(path: string): HostBudgetLedger {
     transact: (update) =>
       run("transact", async (state) => {
         const result = update(state);
-        const nextState = compactTerminalReservations({
+        const candidate = compactTerminalReservations({
           ...result.state,
-          revision: state.revision + 1,
+          revision: state.revision,
         });
+        if (samePersistedState(state, candidate)) {
+          return { value: result.value, revision: state.revision };
+        }
+        const nextState = { ...candidate, revision: state.revision + 1 };
         await writeLedgerFile(path, nextState);
         return { value: result.value, revision: nextState.revision };
       }),
@@ -353,10 +258,14 @@ export const makeMemoryHostBudgetLedger = Effect.fn("makeMemoryHostBudgetLedger"
       mutex.withPermits(1)(
         Effect.gen(function* () {
           const result = update(state);
-          state = compactTerminalReservations({
+          const candidate = compactTerminalReservations({
             ...result.state,
-            revision: state.revision + 1,
+            revision: state.revision,
           });
+          if (samePersistedState(state, candidate)) {
+            return { value: result.value, revision: state.revision };
+          }
+          state = { ...candidate, revision: state.revision + 1 };
           const previous = changed;
           changed = Deferred.makeUnsafe<void>();
           yield* Deferred.succeed(previous, undefined);

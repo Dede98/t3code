@@ -672,21 +672,20 @@ export const make = Effect.fn("resourceAdmission.make")(function* (options: {
           };
         }
         let grants: ReadonlyArray<ResourceAdmissionGrant> = [];
-        if (
-          state.reservations[request.requestId]!.state === "waiting" &&
-          state.reservations[request.requestId]!.activity === "unknown"
-        ) {
-          state = {
-            ...state,
-            reservations: {
-              ...state.reservations,
-              [request.requestId]: {
-                ...state.reservations[request.requestId]!,
-                activity: "possible",
-                activityObservedAtMs: nowMs,
+        if (state.reservations[request.requestId]!.state === "waiting") {
+          if (state.reservations[request.requestId]!.activity === "unknown") {
+            state = {
+              ...state,
+              reservations: {
+                ...state.reservations,
+                [request.requestId]: {
+                  ...state.reservations[request.requestId]!,
+                  activity: "possible",
+                  activityObservedAtMs: nowMs,
+                },
               },
-            },
-          };
+            };
+          }
           const scheduled = schedule({ state, sample, settings, nowMs });
           state = scheduled.state;
           grants = scheduled.grants;
@@ -1106,9 +1105,30 @@ export const make = Effect.fn("resourceAdmission.make")(function* (options: {
               message: "Waiting admission did not persist a ledger revision.",
             };
           }
+          const awaitBackgroundAging =
+            input.priority === "background" && update.result.reason === "interactive-priority"
+              ? Effect.gen(function* () {
+                  const [state, configuredSettings, now] = yield* Effect.all([
+                    options.ledger.read,
+                    currentSettings,
+                    DateTime.now,
+                  ]);
+                  const reservation = state.reservations[input.requestId];
+                  if (reservation === undefined || reservation.state !== "waiting") return;
+                  const delayMs =
+                    reservation.requestedAtMs +
+                    effectiveSettings(state, configuredSettings).backgroundMaxGrantDelayMs -
+                    DateTime.toEpochMillis(now);
+                  if (delayMs <= 0) return yield* Effect.never;
+                  yield* Effect.sleep(delayMs);
+                })
+              : Effect.never;
           yield* Effect.race(
-            options.ledger.awaitChange(revision),
-            pressure.awaitChange(update.pressureSampledAtMs),
+            Effect.race(
+              options.ledger.awaitChange(revision),
+              pressure.awaitChange(update.pressureSampledAtMs),
+            ),
+            awaitBackgroundAging,
           ).pipe(
             restore,
             Effect.onInterrupt(() =>

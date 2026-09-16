@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
@@ -38,11 +39,12 @@ const request = (
 const makeHarness = Effect.fn("resourceAdmission.test.makeHarness")(function* (options?: {
   readonly settings?: Partial<ResourceAdmissionSettings>;
   readonly sample?: () => ResourcePressureSample;
+  readonly awaitPressureChange?: (afterSampledAtMs: number) => Effect.Effect<void>;
 }) {
   const ledger = yield* makeMemoryHostBudgetLedger();
   const pressure = ResourcePressure.of({
     sample: Effect.sync(options?.sample ?? healthySample),
-    awaitChange: () => Effect.never,
+    awaitChange: options?.awaitPressureChange ?? (() => Effect.never),
   });
   const service = yield* make({
     ledger,
@@ -130,6 +132,105 @@ it.effect("ages background work into the next available grant after thirty secon
     yield* TestClock.adjust("30 seconds");
     const released = yield* service.release(running.authority);
     assert.equal(released.newlyAdmitted[0]?.requestId, "aged-background");
+  }),
+);
+
+it.effect("wakes a reserved background acquire exactly once when its aging deadline arrives", () =>
+  Effect.gen(function* () {
+    const pressureWaitStarted = yield* Deferred.make<void>();
+    const background = request("aging-acquire");
+    const { service } = yield* makeHarness({
+      settings: {
+        providerMaxConcurrent: 1,
+        interactiveReserve: 1,
+        backgroundMaxGrantDelayMs: 30_000,
+      },
+      awaitPressureChange: () =>
+        Deferred.succeed(pressureWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
+    });
+
+    const fiber = yield* service.acquire(background).pipe(Effect.forkChild);
+    yield* Deferred.await(pressureWaitStarted);
+    assert.equal(
+      (yield* service.snapshot).entries.find((entry) => entry.requestId === background.requestId)
+        ?.state,
+      "waiting",
+    );
+
+    yield* TestClock.adjust("30 seconds");
+    const admission = yield* Fiber.join(fiber);
+    assert.equal(admission._tag, "Admitted");
+    if (admission._tag !== "Admitted") return yield* Effect.die("expected aged admission");
+    const replay = (yield* service.request(background)).result;
+    assert.equal(replay._tag, "Admitted");
+    if (replay._tag === "Admitted") assert.deepEqual(replay.authority, admission.authority);
+    assert.equal(
+      (yield* service.snapshot).entries.filter(
+        (entry) => entry.requestId === background.requestId && entry.state === "admitted",
+      ).length,
+      1,
+    );
+  }),
+);
+
+it.effect("does not spin an aged reserved waiter while CPU pressure still blocks admission", () =>
+  Effect.gen(function* () {
+    let sample = { ...healthySample(), sampledAtMs: 2, cpuUtilization: 0.99 };
+    let sampleReads = 0;
+    let pressureWaits = 0;
+    const firstPressureWait = yield* Deferred.make<void>();
+    const secondPressureWait = yield* Deferred.make<void>();
+    const pressureChanged = yield* Deferred.make<void>();
+    const background = request("aged-under-cpu-pressure");
+    const ledger = yield* makeMemoryHostBudgetLedger();
+    const pressure = ResourcePressure.of({
+      sample: Effect.sync(() => {
+        sampleReads += 1;
+        return sample;
+      }),
+      awaitChange: () =>
+        Effect.suspend(() => {
+          pressureWaits += 1;
+          const started = pressureWaits === 1 ? firstPressureWait : secondPressureWait;
+          return Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Deferred.await(pressureChanged)),
+          );
+        }),
+    });
+    const service = yield* make({
+      ledger,
+      settings: {
+        ...defaultResourceAdmissionSettings,
+        providerMaxConcurrent: 1,
+        interactiveReserve: 1,
+        backgroundMaxGrantDelayMs: 30_000,
+      },
+    }).pipe(Effect.provideService(ResourcePressure, pressure));
+
+    const fiber = yield* service.acquire(background).pipe(Effect.forkChild);
+    yield* Deferred.await(firstPressureWait);
+    yield* TestClock.adjust("30 seconds");
+    yield* Deferred.await(secondPressureWait);
+    assert.equal(
+      (yield* service.snapshot).entries.find((entry) => entry.requestId === background.requestId)
+        ?.state,
+      "waiting",
+    );
+
+    const readsWhileParked = sampleReads;
+    const revisionWhileParked = (yield* ledger.read).revision;
+    yield* Effect.forEach([1, 2, 3, 4, 5], () => Effect.yieldNow);
+    assert.equal(sampleReads, readsWhileParked);
+    assert.equal((yield* ledger.read).revision, revisionWhileParked);
+
+    sample = { ...sample, sampledAtMs: 3, cpuUtilization: 0.7 };
+    yield* Deferred.succeed(pressureChanged, undefined);
+    const admission = yield* Fiber.join(fiber);
+    assert.equal(admission._tag, "Admitted");
+    if (admission._tag !== "Admitted") return yield* Effect.die("expected CPU admission");
+    const replay = (yield* service.request(background)).result;
+    if (replay._tag !== "Admitted") return yield* Effect.die("expected replayed admission");
+    assert.deepEqual(replay.authority, admission.authority);
   }),
 );
 
@@ -287,6 +388,80 @@ it.effect("uses stable CPU and memory hysteresis for background starts", () =>
       availableMemoryBytes: 2 * 1024 * 1024 * 1024,
     };
     assert.equal((yield* service.refresh)[0]?.requestId, "memory");
+  }),
+);
+
+it.effect("reschedules a waiting acquire when CPU pressure falls below the resume threshold", () =>
+  Effect.gen(function* () {
+    let sample = { ...healthySample(), sampledAtMs: 2, cpuUtilization: 0.9 };
+    const pressureWaitStarted = yield* Deferred.make<void>();
+    const pressureChanged = yield* Deferred.make<void>();
+    const pending = request("cpu-acquire");
+    const { service } = yield* makeHarness({
+      sample: () => sample,
+      awaitPressureChange: () =>
+        Deferred.succeed(pressureWaitStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(pressureChanged)),
+        ),
+    });
+
+    const fiber = yield* service.acquire(pending).pipe(Effect.forkChild);
+    yield* Deferred.await(pressureWaitStarted);
+    assert.equal(
+      (yield* service.snapshot).entries.find((entry) => entry.requestId === pending.requestId)
+        ?.waitReason,
+      "cpu-pressure",
+    );
+
+    sample = { ...sample, sampledAtMs: 3, cpuUtilization: 0.7 };
+    yield* Deferred.succeed(pressureChanged, undefined);
+    const admission = yield* Fiber.join(fiber);
+    assert.equal(admission._tag, "Admitted");
+    if (admission._tag !== "Admitted") return yield* Effect.die("expected CPU admission");
+    const replay = (yield* service.request(pending)).result;
+    if (replay._tag !== "Admitted") return yield* Effect.die("expected replayed admission");
+    assert.deepEqual(replay.authority, admission.authority);
+  }),
+);
+
+it.effect("reschedules a waiting acquire when memory pressure crosses the resume threshold", () =>
+  Effect.gen(function* () {
+    let sample = {
+      ...healthySample(),
+      sampledAtMs: 2,
+      availableMemoryBytes: 1024 * 1024 * 1024,
+    };
+    const pressureWaitStarted = yield* Deferred.make<void>();
+    const pressureChanged = yield* Deferred.make<void>();
+    const pending = request("memory-acquire");
+    const { service } = yield* makeHarness({
+      sample: () => sample,
+      awaitPressureChange: () =>
+        Deferred.succeed(pressureWaitStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(pressureChanged)),
+        ),
+    });
+
+    const fiber = yield* service.acquire(pending).pipe(Effect.forkChild);
+    yield* Deferred.await(pressureWaitStarted);
+    assert.equal(
+      (yield* service.snapshot).entries.find((entry) => entry.requestId === pending.requestId)
+        ?.waitReason,
+      "memory-pressure",
+    );
+
+    sample = {
+      ...sample,
+      sampledAtMs: 3,
+      availableMemoryBytes: 2 * 1024 * 1024 * 1024,
+    };
+    yield* Deferred.succeed(pressureChanged, undefined);
+    const admission = yield* Fiber.join(fiber);
+    assert.equal(admission._tag, "Admitted");
+    if (admission._tag !== "Admitted") return yield* Effect.die("expected memory admission");
+    const replay = (yield* service.request(pending)).result;
+    if (replay._tag !== "Admitted") return yield* Effect.die("expected replayed admission");
+    assert.deepEqual(replay.authority, admission.authority);
   }),
 );
 
