@@ -388,8 +388,18 @@ export const makeEpicQueue = Effect.gen(function* () {
         continue;
       }
       const inspected = inspectedResult.success;
+      const planValid = yield* validateEpicDependencyPlan(
+        inspected.source,
+        entry.dependencyPlan,
+        entry.parallelism,
+      ).pipe(
+        Effect.as(true),
+        Effect.catchTag("AgentControlEpicRpcError", (error) =>
+          error.code === "invalid-dependency-plan" ? Effect.succeed(false) : Effect.fail(error),
+        ),
+      );
       const blockers =
-        epicStructureDigest(inspected.source) === epicStructureDigest(entry.source)
+        planValid && epicStructureDigest(inspected.source) === epicStructureDigest(entry.source)
           ? [
               ...inspected.blockers,
               ...(!inspected.source.tasks.some((task) => task.issue.state === "open")
@@ -408,7 +418,7 @@ export const makeEpicQueue = Effect.gen(function* () {
                 code: "scope-changed",
                 issueNumber: entry.source.epic.number,
                 message:
-                  "Epic membership or dependencies changed after approval. Remove this waiting entry and approve its current scope.",
+                  "Epic scope or reviewed dependency plan changed after approval. Remove this waiting entry and approve its current scope.",
               },
             ];
       entries = entries.map((item) => (item === entry ? { ...entry, blockers } : item));

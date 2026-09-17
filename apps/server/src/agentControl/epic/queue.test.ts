@@ -22,6 +22,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import { AgentControlEngine } from "../Services/AgentControlEngine.ts";
+import { epicIssueContentFingerprint, epicSourceFingerprint } from "../github/githubEpicSource.ts";
 import { epicJson, loadEpicRun, loadSelectedEpic, saveEpicRun } from "./authority.ts";
 import { makeEpicQueue } from "./queue.ts";
 import { loadEpicQueue, loadEnabledEpicQueue } from "./queueAuthority.ts";
@@ -245,6 +246,90 @@ const fixture = Effect.fn("epicQueueFixture")(function* (id = projectId) {
 });
 
 describe("durable Epic queue", () => {
+  for (const [changedField, parallelism] of [
+    ["title", 1],
+    ["body", 2],
+  ] as const) {
+    it.effect(
+      `keeps a changed ${changedField} local to its reviewed queue entry across recovery and requires fresh approval`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          const inspectedSource = (changed: boolean): AgentControlEpicSource => {
+            const original = source(10);
+            const tasks = original.tasks.map((task) => {
+              const content = {
+                title: changed && changedField === "title" ? "Changed task" : task.issue.title,
+                body: changed && changedField === "body" ? "Changed scope" : "Approved scope",
+              };
+              return {
+                ...task,
+                issue: {
+                  ...task.issue,
+                  title: content.title,
+                  contentFingerprint: epicIssueContentFingerprint(content),
+                },
+              };
+            });
+            return { ...original, tasks, fingerprint: epicSourceFingerprint(original.epic, tasks) };
+          };
+          const approveSource = (current: AgentControlEpicSource) =>
+            f.change({
+              kind: "approve",
+              epicNumber: current.epic.number,
+              expectedFingerprint: current.fingerprint,
+              parallelism,
+              dependencyPlan: {
+                version: 1,
+                sourceFingerprint: current.fingerprint,
+                rationale: "Reviewed isolated document task.",
+                tasks: current.tasks.map((task) => ({
+                  issueNodeId: task.issue.issueNodeId,
+                  dependsOn: [],
+                })),
+              },
+            });
+          const approvedSource = inspectedSource(false);
+          f.previews.set(10, { projectId, source: approvedSource, canStart: true, blockers: [] });
+          const approved = (yield* approveSource(approvedSource)).entries[0]!;
+          const currentSource = inspectedSource(true);
+          f.previews.set(10, { projectId, source: currentSource, canStart: true, blockers: [] });
+          f.setMode("armed");
+          yield* f.process();
+          const blocked = (yield* f.read())!.entries[0]!;
+          assert.equal(blocked.status, "pending");
+          assert.equal(blocked.blockers[0]?.code, "scope-changed");
+          assert.include(blocked.blockers[0]!.message, "approve its current scope");
+          assert.deepEqual(blocked.source, approved.source);
+          assert.deepEqual(blocked.dependencyPlan, approved.dependencyPlan);
+          assert.isNull(yield* f.selected());
+          assert.lengthOf(yield* f.runs(), 0);
+          assert.lengthOf(f.fetched, 0);
+
+          // A fresh service reads the durable blocker without failing recovery.
+          yield* TestClock.adjust("5 minutes");
+          yield* f.process();
+          assert.deepEqual((yield* f.read())!.entries[0], blocked);
+          yield* f.approve(20);
+          yield* f.process();
+          assert.equal((yield* f.selected())?.source.epic.number, 20);
+          assert.equal((yield* f.read())!.entries[0]?.blockers[0]?.code, "scope-changed");
+          assert.lengthOf(yield* f.runs(), 1);
+
+          yield* f.change({ kind: "remove", entryId: approved.entryId });
+          yield* approveSource(currentSource);
+          yield* f.succeed(true);
+          f.setObservation("merged");
+          yield* f.process();
+          const selected = (yield* f.selected())!;
+          assert.equal(selected.source.epic.number, 10);
+          assert.equal(selected.dependencyPlan?.sourceFingerprint, currentSource.fingerprint);
+          assert.equal(selected.parallelism, parallelism);
+          assert.lengthOf(yield* f.runs(), 2);
+        }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+    );
+  }
+
   it.effect(
     "rejects adoption of a stopped manual Epic without changing its selection or creating a queue",
     () =>
