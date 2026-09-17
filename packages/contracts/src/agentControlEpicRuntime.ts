@@ -1,5 +1,9 @@
 import * as Schema from "effect/Schema";
-import { AgentControlEpicSource } from "./agentControlEpic.ts";
+import {
+  AgentControlEpicSource,
+  AgentControlEpicDependencyPlan,
+  AgentControlEpicParallelism,
+} from "./agentControlEpic.ts";
 import { AgentControlVerificationChecks } from "./agentControl.ts";
 import { AgentControlGithubRepositoryBinding } from "./agentControlGithub.ts";
 
@@ -32,18 +36,6 @@ export const AgentControlEpicAcceptedResult = Schema.Struct({
   evidenceId: Schema.String,
 });
 export type AgentControlEpicAcceptedResult = typeof AgentControlEpicAcceptedResult.Type;
-export const AgentControlEpicMemberView = Schema.Struct({
-  issueNodeId: Schema.String,
-  issueNumber: PositiveInt,
-  taskId: Schema.NullOr(AgentControlTaskId),
-  childRunId: Schema.NullOr(Schema.String),
-  status: Schema.Literals(["pending", "running", "accepted", "external-closed", "failed"]),
-  baseCommitSha: Schema.NullOr(Schema.String),
-  reservationId: Schema.NullOr(Schema.String),
-  taskFinalizationEvidenceId: Schema.NullOr(Schema.String),
-  accepted: Schema.NullOr(AgentControlEpicAcceptedResult),
-});
-export type AgentControlEpicMemberView = typeof AgentControlEpicMemberView.Type;
 export const AgentControlEpicFinalVerification = Schema.Struct({
   manifestDigest: Schema.optionalKey(Schema.String),
   status: Schema.Literals(["passed", "failed", "blocked"]),
@@ -65,6 +57,24 @@ export const AgentControlEpicFinalVerification = Schema.Struct({
   ),
 });
 export type AgentControlEpicFinalVerification = typeof AgentControlEpicFinalVerification.Type;
+export const AgentControlEpicMemberView = Schema.Struct({
+  waitReason: Schema.optionalKey(
+    Schema.Literals(["dependencies", "capacity", "integration", "blocker"]),
+  ),
+  blocker: Schema.optionalKey(Schema.String),
+  issueNodeId: Schema.String,
+  issueNumber: PositiveInt,
+  taskId: Schema.NullOr(AgentControlTaskId),
+  childRunId: Schema.NullOr(Schema.String),
+  status: Schema.Literals(["pending", "running", "accepted", "external-closed", "failed"]),
+  baseCommitSha: Schema.NullOr(Schema.String),
+  reservationId: Schema.NullOr(Schema.String),
+  taskFinalizationEvidenceId: Schema.NullOr(Schema.String),
+  accepted: Schema.NullOr(AgentControlEpicAcceptedResult),
+  captured: Schema.optionalKey(AgentControlEpicAcceptedResult),
+  integrationVerification: Schema.optionalKey(AgentControlEpicFinalVerification),
+});
+export type AgentControlEpicMemberView = typeof AgentControlEpicMemberView.Type;
 export const AgentControlEpicHandoffPullRequest = Schema.Struct({
   number: PositiveInt,
   url: Schema.String,
@@ -97,6 +107,10 @@ export const AgentControlEpicRuntimeView = Schema.Struct({
   revision: NonNegativeInt,
   status: Schema.Literals(["running", "blocked", "verifying", "succeeded", "stopped"]),
   source: AgentControlEpicSource,
+  parallelism: Schema.optionalKey(AgentControlEpicParallelism),
+  dependencyPlan: Schema.optionalKey(AgentControlEpicDependencyPlan),
+  dependencyPlanDigest: Schema.optionalKey(Schema.String),
+  integrationVerification: Schema.optionalKey(AgentControlEpicFinalVerification),
   checks: AgentControlVerificationChecks,
   members: Schema.Array(AgentControlEpicMemberView),
   activeTaskId: Schema.NullOr(AgentControlTaskId),
@@ -135,6 +149,8 @@ export const AgentControlEpicPreviewInput = Schema.Struct({
 export type AgentControlEpicPreviewInput = typeof AgentControlEpicPreviewInput.Type;
 export const AgentControlEpicStartInput = Schema.Struct({
   ...AgentControlEpicPreviewInput.fields,
+  parallelism: Schema.optionalKey(AgentControlEpicParallelism),
+  dependencyPlan: Schema.optionalKey(AgentControlEpicDependencyPlan),
   commandId: CommandId,
   expectedRevision: NonNegativeInt,
   expectedFingerprint: Schema.String,

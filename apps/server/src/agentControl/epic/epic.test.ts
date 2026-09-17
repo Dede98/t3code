@@ -32,6 +32,7 @@ import {
   loadEpicRun,
   loadEpicRunBase,
   saveEpicRun,
+  requireEpicIntegrationAuthority,
 } from "./authority.ts";
 import { epicSourceChanges, selectEpicMember } from "./model.ts";
 import { makeAgentControlEpic } from "./Layers/AgentControlEpic.ts";
@@ -323,10 +324,40 @@ describe("Epic persistence and existing selection", () => {
       assert.equal(results.filter(Exit.isSuccess).length, 1);
       assert.equal((yield* loadEpicRun(sql, state.epicRunId))?.revision, 2);
       const current = (yield* loadEpicRun(sql, state.epicRunId))!;
+      assert.propertyVal(
+        yield* requireEpicIntegrationAuthority(state, current).pipe(Effect.flip),
+        "code",
+        "revision-conflict",
+      );
+      yield* requireEpicIntegrationAuthority(current, current);
+      const stopped = yield* sql.withTransaction(saveEpicRun(sql, current, { status: "stopped" }));
+      assert.propertyVal(
+        yield* requireEpicIntegrationAuthority(current, stopped).pipe(Effect.flip),
+        "code",
+        "revision-conflict",
+      );
+      assert.propertyVal(
+        yield* requireEpicIntegrationAuthority(stopped, stopped).pipe(Effect.flip),
+        "code",
+        "authority-conflict",
+      );
+      assert.propertyVal(
+        yield* requireEpicIntegrationAuthority(state, {
+          ...current,
+          dependencyPlanDigest: "different-plan",
+        }).pipe(Effect.flip),
+        "code",
+        "authority-conflict",
+      );
+      assert.propertyVal(
+        yield* requireEpicIntegrationAuthority(state, null).pipe(Effect.flip),
+        "code",
+        "authority-conflict",
+      );
       assert.isTrue(
         Exit.isFailure(
           yield* Effect.exit(
-            sql.withTransaction(saveEpicRun(sql, current, { source: { ...source, tasks: [] } })),
+            sql.withTransaction(saveEpicRun(sql, stopped, { source: { ...source, tasks: [] } })),
           ),
         ),
       );
@@ -874,6 +905,267 @@ describe("Epic service lifecycle", () => {
         assert.equal(current.status, "blocked");
         assert.deepEqual(f.attempts, [1, 2]);
         assert.equal(current.finalVerificationHistory.length, 2);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+});
+
+const reviewedPlan = {
+  version: 1 as const,
+  sourceFingerprint: source.fingerprint,
+  rationale: "Independent documents for 2 and 4; task 3 consumes both.",
+  tasks: [
+    { issueNodeId: "issue-2", dependsOn: [] },
+    { issueNodeId: "issue-4", dependsOn: [] },
+    { issueNodeId: "issue-3", dependsOn: ["issue-2", "issue-4"] },
+  ],
+};
+const plannedState = (parallelism: number): AgentControlEpicRuntimeView => ({
+  ...initial(),
+  parallelism,
+  dependencyPlan: reviewedPlan,
+  dependencyPlanDigest: epicDigest(reviewedPlan),
+  initialBase: { commitSha: "initial-head", targetBranch: "main" },
+});
+
+describe("Epic parallel selection and recovery", () => {
+  for (const limit of [1, 2])
+    it.effect(`reserves deterministic independent members up to limit ${limit}`, () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        f.setMode("armed");
+        yield* seedRun(f.sql, plannedState(limit));
+        const service = yield* f.make();
+        yield* service.processProject(projectId);
+        const state = (yield* service.get(projectId))!;
+        assert.deepEqual(
+          state.members
+            .filter((member) => member.status === "running")
+            .map((member) => member.issueNumber),
+          limit === 1 ? [2] : [2, 4],
+        );
+        assert.equal(
+          state.members.find((member) => member.issueNumber === 3)?.waitReason,
+          "dependencies",
+        );
+        const restarted = yield* f.make();
+        yield* restarted.processProject(projectId);
+        assert.deepEqual((yield* restarted.get(projectId))?.members, state.members);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+    );
+
+  it.effect("keeps independent B running after A fails and blocks C", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      f.setMode("armed");
+      const state = plannedState(2);
+      yield* seedRun(f.sql, {
+        ...state,
+        members: state.members.map((member) =>
+          member.issueNumber === 2 ? { ...member, status: "failed" } : member,
+        ),
+      });
+      const service = yield* f.make();
+      yield* service.processProject(projectId);
+      const current = (yield* service.get(projectId))!;
+      assert.equal(current.status, "running");
+      assert.equal(current.members.find((member) => member.issueNumber === 4)?.status, "running");
+      assert.equal(current.members.find((member) => member.issueNumber === 3)?.status, "pending");
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("pause prevents new reservations and plan edits cannot rewrite issued authority", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* seedRun(f.sql, plannedState(2));
+      const service = yield* f.make();
+      yield* service.processProject(projectId);
+      const state = (yield* service.get(projectId))!;
+      assert.isTrue(state.members.every((member) => member.status === "pending"));
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            saveEpicRun(f.sql, state, {
+              dependencyPlan: { ...reviewedPlan, rationale: "replacement" },
+            }),
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(saveEpicRun(f.sql, state, { parallelism: 4 }))),
+      );
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+});
+
+describe("Epic integrated dependency progress", () => {
+  const accepted = (id: string) => ({
+    commitSha: `commit-${id}`,
+    treeSha: `tree-${id}`,
+    codeDigest: `code-${id}`,
+    evidenceId: `accepted-${id}`,
+  });
+  const proof = (commitSha: string) => ({
+    status: "passed" as const,
+    commitSha,
+    evidenceId: `verified-${commitSha}`,
+    detail: "Current integration checks passed",
+    checks: [],
+  });
+
+  it.effect(
+    "resumes only captured integration failures with fresh attempt authority and clean task status",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        f.setMode("armed");
+        const planned = plannedState(2);
+        const state: AgentControlEpicRuntimeView = {
+          ...planned,
+          status: "blocked",
+          blockers: [
+            { code: "integration-check-failed", issueNumber: 2, message: "combined check failed" },
+          ],
+          members: planned.members.map((member) =>
+            member.issueNumber === 2
+              ? {
+                  ...member,
+                  taskId: AgentControlTaskId.make("task-2"),
+                  childRunId: "execution-a",
+                  status: "failed",
+                  captured: accepted("a"),
+                  reservationId: "reservation-a",
+                  taskFinalizationEvidenceId: "task-proof-a",
+                  waitReason: "blocker",
+                  blocker: "combined check failed",
+                }
+              : member.issueNumber === 4
+                ? {
+                    ...member,
+                    status: "failed",
+                    waitReason: "blocker",
+                    blocker: "implementation failed",
+                  }
+                : member,
+          ),
+        };
+        yield* seedRun(f.sql, state);
+        const service = yield* f.make();
+        const resumed = yield* service.resume({
+          projectId,
+          epicRunId: state.epicRunId,
+          expectedRevision: state.revision,
+          commandId: CommandId.make("resume-captured"),
+        });
+        const a = resumed.members.find((member) => member.issueNumber === 2)!;
+        const b = resumed.members.find((member) => member.issueNumber === 4)!;
+        assert.equal(resumed.verificationAttempt, 2);
+        assert.deepEqual(resumed.blockers, []);
+        assert.equal(a.status, "running");
+        assert.equal(a.waitReason, "integration");
+        assert.isUndefined(a.blocker);
+        assert.equal(a.childRunId, "execution-a");
+        assert.equal(a.reservationId, "reservation-a");
+        assert.deepEqual(a.captured, accepted("a"));
+        assert.equal(b.status, "failed");
+        assert.equal(b.blocker, "implementation failed");
+        const reopened = yield* f.make();
+        assert.deepEqual((yield* reopened.get(projectId))?.members, resumed.members);
+        assert.deepEqual(
+          (yield* reopened.resume({
+            projectId,
+            epicRunId: state.epicRunId,
+            expectedRevision: state.revision,
+            commandId: CommandId.make("resume-captured"),
+          })).members,
+          resumed.members,
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  for (const currentProof of [false, true])
+    it.effect(
+      `releases C only when both captured predecessors have accepted integration and ${currentProof ? "current" : "stale"} head proof`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          f.setMode("armed");
+          const planned = plannedState(2);
+          const state: AgentControlEpicRuntimeView = {
+            ...planned,
+            acceptedCommitSha: "current-integration",
+            integrationVerification: proof(
+              currentProof ? "current-integration" : "old-integration",
+            ),
+            members: planned.members.map((member) =>
+              member.issueNumber === 3
+                ? member
+                : {
+                    ...member,
+                    status: "accepted",
+                    taskId: AgentControlTaskId.make(`task-${member.issueNumber}`),
+                    childRunId: `execution-${member.issueNumber}`,
+                    accepted: accepted(String(member.issueNumber)),
+                    captured: accepted(`local-${member.issueNumber}`),
+                  },
+            ),
+          };
+          yield* seedRun(f.sql, state);
+          const service = yield* f.make();
+          yield* service.processProject(projectId);
+          const after = (yield* service.get(projectId))!;
+          const c = after.members.find((member) => member.issueNumber === 3)!;
+          assert.equal(c.status, currentProof ? "running" : "pending");
+          assert.equal(c.waitReason, currentProof ? "capacity" : "dependencies");
+          assert.equal(c.baseCommitSha, currentProof ? "current-integration" : null);
+          assert.isNull(c.childRunId);
+          assert.isTrue(
+            after.members
+              .filter((member) => member.issueNumber !== 3)
+              .every((member) => member.status === "accepted"),
+          );
+          const recovered = yield* f.make();
+          yield* recovered.processProject(projectId);
+          assert.deepEqual((yield* recovered.get(projectId))?.members, after.members);
+        }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+    );
+
+  it.effect(
+    "does not release a successor for captured local results or closed issue metadata",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        f.setMode("armed");
+        f.setSource({
+          ...source,
+          tasks: source.tasks.map((task) =>
+            task.issue.number === 4 ? { ...task, issue: { ...task.issue, state: "closed" } } : task,
+          ),
+        });
+        const planned = plannedState(2);
+        yield* seedRun(f.sql, {
+          ...planned,
+          acceptedCommitSha: "current-integration",
+          integrationVerification: proof("current-integration"),
+          members: planned.members.map((member) =>
+            member.issueNumber === 3
+              ? member
+              : {
+                  ...member,
+                  status: member.issueNumber === 2 ? "accepted" : "failed",
+                  accepted: member.issueNumber === 2 ? accepted("a") : null,
+                  captured: accepted(String(member.issueNumber)),
+                },
+          ),
+        });
+        const service = yield* f.make();
+        yield* service.processProject(projectId);
+        const after = (yield* service.get(projectId))!;
+        assert.equal(after.members.find((member) => member.issueNumber === 3)?.status, "pending");
+        assert.equal(
+          after.members.find((member) => member.issueNumber === 3)?.waitReason,
+          "dependencies",
+        );
+        assert.equal(after.status, "blocked");
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
 });

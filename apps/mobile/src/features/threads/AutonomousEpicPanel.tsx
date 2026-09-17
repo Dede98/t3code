@@ -13,6 +13,8 @@ import {
   agentControlEpicControlInput,
   agentControlEpicStartBlockers,
   agentControlEpicStartInput,
+  agentControlEpicExecutionOptions,
+  agentControlEpicMemberProgress,
   agentControlEpicStatus,
   agentControlEpicHandoffBlockers,
   agentControlEpicPublishHandoffInput,
@@ -79,6 +81,9 @@ export function AutonomousEpicPanel({
   const requestedRunId = useRef<string | null>(null);
   const [savedEpicId, setSavedEpicId] = useState<string | null>(null);
   const [number, setNumber] = useState("");
+  const [parallelism, setParallelism] = useState("1");
+  const [rationale, setRationale] = useState("");
+  const [reviewed, setReviewed] = useState(false);
   const [preview, setPreview] = useState<AgentControlEpicPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(true);
@@ -122,6 +127,16 @@ export function AutonomousEpicPanel({
     ]),
   ];
   const source = epic?.source ?? preview?.source;
+  const limit = Number(parallelism);
+  const executionBlocker =
+    !Number.isInteger(limit) || limit < 1 || limit > 4
+      ? "Choose a parallel task limit from 1 to 4."
+      : (limit > 1 || reviewed) && (!reviewed || !rationale.trim())
+        ? "Review the complete dependency graph and explain why unrelated tasks can run independently."
+        : null;
+  const executionOptions = preview
+    ? agentControlEpicExecutionOptions(preview, limit, rationale, reviewed)
+    : {};
   const issueNumber = Number(number);
   const canInspect =
     readiness.connected &&
@@ -157,7 +172,11 @@ export function AutonomousEpicPanel({
   ) {
     const snapshot = readiness.snapshot;
     if (!snapshot || readOnly || inFlight.current || queueBlockers.length > 0) return;
-    if (action === "approve" && (!preview || approvalBlockers.length > 0)) return;
+    if (
+      action === "approve" &&
+      (!preview || approvalBlockers.length > 0 || executionBlocker !== null)
+    )
+      return;
     if (action === "leave" && leaveBlockers.length > 0) return;
     if (
       action !== "approve" &&
@@ -173,6 +192,7 @@ export function AutonomousEpicPanel({
               kind: "approve",
               epicNumber: preview.source.epic.number,
               expectedFingerprint: preview.source.fingerprint,
+              ...executionOptions,
             })
           : action === "remove" && entryId
             ? agentControlEpicQueueChangeInput(snapshot, { kind: "remove", entryId })
@@ -195,12 +215,12 @@ export function AutonomousEpicPanel({
   }
 
   async function execute(action: "preview" | "start" | "resume" | "stop" | "clear") {
-    if (inFlight.current || readiness.pending || !readiness.connected) return;
+    if (readOnly || inFlight.current || readiness.pending || !readiness.connected) return;
     if (
       action === "preview"
         ? !canInspect
         : action === "start"
-          ? blockers.length > 0
+          ? blockers.length > 0 || executionBlocker !== null
           : !agentControlEpicControlAllowed(readiness, action)
     )
       return;
@@ -209,6 +229,8 @@ export function AutonomousEpicPanel({
     try {
       if (action === "preview") {
         setPreview(null);
+        setReviewed(false);
+        setRationale("");
         const result = await inspect({
           environmentId,
           input: { projectId, epicNumber: issueNumber },
@@ -221,7 +243,7 @@ export function AutonomousEpicPanel({
           action === "start" && readiness.snapshot && preview
             ? await start({
                 environmentId,
-                input: agentControlEpicStartInput(readiness.snapshot, preview),
+                input: agentControlEpicStartInput(readiness.snapshot, preview, executionOptions),
               })
             : epic && action !== "start"
               ? await { resume, stop, clear }[action]({
@@ -247,8 +269,8 @@ export function AutonomousEpicPanel({
           <Text className="text-base font-t3-bold">Execute a GitHub Epic</Text>
           <Text className="text-sm text-foreground-muted">
             Inspect native GitHub sub-issues and dependencies before starting. One level in this
-            repository is supported. Accepted work becomes the next task’s starting point, followed
-            by verification of the common result.
+            repository is supported. Reviewed independent tasks can run concurrently in separate
+            worktrees. Each result is integrated and checked before dependents start.
           </Text>
           <TextInput
             accessibilityLabel="Epic issue number"
@@ -280,13 +302,52 @@ export function AutonomousEpicPanel({
                     </Text>
                   ))
                 : null}
+              <Text className="text-sm">Concurrent tasks (1–4)</Text>
+              <TextInput
+                accessibilityLabel="Concurrent Epic tasks"
+                keyboardType="number-pad"
+                value={parallelism}
+                editable={!readiness.pending}
+                onChangeText={setParallelism}
+                className="rounded-lg border border-border-subtle bg-card p-3 text-foreground"
+              />
+              <View className="gap-2">
+                <Action disabled={readiness.pending} onPress={() => setReviewed(!reviewed)}>
+                  {reviewed
+                    ? "Dependency review confirmed — undo"
+                    : limit === 1
+                      ? "Use reviewed dependency plan (optional)"
+                      : "Confirm complete dependency review"}
+                </Action>
+                <Text className="text-xs text-foreground-muted">
+                  I reviewed every task: the shown dependencies are complete, and tasks with no
+                  dependency path between them can safely run independently.
+                </Text>
+                {limit > 1 || reviewed ? (
+                  <TextInput
+                    accessibilityLabel="Parallel task independence rationale"
+                    placeholder="Why can unrelated tasks run independently?"
+                    value={rationale}
+                    editable={!readiness.pending}
+                    onChangeText={setRationale}
+                    className="rounded-lg border border-border-subtle bg-card p-3 text-foreground"
+                  />
+                ) : null}
+                <Text className="text-xs text-foreground-muted">
+                  Missing edges alone do not prove independence. Update GitHub dependencies and
+                  inspect again if needed. This approval is frozen when started or queued.
+                </Text>
+              </View>
+              {executionBlocker ? (
+                <Text className="text-sm text-destructive">{executionBlocker}</Text>
+              ) : null}
               {previewMessages.map((blocker) => (
                 <Text key={blocker} className="text-sm text-destructive">
                   {blocker}
                 </Text>
               ))}
               <Action
-                disabled={approvalBlockers.length > 0}
+                disabled={approvalBlockers.length > 0 || executionBlocker !== null}
                 onPress={() => void editQueue("approve")}
               >
                 Approve for Epic queue
@@ -298,7 +359,10 @@ export function AutonomousEpicPanel({
               ))}
               {!queue ? (
                 <>
-                  <Action disabled={blockers.length > 0} onPress={() => void execute("start")}>
+                  <Action
+                    disabled={blockers.length > 0 || executionBlocker !== null}
+                    onPress={() => void execute("start")}
+                  >
                     Start inspected Epic
                   </Action>
                   {blockers.map((blocker) => (
@@ -437,26 +501,37 @@ export function AutonomousEpicPanel({
             const member = epic?.members.find(
               (candidate) => candidate.issueNodeId === task.issue.issueNodeId,
             );
-            const child = readiness.snapshot?.runs.find(
-              (run) => run.state.runId === member?.childRunId,
-            );
-            const stage = child?.stages
-              .toSorted(
-                (a, b) => a.stageOrdinal - b.stageOrdinal || a.attemptOrdinal - b.attemptOrdinal,
-              )
-              .at(-1);
+            const approvedDependencies = epic?.dependencyPlan?.tasks.find(
+              (entry) => entry.issueNodeId === task.issue.issueNodeId,
+            )?.dependsOn;
+            const dependencyNumbers = approvedDependencies
+              ? approvedDependencies.map(
+                  (id) =>
+                    source.tasks.find((entry) => entry.issue.issueNodeId === id)?.issue.number ??
+                    id,
+                )
+              : task.dependencies.map((dependency) => dependency.number);
+            const progress = member
+              ? agentControlEpicMemberProgress(member, readiness.snapshot?.runs ?? [])
+              : null;
             return (
               <View key={task.issue.issueNodeId} className="gap-1 rounded-xl bg-card p-3">
                 <Text className="text-sm font-t3-bold">
                   #{task.issue.number} {task.issue.title} · {member?.status ?? task.issue.state}
-                  {member?.taskId && member.taskId === epic?.activeTaskId ? " · Active task" : ""}
+                  {member?.status === "running" ? " · Active task" : ""}
                 </Text>
-                {task.dependencies.length ? (
+                {progress ? <Text className="text-sm">{progress.label}</Text> : null}
+                {dependencyNumbers.length ? (
                   <Text className="text-xs text-foreground-muted">
-                    Requires{" "}
-                    {task.dependencies.map((dependency) => `#${dependency.number}`).join(", ")}
+                    Requires {dependencyNumbers.map((number) => `#${number}`).join(", ")}
                   </Text>
-                ) : null}
+                ) : (
+                  <Text className="text-xs text-foreground-muted">
+                    {approvedDependencies
+                      ? "No dependencies (reviewed)"
+                      : "No declared dependencies · independence not reviewed"}
+                  </Text>
+                )}
                 {member?.baseCommitSha ? (
                   <Text selectable className="text-xs">
                     Starting commit: {member.baseCommitSha}
@@ -468,11 +543,14 @@ export function AutonomousEpicPanel({
                     {member.accepted.evidenceId}
                   </Text>
                 ) : null}
-                {stage?.threadId ? (
+                {progress?.threadId ? (
                   <View className="gap-2">
                     <Action
                       onPress={() =>
-                        navigation.navigate("Thread", { environmentId, threadId: stage.threadId! })
+                        navigation.navigate("Thread", {
+                          environmentId,
+                          threadId: progress.threadId!,
+                        })
                       }
                     >
                       Open task thread
@@ -481,7 +559,7 @@ export function AutonomousEpicPanel({
                       onPress={() =>
                         navigation.navigate("ThreadReview", {
                           environmentId,
-                          threadId: stage.threadId!,
+                          threadId: progress.threadId!,
                         })
                       }
                     >
@@ -509,6 +587,10 @@ export function AutonomousEpicPanel({
           <Text accessibilityRole="summary" className="text-sm font-t3-bold">
             {agentControlEpicStatus(epic).label}
           </Text>
+          <Text className="text-xs">Concurrent task limit: {epic.parallelism ?? 1}</Text>
+          {epic.dependencyPlan ? (
+            <Text className="text-xs">Approved independence: {epic.dependencyPlan.rationale}</Text>
+          ) : null}
           <Text selectable className="text-xs">
             Epic run: {epic.epicRunId}
           </Text>

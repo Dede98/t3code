@@ -8,6 +8,7 @@ import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import {
   AgentControlEpicAcceptedResult,
+  AgentControlEpicFinalVerification,
   AgentControlEpicRpcError,
   AgentControlWorktreeRpcError,
   AgentControlRunOnceId,
@@ -463,6 +464,421 @@ export const makeEpicResults = Effect.gen(function* () {
       ),
     );
 
+  const verifyAt = Effect.fn("verifyEpicIntegrationAt")(function* (
+    input: import("./Services/AgentControlEpicResultHooks.ts").AgentControlEpicVerifyInput,
+    cwd: string,
+    providerInstanceId: string,
+    initialBaseCommitSha: string,
+    evidenceId: string,
+    authorize: Effect.Effect<void, AgentControlEpicRpcError>,
+  ) {
+    yield* authorize;
+    const temporary = yield* Effect.acquireRelease(
+      Effect.tryPromise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-epic-final-index-")),
+      ),
+      (path) => Effect.promise(() => NodeFSP.rm(path, { recursive: true, force: true })),
+    );
+    const indexEnv = { GIT_INDEX_FILE: NodePath.join(temporary, "index") };
+    yield* git(cwd, ["read-tree", input.commitSha], indexEnv);
+    yield* verifyMaterializedIndex(cwd, temporary, indexEnv);
+    const documents = yield* sql<{
+      codeDigest: string;
+      checksJson: string;
+      manifestDigest: string;
+    }>`SELECT code_digest AS "codeDigest",checks_json AS "checksJson",manifest_digest AS "manifestDigest" FROM agent_control_verification_check_manifests WHERE provider_delivery_id=${evidenceId}`;
+    const document = {
+      providerDeliveryId: evidenceId,
+      handoffId: evidenceId,
+      fenceToken: input.attempt,
+      worktreePath: cwd,
+      codeDigest: bindVerificationInspectionDigest(
+        initialBaseCommitSha,
+        yield* snapshotVerificationCode(cwd),
+        documents[0] && !pagedInspectionBase(documents[0].codeDigest) ? "single" : "paged",
+      ),
+      checksJson: canonicalJson(input.checks),
+    };
+    const manifest: VerificationCheckManifest = {
+      ...document,
+      manifestDigest: sha256Utf8(canonicalJson(document)),
+    };
+    if (
+      documents[0] &&
+      (documents[0].manifestDigest !== manifest.manifestDigest ||
+        documents[0].checksJson !== manifest.checksJson)
+    )
+      return yield* authorityFailure(
+        "The final verification attempt belongs to a different result or check configuration.",
+      );
+    yield* sql`INSERT INTO agent_control_verification_check_manifests(provider_delivery_id,handoff_id,fence_token,worktree_path,code_digest,checks_json,manifest_digest,created_at) VALUES (${evidenceId},${evidenceId},${input.attempt},${cwd},${manifest.codeDigest},${manifest.checksJson},${manifest.manifestDigest},${yield* now}) ON CONFLICT(provider_delivery_id) DO NOTHING`;
+    const inspection = yield* executeVerificationInspection(sql, {
+      manifest,
+      checkId: "git-diff",
+      providerTurnId: evidenceId,
+      authorize,
+    });
+    const inventory = readInspectionInventory(canonicalJson({ ...inspection }));
+    if (inspection.exitCode === 0 && inventory) {
+      for (let page = 1; page <= inventory.pageDigests.length; page++) {
+        const result = yield* executeVerificationInspection(sql, {
+          manifest,
+          checkId: inspectionPageId(page),
+          providerTurnId: evidenceId,
+          authorize,
+        });
+        if (result.exitCode !== 0) break;
+      }
+    }
+    for (const check of input.checks) {
+      yield* executeVerificationCheck(sql, {
+        manifest,
+        checkId: check.id,
+        providerTurnId: evidenceId,
+        authorize,
+        execute: executor.execute({
+          providerInstanceId: providerInstanceId,
+          cwd,
+          checks: input.checks,
+          checkId: check.id,
+        }),
+      });
+    }
+    yield* verifyMaterializedIndex(cwd, temporary, indexEnv);
+    const assessment = yield* assessVerificationChecks(sql, {
+      evidence: {
+        providerDeliveryId: evidenceId,
+        handoffId: evidenceId,
+        fenceToken: input.attempt,
+        worktreePath: cwd,
+      },
+      delivery: { providerTurnId: evidenceId },
+    });
+    const rows = yield* sql<{
+      checkId: string;
+      status: "passed" | "failed" | "unavailable" | "stale";
+      resultJson: string;
+      completedAt: string;
+    }>`SELECT check_id AS "checkId",status,result_json AS "resultJson",completed_at AS "completedAt" FROM agent_control_verification_check_results WHERE provider_delivery_id=${evidenceId}`;
+    const resultSchema = Schema.Struct({
+      exitCode: Schema.Int,
+      stdout: Schema.String,
+      stderr: Schema.String,
+    });
+    const checks = yield* Effect.forEach(
+      [...input.checks, VERIFICATION_INSPECTION_DISPLAY],
+      (check) =>
+        Effect.gen(function* () {
+          const row = rows.find((row) => row.checkId === check.id);
+          const result = row
+            ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(resultSchema))(row.resultJson)
+            : null;
+          const progress =
+            check.id === "git-diff" && row?.status === "passed"
+              ? yield* inspectionProgress(
+                  sql,
+                  evidenceId,
+                  manifest.manifestDigest,
+                  manifest.codeDigest,
+                  row.resultJson,
+                )
+              : null;
+          return {
+            ...check,
+            status: progress?.status ?? row?.status ?? ("missing" as const),
+            exitCode: result?.exitCode ?? null,
+            output: result
+              ? [progress?.detail, result.stdout, result.stderr].filter(Boolean).join("\n")
+              : null,
+            completedAt: row?.completedAt ?? null,
+          };
+        }),
+    );
+    return {
+      status:
+        assessment.code === null
+          ? ("passed" as const)
+          : assessment.code === "verification-checks-failed"
+            ? ("failed" as const)
+            : ("blocked" as const),
+      commitSha: input.commitSha,
+      manifestDigest: manifest.manifestDigest,
+      evidenceId,
+      detail: assessment.code ?? "All required checks passed on the common result.",
+      checks,
+    };
+  });
+
+  const integrationResultSchema = Schema.Struct({
+    accepted: AgentControlEpicAcceptedResult,
+    verification: AgentControlEpicFinalVerification,
+  });
+  const integrationRows = (epicRunId: string, childRunId: string) => sql<{
+    integrationId: string;
+    inputJson: string;
+    expectedCommitSha: string;
+    capturedCommitSha: string;
+    commitSha: string;
+    treeSha: string;
+    worktreePath: string;
+    branchRef: string;
+  }>`SELECT integration_id AS "integrationId",input_json AS "inputJson",expected_commit_sha AS "expectedCommitSha",captured_commit_sha AS "capturedCommitSha",commit_sha AS "commitSha",tree_sha AS "treeSha",worktree_path AS "worktreePath",branch_ref AS "branchRef"
+    FROM agent_control_epic_integration_intents WHERE epic_run_id=${epicRunId} AND child_run_id=${childRunId}`;
+
+  const integrate: NonNullable<AgentControlEpicResultHooksShape["integrate"]> = (input) => {
+    const member = input.lastAccepted;
+    if (
+      !member.taskId ||
+      !member.childRunId ||
+      !member.reservationId ||
+      !member.taskFinalizationEvidenceId ||
+      !input.initialBaseCommitSha
+    )
+      return Effect.fail(
+        authorityFailure("Integration requires complete task and original base authority."),
+      );
+    const captureInput = {
+      epicRunId: input.epicRunId,
+      projectId: input.projectId,
+      taskId: member.taskId,
+      childRunId: member.childRunId,
+      reservationId: member.reservationId,
+      taskFinalizationEvidenceId: member.taskFinalizationEvidenceId,
+      previousCommitSha: member.baseCommitSha,
+    };
+    return owned(captureInput, (state) =>
+      Effect.gen(function* () {
+        yield* input.authorize;
+        const cwd = state.internalWorktreePath;
+        const captureRows = yield* sql<{
+          resultJson: string;
+          resultDigest: string;
+        }>`SELECT result_json AS "resultJson",result_digest AS "resultDigest" FROM agent_control_epic_capture_results WHERE child_run_id=${member.childRunId}`;
+        const retained = captureRows[0];
+        if (
+          !retained ||
+          sha256Utf8(retained.resultJson) !== retained.resultDigest ||
+          canonicalJson(input.captured) !== retained.resultJson
+        )
+          return yield* authorityFailure(
+            "Integration does not match the immutable captured task result.",
+          );
+        const proof = (yield* verification(captureInput))[0];
+        if (!proof)
+          return yield* authorityFailure(
+            "Integration has no accepted task verification authority.",
+          );
+        const identity = {
+          epicRunId: input.epicRunId,
+          projectId: input.projectId,
+          childRunId: member.childRunId,
+          captured: input.captured,
+          expectedCommitSha: input.expectedCommitSha,
+          initialBaseCommitSha: input.initialBaseCommitSha,
+          checks: input.checks,
+        };
+        const inputJson = canonicalJson(identity);
+        const integrationId = `epic-integration:${sha256Utf8(inputJson)}`;
+        const branchRef = `refs/heads/t3auto/epic-${sha256Utf8(input.epicRunId).slice(0, 24)}`;
+        const worktreePath = NodePath.join(
+          state.repositoryCommonDir,
+          "t3-epic-integrations",
+          sha256Utf8(input.epicRunId).slice(0, 24),
+          sha256Utf8(integrationId).slice(0, 24),
+        );
+        let intent = (yield* integrationRows(input.epicRunId, captureInput.childRunId)).find(
+          (item) => item.integrationId === integrationId,
+        );
+        if (
+          intent &&
+          (intent.inputJson !== inputJson ||
+            intent.integrationId !== integrationId ||
+            intent.branchRef !== branchRef ||
+            intent.worktreePath !== worktreePath)
+        )
+          return yield* authorityFailure(
+            "An integration retry cannot change its captured task, branch, base, or checks.",
+          );
+        const branchHead = () =>
+          git(cwd, ["rev-parse", "--verify", branchRef]).pipe(
+            Effect.catch(() => Effect.succeed(null)),
+          );
+        let head = yield* branchHead();
+        if (head === null) {
+          if (input.expectedCommitSha !== input.initialBaseCommitSha)
+            return yield* authorityFailure("The existing Epic integration branch is missing.");
+          yield* input.authorize;
+          yield* git(cwd, ["update-ref", branchRef, input.expectedCommitSha, "0".repeat(40)]);
+          head = input.expectedCommitSha;
+        }
+        if (head !== input.expectedCommitSha && head !== intent?.commitSha)
+          return yield* authorityFailure(
+            "The Epic integration branch no longer has the expected commit.",
+          );
+        if (!intent) {
+          // Git's merge-tree computes a three-way merge without touching either task's index/files.
+          const merge = yield* git(cwd, [
+            "merge-tree",
+            "--write-tree",
+            input.expectedCommitSha,
+            input.captured.commitSha,
+          ]).pipe(
+            Effect.mapError(() =>
+              fail(
+                "The task conflicts with the current Epic integration result. Resolve the integration blocker before continuing.",
+              ),
+            ),
+          );
+          const treeSha = merge.split("\n")[0]!;
+          const createdAt = yield* now;
+          const commitSha = yield* git(
+            cwd,
+            [
+              "commit-tree",
+              treeSha,
+              "-p",
+              input.expectedCommitSha,
+              "-p",
+              input.captured.commitSha,
+              "-m",
+              `T3Auto integration ${integrationId}`,
+            ],
+            {
+              GIT_AUTHOR_NAME: "T3Auto",
+              GIT_AUTHOR_EMAIL: "t3auto@localhost",
+              GIT_COMMITTER_NAME: "T3Auto",
+              GIT_COMMITTER_EMAIL: "t3auto@localhost",
+              GIT_AUTHOR_DATE: createdAt,
+              GIT_COMMITTER_DATE: createdAt,
+            },
+          );
+          yield* input.authorize;
+          // This immutable intent precedes worktree materialization, checks, and branch publication.
+          yield* sql`INSERT INTO agent_control_epic_integration_intents(integration_id,epic_run_id,child_run_id,input_json,expected_commit_sha,captured_commit_sha,commit_sha,tree_sha,worktree_path,branch_ref,created_at)
+          VALUES (${integrationId},${input.epicRunId},${member.childRunId},${inputJson},${input.expectedCommitSha},${input.captured.commitSha},${commitSha},${treeSha},${worktreePath},${branchRef},${createdAt})`;
+          intent = {
+            integrationId,
+            inputJson,
+            expectedCommitSha: input.expectedCommitSha,
+            capturedCommitSha: input.captured.commitSha,
+            commitSha,
+            treeSha,
+            worktreePath,
+            branchRef,
+          };
+        }
+        const candidate = intent;
+        const exists = yield* Effect.tryPromise(() =>
+          NodeFSP.lstat(worktreePath).then(
+            () => true,
+            (error: NodeJS.ErrnoException) => {
+              if (error.code === "ENOENT") return false;
+              throw error;
+            },
+          ),
+        );
+        if (!exists) {
+          yield* Effect.tryPromise(() =>
+            NodeFSP.mkdir(NodePath.dirname(worktreePath), { recursive: true }),
+          );
+          yield* git(cwd, ["worktree", "add", "--detach", worktreePath, candidate.commitSha]);
+        }
+        const repositoryCommonDir = yield* Effect.tryPromise(() =>
+          NodeFSP.realpath(state.repositoryCommonDir),
+        );
+        const authorize = Effect.gen(function* () {
+          yield* input.authorize;
+          const observedCommonDir = yield* git(worktreePath, [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+          ]);
+          const canonicalCommonDir = yield* Effect.tryPromise(() =>
+            NodeFSP.realpath(observedCommonDir),
+          ).pipe(Effect.mapError(() => fail("The integration repository is unavailable.")));
+          const current = yield* branchHead();
+          if (current !== input.expectedCommitSha && current !== candidate.commitSha)
+            return yield* authorityFailure(
+              "The Epic integration head changed during verification.",
+            );
+          if (
+            (yield* git(worktreePath, ["rev-parse", "HEAD"])) !== candidate.commitSha ||
+            canonicalCommonDir !== repositoryCommonDir ||
+            (yield* git(worktreePath, ["status", "--porcelain", "--untracked-files=all"]))
+          )
+            return yield* fail(
+              "The retained integration worktree changed; its checks cannot be accepted.",
+            );
+        });
+        yield* authorize;
+        const previous = yield* sql<{
+          resultJson: string;
+          resultDigest: string;
+        }>`SELECT result_json AS "resultJson",result_digest AS "resultDigest" FROM agent_control_epic_integration_results WHERE integration_id=${integrationId}`;
+        if (previous[0]) {
+          if (previous[0].resultDigest !== sha256Utf8(previous[0].resultJson))
+            return yield* authorityFailure("Retained integration receipt is corrupt.");
+          const completed = yield* Schema.decodeUnknownEffect(
+            Schema.fromJsonString(integrationResultSchema),
+          )(previous[0].resultJson);
+          if (
+            completed.accepted.commitSha !== candidate.commitSha ||
+            completed.accepted.treeSha !== candidate.treeSha ||
+            completed.verification.status !== "passed" ||
+            completed.verification.commitSha !== candidate.commitSha ||
+            (yield* branchHead()) !== candidate.commitSha
+          )
+            return yield* authorityFailure(
+              "Retained integration receipt contradicts the current branch.",
+            );
+          return completed;
+        }
+        const verified = yield* verifyAt(
+          { ...input, commitSha: candidate.commitSha },
+          worktreePath,
+          proof.providerInstanceId,
+          input.initialBaseCommitSha!,
+          `${integrationId}:${input.attempt}`,
+          authorize,
+        );
+        const result = yield* Schema.decodeUnknownEffect(integrationResultSchema)({
+          accepted: {
+            commitSha: candidate.commitSha,
+            treeSha: candidate.treeSha,
+            codeDigest: yield* snapshotVerificationCode(worktreePath),
+            evidenceId: integrationId,
+          },
+          verification: verified,
+        });
+        if (verified.status !== "passed") return result;
+        const resultJson = canonicalJson(result);
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            // Acquire SQLite's writer lock before the last authority read. Other server
+            // processes cannot stop/revise the Epic between authorization and Git CAS.
+            // The existing immutable intent survives rollback if Git succeeds first.
+            yield* sql`INSERT OR IGNORE INTO agent_control_epic_integration_intents SELECT * FROM agent_control_epic_integration_intents WHERE integration_id=${integrationId}`;
+            yield* authorize;
+            if ((yield* branchHead()) === input.expectedCommitSha)
+              yield* git(cwd, [
+                "update-ref",
+                branchRef,
+                candidate.commitSha,
+                input.expectedCommitSha,
+              ]);
+            yield* sql`INSERT INTO agent_control_epic_integration_results(integration_id,result_json,result_digest,accepted_at) VALUES (${integrationId},${resultJson},${sha256Utf8(resultJson)},${yield* now}) ON CONFLICT(integration_id) DO NOTHING`;
+          }),
+        );
+        return result;
+      }),
+    ).pipe(
+      Effect.scoped,
+      Effect.mapError((cause) =>
+        resultError(cause, "The task could not be integrated and verified."),
+      ),
+    );
+  };
+
   const verify: AgentControlEpicResultHooksShape["verify"] = (input) => {
     const member = input.lastAccepted;
     if (
@@ -514,7 +930,18 @@ export const makeEpicResults = Effect.gen(function* () {
         owned(captureInput, (state) =>
           Effect.gen(function* () {
             const evidenceId = `epic-final:${input.epicRunId}:${input.attempt}`;
-            const cwd = state.internalWorktreePath;
+            const installed =
+              yield* sql`SELECT 1 FROM sqlite_schema WHERE type='table' AND name='agent_control_epic_integration_intents'`;
+            const integrated = installed.length
+              ? (yield* integrationRows(input.epicRunId, member.childRunId!)).find(
+                  (item) => item.commitSha === input.commitSha,
+                )
+              : undefined;
+            if (integrated && integrated.commitSha !== input.commitSha)
+              return yield* authorityFailure(
+                "Final verification does not match the integrated result.",
+              );
+            const cwd = integrated?.worktreePath ?? state.internalWorktreePath;
             const proof = (yield* verification(captureInput))[0];
             if (!proof)
               return yield* authorityFailure(
@@ -522,148 +949,25 @@ export const makeEpicResults = Effect.gen(function* () {
               );
             const authorize = Effect.gen(function* () {
               if (
+                integrated &&
+                (yield* git(cwd, ["rev-parse", integrated.branchRef])) !== input.commitSha
+              )
+                return yield* authorityFailure("Final verification has a stale integration head.");
+              if (
                 (yield* git(cwd, ["rev-parse", "HEAD"])) !== input.commitSha ||
                 (yield* git(cwd, ["status", "--porcelain", "--untracked-files=all"]))
               )
                 return yield* fail("The common result changed during final verification.");
             });
             yield* authorize;
-            const temporary = yield* Effect.acquireRelease(
-              Effect.tryPromise(() =>
-                NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-epic-final-index-")),
-              ),
-              (path) => Effect.promise(() => NodeFSP.rm(path, { recursive: true, force: true })),
-            );
-            const indexEnv = { GIT_INDEX_FILE: NodePath.join(temporary, "index") };
-            yield* git(cwd, ["read-tree", input.commitSha], indexEnv);
-            yield* verifyMaterializedIndex(cwd, temporary, indexEnv);
-            const documents = yield* sql<{
-              codeDigest: string;
-              checksJson: string;
-              manifestDigest: string;
-            }>`SELECT code_digest AS "codeDigest",checks_json AS "checksJson",manifest_digest AS "manifestDigest" FROM agent_control_verification_check_manifests WHERE provider_delivery_id=${evidenceId}`;
-            const document = {
-              providerDeliveryId: evidenceId,
-              handoffId: evidenceId,
-              fenceToken: input.attempt,
-              worktreePath: cwd,
-              codeDigest: bindVerificationInspectionDigest(
-                initialBaseCommitSha,
-                yield* snapshotVerificationCode(cwd),
-                documents[0] && !pagedInspectionBase(documents[0].codeDigest) ? "single" : "paged",
-              ),
-              checksJson: canonicalJson(input.checks),
-            };
-            const manifest: VerificationCheckManifest = {
-              ...document,
-              manifestDigest: sha256Utf8(canonicalJson(document)),
-            };
-            if (
-              documents[0] &&
-              (documents[0].manifestDigest !== manifest.manifestDigest ||
-                documents[0].checksJson !== manifest.checksJson)
-            )
-              return yield* authorityFailure(
-                "The final verification attempt belongs to a different result or check configuration.",
-              );
-            yield* sql`INSERT INTO agent_control_verification_check_manifests(provider_delivery_id,handoff_id,fence_token,worktree_path,code_digest,checks_json,manifest_digest,created_at) VALUES (${evidenceId},${evidenceId},${input.attempt},${cwd},${manifest.codeDigest},${manifest.checksJson},${manifest.manifestDigest},${yield* now}) ON CONFLICT(provider_delivery_id) DO NOTHING`;
-            const inspection = yield* executeVerificationInspection(sql, {
-              manifest,
-              checkId: "git-diff",
-              providerTurnId: evidenceId,
-              authorize,
-            });
-            const inventory = readInspectionInventory(canonicalJson({ ...inspection }));
-            if (inspection.exitCode === 0 && inventory) {
-              for (let page = 1; page <= inventory.pageDigests.length; page++) {
-                const result = yield* executeVerificationInspection(sql, {
-                  manifest,
-                  checkId: inspectionPageId(page),
-                  providerTurnId: evidenceId,
-                  authorize,
-                });
-                if (result.exitCode !== 0) break;
-              }
-            }
-            for (const check of input.checks) {
-              yield* executeVerificationCheck(sql, {
-                manifest,
-                checkId: check.id,
-                providerTurnId: evidenceId,
-                authorize,
-                execute: executor.execute({
-                  providerInstanceId: proof.providerInstanceId,
-                  cwd,
-                  checks: input.checks,
-                  checkId: check.id,
-                }),
-              });
-            }
-            yield* verifyMaterializedIndex(cwd, temporary, indexEnv);
-            const assessment = yield* assessVerificationChecks(sql, {
-              evidence: {
-                providerDeliveryId: evidenceId,
-                handoffId: evidenceId,
-                fenceToken: input.attempt,
-                worktreePath: cwd,
-              },
-              delivery: { providerTurnId: evidenceId },
-            });
-            const rows = yield* sql<{
-              checkId: string;
-              status: "passed" | "failed" | "unavailable" | "stale";
-              resultJson: string;
-              completedAt: string;
-            }>`SELECT check_id AS "checkId",status,result_json AS "resultJson",completed_at AS "completedAt" FROM agent_control_verification_check_results WHERE provider_delivery_id=${evidenceId}`;
-            const resultSchema = Schema.Struct({
-              exitCode: Schema.Int,
-              stdout: Schema.String,
-              stderr: Schema.String,
-            });
-            const checks = yield* Effect.forEach(
-              [...input.checks, VERIFICATION_INSPECTION_DISPLAY],
-              (check) =>
-                Effect.gen(function* () {
-                  const row = rows.find((row) => row.checkId === check.id);
-                  const result = row
-                    ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(resultSchema))(
-                        row.resultJson,
-                      )
-                    : null;
-                  const progress =
-                    check.id === "git-diff" && row?.status === "passed"
-                      ? yield* inspectionProgress(
-                          sql,
-                          evidenceId,
-                          manifest.manifestDigest,
-                          manifest.codeDigest,
-                          row.resultJson,
-                        )
-                      : null;
-                  return {
-                    ...check,
-                    status: progress?.status ?? row?.status ?? ("missing" as const),
-                    exitCode: result?.exitCode ?? null,
-                    output: result
-                      ? [progress?.detail, result.stdout, result.stderr].filter(Boolean).join("\n")
-                      : null,
-                    completedAt: row?.completedAt ?? null,
-                  };
-                }),
-            );
-            return {
-              status:
-                assessment.code === null
-                  ? ("passed" as const)
-                  : assessment.code === "verification-checks-failed"
-                    ? ("failed" as const)
-                    : ("blocked" as const),
-              commitSha: input.commitSha,
-              manifestDigest: manifest.manifestDigest,
+            return yield* verifyAt(
+              input,
+              cwd,
+              proof.providerInstanceId,
+              initialBaseCommitSha,
               evidenceId,
-              detail: assessment.code ?? "All required checks passed on the common result.",
-              checks,
-            };
+              authorize,
+            );
           }),
         ),
       ),
@@ -671,6 +975,6 @@ export const makeEpicResults = Effect.gen(function* () {
       Effect.mapError((cause) => resultError(cause, "Final Epic checks could not be completed.")),
     );
   };
-  return { capture, verify } satisfies AgentControlEpicResultHooksShape;
+  return { capture, integrate, verify } satisfies AgentControlEpicResultHooksShape;
 });
 export const EpicResultsLive = Layer.effect(AgentControlEpicResultHooks, makeEpicResults);

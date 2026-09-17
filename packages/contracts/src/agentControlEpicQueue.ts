@@ -1,11 +1,17 @@
 import * as Schema from "effect/Schema";
 import { CommandId, IsoDateTime, NonNegativeInt, PositiveInt, ProjectId } from "./baseSchemas.ts";
-import { AgentControlEpicSource } from "./agentControlEpic.ts";
+import {
+  AgentControlEpicSource,
+  AgentControlEpicDependencyPlan,
+  AgentControlEpicParallelism,
+} from "./agentControlEpic.ts";
 import { AgentControlEpicBlocker } from "./agentControlEpicRuntime.ts";
 
 export const AgentControlEpicQueueEntry = Schema.Struct({
   entryId: Schema.String,
   source: AgentControlEpicSource,
+  parallelism: Schema.optionalKey(AgentControlEpicParallelism),
+  dependencyPlan: Schema.optionalKey(AgentControlEpicDependencyPlan),
   approvedAt: IsoDateTime,
   epicRunId: Schema.NullOr(Schema.String),
   status: Schema.Literals(["pending", "active", "merged"]),
@@ -36,6 +42,8 @@ export const AgentControlEpicQueueChangeInput = Schema.Struct({
       kind: Schema.Literal("approve"),
       epicNumber: PositiveInt,
       expectedFingerprint: Schema.String,
+      parallelism: Schema.optionalKey(AgentControlEpicParallelism),
+      dependencyPlan: Schema.optionalKey(AgentControlEpicDependencyPlan),
     }),
     Schema.Struct({ kind: Schema.Literal("remove"), entryId: Schema.String }),
     Schema.Struct({ kind: Schema.Literal("reorder"), entryIds: Schema.Array(Schema.String) }),

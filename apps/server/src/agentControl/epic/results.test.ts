@@ -9,6 +9,7 @@ import * as NodeSqlite from "node:sqlite";
 import { describe, expect, it, vi } from "@effect/vitest";
 import {
   AgentControlTaskId,
+  AgentControlEpicRpcError,
   AgentControlWorktreeReservationState,
   AgentControlWorktreeRpcError,
   AgentControlWorktreeReservationId,
@@ -27,6 +28,7 @@ import * as Semaphore from "effect/Semaphore";
 import type * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import Migration090 from "../../persistence/Migrations/090_AgentControlEpicIntegration.ts";
 import Migration087 from "../../persistence/Migrations/087_AgentControlVerificationInspectionPages.ts";
 import Migration076 from "../../persistence/Migrations/076_AgentControlVerificationChecks.ts";
 import Migration084 from "../../persistence/Migrations/084_AgentControlEpicResults.ts";
@@ -1083,6 +1085,56 @@ describe("Epic handoff retained verification authority", () => {
               NodeFSP.writeFile(NodePath.join(repo.cwd, "source.txt"), "new unverified files\n"),
             );
             expect((yield* verifier.verify(state)).authority.commitSha).toBe(accepted.commitSha);
+            if (queued) {
+              yield* Migration090;
+              const integrated = yield* hooks.integrate({
+                ...finalRequest,
+                lastAccepted,
+                captured: accepted,
+                expectedCommitSha: repo.base,
+                authorize: Effect.void,
+              });
+              const integratedMember = {
+                ...lastAccepted,
+                captured: accepted,
+                accepted: integrated.accepted,
+                integrationVerification: integrated.verification,
+              };
+              const integratedFinal = yield* hooks.verify({
+                ...finalRequest,
+                lastAccepted: integratedMember,
+                commitSha: integrated.accepted.commitSha,
+                attempt: 2,
+              });
+              const integratedState = {
+                ...state,
+                members: [integratedMember],
+                acceptedCommitSha: integrated.accepted.commitSha,
+                verificationAttempt: 2,
+                finalVerification: integratedFinal,
+                finalVerificationHistory: [integratedFinal],
+              };
+              expect((yield* verifier.verify(integratedState)).authority.commitSha).toBe(
+                integrated.accepted.commitSha,
+              );
+              expect(
+                (yield* verifier
+                  .verify({
+                    ...integratedState,
+                    members: [
+                      {
+                        ...integratedMember,
+                        integrationVerification: {
+                          ...integrated.verification,
+                          commitSha: repo.base,
+                        },
+                      },
+                    ],
+                  })
+                  .pipe(Effect.flip)).code,
+              ).toBe("handoff-evidence-invalid");
+            }
+
             for (const broken of [
               { ...state, finalVerification: null },
               { ...state, finalVerificationHistory: [] },
@@ -1140,4 +1192,313 @@ describe("Epic handoff retained verification authority", () => {
           }),
         ),
     );
+});
+
+describe("Epic task integration", () => {
+  it.effect("merges independently captured tasks in order and checks each combined tree", () =>
+    testWithRepo((repo) =>
+      Effect.gen(function* () {
+        yield* Migration090;
+        const sql = yield* SqlClient.SqlClient;
+        const observed: Array<string> = [];
+        const executor = {
+          execute: ({ cwd }: { cwd: string }) =>
+            Effect.gen(function* () {
+              const files = yield* git(cwd, ["ls-tree", "--name-only", "HEAD"]).pipe(Effect.orDie);
+              observed.push(files);
+              return success;
+            }),
+        };
+        const hooks = yield* makeEpicResults.pipe(
+          Effect.provideService(EpicCheckExecutor, executor),
+        );
+        const a = yield* hooks.capture(captureInput);
+        const inputA = {
+          ...finalInput(a, repo.base),
+          captured: a,
+          expectedCommitSha: repo.base,
+          authorize: Effect.void,
+        };
+        const [integratedA, repeatedA] = yield* Effect.all(
+          [hooks.integrate(inputA), hooks.integrate(inputA)],
+          { concurrency: 2 },
+        );
+        expect(repeatedA).toEqual(integratedA);
+        expect(integratedA.verification.status).toBe("passed");
+        expect(integratedA.accepted.commitSha).not.toBe(a.commitSha);
+        const secondPath = NodePath.join(repo.root, "task-b");
+        yield* git(repo.cwd, ["worktree", "add", "-b", "task-b", secondPath, repo.base]);
+        yield* io(() => NodeFSP.writeFile(NodePath.join(secondPath, "b.txt"), "independent B\n"));
+        yield* Effect.sync(() => {
+          const database = new NodeSqlite.DatabaseSync(repo.database);
+          try {
+            database
+              .prepare(
+                "INSERT INTO agent_control_task_verification_finalization_evidence VALUES ('task-proof-b','task-b','project','succeeded','stage-proof-b',?)",
+              )
+              .run(at);
+            database.exec(
+              "INSERT INTO agent_control_verification_finalization_evidence VALUES ('stage-proof-b','child-check-b','child-turn-b','codex','child-handoff-b',1)",
+            );
+          } finally {
+            database.close();
+          }
+        });
+        const document = {
+          providerDeliveryId: "child-check-b",
+          handoffId: "child-handoff-b",
+          fenceToken: 1,
+          worktreePath: secondPath,
+          codeDigest: yield* snapshotVerificationCode(secondPath),
+          checksJson: canonicalJson(checks),
+        };
+        const manifest = { ...document, manifestDigest: sha256Utf8(canonicalJson(document)) };
+        yield* sql`INSERT INTO agent_control_verification_check_manifests VALUES (${manifest.providerDeliveryId},${manifest.handoffId},${manifest.fenceToken},${manifest.worktreePath},${manifest.codeDigest},${manifest.checksJson},${manifest.manifestDigest},${at})`;
+        yield* executeVerificationCheck(sql, {
+          manifest,
+          checkId: "tests",
+          providerTurnId: "child-turn-b",
+          authorize: Effect.void,
+          execute: Effect.succeed(success),
+        });
+        yield* sealVerificationCheckAssessment(sql, {
+          evidence: manifest,
+          delivery: { providerTurnId: "child-turn-b" },
+        });
+        const hooksB = yield* makeEpicResults.pipe(
+          Effect.provideService(EpicCheckExecutor, executor),
+          Effect.provide(
+            Layer.mock(AgentControlWorktreeController)({
+              useAcceptedWorktree: (_input, callback) =>
+                Effect.scoped(
+                  callback({
+                    ...reservation(repo),
+                    internalWorktreePath: secondPath,
+                    branchName: "task-b",
+                  }),
+                ),
+            }),
+          ),
+        );
+        const inputB = {
+          ...captureInput,
+          taskId: "task-b",
+          childRunId: "child-b",
+          reservationId: "reservation-b",
+          taskFinalizationEvidenceId: "task-proof-b",
+          previousCommitSha: repo.base,
+        };
+        const b = yield* hooksB.capture(inputB);
+        const memberB = {
+          ...finalInput(b, repo.base).lastAccepted,
+          taskId: AgentControlTaskId.make("task-b"),
+          childRunId: "child-b",
+          reservationId: "reservation-b",
+          taskFinalizationEvidenceId: "task-proof-b",
+          baseCommitSha: repo.base,
+        };
+        const integrationB = {
+          ...finalInput(b, repo.base),
+          lastAccepted: memberB,
+          captured: b,
+          expectedCommitSha: integratedA.accepted.commitSha,
+          authorize: Effect.void,
+        };
+        const integratedB = yield* hooksB.integrate(integrationB);
+        expect(integratedB.verification.status).toBe("passed");
+        expect(yield* git(repo.cwd, ["show", `${integratedB.accepted.commitSha}:source.txt`])).toBe(
+          "accepted A",
+        );
+        expect(yield* git(repo.cwd, ["show", `${integratedB.accepted.commitSha}:b.txt`])).toBe(
+          "independent B",
+        );
+        expect(yield* git(secondPath, ["show", "HEAD:source.txt"])).toBe("base");
+        expect(observed).toEqual(["source.txt", "b.txt\nsource.txt"]);
+        expect(yield* hooksB.integrate(integrationB)).toEqual(integratedB);
+        expect(observed).toHaveLength(2);
+        const final = yield* hooksB.verify({
+          ...finalInput(integratedB.accepted, repo.base),
+          firstAccepted: inputA.firstAccepted,
+          lastAccepted: { ...memberB, accepted: integratedB.accepted, captured: b },
+          commitSha: integratedB.accepted.commitSha,
+        });
+        expect(final.status).toBe("passed");
+        expect(observed).toHaveLength(3);
+      }),
+    ),
+  );
+
+  it.effect(
+    "recovers publication before the result receipt across database reopen without repeating checks",
+    () =>
+      Effect.gen(function* () {
+        const repo = yield* repository;
+        let executions = 0;
+        const executor = {
+          execute: () =>
+            Effect.sync(() => {
+              executions++;
+              return success;
+            }),
+        };
+        const saved = yield* session(
+          repo,
+          Effect.gen(function* () {
+            yield* initialize(repo);
+            yield* Migration090;
+            const sql = yield* SqlClient.SqlClient;
+            const hooks = yield* makeEpicResults.pipe(
+              Effect.provideService(EpicCheckExecutor, executor),
+            );
+            const captured = yield* hooks.capture(captureInput);
+            const input = {
+              ...finalInput(captured, repo.base),
+              captured,
+              expectedCommitSha: repo.base,
+              authorize: Effect.void,
+            };
+            yield* sql`CREATE TRIGGER integration_crash BEFORE INSERT ON agent_control_epic_integration_results BEGIN SELECT RAISE(ABORT,'crash after git'); END`;
+            expect((yield* hooks.integrate(input).pipe(Effect.flip)).code).toBe("epic-unavailable");
+            const intents = yield* sql<{
+              commitSha: string;
+              branchRef: string;
+            }>`SELECT commit_sha AS "commitSha",branch_ref AS "branchRef" FROM agent_control_epic_integration_intents`;
+            expect(yield* git(repo.cwd, ["rev-parse", intents[0]!.branchRef])).toBe(
+              intents[0]!.commitSha,
+            );
+            expect((yield* sql`SELECT * FROM agent_control_epic_integration_results`).length).toBe(
+              0,
+            );
+            yield* sql`DROP TRIGGER integration_crash`;
+            return { input, commitSha: intents[0]!.commitSha };
+          }),
+        );
+        yield* session(
+          repo,
+          Effect.gen(function* () {
+            const hooks = yield* makeEpicResults.pipe(
+              Effect.provideService(EpicCheckExecutor, executor),
+            );
+            const result = yield* hooks.integrate(saved.input);
+            expect(result.accepted.commitSha).toBe(saved.commitSha);
+            expect(result.verification.status).toBe("passed");
+            expect(executions).toBe(1);
+          }),
+        );
+      }),
+  );
+
+  it.effect(
+    "does not publish failed checks, then uses a new verification attempt on explicit retry",
+    () =>
+      testWithRepo((repo) =>
+        Effect.gen(function* () {
+          yield* Migration090;
+          const sql = yield* SqlClient.SqlClient;
+          let passing = false;
+          const hooks = yield* makeEpicResults.pipe(
+            Effect.provideService(EpicCheckExecutor, {
+              execute: () => Effect.sync(() => (passing ? success : failure)),
+            }),
+          );
+          const captured = yield* hooks.capture(captureInput);
+          const input = {
+            ...finalInput(captured, repo.base),
+            captured,
+            expectedCommitSha: repo.base,
+            authorize: Effect.void,
+          };
+          const result = yield* hooks.integrate(input);
+          expect(result.verification.status).toBe("failed");
+          const intents = yield* sql<{
+            branchRef: string;
+          }>`SELECT branch_ref AS "branchRef" FROM agent_control_epic_integration_intents`;
+          expect(yield* git(repo.cwd, ["rev-parse", intents[0]!.branchRef])).toBe(repo.base);
+          expect((yield* sql`SELECT * FROM agent_control_epic_integration_results`).length).toBe(0);
+          passing = true;
+          expect((yield* hooks.integrate({ ...input, attempt: 2 })).verification.status).toBe(
+            "passed",
+          );
+        }),
+      ),
+  );
+
+  it.effect("rejects stale authority and unexpected integration branch movement", () =>
+    testWithRepo((repo) =>
+      Effect.gen(function* () {
+        yield* Migration090;
+        const hooks = yield* makeEpicResults.pipe(
+          Effect.provideService(EpicCheckExecutor, { execute: () => Effect.succeed(success) }),
+        );
+        const captured = yield* hooks.capture(captureInput);
+        const input = {
+          ...finalInput(captured, repo.base),
+          captured,
+          expectedCommitSha: repo.base,
+          authorize: Effect.void,
+        };
+        const denied = Effect.fail(
+          new AgentControlEpicRpcError({ code: "authority-conflict", message: "stale fence" }),
+        );
+        expect(
+          (yield* hooks.integrate({ ...input, authorize: denied }).pipe(Effect.flip)).code,
+        ).toBe("authority-conflict");
+        const integrated = yield* hooks.integrate(input);
+        const sql = yield* SqlClient.SqlClient;
+        const rows = yield* sql<{
+          branchRef: string;
+        }>`SELECT branch_ref AS "branchRef" FROM agent_control_epic_integration_intents`;
+        yield* git(repo.cwd, [
+          "update-ref",
+          rows[0]!.branchRef,
+          captured.commitSha,
+          integrated.accepted.commitSha,
+        ]);
+        expect((yield* hooks.integrate(input).pipe(Effect.flip)).code).toBe("authority-conflict");
+      }),
+    ),
+  );
+  it.effect("retains other tasks when a task conflicts with the integration head", () =>
+    testWithRepo((repo) =>
+      Effect.gen(function* () {
+        yield* Migration090;
+        const hooks = yield* makeEpicResults;
+        const captured = yield* hooks.capture(captureInput);
+        const other = NodePath.join(repo.root, "conflicting-task");
+        yield* git(repo.cwd, ["worktree", "add", "--detach", other, repo.base]);
+        yield* io(() =>
+          NodeFSP.writeFile(NodePath.join(other, "source.txt"), "other successful task\n"),
+        );
+        yield* git(other, ["add", "source.txt"]);
+        yield* git(other, [
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@example.invalid",
+          "commit",
+          "-qm",
+          "other result",
+        ]);
+        const expectedCommitSha = yield* git(other, ["rev-parse", "HEAD"]);
+        const branchRef = `refs/heads/t3auto/epic-${sha256Utf8(captureInput.epicRunId).slice(0, 24)}`;
+        yield* git(repo.cwd, ["update-ref", branchRef, expectedCommitSha, "0".repeat(40)]);
+        const error = yield* hooks
+          .integrate({
+            ...finalInput(captured, repo.base),
+            captured,
+            expectedCommitSha,
+            authorize: Effect.void,
+          })
+          .pipe(Effect.flip);
+        expect(error.code).toBe("epic-result-unavailable");
+        expect(error.message).toContain("conflicts");
+        expect(yield* git(repo.cwd, ["rev-parse", branchRef])).toBe(expectedCommitSha);
+        expect(yield* git(repo.cwd, ["show", `${expectedCommitSha}:source.txt`])).toBe(
+          "other successful task",
+        );
+        const sql = yield* SqlClient.SqlClient;
+        expect((yield* sql`SELECT * FROM agent_control_epic_integration_intents`).length).toBe(0);
+      }),
+    ),
+  );
 });

@@ -1,7 +1,7 @@
 import {
   AgentControlEpicRpcError,
   AgentControlEpicRuntimeView,
-  type AgentControlRunOnceId,
+  AgentControlRunOnceId,
   type AgentControlTaskId,
   type ProjectId,
 } from "@t3tools/contracts";
@@ -43,6 +43,25 @@ export const loadEpicRun = Effect.fn("loadEpicRun")(function* (
   return state;
 });
 
+/** A competing tick may advance the same run. Its stale proof is retryable, never adoptable. */
+export const requireEpicIntegrationAuthority = Effect.fn("requireEpicIntegrationAuthority")(
+  function* (expected: AgentControlEpicRuntimeView, selected: AgentControlEpicRuntimeView | null) {
+    if (
+      !selected ||
+      selected.epicRunId !== expected.epicRunId ||
+      selected.dependencyPlanDigest !== expected.dependencyPlanDigest
+    )
+      return yield* epicError("authority-conflict", "Epic integration identity or plan changed.");
+    if (selected.revision !== expected.revision)
+      return yield* epicError(
+        "revision-conflict",
+        "Epic integration progress changed; reload before retrying.",
+      );
+    if (selected.status !== "running")
+      return yield* epicError("authority-conflict", "Epic integration authority is inactive.");
+  },
+);
+
 /** Historical migration tests predate Epic execution; absent tables mean no selection. */
 export const loadSelectedEpic = Effect.fn("loadSelectedEpic")(function* (
   sql: SqlClient.SqlClient,
@@ -67,6 +86,17 @@ export const saveEpicRun = Effect.fn("saveEpicRun")(function* (
   previous: AgentControlEpicRuntimeView,
   changes: Partial<AgentControlEpicRuntimeView>,
 ) {
+  if (
+    (changes.dependencyPlan !== undefined &&
+      epicDigest(changes.dependencyPlan) !== epicDigest(previous.dependencyPlan ?? null)) ||
+    (changes.dependencyPlanDigest !== undefined &&
+      changes.dependencyPlanDigest !== previous.dependencyPlanDigest) ||
+    (changes.parallelism !== undefined && changes.parallelism !== previous.parallelism)
+  )
+    return yield* epicError(
+      "authority-conflict",
+      "An approved dependency plan and its parallelism are immutable. Start a new run to change them.",
+    );
   const state = {
     ...previous,
     ...changes,
@@ -100,7 +130,7 @@ export const bindEpicChildRun = Effect.fn("bindEpicChildRun")(function* (
   const member = epic.members.find((item) => item.taskId === taskId);
   if (
     epic.status !== "running" ||
-    epic.activeTaskId !== taskId ||
+    (!epic.dependencyPlan && epic.activeTaskId !== taskId) ||
     !member ||
     member.status !== "running" ||
     (member.childRunId !== null && member.childRunId !== childRunId)
@@ -125,10 +155,27 @@ export const loadEpicRunBase = Effect.fn("loadEpicRunBase")(function* (
   const epic = yield* loadSelectedEpic(sql, projectId);
   if (!epic) return null;
   const member = epic.members.find((item) => item.taskId === taskId);
+  if (epic.dependencyPlan && childRunId === null && member?.childRunId) {
+    const executions = yield* sql<{ baseCommitSha: string; planDigest: string }>`
+      SELECT base_commit_sha AS "baseCommitSha",plan_digest AS "planDigest"
+      FROM main.agent_control_epic_task_executions
+      WHERE execution_id=${member.childRunId} AND epic_run_id=${epic.epicRunId}
+        AND project_id=${projectId} AND task_id=${taskId}`;
+    if (
+      executions.length !== 1 ||
+      executions[0]!.baseCommitSha !== member.baseCommitSha ||
+      executions[0]!.planDigest !== epic.dependencyPlanDigest
+    )
+      return yield* epicError(
+        "authority-conflict",
+        "The task execution does not match its approved plan and base.",
+      );
+    childRunId = AgentControlRunOnceId.make(member.childRunId);
+  }
   if (
     childRunId === null ||
     epic.status !== "running" ||
-    epic.activeTaskId !== taskId ||
+    (!epic.dependencyPlan && epic.activeTaskId !== taskId) ||
     !member ||
     member.childRunId !== childRunId ||
     member.status !== "running"
@@ -137,7 +184,10 @@ export const loadEpicRunBase = Effect.fn("loadEpicRunBase")(function* (
       "authority-conflict",
       "The worktree is not bound to the active Epic child run.",
     );
-  if (member.baseCommitSha !== (epic.acceptedCommitSha ?? epic.initialBase?.commitSha ?? null))
+  if (
+    !epic.dependencyPlan &&
+    member.baseCommitSha !== (epic.acceptedCommitSha ?? epic.initialBase?.commitSha ?? null)
+  )
     return yield* epicError(
       "authority-conflict",
       "The Epic child base does not match the accepted result.",

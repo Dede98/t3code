@@ -1,3 +1,4 @@
+import { epicDependenciesSatisfied } from "./dependencyPlan.ts";
 import type {
   AgentControlEpicBlocker,
   AgentControlEpicRuntimeView,
@@ -55,12 +56,14 @@ export const selectEpicMember = (
             (member) =>
               member.issueNodeId === task.issue.issueNodeId && member.status === "pending",
           ) &&
-          task.dependencies.every(
-            (dependency) =>
-              satisfied.has(dependency.issueNodeId) ||
-              (dependency.state === "closed" &&
-                !epic.members.some((member) => member.issueNodeId === dependency.issueNodeId)),
-          ),
+          (epic.dependencyPlan
+            ? epicDependenciesSatisfied(epic, task.issue.issueNodeId)
+            : task.dependencies.every(
+                (dependency) =>
+                  satisfied.has(dependency.issueNodeId) ||
+                  (dependency.state === "closed" &&
+                    !epic.members.some((member) => member.issueNodeId === dependency.issueNodeId)),
+              )),
       ) ?? null
   );
 };
@@ -79,6 +82,25 @@ export const epicSourceChanges = (
       },
     ];
   const blockers: Array<AgentControlEpicBlocker> = [];
+  if (epic.dependencyPlan) {
+    const frozenIssues = [epic.source.epic, ...epic.source.tasks.map((task) => task.issue)];
+    const currentIssues = [current.epic, ...current.tasks.map((task) => task.issue)];
+    for (const frozen of frozenIssues) {
+      const observed = currentIssues.find((issue) => issue.issueNodeId === frozen.issueNodeId);
+      if (
+        observed &&
+        (observed.title !== frozen.title ||
+          (frozen.contentFingerprint !== undefined &&
+            observed.contentFingerprint !== frozen.contentFingerprint))
+      )
+        blockers.push({
+          code: "scope-changed",
+          issueNumber: frozen.number,
+          message:
+            "Issue content changed after the dependency plan was approved. Review independence again in a new Epic run.",
+        });
+    }
+  }
   for (const dependency of current.dependencies ?? []) {
     if (dependency.repositoryNodeId !== current.repository.repositoryNodeId)
       blockers.push({

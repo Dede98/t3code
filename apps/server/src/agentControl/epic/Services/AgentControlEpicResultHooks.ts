@@ -30,6 +30,20 @@ export interface AgentControlEpicVerifyInput {
   readonly attempt: number;
 }
 export interface AgentControlEpicResultHooksShape {
+  readonly integrate?: (
+    input: AgentControlEpicVerifyInput & {
+      readonly captured: AgentControlEpicAcceptedResult;
+      readonly expectedCommitSha: string;
+      /** Rechecked under the repository lock before publishing any Git result. */
+      readonly authorize: Effect.Effect<void, AgentControlEpicRpcError>;
+    },
+  ) => Effect.Effect<
+    {
+      readonly accepted: AgentControlEpicAcceptedResult;
+      readonly verification: AgentControlEpicFinalVerification;
+    },
+    AgentControlEpicRpcError
+  >;
   readonly capture: (
     input: AgentControlEpicCaptureInput,
   ) => Effect.Effect<AgentControlEpicAcceptedResult, AgentControlEpicRpcError>;

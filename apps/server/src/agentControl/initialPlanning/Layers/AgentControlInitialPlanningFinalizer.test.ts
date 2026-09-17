@@ -30651,11 +30651,12 @@ const settleRepairVerification = Effect.fn("settleRepairVerification")(function*
   assert.equal((yield* finalizer.processHandoff(handoffId))._tag, "Finalized");
 });
 
-// Only Run-once activation is synthesized here. The source task, plan, delivery,
+// Only Run-once activation or the Epic execution binding is synthesized here.
+// The source task, plan, delivery,
 // output capture, verdict, stage finalization and repair admission use their real
 // services. Activation/lineage and actual provider slots have separate integration
 // coverage; these fixtures isolate the Verification -> Repair transaction.
-const seedRepairRun = (database: SharedDatabase, task: AgentControlTaskState) =>
+const seedRepairRun = (database: SharedDatabase, task: AgentControlTaskState, epic = false) =>
   Effect.sync(() => {
     const native = new NodeSqlite.DatabaseSync(database.filename);
     NodeSqliteClient.registerNodeSqliteFunctions(native);
@@ -30667,40 +30668,74 @@ const seedRepairRun = (database: SharedDatabase, task: AgentControlTaskState) =>
       .all() as Array<{ name: string; sql: string }>;
     try {
       for (const trigger of triggers) native.exec(`DROP TRIGGER "${trigger.name}"`);
-      const runId = `run-once-${"a".repeat(64)}`;
-      const columns = native
-        .prepare("PRAGMA table_info(agent_control_run_once_activations)")
-        .all() as Array<{ name: string; type: string; notnull: number }>;
-      const values = columns.map((column) =>
-        column.name === "run_id"
-          ? runId
-          : column.name === "project_id"
-            ? task.source.projectId
-            : column.name === "origin_mode"
-              ? "observe"
-              : column.notnull === 0
-                ? null
-                : column.type === "INTEGER"
-                  ? 1
-                  : column.name.endsWith("_at")
-                    ? createdAt
-                    : `${column.name}-fixture`,
-      );
-      native
-        .prepare(
-          `INSERT INTO agent_control_run_once_activations (${columns.map((c) => `"${c.name}"`).join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
-        )
-        .run(...values);
-      native
-        .prepare(`INSERT INTO agent_control_run_once_states
+      const runId = `${epic ? "epic-task" : "run-once"}-${"a".repeat(64)}`;
+      if (epic) {
+        const state = canonicalJson({
+          status: "running",
+          dependencyPlanDigest: "a".repeat(64),
+          members: [{ taskId: task.taskId, childRunId: runId, status: "running" }],
+        });
+        native
+          .prepare(
+            "INSERT INTO agent_control_epic_runs(epic_run_id,project_id,revision,state_json,state_digest) VALUES (?,?,1,?,?)",
+          )
+          .run("repair-epic", task.source.projectId, state, "a".repeat(64));
+        native
+          .prepare("INSERT INTO agent_control_epic_targets(project_id,epic_run_id) VALUES (?,?)")
+          .run(task.source.projectId, "repair-epic");
+        native
+          .prepare(
+            "INSERT INTO agent_control_epic_task_executions(execution_id,epic_run_id,project_id,task_id,plan_digest,base_commit_sha,project_revision,phase,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'thread-activated',?,?)",
+          )
+          .run(
+            runId,
+            "repair-epic",
+            task.source.projectId,
+            task.taskId,
+            "a".repeat(64),
+            "b".repeat(40),
+            createdAt,
+            createdAt,
+          );
+      } else {
+        const columns = native
+          .prepare("PRAGMA table_info(agent_control_run_once_activations)")
+          .all() as Array<{ name: string; type: string; notnull: number }>;
+        const values = columns.map((column) =>
+          column.name === "run_id"
+            ? runId
+            : column.name === "project_id"
+              ? task.source.projectId
+              : column.name === "origin_mode"
+                ? "observe"
+                : column.notnull === 0
+                  ? null
+                  : column.type === "INTEGER"
+                    ? 1
+                    : column.name.endsWith("_at")
+                      ? createdAt
+                      : `${column.name}-fixture`,
+        );
+        native
+          .prepare(
+            `INSERT INTO agent_control_run_once_activations (${columns.map((c) => `"${c.name}"`).join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
+          )
+          .run(...values);
+        native
+          .prepare(`INSERT INTO agent_control_run_once_states
       (run_id,project_id,status,next_ordinal,last_step,task_id,activation_project_revision,updated_at)
       VALUES (?,?,'active',8,'thread-activated',?,1,?)`)
-        .run(runId, task.source.projectId, task.taskId, createdAt);
+          .run(runId, task.source.projectId, task.taskId, createdAt);
+      }
       native
         .prepare(
           "INSERT INTO agent_control_project_states (project_id,mode,paused_from_mode,revision,last_event_sequence,updated_at) VALUES (?,'run-once',NULL,1,1,?) ON CONFLICT(project_id) DO UPDATE SET mode='run-once',paused_from_mode=NULL",
         )
         .run(task.source.projectId, createdAt);
+      if (epic)
+        native
+          .prepare("UPDATE agent_control_project_states SET mode='armed' WHERE project_id=?")
+          .run(task.source.projectId);
       for (const trigger of triggers) native.exec(trigger.sql);
       native.exec("COMMIT");
     } finally {
@@ -30788,6 +30823,7 @@ const buildRepairTaskFinalizer = Effect.fn("buildRepairTaskFinalizer")(function*
 });
 
 it.effect.each([
+  "epic-passed",
   "passed",
   "failed",
   "repair-failed",
@@ -30837,7 +30873,7 @@ it.effect.each([
           });
           const { database, setup, planningFinalizer } = prepared;
           const task = setup.candidate.task;
-          yield* seedRepairRun(database, task);
+          yield* seedRepairRun(database, task, scenario === "epic-passed");
           const output = (verdict: "passed" | "failed") =>
             canonicalJson({
               schemaVersion: "agent-control-verification-result-v1",
@@ -31154,6 +31190,16 @@ it.effect.each([
 );
 
 it.effect.each([
+  ...(["epic stopped", "epic disarmed"] as const).map((name) => ({
+    name,
+    output: canonicalJson({
+      schemaVersion: "agent-control-verification-result-v1",
+      verdict: "failed",
+      report: "The required check failed.",
+    }),
+    state: "completed" as const,
+    status: "failed" as const,
+  })),
   {
     name: "direct pass",
     output: canonicalJson({
@@ -31206,8 +31252,13 @@ it.effect.each([
             },
           },
         );
-        yield* seedRepairRun(database, prepared.setup.candidate.task);
+        const epic = name === "epic stopped" || name === "epic disarmed";
+        yield* seedRepairRun(database, prepared.setup.candidate.task, epic);
         yield* settleRepairVerification(prepared, name, output, state);
+        if (name === "epic stopped")
+          yield* database.sqlA`UPDATE agent_control_epic_runs SET revision=revision+1,state_json=json_set(state_json,'$.status','stopped') WHERE epic_run_id='repair-epic'`;
+        if (name === "epic disarmed")
+          yield* database.sqlA`UPDATE agent_control_project_states SET mode='observe' WHERE project_id=${prepared.setup.candidate.task.source.projectId}`;
         const finalizer = yield* buildRepairTaskFinalizer(prepared);
         assert.equal((yield* finalizer.processHandoff(prepared.handoffId))._tag, "Finalized");
         assert.equal((yield* finalizer.processHandoff(prepared.handoffId))._tag, "Replayed");

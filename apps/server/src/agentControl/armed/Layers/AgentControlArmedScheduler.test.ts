@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AgentControlWorktreeRpcError,
+  AgentControlEpicRpcError,
   CommandId,
   EventId,
   ProjectId,
@@ -1279,6 +1280,87 @@ layer("AgentControlArmedScheduler", (it) => {
 });
 
 layer("Armed recovery failure boundary", (it) => {
+  for (const code of ["revision-conflict", "authority-conflict"] as const) {
+    it.effect(
+      `handles Epic startup ${code} without confusing progress with corrupted authority`,
+      () =>
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const engine = yield* AgentControlEngine;
+          const id = ProjectId.make(`epic-startup-${code}`);
+          yield* addProject(sql, id);
+          yield* engine.dispatchHuman({
+            commandId: CommandId.make(`${id}-observe`),
+            projectId: id,
+            expectedRevision: 0,
+            mode: "observe",
+          });
+          yield* engine.dispatchHuman({
+            commandId: CommandId.make(`${id}-armed`),
+            projectId: id,
+            expectedRevision: 1,
+            mode: "armed",
+          });
+          yield* Effect.addFinalizer(() =>
+            engine.getProjectState({ projectId: id }).pipe(
+              Effect.flatMap((state) =>
+                engine.dispatchHuman({
+                  commandId: CommandId.make(`${id}-cleanup`),
+                  projectId: id,
+                  expectedRevision: state.revision,
+                  mode: "observe",
+                }),
+              ),
+              Effect.orDie,
+            ),
+          );
+          yield* sql.withTransaction(
+            saveEpicQueue(sql, null, {
+              projectId: id,
+              revision: 0,
+              enabled: true,
+              entries: [],
+              nextEntryId: null,
+              waitReason: null,
+              nextCheckAt: null,
+            }),
+          );
+          let calls = 0;
+          const rescanned = yield* Deferred.make<void>();
+          const scheduler = yield* make().pipe(
+            Effect.provideService(AgentControlEpicProgress, {
+              processProject: (project) =>
+                Effect.gen(function* () {
+                  if (project !== id) return;
+                  calls += 1;
+                  if (calls === 1)
+                    return yield* new AgentControlEpicRpcError({
+                      code,
+                      message: "Concurrent Epic owner changed state",
+                    });
+                  yield* Deferred.succeed(rescanned, undefined);
+                }),
+            }),
+          );
+          const activation = yield* makeReactorStartupActivation;
+          if (code === "authority-conflict") {
+            const failure = yield* scheduler.prepare(activation).pipe(Effect.flip);
+            assert.equal(failure.reason, "authority-conflict");
+            assert.equal(calls, 1);
+            return;
+          }
+          yield* scheduler.prepare(activation);
+          assert.equal(calls, 1);
+          yield* activation.open;
+          yield* Deferred.await(rescanned);
+          const fatal = yield* Effect.forkScoped(scheduler.awaitFailure);
+          yield* Effect.yieldNow;
+          assert.isUndefined(fatal.pollUnsafe());
+          assert.equal(calls, 2);
+        }),
+    );
+  }
+
   it.effect("keeps a recovered project blocker isolated after Armed workers activate", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

@@ -16,6 +16,7 @@ import {
   ProviderInstanceId,
   ProviderDriverKind,
   AgentControlRunOnceStageView,
+  AgentControlRunOnceId,
   type AgentControlPreflightRuntimeResult,
   type AgentControlPolicyStateResult,
 } from "@t3tools/contracts";
@@ -31,6 +32,8 @@ import {
   agentControlEpicQueueView,
   agentControlEpicStartBlockers,
   agentControlEpicStartInput,
+  agentControlEpicExecutionOptions,
+  agentControlEpicMemberProgress,
   agentControlEpicControlInput,
   agentControlEpicControlAllowed,
   agentControlEpicStatus,
@@ -1046,6 +1049,96 @@ const epicRun: AgentControlEpicRuntimeView = {
 };
 
 describe("Epic execution client state", () => {
+  it("allows reviewed integration retries without treating a failed provider task as retryable", () => {
+    const dependencyPlan = agentControlEpicExecutionOptions(
+      epicPreview,
+      2,
+      "Separate components",
+    ).dependencyPlan!;
+    const blocked = {
+      ...epicRun,
+      status: "blocked" as const,
+      dependencyPlan,
+      members: epicRun.members.map((member) => ({
+        ...member,
+        status: "failed" as const,
+        captured: member.accepted!,
+      })),
+    };
+    const readiness = { ...start, snapshot: { ...snapshot, epic: blocked } };
+    expect(agentControlEpicControlAllowed(readiness, "resume")).toBe(true);
+    expect(
+      agentControlEpicControlAllowed(
+        {
+          ...readiness,
+          snapshot: {
+            ...snapshot,
+            epic: {
+              ...blocked,
+              members: epicRun.members.map((member) => ({ ...member, status: "failed" as const })),
+            },
+          },
+        },
+        "resume",
+      ),
+    ).toBe(false);
+  });
+
+  it("requires a new command identity for a different approved parallel plan", () => {
+    const serial = agentControlEpicStartInput(snapshot, epicPreview);
+    const options = agentControlEpicExecutionOptions(epicPreview, 2, "Separate components");
+    const parallel = agentControlEpicStartInput(snapshot, epicPreview, options);
+    expect(agentControlEpicExecutionOptions(epicPreview, 1, "")).toEqual({});
+    const reviewedSerial = agentControlEpicExecutionOptions(
+      epicPreview,
+      1,
+      "Separate components",
+      true,
+    );
+    expect(reviewedSerial.parallelism).toBe(1);
+    expect(reviewedSerial.dependencyPlan).toEqual(options.dependencyPlan);
+    expect(agentControlEpicStartInput(snapshot, epicPreview, reviewedSerial).commandId).not.toBe(
+      serial.commandId,
+    );
+
+    expect(parallel.commandId).not.toBe(serial.commandId);
+    expect(agentControlEpicStartInput(snapshot, epicPreview, options)).toEqual(parallel);
+    expect(
+      agentControlEpicStartInput(
+        snapshot,
+        epicPreview,
+        agentControlEpicExecutionOptions(epicPreview, 3, "Separate components"),
+      ).commandId,
+    ).not.toBe(parallel.commandId);
+    expect(options.dependencyPlan?.tasks).toEqual([{ issueNodeId: "issue", dependsOn: [] }]);
+  });
+
+  it("keeps concurrent task navigation and server wait reasons attached to the matching run", () => {
+    const member = { ...epicRun.members[0]!, status: "running" as const };
+    const other = {
+      ...run,
+      state: { ...run.state, runId: AgentControlRunOnceId.make("other") },
+      stages: [],
+    };
+    const progress = agentControlEpicMemberProgress(member, [other, run]);
+    expect(progress.threadId).toBe(run.stages.at(-1)?.threadId ?? null);
+    expect(
+      agentControlEpicMemberProgress({ ...member, waitReason: "dependencies" }, []).label,
+    ).toContain("predecessor integrations");
+    expect(agentControlEpicMemberProgress({ ...member, waitReason: "capacity" }, []).label).toBe(
+      "Waiting for capacity",
+    );
+    expect(
+      agentControlEpicMemberProgress({ ...member, waitReason: "integration" }, []).label,
+    ).toContain("combined result");
+    expect(
+      agentControlEpicMemberProgress(
+        { ...member, waitReason: "blocker", blocker: "Merge conflict" },
+        [],
+      ).label,
+    ).toBe("Blocked: Merge conflict");
+  });
+
   it("admits inspected scope independently of unrelated backlog ordering and retains stable command identity", () => {
     const readiness = { ...start, snapshot: { ...snapshot, tasks: [], nextTaskId: null } };
     expect(agentControlEpicStartBlockers(readiness, epicPreview)).toEqual([]);

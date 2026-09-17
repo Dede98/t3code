@@ -23,7 +23,10 @@ it.effect("reopens after a usage refresh polls a provider without queued admissi
     yield* Effect.service(ProviderAdmissionStore).pipe(
       Effect.provide(Layer.fresh(ProviderAdmissionStoreLive)),
     );
-    yield* sql`UPDATE agent_control_provider_capacity_current SET revision=2 WHERE provider_instance_id='codex'`;
+    // Refreshing an empty lane no longer manufactures capacity. Startup still
+    // checks its DDL even when there have been no stage admissions.
+    assert.deepStrictEqual(yield* sql`SELECT * FROM agent_control_provider_capacity_current`, []);
+    yield* sql`DROP TRIGGER agent_control_provider_capacity_current_validate_update`;
     const exit = yield* Effect.service(ProviderAdmissionStore).pipe(
       Effect.provide(Layer.fresh(ProviderAdmissionStoreLive)),
       Effect.exit,

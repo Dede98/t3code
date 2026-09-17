@@ -2,7 +2,11 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-import { epicSourceFingerprint, makeEpicInspector } from "./githubEpicSource.ts";
+import {
+  epicIssueContentFingerprint,
+  epicSourceFingerprint,
+  makeEpicInspector,
+} from "./githubEpicSource.ts";
 import { GithubIssueTrackerClientError } from "./Services/GithubIssueTrackerClient.ts";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -14,6 +18,7 @@ const rawIssue = (number: number, subIssues = 0, dependencies = 0) => ({
   repository_url: "https://api.github.com/repos/owner/repo",
   html_url: `https://github.com/owner/repo/issues/${number}`,
   title: `Issue ${number}`,
+  body: null as string | null,
   state: "open",
   sub_issues_summary: { total: subIssues },
   issue_dependencies_summary: { total_blocked_by: dependencies },
@@ -75,6 +80,25 @@ const fixture = (
 };
 
 describe("native GitHub epic source", () => {
+  it.effect(
+    "binds approval to issue body content and rejects content changes during inspection",
+    () =>
+      Effect.gen(function* () {
+        const original = yield* fixture().run;
+        const changed = yield* fixture({
+          root: { ...rawIssue(1, 3), body: "Tasks now edit the same file" },
+        }).run;
+        expect(changed.fingerprint).not.toBe(original.fingerprint);
+        expect(changed.epic.contentFingerprint).not.toBe(original.epic.contentFingerprint);
+        const inconsistent = yield* fixture({
+          transform: (path, value, call) =>
+            path === "repos/owner/repo/issues/1" && call > 1
+              ? { ...(value as ReturnType<typeof rawIssue>), body: "edited after preview" }
+              : value,
+        }).run.pipe(Effect.exit);
+        expect(inconsistent._tag).toBe("Failure");
+      }),
+  );
   it.effect(
     "preserves native order, reads all pages and explicit dependencies without interpreting body links",
     () =>
@@ -346,13 +370,23 @@ describe("native GitHub epic source", () => {
   );
 
   it.effect(
-    "fingerprints order, identity, dependency and state changes but excludes mutable prose and timestamps",
+    "fingerprints order, identity, dependency, state and approved content without timestamps",
     () =>
       Effect.gen(function* () {
         const source = yield* fixture().run;
         expect(
-          epicSourceFingerprint({ ...source.epic, title: "changed title" }, source.tasks),
-        ).toBe(source.fingerprint);
+          epicSourceFingerprint(
+            {
+              ...source.epic,
+              title: "changed title",
+              contentFingerprint: epicIssueContentFingerprint({
+                title: "changed title",
+                body: null,
+              }),
+            },
+            source.tasks,
+          ),
+        ).not.toBe(source.fingerprint);
         expect(epicSourceFingerprint(source.epic, source.tasks.toReversed())).not.toBe(
           source.fingerprint,
         );

@@ -29,6 +29,7 @@ const RawIssue = Schema.Struct({
   repository_url: TrimmedNonEmptyString,
   html_url: TrimmedNonEmptyString,
   title: Schema.String,
+  body: Schema.optionalKey(Schema.NullOr(Schema.String)),
   state: Schema.Literals(["open", "closed"]),
   pull_request: Schema.optionalKey(Schema.Unknown),
   sub_issues_summary: Schema.Struct({ total: NonNegativeInt }),
@@ -38,6 +39,14 @@ const decodeIssue = Schema.decodeUnknownEffect(Schema.fromJsonString(RawIssue));
 const decodePage = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Array(RawIssue)));
 const incomplete = () =>
   new GithubIssueTrackerClientError({ code: "github-decode-failed", operation: "inspect-epic" });
+
+export const epicIssueContentFingerprint = (issue: {
+  readonly title: string;
+  readonly body?: string | null;
+}) =>
+  NodeCrypto.createHash("sha256")
+    .update(encodeJson([issue.title, issue.body ?? null]))
+    .digest("hex");
 
 export const epicSourceFingerprint = (
   epic: AgentControlEpicIssue,
@@ -50,6 +59,7 @@ export const epicSourceFingerprint = (
     issue.number,
     issue.state,
     issue.subIssueCount,
+    ...(issue.contentFingerprint === undefined ? [] : [issue.contentFingerprint]),
   ];
   return NodeCrypto.createHash("sha256")
     .update(
@@ -125,6 +135,7 @@ export const makeEpicInspector = (options: {
         raw.number,
         raw.state,
         raw.sub_issues_summary.total,
+        epicIssueContentFingerprint(raw),
       ]);
       const previous = observedIssues.get(raw.node_id);
       if (previous !== undefined && previous !== observed) return yield* incomplete();
@@ -136,6 +147,7 @@ export const makeEpicInspector = (options: {
         number: raw.number,
         url: raw.html_url,
         title: raw.title,
+        contentFingerprint: epicIssueContentFingerprint(raw),
         state: raw.state,
         subIssueCount: raw.sub_issues_summary.total,
       } satisfies AgentControlEpicIssue;
@@ -298,6 +310,7 @@ export const makeEpicInspector = (options: {
     if (
       finalRoot.node_id !== root.node_id ||
       finalRoot.state !== root.state ||
+      epicIssueContentFingerprint(finalRoot) !== epicIssueContentFingerprint(root) ||
       finalRoot.issue_dependencies_summary.total_blocked_by !==
         root.issue_dependencies_summary.total_blocked_by ||
       encodeJson(
@@ -306,6 +319,7 @@ export const makeEpicInspector = (options: {
           issue.state,
           issue.sub_issues_summary.total,
           issue.issue_dependencies_summary.total_blocked_by,
+          epicIssueContentFingerprint(issue),
         ]),
       ) !==
         encodeJson(
@@ -314,6 +328,7 @@ export const makeEpicInspector = (options: {
             issue.state,
             issue.sub_issues_summary.total,
             issue.issue_dependencies_summary.total_blocked_by,
+            epicIssueContentFingerprint(issue),
           ]),
         )
     )

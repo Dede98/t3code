@@ -1,5 +1,6 @@
 import type {
   AgentControlEpicRuntimeView,
+  AgentControlEpicDependencyPlan,
   AgentControlEpicSource,
   AgentControlVerificationChecks,
   ProjectId,
@@ -7,6 +8,7 @@ import type {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
+import { validateEpicDependencyPlan } from "./dependencyPlan.ts";
 import { epicDigest, epicJson } from "./authority.ts";
 
 export const createEpicRun = Effect.fn("createEpicRun")(function* (input: {
@@ -14,8 +16,11 @@ export const createEpicRun = Effect.fn("createEpicRun")(function* (input: {
   commandId: string;
   source: AgentControlEpicSource;
   checks: AgentControlVerificationChecks;
+  parallelism?: number;
+  dependencyPlan?: AgentControlEpicDependencyPlan;
   initialBase?: { commitSha: string; targetBranch: string };
 }) {
+  yield* validateEpicDependencyPlan(input.source, input.dependencyPlan, input.parallelism);
   const now = DateTime.formatIso(yield* DateTime.now);
   return {
     epicRunId: `epic-${epicDigest({ projectId: input.projectId, commandId: input.commandId })}`,
@@ -24,6 +29,13 @@ export const createEpicRun = Effect.fn("createEpicRun")(function* (input: {
     status: "running",
     source: input.source,
     checks: input.checks,
+    parallelism: input.parallelism ?? 1,
+    ...(input.dependencyPlan
+      ? {
+          dependencyPlan: input.dependencyPlan,
+          dependencyPlanDigest: epicDigest(input.dependencyPlan),
+        }
+      : {}),
     ...(input.initialBase ? { initialBase: input.initialBase } : {}),
     members: input.source.tasks.map((task) => ({
       issueNodeId: task.issue.issueNodeId,

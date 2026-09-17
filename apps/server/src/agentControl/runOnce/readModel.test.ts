@@ -1,9 +1,11 @@
+import { unsettledEpicExecutions } from "../epic/executionState.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AgentControlRunOnceId,
   AgentControlTaskId,
   type AgentControlEpicRuntimeView,
   ProjectId,
+  ThreadId,
   type AgentControlRunOnceSnapshot,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
@@ -967,6 +969,192 @@ layer("Run-Once client read model", (it) => {
           [activeOrdinary],
         );
         assert.deepStrictEqual(resumedOrdinary.epicHistory, cleared.epicHistory);
+        const plannedIds = ["parallel-child-a", "parallel-child-b"];
+        const planned = makeEpic("parallel-epic", plannedIds, true);
+        const plan = {
+          version: 1 as const,
+          sourceFingerprint: planned.source.fingerprint,
+          rationale: "Separate packages reviewed",
+          tasks: planned.source.tasks.map((task) => ({
+            issueNodeId: task.issue.issueNodeId,
+            dependsOn: [],
+          })),
+        };
+        const parallel: AgentControlEpicRuntimeView = {
+          ...planned,
+          parallelism: 2,
+          dependencyPlan: plan,
+          dependencyPlanDigest: epicDigest(plan),
+          acceptedCommitSha: null,
+          activeTaskId: null,
+          members: planned.members.map((member) => ({
+            ...member,
+            status: "running",
+            accepted: null,
+            taskFinalizationEvidenceId: null,
+          })),
+        };
+        const parallelState = {
+          epic_run_id: parallel.epicRunId,
+          revision: parallel.revision,
+          state_json: epicJson(parallel),
+          state_digest: epicDigest(parallel),
+        };
+        yield* insertFixture("agent_control_epic_runs", { ...parallelState, project_id: id });
+        yield* insertFixture("agent_control_epic_history", parallelState);
+        yield* insertFixture("agent_control_epic_targets", {
+          project_id: id,
+          epic_run_id: parallel.epicRunId,
+        });
+        for (const child of plannedIds) {
+          yield* insertFixture("agent_control_epic_task_executions", {
+            execution_id: child,
+            epic_run_id: parallel.epicRunId,
+            project_id: id,
+            task_id: `${child}-task`,
+            plan_digest: parallel.dependencyPlanDigest!,
+            base_commit_sha: "base",
+            project_revision: 12,
+            stage_run_id: `${child}-stage`,
+            lease_id: null,
+            worktree_reservation_id: `${child}-worktree`,
+            controlled_thread_reservation_id: null,
+            thread_id: `${child}-thread`,
+            phase: "thread-activated",
+            created_at: at,
+            updated_at: at,
+          });
+          yield* insertFixture("agent_control_stage_run_states", {
+            stage_run_id: `${child}-stage`,
+            project_id: id,
+            task_id: `${child}-task`,
+            stage_ordinal: 1,
+            attempt_ordinal: 1,
+            state_json: encodeUnknownJson({
+              schemaVersion: 1,
+              projectId: id,
+              taskId: `${child}-task`,
+              stageRunId: `${child}-stage`,
+              attemptId: `${child}-attempt`,
+              roleId: "planning",
+              stageKind: "planning",
+              stageOrdinal: 1,
+              attemptOrdinal: 1,
+              status: "running",
+              taskRevision: 1,
+              githubIntakeSequence: 7,
+              sourceIdentityFingerprint: "fingerprint",
+              createdAt: at,
+              updatedAt: at,
+              revision: 1,
+              sequence: 1,
+            }),
+          });
+          yield* insertFixture("agent_control_initial_planning_handoff_intents", {
+            handoff_id: `${child}-handoff`,
+            stage_run_id: `${child}-stage`,
+            task_id: `${child}-task`,
+            project_id: id,
+            thread_id: `${child}-thread`,
+            worktree_path: `/isolated/${child}`,
+            provider_delivery_id: `${child}-delivery`,
+            worktree_reservation_id: `${child}-worktree`,
+            provider_instance_id: "codex-production",
+            model_selection_json: encodeUnknownJson({
+              instanceId: "codex-production",
+              model: "gpt-5",
+            }),
+          });
+        }
+        for (const child of plannedIds)
+          yield* insertFixture("agent_control_initial_planning_deliveries", {
+            handoff_id: `${child}-handoff`,
+            state: "provider-started",
+          });
+        yield* insertFixture("resource_admission_wait_status", {
+          handoff_id: "parallel-child-b-handoff",
+          reason: "interactive-priority",
+          detail: "Manual thread has priority",
+          updated_at: at,
+        });
+        const parallelSnapshot = yield* read.getSnapshot({ projectId: id });
+        const parallelRuns = parallelSnapshot.runs.filter((run) =>
+          plannedIds.includes(run.state.runId),
+        );
+        assert.equal(parallelRuns.length, 2);
+        assert.deepStrictEqual(
+          parallelRuns.map((run) => [run.originMode, run.state.status, run.stages[0]?.threadId]),
+          [
+            ["armed", "active", ThreadId.make("parallel-child-a-thread")],
+            ["armed", "active", ThreadId.make("parallel-child-b-thread")],
+          ],
+        );
+        assert.isUndefined(parallelRuns[0]?.stages[0]?.admissionWait);
+        assert.equal(parallelRuns[1]?.stages[0]?.admissionWait?.reason, "interactive-priority");
+        assert.equal(
+          parallelRuns[1]?.stages[0]?.admissionWait?.detail,
+          "Manual thread has priority",
+        );
+        assert.equal((yield* unsettledEpicExecutions(sql, id)).size, 2);
+        for (const child of plannedIds) {
+          yield* insertFixture("agent_control_task_verification_finalization_evidence", {
+            task_finalization_evidence_id: `${child}-finalized`,
+            task_id: `${child}-task`,
+            project_id: id,
+          });
+          yield* insertFixture("agent_control_task_verification_finalization_receipts", {
+            receipt_id: `${child}-receipt`,
+            task_finalization_evidence_id: `${child}-finalized`,
+            status: "accepted",
+          });
+          yield* insertFixture("agent_control_task_verification_finalization_markers", {
+            marker_id: `${child}-marker`,
+            receipt_id: `${child}-receipt`,
+            task_finalization_evidence_id: `${child}-finalized`,
+          });
+        }
+        assert.equal((yield* unsettledEpicExecutions(sql, id)).size, 2);
+        for (const child of plannedIds)
+          yield* sql`UPDATE agent_control_initial_planning_deliveries SET state='completed' WHERE handoff_id=${`${child}-handoff`}`;
+        assert.equal((yield* unsettledEpicExecutions(sql, id)).size, 0);
+        yield* insertFixture("resource_admission_provider_requests", {
+          request_id: "parallel-unknown-request",
+          handoff_id: "parallel-child-b-handoff",
+          status: "entered",
+          last_observed_activity: "unknown",
+          updated_at: at,
+        });
+        assert.deepStrictEqual(
+          [...(yield* unsettledEpicExecutions(sql, id))],
+          ["parallel-child-b"],
+        );
+        assert.equal(
+          (yield* read.getSnapshot({
+            projectId: id,
+            runId: AgentControlRunOnceId.make("parallel-child-b"),
+          })).runs[0]?.state.status,
+          "active",
+        );
+        yield* sql`UPDATE resource_admission_provider_requests SET status='released' WHERE request_id='parallel-unknown-request'`;
+        assert.equal((yield* unsettledEpicExecutions(sql, id)).size, 0);
+        yield* sql`DELETE FROM agent_control_epic_targets WHERE project_id=${id}`;
+        assert.deepStrictEqual(
+          (yield* read.getSnapshot({ projectId: id })).runs.map((run) => run.state.runId),
+          [activeOrdinary],
+        );
+        const savedParallel = yield* read.getSnapshot({
+          projectId: id,
+          runId: AgentControlRunOnceId.make(plannedIds[1]!),
+        });
+        assert.equal(savedParallel.runs.length, 1);
+        assert.equal(savedParallel.runs[0]?.stages[0]?.threadId, "parallel-child-b-thread");
+        assert.deepStrictEqual(
+          (yield* read.getSnapshot({
+            projectId: ProjectId.make("different-project"),
+            runId: AgentControlRunOnceId.make(plannedIds[1]!),
+          })).runs,
+          [],
+        );
       }).pipe(Effect.scoped),
   );
 });

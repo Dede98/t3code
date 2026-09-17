@@ -93,3 +93,14 @@ export const loadRunOnceRepairForImplementationStage = Effect.fn(
   if (rows.length !== 1) return yield* new RunOnceRepairEvidenceError({});
   return yield* loadRunOnceRepair(sql, rows[0]!.verificationHandoffId);
 });
+
+/** Historical snapshots have only Run Once; current snapshots also bind Epic executions. */
+export const taskExecutionAuthority = Effect.fn("taskExecutionAuthority")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  const installed =
+    yield* sql`SELECT 1 FROM main.sqlite_schema WHERE type='view' AND name='agent_control_task_execution_authority'`;
+  return installed.length
+    ? sql`agent_control_task_execution_authority`
+    : sql`(SELECT *, 'run-once' AS active_mode FROM agent_control_run_once_states)`;
+});

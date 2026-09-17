@@ -1,3 +1,4 @@
+import { taskExecutionAuthority } from "../../runOnce/repair.ts";
 import { loadRunOnceRepair, type RunOnceRepair } from "../../runOnce/repair.ts";
 import {
   AgentControlAttemptId,
@@ -788,11 +789,12 @@ const make = Effect.gen(function* () {
               return yield* useTask(planning.projectId, planning.taskId, (task) =>
                 Effect.gen(function* () {
                   if (repair !== null) {
-                    const activeRun = yield* sql`SELECT 1 FROM agent_control_run_once_states run
+                    const executionAuthority = yield* taskExecutionAuthority(sql);
+                    const activeRun = yield* sql`SELECT 1 FROM ${executionAuthority} run
                       JOIN agent_control_project_states project ON project.project_id = run.project_id
                       WHERE run.run_id = ${repair.runId} AND run.project_id = ${planning.projectId}
                         AND run.task_id = ${planning.taskId} AND run.status = 'active'
-                        AND run.last_step = 'thread-activated' AND project.mode = 'run-once'
+                        AND run.last_step = 'thread-activated' AND project.mode = run.active_mode
                         AND project.paused_from_mode IS NULL`;
                     if (activeRun.length !== 1)
                       return yield* admissionError(

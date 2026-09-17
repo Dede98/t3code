@@ -1,3 +1,4 @@
+import { PROVIDER_AUTHORITY_LANE_DDL_FINGERPRINTS } from "../../../persistence/Migrations/091_AgentControlProviderAuthorityLanes.ts";
 import { ProviderInstanceId } from "@t3tools/contracts";
 import {
   ARCHIVED_PREPARATION_ADMISSION_TRIGGER,
@@ -414,6 +415,20 @@ const resourceAgingDeadline = (
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const laneSchema =
+    yield* sql`SELECT 1 FROM pragma_table_info('agent_control_provider_capacity_current') WHERE name='capacity_lane'`;
+  const hasAuthorityLanes = laneSchema.length !== 0;
+  const laneWhere = (admissionId: string) =>
+    hasAuthorityLanes ? sql`AND capacity_lane=${admissionId}` : sql``;
+  const nextFence = (providerInstanceId: string, previous: number) =>
+    hasAuthorityLanes
+      ? sql<{
+          next: number;
+        }>`SELECT COALESCE(MAX(provider_fence_token),0)+1 AS next FROM agent_control_provider_claim_history WHERE provider_instance_id=${providerInstanceId}`.pipe(
+          Effect.map((rows) => rows[0]!.next),
+        )
+      : Effect.succeed(previous + 1);
+
   const sharedResourceMigration = yield* sql<{ count: number }>`SELECT count(*) AS count
     FROM main.effect_sql_agent_control_migrations
     WHERE migration_id=88 AND name='SharedProviderResourceAdmission'`;
@@ -477,7 +492,7 @@ const make = Effect.gen(function* () {
         AND typeof(intent_fingerprint)='text'
     `.pipe(Effect.map((rows) => rows[0]));
 
-  const readCapacity = (providerInstanceId: string) =>
+  const readCapacity = (providerInstanceId: string, admissionId: string) =>
     sql<CapacityRow>`
       SELECT provider_instance_id AS "providerInstanceId", last_fence_token AS "lastFenceToken",
         active_admission_id AS "activeAdmissionId", active_state AS "activeState",
@@ -485,7 +500,7 @@ const make = Effect.gen(function* () {
         active_fence_token AS "activeFenceToken", active_marker_fingerprint AS "activeMarkerFingerprint"
       FROM main.agent_control_provider_capacity_current
       WHERE provider_instance_id=${providerInstanceId} AND typeof(provider_instance_id)='text'
-        AND typeof(last_fence_token)='integer'
+        ${laneWhere(admissionId)} AND typeof(last_fence_token)='integer'
     `.pipe(Effect.map((rows) => rows[0]));
 
   const appendAuthority = Effect.fn("ProviderAdmissionStore.appendAuthority")(function* (input: {
@@ -911,8 +926,25 @@ const make = Effect.gen(function* () {
       FROM main.resource_admission_provider_requests
       WHERE account_scope=${accountScope} AND status IN ('admitted','entered')
     `;
-      let active = counts[0]?.active ?? 0;
-      let background = counts[0]?.background ?? 0;
+      // Older entered authority may predate shared resource permits. Preserve
+      // that unknown occupancy until its durable stage terminal receipt lands.
+      const legacy = hasAuthorityLanes
+        ? yield* sql<{ count: number }>`
+        SELECT count(*) AS count FROM agent_control_provider_admission_current admission
+        WHERE admission.status IN ('entered','quarantined')
+          AND (EXISTS (SELECT 1 FROM resource_admission_provider_requests request
+            WHERE request.account_scope=${accountScope} AND request.provider_instance_id=admission.provider_instance_id)
+            OR NOT EXISTS (SELECT 1 FROM resource_admission_provider_requests request
+              WHERE request.provider_instance_id=admission.provider_instance_id))
+          AND NOT EXISTS (SELECT 1 FROM resource_admission_provider_requests request
+            WHERE request.source='automatic' AND request.stage=admission.stage AND request.handoff_id=admission.handoff_id
+              AND request.provider_instance_id=admission.provider_instance_id
+              AND ((request.account_scope=${accountScope} AND request.status IN ('admitted','entered'))
+                OR (request.status='released' AND (request.entered_at IS NOT NULL OR request.last_observed_activity='inactive'))))`
+        : [];
+      const legacyActive = legacy[0]?.count ?? 0;
+      let active = (counts[0]?.active ?? 0) + legacyActive;
+      let background = (counts[0]?.background ?? 0) + legacyActive;
       let fence = scope.lastFenceToken;
       let streak = scope.consecutiveInteractiveGrants;
       let grants = 0;
@@ -992,13 +1024,13 @@ const make = Effect.gen(function* () {
       FROM main.resource_admission_provider_requests
       WHERE account_scope=${accountScope} AND status IN ('admitted','entered')
     `;
-      const available = (capacity[0]?.active ?? 0) < scope.maxConcurrent;
-      const backgroundAvailable = (capacity[0]?.background ?? 0) < backgroundLimit;
+      const available = (capacity[0]?.active ?? 0) + legacyActive < scope.maxConcurrent;
+      const backgroundAvailable = (capacity[0]?.background ?? 0) + legacyActive < backgroundLimit;
       yield* sql`
       UPDATE main.resource_admission_provider_requests SET
         wait_reason=CASE
           WHEN usage_status NOT IN ('allowed','warning','unsupported') THEN 'provider-usage'
-          WHEN EXISTS (
+          WHEN ${legacyActive > 0 ? 1 : 0}=1 OR EXISTS (
             SELECT 1 FROM main.resource_admission_provider_requests uncertain
             WHERE uncertain.account_scope=${accountScope} AND uncertain.status='entered'
               AND uncertain.last_observed_activity='unknown'
@@ -1545,16 +1577,16 @@ const make = Effect.gen(function* () {
           if (current === undefined) {
             return yield* fail("request-current", "authority-missing", admissionId);
           }
-          let capacity = yield* readCapacity(String(input.request.providerInstanceId));
+          let capacity = yield* readCapacity(String(input.request.providerInstanceId), admissionId);
           if (capacity === undefined) {
             yield* sql`
               INSERT INTO main.agent_control_provider_capacity_current (
-                provider_instance_id,last_fence_token,active_admission_id,active_state,
+                ${hasAuthorityLanes ? sql`capacity_lane,` : sql``} provider_instance_id,last_fence_token,active_admission_id,active_state,
                 active_owner_id,active_lease_expires_at,active_fence_token,
                 active_marker_fingerprint,revision,updated_at
-              ) VALUES (${String(input.request.providerInstanceId)},0,NULL,NULL,NULL,NULL,NULL,NULL,1,${input.now})
+              ) VALUES (${hasAuthorityLanes ? sql`${admissionId},` : sql``} ${String(input.request.providerInstanceId)},0,NULL,NULL,NULL,NULL,NULL,NULL,1,${input.now})
             `;
-            capacity = yield* readCapacity(String(input.request.providerInstanceId));
+            capacity = yield* readCapacity(String(input.request.providerInstanceId), admissionId);
           }
           if (capacity === undefined) {
             return yield* fail("request-capacity", "authority-missing", admissionId);
@@ -1613,7 +1645,10 @@ const make = Effect.gen(function* () {
                 retryAt: null,
               } satisfies ProviderAdmissionDecision;
             }
-            fence = capacity.lastFenceToken + 1;
+            fence = yield* nextFence(
+              String(input.request.providerInstanceId),
+              capacity.lastFenceToken,
+            );
           } else {
             const candidates = yield* sql.unsafe<{ readonly admissionId: string }>(
               PROVIDER_ADMISSION_OLDEST_ELIGIBLE_SQL,
@@ -1626,7 +1661,10 @@ const make = Effect.gen(function* () {
                 retryAt: null,
               } satisfies ProviderAdmissionDecision;
             }
-            fence = capacity.lastFenceToken + 1;
+            fence = yield* nextFence(
+              String(input.request.providerInstanceId),
+              capacity.lastFenceToken,
+            );
           }
           const claimFingerprint = sha256Utf8(
             canonicalJson([admissionId, input.ownerId, fence, input.now, input.leaseExpiresAt]),
@@ -1652,7 +1690,7 @@ const make = Effect.gen(function* () {
               active_owner_id=${input.ownerId},active_lease_expires_at=${input.leaseExpiresAt},
               active_fence_token=${fence},active_marker_fingerprint=NULL,
               revision=revision+1,updated_at=${input.now}
-            WHERE provider_instance_id=${String(input.request.providerInstanceId)}
+            WHERE provider_instance_id=${String(input.request.providerInstanceId)} ${laneWhere(admissionId)}
           `;
           }
           const marker = yield* appendAuthority({
@@ -1683,7 +1721,7 @@ const make = Effect.gen(function* () {
             active_owner_id=${input.ownerId},active_lease_expires_at=${input.leaseExpiresAt},
             active_fence_token=${fence},active_marker_fingerprint=${marker.markerFingerprint},revision=revision+1,
             updated_at=${input.now}
-          WHERE provider_instance_id=${String(input.request.providerInstanceId)}
+          WHERE provider_instance_id=${String(input.request.providerInstanceId)} ${laneWhere(admissionId)}
         `;
           if (recovery?.deliveryState === "claimed") {
             const table = providerAdmissionDeliveryTables.find(
@@ -1755,30 +1793,40 @@ const make = Effect.gen(function* () {
     return yield* sql
       .withTransaction(
         Effect.gen(function* () {
-          let capacity = yield* readCapacity(input.providerInstanceId);
+          const candidates = yield* sql.unsafe<{ readonly admissionId: string }>(
+            PROVIDER_ADMISSION_OLDEST_ELIGIBLE_SQL,
+            [input.providerInstanceId],
+          );
+          if (candidates.length === 0) {
+            if (
+              !hasAuthorityLanes &&
+              (yield* readCapacity(input.providerInstanceId, "")) === undefined
+            )
+              yield* sql`INSERT INTO main.agent_control_provider_capacity_current (
+                provider_instance_id,last_fence_token,active_admission_id,active_state,
+                active_owner_id,active_lease_expires_at,active_fence_token,active_marker_fingerprint,revision,updated_at
+              ) VALUES (${input.providerInstanceId},0,NULL,NULL,NULL,NULL,NULL,NULL,1,${input.now})`;
+            return null;
+          }
+          if (candidates.length !== 1) {
+            return yield* fail("admit-oldest-candidate", "authority-divergent");
+          }
+          const admissionId = candidates[0]!.admissionId;
+          let capacity = yield* readCapacity(input.providerInstanceId, admissionId);
           if (capacity === undefined) {
             yield* sql`
             INSERT INTO main.agent_control_provider_capacity_current (
-              provider_instance_id,last_fence_token,active_admission_id,active_state,
+              ${hasAuthorityLanes ? sql`capacity_lane,` : sql``} provider_instance_id,last_fence_token,active_admission_id,active_state,
               active_owner_id,active_lease_expires_at,active_fence_token,
               active_marker_fingerprint,revision,updated_at
-            ) VALUES (${input.providerInstanceId},0,NULL,NULL,NULL,NULL,NULL,NULL,1,${input.now})
+            ) VALUES (${hasAuthorityLanes ? sql`${admissionId},` : sql``} ${input.providerInstanceId},0,NULL,NULL,NULL,NULL,NULL,NULL,1,${input.now})
           `;
-            capacity = yield* readCapacity(input.providerInstanceId);
+            capacity = yield* readCapacity(input.providerInstanceId, admissionId);
           }
           if (capacity === undefined) {
             return yield* fail("admit-oldest-capacity", "authority-missing");
           }
           if (capacity.activeAdmissionId !== null) return null;
-          const candidates = yield* sql.unsafe<{ readonly admissionId: string }>(
-            PROVIDER_ADMISSION_OLDEST_ELIGIBLE_SQL,
-            [input.providerInstanceId],
-          );
-          if (candidates.length === 0) return null;
-          if (candidates.length !== 1) {
-            return yield* fail("admit-oldest-candidate", "authority-divergent");
-          }
-          const admissionId = candidates[0]!.admissionId;
           const [current, intent] = yield* Effect.all([
             readCurrent(admissionId),
             readIntent(admissionId),
@@ -1793,7 +1841,7 @@ const make = Effect.gen(function* () {
           ) {
             return yield* fail("admit-oldest-authority", "authority-divergent", admissionId);
           }
-          const fence = capacity.lastFenceToken + 1;
+          const fence = yield* nextFence(input.providerInstanceId, capacity.lastFenceToken);
           const claimFingerprint = sha256Utf8(
             canonicalJson([admissionId, input.ownerId, fence, input.now, input.leaseExpiresAt]),
           );
@@ -1817,7 +1865,7 @@ const make = Effect.gen(function* () {
             active_owner_id=${input.ownerId},active_lease_expires_at=${input.leaseExpiresAt},
             active_fence_token=${fence},active_marker_fingerprint=NULL,
             revision=revision+1,updated_at=${input.now}
-          WHERE provider_instance_id=${input.providerInstanceId}
+          WHERE provider_instance_id=${input.providerInstanceId} ${laneWhere(admissionId)}
             AND active_admission_id IS NULL
         `;
           const marker = yield* appendAuthority({
@@ -1875,7 +1923,7 @@ const make = Effect.gen(function* () {
     const [current, intent, capacity] = yield* Effect.all([
       readCurrent(input.permit.admissionId),
       readIntent(input.permit.admissionId),
-      readCapacity(String(input.permit.providerInstanceId)),
+      readCapacity(String(input.permit.providerInstanceId), input.permit.admissionId),
     ]);
     if (current === undefined || intent === undefined || capacity === undefined) {
       return yield* fail("pre-effect-read", "authority-missing", input.permit.admissionId);
@@ -2916,7 +2964,13 @@ const make = Effect.gen(function* () {
           : EXPECTED_PROVIDER_ADMISSION_DDL_FINGERPRINTS;
       if (
         objects.length !== PROVIDER_ADMISSION_SCHEMA_OBJECTS.length ||
-        objects.some((object) => expectedFingerprints[object.name] !== sha256Utf8(object.source))
+        objects.some(
+          (object) =>
+            (hasAuthorityLanes
+              ? (PROVIDER_AUTHORITY_LANE_DDL_FINGERPRINTS[object.name] ??
+                expectedFingerprints[object.name])
+              : expectedFingerprints[object.name]) !== sha256Utf8(object.source),
+        )
       ) {
         return yield* fail("startup-ddl-audit", "authority-divergent");
       }
@@ -3049,7 +3103,9 @@ const make = Effect.gen(function* () {
           SELECT MAX(history.provider_fence_token)
           FROM main.agent_control_provider_claim_history history
           WHERE history.provider_instance_id=capacity.provider_instance_id
+            ${hasAuthorityLanes ? sql`AND history.admission_id=capacity.capacity_lane` : sql``}
         ),0)
+        ${hasAuthorityLanes ? sql`OR (capacity.active_admission_id IS NOT NULL AND capacity.active_admission_id!=capacity.capacity_lane)` : sql``}
         OR (capacity.active_admission_id IS NOT NULL AND NOT EXISTS (
           SELECT 1 FROM main.agent_control_provider_admission_current admission
           WHERE admission.admission_id=capacity.active_admission_id
@@ -3063,6 +3119,7 @@ const make = Effect.gen(function* () {
         OR (capacity.active_admission_id IS NULL AND EXISTS (
           SELECT 1 FROM main.agent_control_provider_admission_current admission
           WHERE admission.provider_instance_id=capacity.provider_instance_id
+            ${hasAuthorityLanes ? sql`AND admission.admission_id=capacity.capacity_lane` : sql``}
             AND admission.status IN ('admitted','entered','quarantined')
         ))
     `;
@@ -3086,7 +3143,12 @@ const make = Effect.gen(function* () {
            WHERE NOT EXISTS (
              SELECT 1 FROM main.agent_control_provider_capacity_current capacity
              WHERE capacity.provider_instance_id=provider.provider_instance_id
-           )) AS "missingCapacityCount",
+           )) + (SELECT count(*) FROM main.agent_control_provider_admission_current admission
+             WHERE admission.status IN ('claimed','admitted','entered','quarantined') AND NOT EXISTS (
+               SELECT 1 FROM main.agent_control_provider_capacity_current capacity
+               WHERE capacity.provider_instance_id=admission.provider_instance_id AND capacity.active_admission_id=admission.admission_id
+                 AND capacity.active_fence_token=admission.provider_fence_token
+             )) AS "missingCapacityCount",
           (SELECT count(*)
            FROM main.agent_control_provider_claim_history claim
            LEFT JOIN main.agent_control_provider_admission_intents intent
@@ -3213,7 +3275,9 @@ const make = Effect.gen(function* () {
           );
           if (
             prior.length !== 1 ||
-            chain.providerFenceToken !== recovery.previousFenceToken + 1 ||
+            (hasAuthorityLanes
+              ? chain.providerFenceToken <= recovery.previousFenceToken
+              : chain.providerFenceToken !== recovery.previousFenceToken + 1) ||
             recovery.previousLeaseExpiresAt > chain.occurredAt ||
             (recovery.deliveryState === "claimed" && recovery.claimExpiresAt > chain.occurredAt) ||
             !entryChains.some(

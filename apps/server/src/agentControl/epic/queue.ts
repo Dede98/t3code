@@ -1,3 +1,6 @@
+import { unsettledEpicExecutions } from "./executionState.ts";
+import { withAgentControlRunOnceProjectFence } from "../runOnce/context.ts";
+import { validateEpicDependencyPlan } from "./dependencyPlan.ts";
 import {
   AgentControlEpicRpcError,
   AgentControlProjectPolicy,
@@ -74,157 +77,170 @@ export const makeEpicQueue = Effect.gen(function* () {
         "scope-changed",
         "The Epic changed since preview. Inspect it again before approving.",
       );
-    return yield* sql.withTransaction(
-      Effect.gen(function* () {
-        const previous = yield* loadEpicQueue(sql, input.projectId);
-        if ((previous?.revision ?? 0) !== input.expectedRevision)
-          return yield* epicError(
-            "revision-conflict",
-            "The Epic queue changed. Reload before editing it.",
-          );
-        const enabled = isAgentControlEpicQueueEnabled(previous);
-        if (!enabled && input.action.kind !== "approve")
-          return yield* epicError("queue-disabled", "Approve an Epic to enable the queue.");
-        const selected = yield* loadSelectedEpic(sql, input.projectId);
-        if (!enabled && selected?.status === "stopped")
-          return yield* epicError(
-            "epic-stopped",
-            "Clear the stopped Epic selection before enabling its project queue.",
-          );
-        const project = yield* engine.getProjectState({ projectId: input.projectId });
-        if (
-          !enabled &&
-          !selected &&
-          (project.mode === "armed" ||
-            project.mode === "run-once" ||
-            project.pausedFromMode === "run-once")
-        )
-          return yield* epicError(
-            "project-busy",
-            "Disarm ordinary task automation and finish its active run before enabling the Epic queue.",
-          );
-        const activeRuns =
-          yield* sql`SELECT 1 FROM main.agent_control_run_once_states WHERE project_id=${input.projectId} AND status='active'`;
-        if (!enabled && !selected && activeRuns.length)
-          return yield* epicError(
-            "project-busy",
-            "Finish the active task before enabling the Epic queue.",
-          );
-        let entries = [...(enabled ? previous!.entries : selected ? [entryForRun(selected)] : [])];
-        const action = input.action;
-        if (action.kind === "leave") {
-          const active = entries.find((entry) => entry.status === "active");
-          if (active && active.epicRunId !== selected?.epicRunId)
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const previous = yield* loadEpicQueue(sql, input.projectId);
+          if ((previous?.revision ?? 0) !== input.expectedRevision)
             return yield* epicError(
-              "authority-conflict",
-              "The active queue entry lost its Epic selection.",
+              "revision-conflict",
+              "The Epic queue changed. Reload before editing it.",
             );
+          const enabled = isAgentControlEpicQueueEnabled(previous);
+          if (!enabled && input.action.kind !== "approve")
+            return yield* epicError("queue-disabled", "Approve an Epic to enable the queue.");
+          const selected = yield* loadSelectedEpic(sql, input.projectId);
+          if (!enabled && selected?.status === "stopped")
+            return yield* epicError(
+              "epic-stopped",
+              "Clear the stopped Epic selection before enabling its project queue.",
+            );
+          const project = yield* engine.getProjectState({ projectId: input.projectId });
           if (
-            project.mode === "armed" ||
-            project.mode === "run-once" ||
-            project.pausedFromMode === "run-once" ||
-            activeRuns.length
+            !enabled &&
+            !selected &&
+            (project.mode === "armed" ||
+              project.mode === "run-once" ||
+              project.pausedFromMode === "run-once")
           )
             return yield* epicError(
-              "queue-busy",
-              "Turn Armed off and wait for active work to settle before leaving the queue.",
+              "project-busy",
+              "Disarm ordinary task automation and finish its active run before enabling the Epic queue.",
             );
-          if (entries.some((entry) => entry.status === "pending"))
+          const activeRuns =
+            yield* sql`SELECT 1 FROM main.agent_control_run_once_states WHERE project_id=${input.projectId} AND status='active'`;
+          if (!enabled && !selected && activeRuns.length)
             return yield* epicError(
-              "queue-has-pending",
-              "Remove waiting entries before leaving the queue. Their approval is not discarded automatically.",
+              "project-busy",
+              "Finish the active task before enabling the Epic queue.",
             );
-          if (selected) {
-            if (!entries.some((entry) => entry.epicRunId === selected.epicRunId))
+          let entries = [
+            ...(enabled ? previous!.entries : selected ? [entryForRun(selected)] : []),
+          ];
+          const action = input.action;
+          if (action.kind === "leave") {
+            const active = entries.find((entry) => entry.status === "active");
+            if (active && active.epicRunId !== selected?.epicRunId)
               return yield* epicError(
                 "authority-conflict",
-                "The selected Epic does not belong to this queue.",
+                "The active queue entry lost its Epic selection.",
               );
-            if (selected.status !== "succeeded" && selected.status !== "stopped")
-              yield* saveEpicRun(sql, selected, { status: "stopped" });
-            yield* sql`DELETE FROM main.agent_control_epic_targets WHERE project_id=${input.projectId} AND epic_run_id=${selected.epicRunId}`;
+            if (
+              project.mode === "armed" ||
+              project.mode === "run-once" ||
+              project.pausedFromMode === "run-once" ||
+              activeRuns.length ||
+              (yield* unsettledEpicExecutions(sql, input.projectId)).size !== 0
+            )
+              return yield* epicError(
+                "queue-busy",
+                "Turn Armed off and wait for active work to settle before leaving the queue.",
+              );
+            if (entries.some((entry) => entry.status === "pending"))
+              return yield* epicError(
+                "queue-has-pending",
+                "Remove waiting entries before leaving the queue. Their approval is not discarded automatically.",
+              );
+            if (selected) {
+              if (!entries.some((entry) => entry.epicRunId === selected.epicRunId))
+                return yield* epicError(
+                  "authority-conflict",
+                  "The selected Epic does not belong to this queue.",
+                );
+              if (selected.status !== "succeeded" && selected.status !== "stopped")
+                yield* saveEpicRun(sql, selected, { status: "stopped" });
+              yield* sql`DELETE FROM main.agent_control_epic_targets WHERE project_id=${input.projectId} AND epic_run_id=${selected.epicRunId}`;
+            }
+            const left = yield* saveEpicQueue(sql, previous, {
+              projectId: input.projectId,
+              revision: previous!.revision,
+              enabled: false,
+              entries: [],
+              nextEntryId: null,
+              waitReason: null,
+              nextCheckAt: null,
+            });
+            yield* sql`INSERT INTO main.agent_control_epic_queue_commands(command_id,request_digest,project_id) VALUES (${input.commandId},${epicDigest(input)},${input.projectId})`;
+            return left;
           }
-          const left = yield* saveEpicQueue(sql, previous, {
+          if (action.kind === "approve") {
+            if (!inspected)
+              return yield* epicError("authority-conflict", "Epic preview is missing.");
+            if (entries.filter((entry) => entry.status !== "merged").length >= 20)
+              return yield* epicError("queue-full", "The queue supports up to 20 Epics.");
+            if (
+              entries.some(
+                (entry) => entry.source.epic.issueNodeId === inspected.source.epic.issueNodeId,
+              )
+            )
+              return yield* epicError(
+                "epic-already-approved",
+                "This Epic is already approved or has queue execution history.",
+              );
+            if (
+              inspected.source.blockers.some((blocker) =>
+                ["cross-repository", "nested-sub-issues", "empty-epic", "closed-epic"].includes(
+                  blocker.code,
+                ),
+              )
+            )
+              return yield* epicError(
+                "unsupported-epic",
+                "Approve an open, same-repository Epic with one level of native sub-issues.",
+              );
+            yield* validateEpicDependencyPlan(
+              inspected.source,
+              action.dependencyPlan,
+              action.parallelism,
+            );
+            entries.push({
+              entryId: `queue-${epicDigest({ projectId: input.projectId, commandId: input.commandId })}`,
+              source: inspected.source,
+              ...(action.parallelism !== undefined ? { parallelism: action.parallelism } : {}),
+              ...(action.dependencyPlan ? { dependencyPlan: action.dependencyPlan } : {}),
+              approvedAt: DateTime.formatIso(yield* DateTime.now),
+              epicRunId: null,
+              status: "pending",
+              blockers: inspected.blockers,
+            });
+          } else if (action.kind === "remove") {
+            const entry = entries.find((entry) => entry.entryId === action.entryId);
+            if (!entry || entry.status !== "pending")
+              return yield* epicError(
+                "entry-started",
+                "Only an unstarted queue entry can be removed.",
+              );
+            entries = entries.filter((item) => item.entryId !== action.entryId);
+          } else {
+            const pending = entries.filter((entry) => entry.status === "pending");
+            if (
+              action.entryIds.length !== pending.length ||
+              new Set(action.entryIds).size !== pending.length ||
+              action.entryIds.some((id) => !pending.some((entry) => entry.entryId === id))
+            )
+              return yield* epicError(
+                "invalid-order",
+                "Reorder exactly the current unstarted entries. Active work cannot be moved.",
+              );
+            entries = [
+              ...entries.filter((entry) => entry.status !== "pending"),
+              ...action.entryIds.map((id) => pending.find((entry) => entry.entryId === id)!),
+            ];
+          }
+          const queue = yield* saveEpicQueue(sql, previous, {
             projectId: input.projectId,
-            revision: previous!.revision,
-            enabled: false,
-            entries: [],
+            enabled: true,
+            revision: previous?.revision ?? 0,
+            entries,
             nextEntryId: null,
-            waitReason: null,
+            waitReason: "Queue changed; waiting for Armed to check eligibility.",
             nextCheckAt: null,
           });
           yield* sql`INSERT INTO main.agent_control_epic_queue_commands(command_id,request_digest,project_id) VALUES (${input.commandId},${epicDigest(input)},${input.projectId})`;
-          return left;
-        }
-        if (action.kind === "approve") {
-          if (!inspected) return yield* epicError("authority-conflict", "Epic preview is missing.");
-          if (entries.filter((entry) => entry.status !== "merged").length >= 20)
-            return yield* epicError("queue-full", "The queue supports up to 20 Epics.");
-          if (
-            entries.some(
-              (entry) => entry.source.epic.issueNodeId === inspected.source.epic.issueNodeId,
-            )
-          )
-            return yield* epicError(
-              "epic-already-approved",
-              "This Epic is already approved or has queue execution history.",
-            );
-          if (
-            inspected.source.blockers.some((blocker) =>
-              ["cross-repository", "nested-sub-issues", "empty-epic", "closed-epic"].includes(
-                blocker.code,
-              ),
-            )
-          )
-            return yield* epicError(
-              "unsupported-epic",
-              "Approve an open, same-repository Epic with one level of native sub-issues.",
-            );
-          entries.push({
-            entryId: `queue-${epicDigest({ projectId: input.projectId, commandId: input.commandId })}`,
-            source: inspected.source,
-            approvedAt: DateTime.formatIso(yield* DateTime.now),
-            epicRunId: null,
-            status: "pending",
-            blockers: inspected.blockers,
-          });
-        } else if (action.kind === "remove") {
-          const entry = entries.find((entry) => entry.entryId === action.entryId);
-          if (!entry || entry.status !== "pending")
-            return yield* epicError(
-              "entry-started",
-              "Only an unstarted queue entry can be removed.",
-            );
-          entries = entries.filter((item) => item.entryId !== action.entryId);
-        } else {
-          const pending = entries.filter((entry) => entry.status === "pending");
-          if (
-            action.entryIds.length !== pending.length ||
-            new Set(action.entryIds).size !== pending.length ||
-            action.entryIds.some((id) => !pending.some((entry) => entry.entryId === id))
-          )
-            return yield* epicError(
-              "invalid-order",
-              "Reorder exactly the current unstarted entries. Active work cannot be moved.",
-            );
-          entries = [
-            ...entries.filter((entry) => entry.status !== "pending"),
-            ...action.entryIds.map((id) => pending.find((entry) => entry.entryId === id)!),
-          ];
-        }
-        const queue = yield* saveEpicQueue(sql, previous, {
-          projectId: input.projectId,
-          enabled: true,
-          revision: previous?.revision ?? 0,
-          entries,
-          nextEntryId: null,
-          waitReason: "Queue changed; waiting for Armed to check eligibility.",
-          nextCheckAt: null,
-        });
-        yield* sql`INSERT INTO main.agent_control_epic_queue_commands(command_id,request_digest,project_id) VALUES (${input.commandId},${epicDigest(input)},${input.projectId})`;
-        return queue;
-      }),
-    );
+          return queue;
+        }),
+      )
+      .pipe((effect) => withAgentControlRunOnceProjectFence(input.projectId, effect));
   });
 
   const process = Effect.fn("EpicQueue.process")(function* (
@@ -456,6 +472,8 @@ export const makeEpicQueue = Effect.gen(function* () {
       projectId,
       commandId: candidate.entryId,
       source: candidatePreview.source,
+      ...(candidate.parallelism !== undefined ? { parallelism: candidate.parallelism } : {}),
+      ...(candidate.dependencyPlan ? { dependencyPlan: candidate.dependencyPlan } : {}),
       checks: policy.verificationChecks ?? [],
       initialBase: base,
     });

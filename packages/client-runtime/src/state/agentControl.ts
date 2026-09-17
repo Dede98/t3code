@@ -17,6 +17,7 @@ import {
   type AgentControlSetProjectModeInput,
   type AgentControlTaskId,
   type AgentControlEpicPreview,
+  type AgentControlEpicMemberView,
   type AgentControlEpicRuntimeView,
   type AgentControlEpicStartInput,
   type AgentControlEpicControlInput,
@@ -412,9 +413,62 @@ export function agentControlEpicStartBlockers(
   return [...new Set(blockers)];
 }
 
+/** Explicit approval records a complete graph; an empty dependency list is an affirmative claim. */
+export function agentControlEpicExecutionOptions(
+  preview: AgentControlEpicPreview,
+  parallelism: number,
+  rationale: string,
+  reviewed = false,
+): Pick<AgentControlEpicStartInput, "parallelism" | "dependencyPlan"> {
+  if (parallelism === 1 && !reviewed) return {};
+  return {
+    parallelism,
+    dependencyPlan: {
+      version: 1,
+      sourceFingerprint: preview.source.fingerprint,
+      rationale: rationale.trim(),
+      tasks: preview.source.tasks.map((task) => ({
+        issueNodeId: task.issue.issueNodeId,
+        dependsOn: task.dependencies.map((dependency) => dependency.issueNodeId),
+      })),
+    },
+  };
+}
+
+/** Display server decisions without reconstructing scheduling in a client. */
+export function agentControlEpicMemberProgress(
+  member: AgentControlEpicMemberView,
+  runs: readonly AgentControlRunOnceView[],
+) {
+  const run = runs.find((candidate) => candidate.state.runId === member.childRunId);
+  const stage = run?.stages
+    .toSorted((a, b) => a.stageOrdinal - b.stageOrdinal || a.attemptOrdinal - b.attemptOrdinal)
+    .at(-1);
+  const label = member.blocker
+    ? `Blocked: ${member.blocker}`
+    : stage?.admissionWait && member.status === "running"
+      ? resourceAdmissionWaitMessage(stage.admissionWait)
+      : member.waitReason
+        ? {
+            dependencies: "Waiting for verified predecessor integrations",
+            capacity: "Waiting for capacity",
+            integration: "Waiting for integration and checks on the combined result",
+            blocker: "Blocked — inspect task evidence",
+          }[member.waitReason]
+        : member.status === "running" && stage
+          ? `${stage.displayStage} · ${stage.status}`
+          : member.status === "accepted"
+            ? "Integrated and verified"
+            : member.status === "failed"
+              ? "Blocked — task failed"
+              : member.status;
+  return { label, threadId: stage?.threadId ?? null };
+}
+
 export function agentControlEpicStartInput(
   snapshot: AgentControlRunOnceSnapshot,
   preview: AgentControlEpicPreview,
+  options: Pick<AgentControlEpicStartInput, "parallelism" | "dependencyPlan"> = {},
 ): AgentControlEpicStartInput {
   return {
     projectId: snapshot.projectId,
@@ -424,11 +478,13 @@ export function agentControlEpicStartInput(
         snapshot.projectState.revision,
         preview.source.epic.issueNodeId,
         preview.source.fingerprint,
+        ...(options.dependencyPlan || (options.parallelism ?? 1) > 1 ? [options] : []),
       ])}`,
     ),
     expectedRevision: snapshot.projectState.revision,
     epicNumber: preview.source.epic.number,
     expectedFingerprint: preview.source.fingerprint,
+    ...options,
   };
 }
 
@@ -463,7 +519,9 @@ export function agentControlEpicControlAllowed(
     );
   if (action === "stop") return !terminal;
   return (
-    !epic.members.some((member) => member.status === "failed") &&
+    !epic.members.some(
+      (member) => member.status === "failed" && (!epic.dependencyPlan || !member.captured),
+    ) &&
     (epic.status === "blocked" ||
       (epic.status === "running" && readiness.snapshot?.armed?.enabled === false)) &&
     readiness.preflight?.ok === true &&

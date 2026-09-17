@@ -6095,6 +6095,25 @@ const make = Effect.gen(function* () {
             repositoryCommonDir: state.repositoryCommonDir,
             runtimeHolderId: holderId,
             effect: Effect.gen(function* () {
+              const hasEpicExecutions = yield* sql`SELECT 1 FROM main.sqlite_schema
+                WHERE type='table' AND name='agent_control_epic_task_executions'`;
+              const epicExecution =
+                hasEpicExecutions.length === 0
+                  ? []
+                  : yield* sql`
+                SELECT execution.execution_id
+                FROM agent_control_epic_task_executions execution
+                JOIN agent_control_epic_targets target ON target.epic_run_id=execution.epic_run_id AND target.project_id=execution.project_id
+                JOIN agent_control_epic_runs epic ON epic.epic_run_id=execution.epic_run_id
+                JOIN json_each(epic.state_json,'$.members') member
+                  ON json_extract(member.value,'$.taskId')=execution.task_id
+                  AND json_extract(member.value,'$.childRunId')=execution.execution_id
+                WHERE execution.execution_id=${input.childRunId} AND execution.project_id=${input.projectId}
+                  AND execution.task_id=${input.taskId} AND execution.worktree_reservation_id=${input.reservationId}
+                  AND execution.phase='thread-activated'
+                  AND ((json_extract(epic.state_json,'$.status')='running' AND json_extract(member.value,'$.status')='running')
+                    OR (json_extract(epic.state_json,'$.status') IN ('running','verifying','succeeded') AND json_extract(member.value,'$.status')='accepted'))
+                  AND json_extract(epic.state_json,'$.dependencyPlanDigest')=execution.plan_digest`;
               const authority = yield* sql`
             SELECT evidence.task_finalization_evidence_id
             FROM agent_control_task_verification_finalization_evidence evidence
@@ -6104,11 +6123,12 @@ const make = Effect.gen(function* () {
             JOIN agent_control_task_verification_finalization_markers marker
               ON marker.marker_id = evidence.marker_id AND marker.receipt_id = receipt.receipt_id
               AND marker.task_finalization_evidence_id = evidence.task_finalization_evidence_id
-            JOIN agent_control_run_once_states run
+            LEFT JOIN agent_control_run_once_states run
               ON run.project_id = evidence.project_id AND run.task_id = evidence.task_id
               AND run.run_id = ${input.childRunId} AND run.worktree_reservation_id = ${input.reservationId}
             JOIN agent_control_task_states task ON task.task_id = evidence.task_id AND task.status = 'succeeded'
-            WHERE evidence.task_finalization_evidence_id = ${input.taskFinalizationEvidenceId}
+            WHERE (run.run_id IS NOT NULL OR ${epicExecution.length === 1 ? 1 : 0})
+              AND evidence.task_finalization_evidence_id = ${input.taskFinalizationEvidenceId}
               AND evidence.project_id = ${input.projectId} AND evidence.task_id = ${input.taskId}
               AND evidence.verification_outcome = 'succeeded' AND evidence.verification_verdict = 'passed'
           `;

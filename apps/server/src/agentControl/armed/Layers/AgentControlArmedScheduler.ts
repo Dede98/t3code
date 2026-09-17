@@ -419,6 +419,12 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
       const selectedEpic = yield* loadSelectedEpic(sql, projectId);
       if (selectedEpic !== null || (yield* loadEnabledEpicQueue(sql, projectId)) !== null)
         yield* epicProgress.processProject(projectId);
+      const epic = yield* loadSelectedEpic(sql, projectId);
+      if (epic?.dependencyPlan) {
+        if (!runOnce.processEpicTasks) return yield* fail(projectId, "authority-conflict");
+        yield* runOnce.processEpicTasks(projectId);
+        return;
+      }
       const dispatch = yield* withAgentControlRunOnceProjectFence(
         projectId,
         Effect.gen(function* () {
@@ -597,7 +603,17 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
           "task",
         );
       }
-      yield* recover;
+      yield* recover.pipe(
+        Effect.catchIf(
+          (failure) =>
+            failure.reason === "persistence" &&
+            isEpicError(failure.cause) &&
+            failure.cause.code === "revision-conflict",
+          // Startup may race another server's successful progress. Let the existing
+          // keyed workers rescan after activation, with their ordinary retry budget.
+          () => catchUp,
+        ),
+      );
       yield* Deferred.succeed(ready, undefined);
     });
 

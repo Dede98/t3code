@@ -1,8 +1,11 @@
 import {
   AgentControlEpicAcceptedResult,
+  AgentControlEpicFinalVerification,
   AgentControlVerificationChecks,
   AgentControlWorktreeReservationId,
   type AgentControlEpicRuntimeView,
+  type AgentControlEpicMemberView,
+  type AgentControlWorktreeReservationState,
   AgentControlEpicRpcError,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -30,6 +33,15 @@ const decodeChecks = Schema.decodeUnknownEffect(
 const invalid = (message: string) => epicError("handoff-evidence-invalid", message);
 const decodeAccepted = Schema.decodeUnknownEffect(
   Schema.fromJsonString(AgentControlEpicAcceptedResult),
+);
+
+const decodeIntegrated = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      accepted: AgentControlEpicAcceptedResult,
+      verification: AgentControlEpicFinalVerification,
+    }),
+  ),
 );
 
 export interface EpicHandoffProof {
@@ -101,7 +113,11 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
         )
       )
         return yield* invalid("The Epic contains work without accepted completion evidence.");
-      const reservations = [];
+      const reservations: Array<{
+        member: AgentControlEpicMemberView;
+        original: AgentControlWorktreeReservationState;
+        integration: { expectedCommitSha: string; worktreePath: string } | undefined;
+      }> = [];
       let childCheckCount = 0;
       for (const member of accepted) {
         if (
@@ -151,15 +167,16 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
         JOIN agent_control_verification_finalization_evidence stage ON stage.finalization_evidence_id=task.verification_evidence_id
         WHERE intent.child_run_id=${member.childRunId} AND intent.epic_run_id=${state.epicRunId} AND intent.project_id=${state.projectId}`;
         const row = rows[0];
+        const captured = member.captured ?? member.accepted;
         if (
           rows.length !== 1 ||
           !row ||
           row.resultDigest !== sha256Utf8(row.resultJson) ||
-          epicDigest(yield* decodeAccepted(row.resultJson)) !== epicDigest(member.accepted) ||
-          row.commitSha !== member.accepted.commitSha ||
-          row.treeSha !== member.accepted.treeSha ||
-          row.codeDigest !== member.accepted.codeDigest ||
-          member.accepted.evidenceId !== `epic-capture:${member.childRunId}` ||
+          epicDigest(yield* decodeAccepted(row.resultJson)) !== epicDigest(captured) ||
+          row.commitSha !== captured.commitSha ||
+          row.treeSha !== captured.treeSha ||
+          row.codeDigest !== captured.codeDigest ||
+          captured.evidenceId !== `epic-capture:${member.childRunId}` ||
           !row.codeDigest.startsWith(VERIFICATION_CODE_SNAPSHOT_PREFIX) ||
           row.inputJson !==
             epicJson({
@@ -215,21 +232,111 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
           );
         const childChecks = yield* decodeChecks(childManifest[0]!.checksJson);
         childCheckCount += childChecks.filter((check) => check.required).length;
-        reservations.push({ member, original });
+        let integration: { expectedCommitSha: string; worktreePath: string } | undefined;
+        if (member.captured) {
+          const integrations = yield* sql<{
+            integrationId: string;
+            inputJson: string;
+            expectedCommitSha: string;
+            capturedCommitSha: string;
+            commitSha: string;
+            treeSha: string;
+            worktreePath: string;
+            resultJson: string;
+            resultDigest: string;
+          }>`SELECT intent.integration_id AS "integrationId",intent.input_json AS "inputJson",intent.expected_commit_sha AS "expectedCommitSha",intent.captured_commit_sha AS "capturedCommitSha",intent.commit_sha AS "commitSha",intent.tree_sha AS "treeSha",intent.worktree_path AS "worktreePath",result.result_json AS "resultJson",result.result_digest AS "resultDigest"
+            FROM agent_control_epic_integration_intents intent JOIN agent_control_epic_integration_results result ON result.integration_id=intent.integration_id
+            WHERE intent.epic_run_id=${state.epicRunId} AND intent.child_run_id=${member.childRunId} AND intent.commit_sha=${member.accepted.commitSha}`;
+          const item = integrations[0];
+          if (
+            !item ||
+            integrations.length !== 1 ||
+            sha256Utf8(item.resultJson) !== item.resultDigest
+          )
+            return yield* invalid("An accepted integration receipt is missing or corrupt.");
+          const integrated = yield* decodeIntegrated(item.resultJson);
+          if (
+            epicDigest(integrated.accepted) !== epicDigest(member.accepted) ||
+            !member.integrationVerification ||
+            epicDigest(integrated.verification) !== epicDigest(member.integrationVerification) ||
+            integrated.verification.status !== "passed" ||
+            integrated.verification.commitSha !== item.commitSha ||
+            integrated.accepted.commitSha !== item.commitSha ||
+            integrated.accepted.treeSha !== item.treeSha ||
+            item.capturedCommitSha !== captured.commitSha ||
+            item.integrationId !== `epic-integration:${sha256Utf8(item.inputJson)}` ||
+            integrated.accepted.evidenceId !== item.integrationId ||
+            !integrated.verification.evidenceId.startsWith(`${item.integrationId}:`) ||
+            item.inputJson !==
+              epicJson({
+                epicRunId: state.epicRunId,
+                projectId: state.projectId,
+                childRunId: member.childRunId,
+                captured,
+                expectedCommitSha: item.expectedCommitSha,
+                initialBaseCommitSha: state.initialBase?.commitSha,
+                checks: state.checks,
+              })
+          )
+            return yield* invalid(
+              "The integration proof does not match the captured task and accepted common result.",
+            );
+          const manifests = yield* sql<{
+            fenceToken: number;
+            codeDigest: string;
+            checksJson: string;
+            manifestDigest: string;
+          }>`SELECT fence_token AS "fenceToken",code_digest AS "codeDigest",checks_json AS "checksJson",manifest_digest AS "manifestDigest" FROM agent_control_verification_check_manifests WHERE provider_delivery_id=${integrated.verification.evidenceId}`;
+          const manifest = manifests[0];
+          if (
+            !manifest ||
+            manifests.length !== 1 ||
+            manifest.manifestDigest !== integrated.verification.manifestDigest ||
+            rawVerificationCodeDigest(manifest.codeDigest) !== integrated.accepted.codeDigest ||
+            manifest.checksJson !== epicJson(state.checks) ||
+            integrated.verification.evidenceId !== `${item.integrationId}:${manifest.fenceToken}`
+          )
+            return yield* invalid("The integration checks do not bind the current common tree.");
+          const assessment = yield* assessVerificationChecks(
+            sql,
+            {
+              evidence: {
+                providerDeliveryId: integrated.verification.evidenceId,
+                handoffId: integrated.verification.evidenceId,
+                fenceToken: manifest.fenceToken,
+                worktreePath: item.worktreePath,
+              },
+              delivery: { providerTurnId: integrated.verification.evidenceId },
+            },
+            { checkCurrentCode: false },
+          );
+          if (assessment.code !== null)
+            return yield* invalid("Required integration checks are incomplete or invalid.");
+          integration = {
+            expectedCommitSha: item.expectedCommitSha,
+            worktreePath: item.worktreePath,
+          };
+        }
+        reservations.push({ member, original, integration });
       }
       // Follow the accepted commit chain, independent of GitHub issue display order.
       const initialBase = state.initialBase?.commitSha ?? null;
-      const first = reservations.find(({ member }) => member.baseCommitSha === initialBase);
+      const previousCommit = (entry: (typeof reservations)[number]) =>
+        entry.integration?.expectedCommitSha ?? entry.member.baseCommitSha;
+      const first = reservations.find((entry) => previousCommit(entry) === initialBase);
       if (!first) return yield* invalid("The original Epic base could not be determined.");
       let previous: string | null = initialBase;
       const visited = new Set<string>();
       while (visited.size < reservations.length) {
-        const next = reservations.filter(({ member }) => member.baseCommitSha === previous);
+        const next = reservations.filter((entry) => previousCommit(entry) === previous);
         if (next.length !== 1 || visited.has(next[0]!.member.childRunId!))
           return yield* invalid("The accepted child commit chain is inconsistent.");
         const entry = next[0]!;
         if (
-          entry.original.baseCommitSha !== (previous ?? first.original.baseCommitSha) ||
+          entry.original.baseCommitSha !==
+            (entry.integration
+              ? entry.member.baseCommitSha
+              : (previous ?? first.original.baseCommitSha)) ||
           epicDigest(entry.original.repository) !== epicDigest(first.original.repository) ||
           entry.original.repositoryCommonDir !== first.original.repositoryCommonDir
         )
@@ -271,7 +378,7 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
             providerDeliveryId: final.evidenceId,
             handoffId: final.evidenceId,
             fenceToken: state.verificationAttempt,
-            worktreePath: last.original.internalWorktreePath,
+            worktreePath: last.integration?.worktreePath ?? last.original.internalWorktreePath,
           },
           delivery: { providerTurnId: final.evidenceId },
         },

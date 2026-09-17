@@ -11,6 +11,8 @@ import {
   agentControlEpicControlInput,
   agentControlEpicStartBlockers,
   agentControlEpicStartInput,
+  agentControlEpicExecutionOptions,
+  agentControlEpicMemberProgress,
   agentControlEpicStatus,
   agentControlEpicHandoffBlockers,
   agentControlEpicPublishHandoffInput,
@@ -23,6 +25,7 @@ import type {
   AgentControlEpicRuntimeView,
   EnvironmentId,
   ProjectId,
+  ThreadId,
 } from "@t3tools/contracts";
 import { agentControlEnvironment } from "../../state/agentControl";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -36,6 +39,7 @@ type Props = {
   handoffPermissionBlocker: string | null;
   onRefresh: () => void;
   onOpenRun: (runId: string) => void;
+  onOpenThread: (threadId: ThreadId, changes?: boolean) => void;
   readOnly?: boolean;
 };
 
@@ -46,9 +50,13 @@ export function AgentControlEpicPanel({
   handoffPermissionBlocker,
   onRefresh,
   onOpenRun,
+  onOpenThread,
   readOnly = false,
 }: Props) {
   const [number, setNumber] = useState("");
+  const [parallelism, setParallelism] = useState("1");
+  const [rationale, setRationale] = useState("");
+  const [reviewed, setReviewed] = useState(false);
   const [preview, setPreview] = useState<AgentControlEpicPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(true);
@@ -91,6 +99,16 @@ export function AgentControlEpicPanel({
     ]),
   ];
   const source = epic?.source ?? preview?.source;
+  const limit = Number(parallelism);
+  const executionBlocker =
+    !Number.isInteger(limit) || limit < 1 || limit > 4
+      ? "Choose a parallel task limit from 1 to 4."
+      : (limit > 1 || reviewed) && (!reviewed || !rationale.trim())
+        ? "Review the complete dependency graph and explain why unrelated tasks can run independently."
+        : null;
+  const executionOptions = preview
+    ? agentControlEpicExecutionOptions(preview, limit, rationale, reviewed)
+    : {};
   const issueNumber = Number(number);
   const canInspect =
     readiness.connected &&
@@ -105,7 +123,11 @@ export function AgentControlEpicPanel({
   ) {
     const snapshot = readiness.snapshot;
     if (!snapshot || readOnly || inFlight.current || queueBlockers.length > 0) return;
-    if (action === "approve" && (!preview || approvalBlockers.length > 0)) return;
+    if (
+      action === "approve" &&
+      (!preview || approvalBlockers.length > 0 || executionBlocker !== null)
+    )
+      return;
     if (action === "leave" && leaveBlockers.length > 0) return;
     if (
       action !== "approve" &&
@@ -121,6 +143,7 @@ export function AgentControlEpicPanel({
               kind: "approve",
               epicNumber: preview.source.epic.number,
               expectedFingerprint: preview.source.fingerprint,
+              ...executionOptions,
             })
           : action === "remove" && entryId
             ? agentControlEpicQueueChangeInput(snapshot, { kind: "remove", entryId })
@@ -143,12 +166,12 @@ export function AgentControlEpicPanel({
   }
 
   async function execute(action: "preview" | "start" | "resume" | "stop" | "clear") {
-    if (inFlight.current || readiness.pending || !readiness.connected) return;
+    if (readOnly || inFlight.current || readiness.pending || !readiness.connected) return;
     if (
       action === "preview"
         ? !canInspect
         : action === "start"
-          ? blockers.length > 0
+          ? blockers.length > 0 || executionBlocker !== null
           : !agentControlEpicControlAllowed(readiness, action)
     )
       return;
@@ -157,6 +180,8 @@ export function AgentControlEpicPanel({
     try {
       if (action === "preview") {
         setPreview(null);
+        setReviewed(false);
+        setRationale("");
         const result = await inspect({
           environmentId,
           input: { projectId, epicNumber: issueNumber },
@@ -169,7 +194,7 @@ export function AgentControlEpicPanel({
           action === "start" && readiness.snapshot && preview
             ? await start({
                 environmentId,
-                input: agentControlEpicStartInput(readiness.snapshot, preview),
+                input: agentControlEpicStartInput(readiness.snapshot, preview, executionOptions),
               })
             : epic && action !== "start"
               ? await { resume, stop, clear }[action]({
@@ -195,8 +220,8 @@ export function AgentControlEpicPanel({
           <h3 className="text-sm font-medium">Execute a GitHub Epic</h3>
           <p className="text-sm text-muted-foreground">
             Inspect native GitHub sub-issues and dependencies before starting. One level in this
-            repository is supported. Each accepted task becomes the next task’s starting point. The
-            common result receives a final verification.
+            repository is supported. Reviewed independent tasks can run concurrently in separate
+            worktrees. Each result is integrated and checked before dependents start.
           </p>
           <div className="flex flex-wrap gap-2">
             <Input
@@ -237,6 +262,48 @@ export function AgentControlEpicPanel({
                   ))}
                 </ol>
               ) : null}
+              <label className="block text-sm">
+                Concurrent tasks (1–4)
+                <Input
+                  aria-label="Concurrent Epic tasks"
+                  type="number"
+                  min={1}
+                  max={4}
+                  value={parallelism}
+                  disabled={readiness.pending}
+                  onChange={(event) => setParallelism(event.target.value)}
+                  className="mt-1 w-24"
+                />
+              </label>
+              <div className="space-y-2">
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={reviewed}
+                    disabled={readiness.pending}
+                    onChange={(event) => setReviewed(event.target.checked)}
+                  />
+                  {limit === 1 ? "Use reviewed dependency plan (optional). " : ""}
+                  I reviewed every task: the shown dependencies are complete, and tasks with no
+                  dependency path between them can safely run independently.
+                </label>
+                {limit > 1 || reviewed ? (
+                  <Input
+                    aria-label="Parallel task independence rationale"
+                    placeholder="Why can unrelated tasks run independently?"
+                    value={rationale}
+                    disabled={readiness.pending}
+                    onChange={(event) => setRationale(event.target.value)}
+                  />
+                ) : null}
+                <p className="text-xs text-muted-foreground">
+                  Missing edges alone do not prove independence. Update GitHub dependencies and
+                  inspect again if needed. This approval is frozen when started or queued.
+                </p>
+              </div>
+              {executionBlocker ? (
+                <p className="text-sm text-amber-600">{executionBlocker}</p>
+              ) : null}
               {previewMessages.map((blocker) => (
                 <p key={blocker} className="text-sm text-amber-600">
                   {blocker}
@@ -244,7 +311,7 @@ export function AgentControlEpicPanel({
               ))}
               <Button
                 size="sm"
-                disabled={approvalBlockers.length > 0}
+                disabled={approvalBlockers.length > 0 || executionBlocker !== null}
                 onClick={() => void editQueue("approve")}
               >
                 Approve for Epic queue
@@ -258,7 +325,7 @@ export function AgentControlEpicPanel({
                 <>
                   <Button
                     size="sm"
-                    disabled={blockers.length > 0}
+                    disabled={blockers.length > 0 || executionBlocker !== null}
                     onClick={() => void execute("start")}
                   >
                     Start inspected Epic
@@ -417,18 +484,55 @@ export function AgentControlEpicPanel({
               const member = epic?.members.find(
                 (candidate) => candidate.issueNodeId === task.issue.issueNodeId,
               );
+              const approvedDependencies = epic?.dependencyPlan?.tasks.find(
+                (entry) => entry.issueNodeId === task.issue.issueNodeId,
+              )?.dependsOn;
+              const dependencyNumbers = approvedDependencies
+                ? approvedDependencies.map(
+                    (id) =>
+                      source.tasks.find((entry) => entry.issue.issueNodeId === id)?.issue.number ??
+                      id,
+                  )
+                : task.dependencies.map((dependency) => dependency.number);
+              const progress = member
+                ? agentControlEpicMemberProgress(member, readiness.snapshot?.runs ?? [])
+                : null;
               return (
                 <li key={task.issue.issueNodeId} className="space-y-1 rounded border p-2">
                   <p>
                     #{task.issue.number} {task.issue.title} · {member?.status ?? task.issue.state}
-                    {member?.taskId && member.taskId === epic?.activeTaskId ? " · Active task" : ""}
+                    {member?.status === "running" ? " · Active task" : ""}
                   </p>
-                  {task.dependencies.length ? (
-                    <p className="text-muted-foreground">
-                      Requires{" "}
-                      {task.dependencies.map((dependency) => `#${dependency.number}`).join(", ")}
-                    </p>
+                  {progress ? <p role="status">{progress.label}</p> : null}
+                  {progress?.threadId ? (
+                    <div className="flex gap-2">
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        onClick={() => onOpenThread(progress.threadId!)}
+                      >
+                        Open task thread
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        onClick={() => onOpenThread(progress.threadId!, true)}
+                      >
+                        Open task changes
+                      </Button>
+                    </div>
                   ) : null}
+                  {dependencyNumbers.length ? (
+                    <p className="text-muted-foreground">
+                      Requires {dependencyNumbers.map((number) => `#${number}`).join(", ")}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      {approvedDependencies
+                        ? "No dependencies (reviewed)"
+                        : "No declared dependencies · independence not reviewed"}
+                    </p>
+                  )}
                   {member?.baseCommitSha ? (
                     <p className="break-all text-xs">Starting commit: {member.baseCommitSha}</p>
                   ) : null}
@@ -459,6 +563,10 @@ export function AgentControlEpicPanel({
             {agentControlEpicStatus(epic).label}
           </p>
           <p className="break-all text-xs">Epic run: {epic.epicRunId}</p>
+          <p className="text-xs">Concurrent task limit: {epic.parallelism ?? 1}</p>
+          {epic.dependencyPlan ? (
+            <p className="text-xs">Approved independence: {epic.dependencyPlan.rationale}</p>
+          ) : null}
           <p className="text-sm">
             {epic.members.filter((member) => member.status === "accepted").length} accepted ·{" "}
             {epic.members.filter((member) => member.status === "external-closed").length} externally
@@ -598,6 +706,7 @@ export function AgentControlEpicPanel({
                 }}
                 onRefresh={onRefresh}
                 onOpenRun={onOpenRun}
+                onOpenThread={onOpenThread}
               />
             </details>
           ))}

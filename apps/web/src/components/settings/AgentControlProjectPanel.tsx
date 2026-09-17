@@ -388,6 +388,7 @@ function AgentControlProjectPanelContent({
             refreshSession();
           }}
           onOpenRun={(runId) => void openSavedRun(runId)}
+          onOpenThread={openThread}
         />
         {!snapshot ? (
           <p className="text-sm text-muted-foreground">Loading saved tasks and runs…</p>

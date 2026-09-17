@@ -1,3 +1,4 @@
+import { makeEpicTaskExecution } from "../epicExecution.ts";
 import { bindEpicChildRun, loadSelectedEpic } from "../../epic/authority.ts";
 import { persistRunOnceDiagnostic } from "../diagnostics.ts";
 import {
@@ -379,6 +380,11 @@ const make = Effect.gen(function* () {
     ),
   );
   const projectLocks = makeAgentControlRunOnceKeyedFence<ProjectId>();
+  const epicTasks = yield* makeEpicTaskExecution();
+  const processEpicTasks = (projectId: ProjectId) =>
+    epicTasks(projectId).pipe(
+      Effect.mapError((cause) => error(projectId, null, null, "persistence", cause)),
+    );
 
   const readProjectHistory = Effect.fn("AgentControlRunOnce.readProjectHistory")(function* (
     projectId: ProjectId,
@@ -2052,6 +2058,7 @@ const make = Effect.gen(function* () {
     });
 
   return AgentControlRunOnceController.of({
+    processEpicTasks,
     recover,
     processProject,
     prepare,

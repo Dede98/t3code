@@ -1,3 +1,5 @@
+import { loadSelectedEpic } from "../../epic/authority.ts";
+import { epicIssueContentFingerprint } from "../../github/githubEpicSource.ts";
 import { AgentControlRunOnceId } from "@t3tools/contracts";
 import type {
   AgentControlGithubIssueSnapshot,
@@ -205,6 +207,56 @@ const make = Effect.gen(function* () {
         ),
       );
 
+  const ensureEpicTaskAuthority = Effect.fn(
+    "AgentControlTaskConsumerGuard.ensureEpicTaskAuthority",
+  )(function* (
+    projectId: ProjectId,
+    taskId: AgentControlTaskId,
+    gate: AgentControlTaskProjectGate,
+    task: AgentControlTaskState,
+  ) {
+    const epic = yield* loadSelectedEpic(sql, projectId).pipe(
+      Effect.mapError(() => guardError(projectId, "task-projection-corrupt")),
+    );
+    const installed =
+      yield* sql`SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='agent_control_epic_task_executions'`.pipe(
+        Effect.mapError(() => guardError(projectId, "internal-persistence-error")),
+      );
+    const bindings =
+      installed.length === 0
+        ? []
+        : yield* sql<{ executionId: string; epicRunId: string; planDigest: string }>`
+        SELECT execution_id AS "executionId",epic_run_id AS "epicRunId",plan_digest AS "planDigest"
+        FROM agent_control_epic_task_executions WHERE project_id=${projectId} AND task_id=${taskId}`.pipe(
+            Effect.mapError(() => guardError(projectId, "internal-persistence-error")),
+          );
+    if (epic?.dependencyPlan || bindings.length > 0) {
+      const member = epic?.members.find((entry) => entry.taskId === taskId);
+      const binding = bindings[0];
+      if (
+        !epic ||
+        epic.status !== "running" ||
+        gate.activation !== "armed" ||
+        !member ||
+        member.status !== "running" ||
+        !member.childRunId ||
+        bindings.length !== 1 ||
+        binding?.executionId !== member.childRunId ||
+        binding.epicRunId !== epic.epicRunId ||
+        binding.planDigest !== epic.dependencyPlanDigest
+      )
+        return yield* guardError(projectId, "task-status-inactive");
+      const frozen = epic.source.tasks.find(
+        (entry) => entry.issue.issueNodeId === task.source.issueNodeId,
+      )?.issue;
+      if (
+        frozen?.contentFingerprint !== undefined &&
+        frozen.contentFingerprint !== epicIssueContentFingerprint(task.sourceSnapshot)
+      )
+        return yield* guardError(projectId, "task-source-mismatch");
+    }
+  });
+
   const useValidatedTask = <A, E, R>(
     projectId: ProjectId,
     taskId: AgentControlTaskId,
@@ -234,6 +286,7 @@ const make = Effect.gen(function* () {
         return yield* guardError(projectId, "task-projection-corrupt");
       }
       const task = matchingTasks[0]!;
+      yield* ensureEpicTaskAuthority(projectId, taskId, gate, task);
       if (task.source.projectId !== projectId) {
         return yield* guardError(projectId, "task-project-mismatch");
       }
@@ -513,6 +566,7 @@ const make = Effect.gen(function* () {
         return yield* guardError(projectId, "task-projection-corrupt");
       }
       const task = matchingTasks[0]!;
+      yield* ensureEpicTaskAuthority(projectId, taskId, gate, task);
       if (task.source.projectId !== projectId) {
         return yield* guardError(projectId, "task-project-mismatch");
       }

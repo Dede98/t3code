@@ -37,7 +37,11 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { loadRunOnceRepair, type RunOnceRepair } from "../../runOnce/repair.ts";
+import {
+  loadRunOnceRepair,
+  taskExecutionAuthority,
+  type RunOnceRepair,
+} from "../../runOnce/repair.ts";
 import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
 import { AgentControlImplementationStageFinalizer } from "../../implementationTurn/Services/AgentControlImplementationStageFinalizer.ts";
 import { AgentControlImplementationAdmission } from "../../implementationAdmission/Services/AgentControlImplementationAdmission.ts";
@@ -1924,8 +1928,9 @@ const make = Effect.gen(function* () {
       document.stagePayload.stageOrdinal !== 3
     )
       return false;
-    const runs = yield* sql<{ runId: string; mode: string }>`
-      SELECT run.run_id AS "runId", project.mode FROM agent_control_run_once_states run
+    const executionAuthority = yield* taskExecutionAuthority(sql);
+    const runs = yield* sql<{ runId: string; mode: string; activeMode: string }>`
+      SELECT run.run_id AS "runId", project.mode, run.active_mode AS "activeMode" FROM ${executionAuthority} run
       JOIN agent_control_project_states project ON project.project_id = run.project_id
       WHERE run.project_id = ${row.projectId} AND run.task_id = ${row.taskId}
         AND run.status = 'active' AND run.last_step = 'thread-activated'
@@ -1934,6 +1939,7 @@ const make = Effect.gen(function* () {
     if (runs.length === 0) return false;
     if (runs.length !== 1) return yield* error(row.handoffId, "repair-run", "authority-conflict");
     if (runs[0]!.mode === "paused") return "waiting" as const;
+    if (runs[0]!.mode !== runs[0]!.activeMode) return false;
     const evaluations = yield* sql`SELECT thread_id AS "threadId",
       provider_instance_id AS "providerInstanceId", provider_turn_id AS "providerTurnId",
       terminal_stream_version AS "sealedAtStreamVersion", handoff_id AS "handoffId",
@@ -2330,10 +2336,11 @@ const make = Effect.gen(function* () {
     return Effect.gen(function* () {
       let candidates: ReadonlyArray<{ handoffId: string }>;
       if ("projectId" in input) {
+        const executionAuthority = yield* taskExecutionAuthority(sql);
         candidates = yield* sql<{ handoffId: string }>`
           SELECT verification.handoff_id AS "handoffId"
           FROM agent_control_verification_finalization_evidence verification
-          JOIN agent_control_run_once_states run
+          JOIN ${executionAuthority} run
             ON run.project_id = verification.project_id AND run.task_id = verification.task_id
             AND run.status = 'active' AND run.last_step = 'thread-activated'
           WHERE verification.project_id = ${input.projectId}

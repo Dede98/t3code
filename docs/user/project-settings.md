@@ -104,9 +104,21 @@ cross-repository structures are blocked. Links and issue-description checklists 
 scope or grant execution approval. Each open task still needs the configured trusted ready label.
 Already closed tasks are shown as externally closed, without a T3 verification claim.
 
-Tasks run sequentially through the existing stages and bounded repair. Each next worktree starts
-from the previous task's verified, accepted commit. The Epic succeeds only after the required
-checks pass again on the combined result. Current mandatory-check execution requires a Codex
+Tasks run sequentially by default. To enable parallel work, choose a **Concurrent tasks** limit
+from 2 to 4 in the inspected Epic, confirm that its dependency graph is complete, and explain why
+tasks without a dependency path can run independently. Missing GitHub edges alone are not proof
+of independence; add any missing dependencies in GitHub and inspect again before approving.
+You can also enable **Use reviewed dependency plan** with a limit of 1 to run the same reviewed
+plan serially. The reviewed plan and limit are saved with the start or queue approval and cannot
+change during that execution.
+
+Each active task has its own thread, branch and worktree. Task cards show dependency, capacity,
+integration and blocker states, with links to that task's thread, changes and evidence. The shared
+resource limits still apply, including capacity for manual threads. Results are integrated one at
+a time and checked against the combined result; a dependent task waits for all predecessors to
+pass integration checks. A failed task blocks its dependents while independent work can continue.
+The Epic succeeds only after all results are integrated and the required checks pass again on the
+combined result. Current mandatory-check execution requires a Codex
 verification route; Planning and Implementation keep their configured routes and fallbacks.
 Git file conversions must preserve the checked files when the accepted commit is checked out again.
 Conversions that change those files block acceptance. Completion does not publish changes or
@@ -116,7 +128,10 @@ Reloads and server restarts retain the same Epic run. Membership or dependency c
 instead of silently changing scope. Resolve a transient blocker and resume the saved run, or end
 it and explicitly clear its target before returning to ordinary automation. A failed task's
 exhausted repair requires inspection and ending that Epic; resuming does not erase or retry its
-old execution. Turning automation off prevents additional task starts. Accepted commits, child
+old execution. Turning automation off prevents new tasks and subsequent stages; the current
+provider turn may settle. Re-enable Armed to continue the saved assignments. Unknown provider or
+process outcomes retain their capacity until recovery establishes the outcome. Ending an Epic is
+terminal; wait for admitted work to settle before clearing its target. Accepted commits, child
 threads and checks remain available for review. A completed Epic never moves on to unrelated
 issues automatically.
 

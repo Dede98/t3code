@@ -1,3 +1,4 @@
+import { unsettledEpicExecutions } from "../epic/executionState.ts";
 import { inspectionProgress } from "../verificationTurn/inspectionPages.ts";
 import { VERIFICATION_INSPECTION_DISPLAY } from "../../provider/VerificationInspection.ts";
 import { verificationInspectionBase } from "../verificationTurn/checkEvidence.ts";
@@ -76,7 +77,7 @@ export function resolveVerificationCheckStatus(input: {
   );
 }
 
-/** Reads only durable projections/evidence, bounded to one selected run. */
+/** Reads durable run evidence; the selected Epic includes each of its task executions. */
 export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const engine = yield* AgentControlEngine;
@@ -175,13 +176,67 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
           (run_id IN (SELECT value FROM json_each(${encodeEpicRunIds(epic?.members.flatMap((member) => (member.childRunId ? [member.childRunId] : [])) ?? [])}))) DESC,
           activation_project_revision DESC LIMIT ${input.runId !== undefined || epicRunIds.length === 0 ? 1 : 100}
       `;
+          const executionTables = yield* sql`SELECT 1 FROM sqlite_schema
+            WHERE name='agent_control_epic_task_executions' AND type='table'`;
+          // Reuse stage, check, and Admission projection below. Execution bindings are
+          // durable authority; a synthetic Run Once activation must never be written.
+          const epicExecutions =
+            executionTables.length === 0
+              ? []
+              : yield* sql<{
+                  runId: string;
+                  status: "active" | "completed";
+                  executionBlocker: string | null;
+                }>`
+            SELECT 1 AS "schemaVersion", execution.execution_id AS "runId",
+              execution.project_id AS "projectId",
+              CASE WHEN json_extract(member.value,'$.status') IN ('accepted','failed')
+                OR json_extract(epic.state_json,'$.status')='stopped' THEN 'completed' ELSE 'active' END AS status,
+              CASE execution.phase WHEN 'reserved' THEN 2 WHEN 'stage-prepared' THEN 3
+                WHEN 'lease-reserved' THEN 4 WHEN 'worktree-ready' THEN 5 ELSE 6 END AS "nextOrdinal",
+              CASE WHEN json_extract(member.value,'$.status') IN ('accepted','failed')
+                OR json_extract(epic.state_json,'$.status')='stopped' THEN 'completed'
+                WHEN execution.phase='reserved' THEN 'task-selected' ELSE execution.phase END AS "lastStep",
+              execution.task_id AS "taskId", execution.stage_run_id AS "stageRunId",
+              execution.lease_id AS "leaseId", execution.worktree_reservation_id AS "worktreeReservationId",
+              execution.controlled_thread_reservation_id AS "controlledThreadReservationId",
+              (SELECT evidence.task_event_id FROM agent_control_task_verification_finalization_evidence evidence
+                WHERE evidence.task_finalization_evidence_id=json_extract(member.value,'$.taskFinalizationEvidenceId')
+                  AND evidence.task_id=execution.task_id AND evidence.project_id=execution.project_id) AS "terminalTaskEventId",
+              execution.project_revision AS "activationProjectRevision", NULL AS "resetProjectRevision",
+              json_extract(epic.state_json,'$.updatedAt') AS "updatedAt",
+              json_extract(member.value,'$.blocker') AS "executionBlocker"
+            FROM agent_control_epic_task_executions execution
+            JOIN agent_control_epic_runs epic ON epic.epic_run_id=execution.epic_run_id AND epic.project_id=execution.project_id
+            JOIN json_each(epic.state_json,'$.members') member
+              ON json_extract(member.value,'$.taskId')=execution.task_id
+              AND json_extract(member.value,'$.childRunId')=execution.execution_id
+            WHERE execution.project_id=${input.projectId}
+              AND json_extract(epic.state_json,'$.dependencyPlanDigest')=execution.plan_digest
+              AND ((${input.runId ?? null} IS NOT NULL AND execution.execution_id=${input.runId ?? null})
+                OR (${input.runId ?? null} IS NULL AND execution.epic_run_id=${epic?.epicRunId ?? null}))
+            ORDER BY (status='active') DESC, execution.created_at, execution.task_id
+          `;
+          const unsettledExecutions = yield* unsettledEpicExecutions(sql, input.projectId);
           const diagnostics = yield* sql<{ runId: string | null; errorCode: string }>`
         SELECT run_id AS "runId", error_code AS "errorCode" FROM main.agent_control_run_once_diagnostics
         WHERE project_id = ${input.projectId}
       `;
           const runs = [];
-          for (const row of rows) {
-            const state = yield* decodeRun(row);
+          for (const row of [...epicExecutions, ...rows]) {
+            const execution = epicExecutions.find((item) => item.runId === row.runId);
+            const state = yield* decodeRun(
+              execution
+                ? {
+                    ...row,
+                    status: unsettledExecutions.has(execution.runId)
+                      ? "active"
+                      : !armed.enabled
+                        ? "completed"
+                        : row.status,
+                  }
+                : row,
+            );
             const activations = yield* sql<{ originMode: string }>`
               SELECT origin_mode AS "originMode" FROM main.agent_control_run_once_activations
               WHERE project_id = ${input.projectId} AND run_id = ${state.runId}
@@ -375,7 +430,9 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
               });
             }
             let errorCode =
-              diagnostics.find((item) => item.runId === state.runId)?.errorCode ?? null;
+              execution?.executionBlocker ??
+              diagnostics.find((item) => item.runId === state.runId)?.errorCode ??
+              null;
             if (
               errorCode === null &&
               state.status === "completed" &&
@@ -404,7 +461,7 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
               }
             }
             runs.push({
-              originMode: activations[0]?.originMode ?? null,
+              originMode: execution ? "armed" : (activations[0]?.originMode ?? null),
               errorCode,
               state,
               task: listed.tasks.find((task) => task.taskId === state.taskId) ?? null,

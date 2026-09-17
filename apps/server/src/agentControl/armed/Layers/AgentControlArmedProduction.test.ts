@@ -1,3 +1,8 @@
+import { epicIssueContentFingerprint } from "../../github/githubEpicSource.ts";
+import { loadSelectedEpic, saveEpicRun } from "../../epic/authority.ts";
+import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
+import { AgentControlEpicProgress } from "../../epic/Services/AgentControlEpicProgress.ts";
+import { createEpicRun, insertEpicRun } from "../../epic/runState.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
@@ -326,6 +331,12 @@ const makePolicyLayer = () =>
   });
 
 it.live.each([
+  {
+    blockedMode: "armed",
+    intakeRefreshes: 0,
+    recoverMissing: false,
+    sourceChange: "epic-parallel",
+  },
   { blockedMode: "run-once", intakeRefreshes: 0, recoverMissing: false, sourceChange: "none" },
   { blockedMode: "armed", intakeRefreshes: 0, recoverMissing: false, sourceChange: "none" },
   { blockedMode: "armed", intakeRefreshes: 1, recoverMissing: false, sourceChange: "none" },
@@ -466,6 +477,9 @@ it.live.each([
           }),
         );
         const armed = Layer.fresh(AgentControlArmedSchedulerLive).pipe(
+          Layer.provide(
+            Layer.succeed(AgentControlEpicProgress, { processProject: () => Effect.void }),
+          ),
           Layer.provideMerge(runOnce),
           Layer.provideMerge(runtime),
           Layer.provideMerge(intake),
@@ -604,8 +618,73 @@ it.live.each([
           });
         });
         const at = DateTime.formatIso(yield* DateTime.now);
-        const issues = [issue(1, at), issue(2, at)];
+        const issues =
+          sourceChange === "epic-parallel"
+            ? [issue(1, at), issue(2, at), issue(3, at)]
+            : [issue(1, at), issue(2, at)];
         yield* seedProject(projectId, repository, issues, "armed");
+        if (sourceChange === "epic-parallel") {
+          const epicIssue = (entry: AgentControlGithubIssueSnapshot) => ({
+            repositoryNodeId: entry.repositoryNodeId,
+            nameWithOwner: "owner/repository",
+            issueNodeId: entry.issueNodeId,
+            number: entry.number,
+            title: entry.title,
+            contentFingerprint: epicIssueContentFingerprint(entry),
+            url: entry.url,
+            state: entry.state,
+            subIssueCount: 0,
+          });
+          const source = {
+            format: "github-native-sub-issues-v1" as const,
+            repository: {
+              repositoryNodeId: "armed-production-repository",
+              nameWithOwner: "owner/repository",
+            },
+            epic: { ...epicIssue(issues[0]!), subIssueCount: 3 },
+            tasks: issues.map((entry, position) => ({
+              issue: epicIssue(entry),
+              position,
+              dependencies: [],
+            })),
+            blockers: [],
+            fingerprint: "explicit-independent-markdown-tasks",
+            inspectedAt: at,
+          };
+          const run = yield* createEpicRun({
+            projectId,
+            commandId: "parallel-epic",
+            source,
+            checks: [],
+            parallelism: 2,
+            initialBase: { commitSha: repository.baseCommitSha, targetBranch: "main" },
+            dependencyPlan: {
+              version: 1,
+              sourceFingerprint: source.fingerprint,
+              rationale: "A and B own separate Markdown files. C combines both outputs.",
+              tasks: issues.map((entry, index) => ({
+                issueNodeId: entry.issueNodeId,
+                dependsOn: index === 2 ? [issues[0]!.issueNodeId, issues[1]!.issueNodeId] : [],
+              })),
+            },
+          });
+          const members = yield* Effect.forEach(run.members, (member, index) =>
+            Effect.gen(function* () {
+              const taskId = yield* deriveAgentControlTaskId({
+                projectId,
+                repositoryNodeId: source.repository.repositoryNodeId,
+                issueNodeId: member.issueNodeId,
+              });
+              return {
+                ...member,
+                taskId,
+                status: index < 2 ? ("running" as const) : ("pending" as const),
+                baseCommitSha: repository.baseCommitSha,
+              };
+            }),
+          );
+          yield* insertEpicRun(sql, { ...run, members, activeTaskId: members[0]!.taskId });
+        }
         for (let refresh = 0; refresh < intakeRefreshes; refresh++) {
           yield* publishSources(projectId, issues, 2 + refresh);
         }
@@ -663,6 +742,9 @@ it.live.each([
               yield* Context.get(restarted, AgentControlRunOnceController).prepare(startup);
               const restartedArmed = yield* Layer.build(
                 Layer.fresh(AgentControlArmedSchedulerLive).pipe(
+                  Layer.provide(
+                    Layer.succeed(AgentControlEpicProgress, { processProject: () => Effect.void }),
+                  ),
                   Layer.provide(Layer.succeedContext(Context.merge(context, restarted))),
                 ),
               );
@@ -711,14 +793,16 @@ it.live.each([
                 AS planningHandoffs
             FROM agent_control_project_states project WHERE project_id=${projectId}
           `,
-          [{ mode: "run-once", selectedTask: firstTaskId, planningHandoffs: 1 }],
+          sourceChange === "epic-parallel"
+            ? [{ mode: "armed", selectedTask: null, planningHandoffs: 2 }]
+            : [{ mode: "run-once", selectedTask: firstTaskId, planningHandoffs: 1 }],
         );
         assert.lengthOf(
           yield* sql`
             SELECT thread_id FROM projection_threads
             WHERE thread_id IN (SELECT thread_id FROM agent_control_initial_planning_handoff_accepted)
           `,
-          1,
+          sourceChange === "epic-parallel" ? 2 : 1,
         );
 
         const coreServices = Layer.succeedContext(context);
@@ -1156,6 +1240,102 @@ it.live.each([
           };
         };
         yield* planningConsumerService.start().pipe(Scope.provide(scope));
+        if (sourceChange === "epic-parallel") {
+          const handoffs = yield* sql<{
+            handoffId: string;
+          }>`SELECT handoff_id AS "handoffId" FROM agent_control_initial_planning_handoff_intents WHERE project_id=${projectId}`;
+          assert.equal(handoffs.length, 2);
+          yield* Effect.forEach(
+            handoffs,
+            ({ handoffId }) => planningWakeupService.wake(handoffId),
+            { discard: true },
+          );
+          yield* planningConsumerService.drain;
+          assert.equal(fakeProvider.sessions.size, 2);
+          assert.equal(
+            [...fakeProvider.sessions.values()].filter(
+              (session) => session.status === "running" && session.activeTurnId,
+            ).length,
+            2,
+          );
+          assert.equal(fakeProvider.turnCount(), 2);
+          const worktrees = yield* sql<{
+            branch: string;
+            worktreePath: string;
+          }>`SELECT branch_name AS "branch",internal_worktree_path AS "worktreePath" FROM agent_control_worktree_reservation_states WHERE project_id=${projectId}`;
+          assert.equal(new Set(worktrees.map((entry) => entry.branch)).size, 2);
+          assert.equal(new Set(worktrees.map((entry) => entry.worktreePath)).size, 2);
+          yield* restartRecovery();
+          yield* scheduler.processProject(projectId);
+          yield* planningConsumerService.drain;
+          assert.equal(fakeProvider.turnCount(), 2);
+          assert.equal(
+            (yield* sql`SELECT 1 FROM agent_control_epic_task_executions WHERE project_id=${projectId}`)
+              .length,
+            2,
+          );
+          const guard = Context.get(context, AgentControlTaskConsumerGuard);
+          const taskId = AgentControlTaskId.make(
+            (yield* sql<{
+              taskId: string;
+            }>`SELECT task_id AS "taskId" FROM agent_control_epic_task_executions WHERE project_id=${projectId} LIMIT 1`)[0]!
+              .taskId,
+          );
+          const providerBoundary = guard.useTaskForProviderEffectInTransaction!;
+          assert.equal(
+            yield* sql.withTransaction(
+              providerBoundary(projectId, taskId, () => Effect.succeed("entered")),
+            ),
+            "entered",
+          );
+          const epic = (yield* loadSelectedEpic(sql, projectId))!;
+          yield* publishSources(
+            projectId,
+            issues.map((entry) => ({
+              ...entry,
+              body: "Edited semantic scope after dependency approval",
+            })),
+            2,
+          );
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                sql.withTransaction(
+                  providerBoundary(projectId, taskId, () =>
+                    Effect.succeed("changed-content-entry"),
+                  ),
+                ),
+              ),
+            ),
+          );
+          yield* sql.withTransaction(saveEpicRun(sql, epic, { status: "stopped" }));
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                sql.withTransaction(
+                  providerBoundary(projectId, taskId, () => Effect.succeed("late-entry")),
+                ),
+              ),
+            ),
+          );
+          assert.equal(
+            (yield* sql`SELECT 1 FROM agent_control_task_execution_authority WHERE project_id=${projectId}`)
+              .length,
+            0,
+          );
+          yield* sql`DELETE FROM agent_control_epic_targets WHERE project_id=${projectId}`;
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                sql.withTransaction(
+                  providerBoundary(projectId, taskId, () => Effect.succeed("cleared-entry")),
+                ),
+              ),
+            ),
+          );
+          assert.deepEqual(yield* sql`PRAGMA foreign_key_check`, []);
+          return;
+        }
         const completeActiveTask = Effect.fn("completeArmedProductionActiveTask")(function* (
           runOrdinal: number,
         ) {

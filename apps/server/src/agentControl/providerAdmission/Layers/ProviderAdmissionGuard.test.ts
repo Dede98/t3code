@@ -21,6 +21,8 @@ import * as TestClock from "effect/testing/TestClock";
 import { runMigrations } from "../../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../../persistence/NodeSqliteClient.ts";
 import Migration076 from "../../../persistence/Migrations/076_AgentControlVerificationChecks.ts";
+import Migration088 from "../../../persistence/Migrations/088_SharedProviderResourceAdmission.ts";
+import Migration091 from "../../../persistence/Migrations/091_AgentControlProviderAuthorityLanes.ts";
 import {
   executeVerificationCheck,
   prepareVerificationCheckManifest,
@@ -36,6 +38,7 @@ import {
   type ProviderAdmissionPermit,
   type ProviderAdmissionRequest,
   type ProviderAdmissionStage,
+  type ProviderResourceAdmissionRequest,
 } from "../model.ts";
 import { ProviderAdmissionGuard } from "../Services/ProviderAdmissionGuard.ts";
 import { ProviderAdmissionReleaseAuthority } from "../Services/ProviderAdmissionReleaseAuthority.ts";
@@ -477,6 +480,7 @@ const guardScenario =
       | "attempted"
       | "attested"
       | "session-rebound",
+    legacySharedCapacity = false,
   ) =>
   () =>
     Effect.scoped(
@@ -900,6 +904,79 @@ const guardScenario =
         `,
           [{ status: "quarantined" }, { status: "quarantined" }, { status: "quarantined" }],
         );
+        if (legacySharedCapacity) {
+          // Historical stage fixtures omit unrelated orchestration parents. Apply
+          // only the capacity migrations; retain all real guard/recovery evidence.
+          yield* sql`PRAGMA foreign_keys=OFF`;
+          yield* secondSql`PRAGMA foreign_keys=OFF`;
+          yield* runMigrations({ toMigrationInclusive: 72 }).pipe(
+            Effect.provideService(SqlClient.SqlClient, secondSql),
+          );
+          yield* Migration088.pipe(Effect.provideService(SqlClient.SqlClient, secondSql));
+          yield* secondSql`INSERT INTO effect_sql_agent_control_migrations (migration_id,name,created_at)
+            VALUES (88,'SharedProviderResourceAdmission',${at})`;
+          yield* Migration091.pipe(Effect.provideService(SqlClient.SqlClient, secondSql));
+          const currentContext = yield* Layer.buildWithScope(
+            Layer.fresh(secondStoreLayer),
+            secondScope,
+          );
+          const current = Context.get(currentContext, ProviderAdmissionStore);
+          const providerInstanceId = ProviderInstanceId.make("another-instance-same-account");
+          const limits = {
+            maxConcurrent: 1,
+            interactiveReserve: 0,
+            backgroundAgingMs: 0,
+            maxInteractiveBurst: 3,
+          };
+          const manual: ProviderResourceAdmissionRequest = {
+            idempotencyKey: "legacy-manual",
+            providerInstanceId,
+            threadId: "manual-thread",
+            accountScope: "codex",
+            workloadClass: "interactive",
+            source: "manual",
+            requestedAt: at,
+          };
+          const acquire = (value: ProviderResourceAdmissionRequest, now = at) =>
+            current.requestResource!({
+              request: value,
+              limits,
+              ownerId: "shared-owner",
+              now,
+              leaseExpiresAt: leaseExpiry,
+              usage: providerAdmissionUsageEvidence({
+                providerInstanceId: value.providerInstanceId,
+                status: "allowed",
+                observedAt: now,
+                source: "refresh",
+                nextRelevantAt: null,
+              }),
+            });
+          const assertWaiting = (decision: { readonly _tag: string; readonly reason?: string }) => {
+            assert.equal(decision._tag, "Waiting");
+            assert.equal(decision.reason, "provider-recovery");
+          };
+          assertWaiting((yield* acquire(manual)).decision);
+          const automatic: ProviderResourceAdmissionRequest = {
+            ...manual,
+            idempotencyKey: "legacy-automatic",
+            providerInstanceId: values[0]!.providerInstanceId,
+            threadId: values[0]!.threadId,
+            workloadClass: "background",
+            source: "automatic",
+            stage: values[0]!.stage,
+            handoffId: values[0]!.handoffId,
+          };
+          assertWaiting((yield* acquire(automatic)).decision);
+          assertWaiting((yield* acquire(manual, "2100-01-01T00:00:00.000Z")).decision);
+          yield* current.cancelResource!({ request: automatic, cancelledAt: at });
+          assertWaiting((yield* acquire(manual)).decision);
+          assert.deepStrictEqual(
+            yield* secondSql`SELECT status FROM agent_control_provider_admission_current ORDER BY provider_instance_id`,
+            [{ status: "quarantined" }, { status: "quarantined" }, { status: "quarantined" }],
+          );
+          return;
+        }
         if (recoverPreInvoke) {
           const recoveryAt = "2099-09-06T07:59:01.000Z";
           if (archiveObstacle !== undefined) {
@@ -1383,6 +1460,10 @@ const guardScenario =
 it.live(
   "guards all stage effects, revalidates replay, and quarantines restart ambiguity",
   guardScenario(false),
+);
+it.live(
+  "retains legacy unknown capacity across account aliases, waiting retries and cancellation",
+  guardScenario(false, false, false, undefined, true),
 );
 it.live(
   "releases verification capacity using distinct native and orchestration event IDs",

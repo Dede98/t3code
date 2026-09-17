@@ -18,6 +18,9 @@ export interface AgentControlRunOnceCommittedPublication {
 export type AgentControlRunOncePublicationConsumerId = string;
 
 export interface AgentControlRunOnceControllerShape {
+  readonly processEpicTasks?: (
+    projectId: ProjectId,
+  ) => Effect.Effect<void, AgentControlRunOnceError>;
   readonly recover: Effect.Effect<void, AgentControlRunOnceError>;
   readonly processProject: (projectId: ProjectId) => Effect.Effect<void, AgentControlRunOnceError>;
   readonly prepare: (

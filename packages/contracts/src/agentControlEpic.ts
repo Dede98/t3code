@@ -11,6 +11,7 @@ export const AgentControlEpicIssue = Schema.Struct({
   number: PositiveInt,
   url: TrimmedNonEmptyString,
   title: Schema.String,
+  contentFingerprint: Schema.optionalKey(TrimmedNonEmptyString),
   state: Schema.Literals(["open", "closed"]),
   subIssueCount: NonNegativeInt,
 });
@@ -48,3 +49,18 @@ export const AgentControlEpicSource = Schema.Struct({
   inspectedAt: IsoDateTime,
 });
 export type AgentControlEpicSource = typeof AgentControlEpicSource.Type;
+
+/** An omitted plan is unknown; an explicit empty dependsOn list is a reviewed root. */
+export const AgentControlEpicDependencyPlan = Schema.Struct({
+  version: Schema.Literal(1),
+  sourceFingerprint: TrimmedNonEmptyString,
+  rationale: TrimmedNonEmptyString,
+  tasks: Schema.Array(
+    Schema.Struct({
+      issueNodeId: TrimmedNonEmptyString,
+      dependsOn: Schema.Array(TrimmedNonEmptyString),
+    }),
+  ),
+});
+export type AgentControlEpicDependencyPlan = typeof AgentControlEpicDependencyPlan.Type;
+export const AgentControlEpicParallelism = PositiveInt.check(Schema.isLessThanOrEqualTo(4));

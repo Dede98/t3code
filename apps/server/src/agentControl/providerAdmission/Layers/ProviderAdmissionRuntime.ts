@@ -188,7 +188,15 @@ const make = Effect.gen(function* () {
 
   const capacityReleased: ProviderAdmissionRuntimeShape["capacityReleased"] = (
     providerInstanceId,
-  ) => PubSub.publish(providerSignals, providerInstanceId).pipe(Effect.asVoid);
+  ) =>
+    Effect.all(
+      [
+        PubSub.publish(providerSignals, providerInstanceId),
+        PubSub.publish(resourceSignals, undefined),
+        PubSub.publish(resourceDeadlineSignals, undefined),
+      ],
+      { discard: true },
+    );
 
   const resourceSettingsChanged = Effect.all(
     [
