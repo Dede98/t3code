@@ -1,3 +1,4 @@
+import { persistImplementationEpicDiagnostic } from "../../runOnce/diagnostics.ts";
 import { taskExecutionAuthority } from "../../runOnce/repair.ts";
 import { loadRunOnceRepair, type RunOnceRepair } from "../../runOnce/repair.ts";
 import {
@@ -1489,6 +1490,16 @@ const make = Effect.gen(function* () {
     } satisfies AgentControlImplementationAdmissionResult;
   });
 
+  const processHandoffWithDiagnostics = (handoffId: string) =>
+    processHandoff(handoffId).pipe(
+      Effect.tapError((failure) => persistImplementationEpicDiagnostic(sql, handoffId, failure)),
+      Effect.tap((result) =>
+        result._tag === "NotCandidate"
+          ? Effect.void
+          : persistImplementationEpicDiagnostic(sql, handoffId, null),
+      ),
+    );
+
   const recover = Effect.gen(function* () {
     const candidates = yield* sql<{ readonly handoffId: string }>`
       SELECT handoff_id AS "handoffId" FROM agent_control_initial_planning_result_evidence
@@ -1516,7 +1527,7 @@ const make = Effect.gen(function* () {
     yield* Effect.forEach(
       [...candidates, ...repairs],
       ({ handoffId }) =>
-        processHandoff(handoffId).pipe(
+        processHandoffWithDiagnostics(handoffId).pipe(
           Effect.catchIf(
             (cause) => cause.reason !== "persistence" && cause.reason !== "revision-conflict",
             (cause) =>
@@ -1539,7 +1550,10 @@ const make = Effect.gen(function* () {
   );
 
   const processSafely = (handoffId: string | null) =>
-    (handoffId === null ? recover : processHandoff(handoffId).pipe(Effect.asVoid)).pipe(
+    (handoffId === null
+      ? recover
+      : processHandoffWithDiagnostics(handoffId).pipe(Effect.asVoid)
+    ).pipe(
       Effect.catchCause((cause) =>
         Effect.logError("implementation admission input failed", {
           handoffId,
@@ -1565,7 +1579,7 @@ const make = Effect.gen(function* () {
   });
 
   return {
-    processHandoff,
+    processHandoff: processHandoffWithDiagnostics,
     loadAcceptedEvidence: replayFirst,
     recover,
     start,

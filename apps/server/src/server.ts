@@ -871,7 +871,21 @@ const AgentControlTaskVerificationFinalizerLayerLive =
     Layer.provide(RuntimeCoreDependenciesBaseLive),
   );
 
+const AgentControlVerificationTurnCoordinatorLayerLive =
+  AgentControlVerificationTurnCoordinatorLive.pipe(
+    Layer.provideMerge(AgentControlVerificationAdmissionLayerLive),
+    Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
+    Layer.provideMerge(AgentControlWorktreeControllerServiceLayerLive),
+    Layer.provideMerge(AgentControlPolicyLayerLive),
+    Layer.provideMerge(OrchestrationLayerLive),
+    Layer.provide(AgentControlVerificationTurnCoordinatorHooksNoop),
+    Layer.provide(VerificationTurnWakeupLayerLive),
+    Layer.provide(RuntimeCoreDependenciesBaseLive),
+  );
+
 const AgentControlRunOnceControllerServiceLayerLive = AgentControlRunOnceControllerLayerLive.pipe(
+  Layer.provide(AgentControlImplementationTurnCoordinatorLayerLive),
+  Layer.provide(AgentControlVerificationTurnCoordinatorLayerLive),
   Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
   Layer.provideMerge(AgentControlWorktreeControllerServiceLayerLive),
   Layer.provideMerge(AgentControlControlledThreadActivationServiceLayerLive),
@@ -921,18 +935,6 @@ const AgentControlArmedSchedulerLayerLive = AgentControlArmedSchedulerLive.pipe(
   Layer.provideMerge(AgentControlRunOnceControllerServiceLayerLive),
   Layer.provide(RuntimeCoreDependenciesBaseLive),
 );
-
-const AgentControlVerificationTurnCoordinatorLayerLive =
-  AgentControlVerificationTurnCoordinatorLive.pipe(
-    Layer.provideMerge(AgentControlVerificationAdmissionLayerLive),
-    Layer.provideMerge(AgentControlRuntimeServicesLayerLive),
-    Layer.provideMerge(AgentControlWorktreeControllerServiceLayerLive),
-    Layer.provideMerge(AgentControlPolicyLayerLive),
-    Layer.provideMerge(OrchestrationLayerLive),
-    Layer.provide(AgentControlVerificationTurnCoordinatorHooksNoop),
-    Layer.provide(VerificationTurnWakeupLayerLive),
-    Layer.provide(RuntimeCoreDependenciesBaseLive),
-  );
 
 const AgentControlReactorServicesLayerLive = AgentControlReactorLive.pipe(
   Layer.provideMerge(

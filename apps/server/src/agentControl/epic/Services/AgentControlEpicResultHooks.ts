@@ -36,6 +36,10 @@ export interface AgentControlEpicResultHooksShape {
       readonly expectedCommitSha: string;
       /** Rechecked under the repository lock before publishing any Git result. */
       readonly authorize: Effect.Effect<void, AgentControlEpicRpcError>;
+      /** Refresh external scope after checks, outside the final SQLite writer lock. */
+      readonly refreshSource?: Effect.Effect<void, AgentControlEpicRpcError>;
+      /** Validate reconciled source under the final writer lock without invalidating completed checks. */
+      readonly authorizePublication?: Effect.Effect<void, AgentControlEpicRpcError>;
     },
   ) => Effect.Effect<
     {

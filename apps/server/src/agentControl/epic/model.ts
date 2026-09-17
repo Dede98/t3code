@@ -137,15 +137,14 @@ export const epicSourceChanges = (
         message: "An accepted Epic member is missing from GitHub.",
       });
     else if (
-      (member.status === "pending" ||
-        (member.status === "running" && member.childRunId === null)) &&
+      (member.status === "pending" || member.status === "running") &&
       task.issue.state === "closed"
     )
       blockers.push({
         code: "closed-during-run",
         issueNumber: member.issueNumber,
         message:
-          "This pending issue was closed after the Epic scope was accepted. It has no T3 verification evidence.",
+          "This issue was closed before its result was integrated. Reopen it and resume, or stop this Epic.",
       });
     else if (member.status === "external-closed" && task.issue.state !== "closed")
       blockers.push({

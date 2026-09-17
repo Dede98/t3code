@@ -851,6 +851,7 @@ export const makeEpicResults = Effect.gen(function* () {
           verification: verified,
         });
         if (verified.status !== "passed") return result;
+        if (input.refreshSource) yield* input.refreshSource;
         const resultJson = canonicalJson(result);
         yield* sql.withTransaction(
           Effect.gen(function* () {
@@ -859,6 +860,7 @@ export const makeEpicResults = Effect.gen(function* () {
             // The existing immutable intent survives rollback if Git succeeds first.
             yield* sql`INSERT OR IGNORE INTO agent_control_epic_integration_intents SELECT * FROM agent_control_epic_integration_intents WHERE integration_id=${integrationId}`;
             yield* authorize;
+            if (input.authorizePublication) yield* input.authorizePublication;
             if ((yield* branchHead()) === input.expectedCommitSha)
               yield* git(cwd, [
                 "update-ref",

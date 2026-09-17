@@ -1,3 +1,4 @@
+import { persistEpicTransitionDiagnostic } from "./diagnostics.ts";
 import {
   AgentControlTaskId,
   ProjectId,
@@ -95,6 +96,7 @@ const fixture = Effect.fn("epicExecutionFixture")(function* () {
   const calls = new Map<string, number>();
   const receipts = new Map<string, unknown>();
   let failWorktree: string | undefined;
+  let failCode = "test-interruption";
   const count = (key: string) => calls.set(key, (calls.get(key) ?? 0) + 1);
   const stages = {
     prepareInitial: (input: { taskId: string; commandId: string }) =>
@@ -125,7 +127,7 @@ const fixture = Effect.fn("epicExecutionFixture")(function* () {
     reserveAndMaterialize: (input: { taskId: string }) =>
       Effect.gen(function* () {
         if (failWorktree === input.taskId)
-          return yield* Effect.fail(epicError("test-interruption", "materialization interrupted"));
+          return yield* Effect.fail(epicError(failCode, "materialization interrupted"));
         return {
           reservationId: `worktree-${input.taskId}`,
         } as AgentControlWorktreeReservationState;
@@ -162,8 +164,9 @@ const fixture = Effect.fn("epicExecutionFixture")(function* () {
     build,
     active,
     calls,
-    fail: (id?: string) => {
+    fail: (id?: string, code = "test-interruption") => {
       failWorktree = id;
+      failCode = code;
     },
   };
 });
@@ -228,4 +231,105 @@ it.effect("pause and disarm forbid new starts and changed plan authority cannot 
     );
     assert.equal(mutation._tag, "Failure");
   }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+);
+
+it.effect("persists separate transition blockers without replacing execution ownership", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    yield* (yield* f.build)(projectId);
+    const before = (yield* loadSelectedEpic(f.sql, projectId))!;
+    const input = (n: number) => ({
+      projectId,
+      taskId: taskId(n),
+      worktreeReservationId: `worktree-${taskId(n)}`,
+      transitionId: `implementation:handoff-${n}`,
+    });
+    const failure = { operation: "worktree-use", reason: "stage-run-missing" };
+    yield* persistEpicTransitionDiagnostic(f.sql, input(1), {
+      operation: "admit",
+      reason: "revision-conflict",
+    });
+    assert.deepEqual(yield* loadSelectedEpic(f.sql, projectId), before);
+    yield* persistEpicTransitionDiagnostic(f.sql, input(1), {
+      operation: "worktree-use",
+      reason: "worktree-evidence-stale",
+      cause: { code: "task-not-consumable", cause: { reason: "watermark-not-completed" } },
+    });
+    assert.deepEqual(yield* loadSelectedEpic(f.sql, projectId), before);
+    yield* persistEpicTransitionDiagnostic(
+      f.sql,
+      {
+        ...input(1),
+        worktreeReservationId: "foreign-worktree",
+      },
+      failure,
+    );
+    assert.deepEqual(yield* loadSelectedEpic(f.sql, projectId), before);
+    yield* persistEpicTransitionDiagnostic(f.sql, input(1), failure);
+    yield* persistEpicTransitionDiagnostic(f.sql, input(2), failure);
+    const blocked = (yield* loadSelectedEpic(f.sql, projectId))!;
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.blockers.length, 2);
+    yield* persistEpicTransitionDiagnostic(f.sql, input(1), {
+      operation: "current-task",
+      reason: "task-evidence-stale",
+      cause: { reason: "task-status-inactive" },
+    });
+    assert.deepEqual(yield* loadSelectedEpic(f.sql, projectId), blocked);
+    assert.include(blocked.members[0]!.blocker!, "stage-run-missing");
+    assert.include(blocked.members[0]!.blocker!, "resume");
+    assert.deepEqual(
+      blocked.members.map((member) => member.childRunId),
+      before.members.map((member) => member.childRunId),
+    );
+    assert.deepEqual(
+      blocked.members.map((member) => member.reservationId),
+      before.members.map((member) => member.reservationId),
+    );
+    yield* persistEpicTransitionDiagnostic(f.sql, input(1), failure);
+    yield* (yield* f.build)(projectId);
+    assert.deepEqual(yield* loadSelectedEpic(f.sql, projectId), blocked);
+    assert.equal(f.calls.get(`thread:${taskId(1)}`), 1);
+    assert.equal(f.calls.get(`thread:${taskId(2)}`), 1);
+    yield* persistEpicTransitionDiagnostic(f.sql, input(1), null);
+    const recovered = (yield* loadSelectedEpic(f.sql, projectId))!;
+    assert.equal(recovered.status, "blocked");
+    assert.isUndefined(recovered.members[0]!.blocker);
+    assert.equal(recovered.blockers.length, 1);
+    assert.equal(recovered.blockers[0]!.issueNumber, 2);
+    assert.isNotNull(recovered.members[1]!.blocker);
+    assert.equal(recovered.blockerHistory.length, 2);
+    yield* f.sql.withTransaction(
+      saveEpicRun(f.sql, recovered, { status: "running", blockers: [] }),
+    );
+    yield* persistEpicTransitionDiagnostic(f.sql, input(2), null);
+    const resumed = (yield* loadSelectedEpic(f.sql, projectId))!;
+    assert.equal(resumed.status, "running");
+    assert.isUndefined(resumed.members[1]!.blocker);
+    assert.isUndefined(resumed.members[1]!.waitReason);
+    yield* f.sql`UPDATE agent_control_project_states SET mode='observe' WHERE project_id=${projectId}`;
+    yield* persistEpicTransitionDiagnostic(f.sql, input(1), failure);
+    assert.deepEqual(yield* loadSelectedEpic(f.sql, projectId), resumed);
+  }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+);
+
+it.effect(
+  "retains a permanent preparation blocker across restart without reassigning its execution",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      f.fail(taskId(1), "reservation-conflict");
+      yield* (yield* f.build)(projectId);
+      const blocked = (yield* loadSelectedEpic(f.sql, projectId))!;
+      assert.equal(blocked.status, "blocked");
+      assert.equal(blocked.blockers[0]?.code, "preparation:reservation-conflict");
+      assert.include(blocked.members[0]!.blocker!, "resume");
+      const bindings = yield* f.sql`SELECT * FROM agent_control_epic_task_executions`;
+      assert.equal(bindings.length, 1);
+      assert.equal(f.active.size, 0);
+      yield* (yield* f.build)(projectId);
+      assert.deepEqual(yield* loadSelectedEpic(f.sql, projectId), blocked);
+      assert.deepEqual(yield* f.sql`SELECT * FROM agent_control_epic_task_executions`, bindings);
+      assert.equal(f.calls.get(`stage:${taskId(1)}`), 1);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
 );

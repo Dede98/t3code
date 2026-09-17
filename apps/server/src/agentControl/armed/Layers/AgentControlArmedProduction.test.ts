@@ -1,3 +1,7 @@
+import { makeAgentControlEpic } from "../../epic/Layers/AgentControlEpic.ts";
+import { makeEpicResults, EpicCheckExecutor } from "../../epic/results.ts";
+import { AgentControlEpicResultHooks } from "../../epic/Services/AgentControlEpicResultHooks.ts";
+import { GithubIssueTrackerClient } from "../../github/Services/GithubIssueTrackerClient.ts";
 import { epicIssueContentFingerprint } from "../../github/githubEpicSource.ts";
 import { loadSelectedEpic, saveEpicRun } from "../../epic/authority.ts";
 import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
@@ -16,6 +20,7 @@ import {
   ThreadId,
   TurnId,
   type AgentControlGithubIssueSnapshot,
+  type AgentControlEpicSource,
   type AgentControlTaskEvent,
   type ProviderRuntimeEvent,
   type ProviderSession,
@@ -60,7 +65,7 @@ import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import { AgentControlPolicyService } from "../../AgentControlPolicyService.ts";
 import { AgentControlControlledThreadActivationLive } from "../../controlledThreadReservation/Layers/AgentControlControlledThreadActivation.ts";
 import { AgentControlControlledThreadMaterializationCoordinatorLive } from "../../controlledThreadReservation/Layers/AgentControlControlledThreadMaterializationCoordinator.ts";
-import { AgentControlControlledThreadActivationHooksNoop } from "../../controlledThreadReservation/Services/AgentControlControlledThreadActivationHooks.ts";
+import { AgentControlControlledThreadActivationHooks } from "../../controlledThreadReservation/Services/AgentControlControlledThreadActivationHooks.ts";
 import { AgentControlControlledThreadMaterializationCoordinatorHooksNoop } from "../../controlledThreadReservation/Services/AgentControlControlledThreadMaterializationCoordinatorHooks.ts";
 import { AgentControlEngine } from "../../Services/AgentControlEngine.ts";
 import { AgentControlGithubEventStore } from "../../github/Services/AgentControlGithubEventStore.ts";
@@ -331,6 +336,38 @@ const makePolicyLayer = () =>
   });
 
 it.live.each([
+  ...(
+    [
+      "paused",
+      "ready-withdrawn",
+      "closed",
+      "human-takeover",
+      "project-paused",
+      "changed-before-integration",
+      "dependency-before-integration",
+      "integration-paused",
+      "integration-content",
+      "integration-dependency",
+      "integration-incomplete",
+    ] as const
+  ).map((change) => ({
+    blockedMode: "armed" as const,
+    intakeRefreshes: 0 as const,
+    recoverMissing: false as const,
+    sourceChange: `epic-parallel-${change}` as const,
+  })),
+  {
+    blockedMode: "armed",
+    intakeRefreshes: 0,
+    recoverMissing: false,
+    sourceChange: "epic-parallel-polls",
+  },
+  {
+    blockedMode: "armed",
+    intakeRefreshes: 0,
+    recoverMissing: false,
+    sourceChange: "epic-parallel-preparation-poll",
+  },
   {
     blockedMode: "armed",
     intakeRefreshes: 0,
@@ -373,6 +410,21 @@ it.live.each([
   ({ blockedMode, intakeRefreshes, recoverMissing, sourceChange }) =>
     Effect.scoped(
       Effect.gen(function* () {
+        const epicParallel = sourceChange.startsWith("epic-parallel");
+        const parallelPolling =
+          sourceChange === "epic-parallel-polls" ||
+          sourceChange === "epic-parallel-preparation-poll" ||
+          sourceChange === "epic-parallel-integration-incomplete";
+        const revokeDuringIntegration =
+          sourceChange === "epic-parallel-integration-paused" ||
+          sourceChange === "epic-parallel-integration-content" ||
+          sourceChange === "epic-parallel-integration-dependency";
+        let beforeInitialThreadMaterialization = Effect.void;
+        let preparationPolls = 0;
+        let parallelPollVersion = 2;
+        const sourceBeforeIntegration =
+          sourceChange === "epic-parallel-changed-before-integration" ||
+          sourceChange === "epic-parallel-dependency-before-integration";
         const cancelledRetry =
           sourceChange === "terminal-retry-cancelled" ||
           sourceChange === "terminal-retry-cancelled-shared-git-dir";
@@ -390,7 +442,9 @@ it.live.each([
         const sql = Context.get(sqlContext, SqlClient.SqlClient);
         yield* sql`PRAGMA journal_mode = WAL`;
         yield* sql`PRAGMA foreign_keys = ON`;
-        yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, sql));
+        yield* runMigrations(
+          sourceChange === "epic-parallel-polls" ? { toMigrationInclusive: 91 } : {},
+        ).pipe(Effect.provideService(SqlClient.SqlClient, sql));
         const fakeProvider = yield* makeProvider();
         const verificationPermits = new Map<string, ProviderAdmissionPermit>();
         const sqlLayer = Layer.succeed(SqlClient.SqlClient, sql);
@@ -459,7 +513,15 @@ it.live.each([
         const activation = Layer.fresh(AgentControlControlledThreadActivationLive).pipe(
           Layer.provideMerge(reservations),
           Layer.provideMerge(coordinator),
-          Layer.provide(AgentControlControlledThreadActivationHooksNoop),
+          Layer.provide(
+            Layer.succeed(AgentControlControlledThreadActivationHooks, {
+              afterPrepareAcceptedBeforeMaterialize: (observation) =>
+                observation.projectId === projectId
+                  ? beforeInitialThreadMaterialization
+                  : Effect.void,
+              afterMaterializationAcceptedBeforeReturn: () => Effect.void,
+            }),
+          ),
         );
         const runOnce = Layer.fresh(AgentControlRunOnceControllerLive).pipe(
           Layer.provideMerge(runtime),
@@ -618,12 +680,12 @@ it.live.each([
           });
         });
         const at = DateTime.formatIso(yield* DateTime.now);
-        const issues =
-          sourceChange === "epic-parallel"
-            ? [issue(1, at), issue(2, at), issue(3, at)]
-            : [issue(1, at), issue(2, at)];
+        const issues = epicParallel
+          ? [issue(1, at), issue(2, at), issue(3, at)]
+          : [issue(1, at), issue(2, at)];
         yield* seedProject(projectId, repository, issues, "armed");
-        if (sourceChange === "epic-parallel") {
+        let epicSource: AgentControlEpicSource | undefined;
+        if (epicParallel) {
           const epicIssue = (entry: AgentControlGithubIssueSnapshot) => ({
             repositoryNodeId: entry.repositoryNodeId,
             nameWithOwner: "owner/repository",
@@ -651,11 +713,23 @@ it.live.each([
             fingerprint: "explicit-independent-markdown-tasks",
             inspectedAt: at,
           };
+          epicSource = source;
           const run = yield* createEpicRun({
             projectId,
             commandId: "parallel-epic",
             source,
-            checks: [],
+            checks: [
+              {
+                id: "integrated-clean-diff",
+                command: "git",
+                args: ["diff", "--check"],
+                cwd: ".",
+                required: true,
+                timeoutMs: 10_000,
+                allowTemporaryFiles: false,
+                resultFormat: "exit-code",
+              },
+            ],
             parallelism: 2,
             initialBase: { commitSha: repository.baseCommitSha, targetBranch: "main" },
             dependencyPlan: {
@@ -684,6 +758,13 @@ it.live.each([
             }),
           );
           yield* insertEpicRun(sql, { ...run, members, activeTaskId: members[0]!.taskId });
+        }
+        if (sourceChange === "epic-parallel-preparation-poll") {
+          beforeInitialThreadMaterialization = Effect.gen(function* () {
+            if (preparationPolls > 0) return;
+            preparationPolls++;
+            yield* publishSources(projectId, issues, parallelPollVersion++);
+          }).pipe(Effect.orDie);
         }
         for (let refresh = 0; refresh < intakeRefreshes; refresh++) {
           yield* publishSources(projectId, issues, 2 + refresh);
@@ -793,7 +874,7 @@ it.live.each([
                 AS planningHandoffs
             FROM agent_control_project_states project WHERE project_id=${projectId}
           `,
-          sourceChange === "epic-parallel"
+          epicParallel
             ? [{ mode: "armed", selectedTask: null, planningHandoffs: 2 }]
             : [{ mode: "run-once", selectedTask: firstTaskId, planningHandoffs: 1 }],
         );
@@ -802,7 +883,7 @@ it.live.each([
             SELECT thread_id FROM projection_threads
             WHERE thread_id IN (SELECT thread_id FROM agent_control_initial_planning_handoff_accepted)
           `,
-          sourceChange === "epic-parallel" ? 2 : 1,
+          epicParallel ? 2 : 1,
         );
 
         const coreServices = Layer.succeedContext(context);
@@ -1240,7 +1321,7 @@ it.live.each([
           };
         };
         yield* planningConsumerService.start().pipe(Scope.provide(scope));
-        if (sourceChange === "epic-parallel") {
+        if (epicParallel) {
           const handoffs = yield* sql<{
             handoffId: string;
           }>`SELECT handoff_id AS "handoffId" FROM agent_control_initial_planning_handoff_intents WHERE project_id=${projectId}`;
@@ -1259,6 +1340,16 @@ it.live.each([
             2,
           );
           assert.equal(fakeProvider.turnCount(), 2);
+          for (const session of fakeProvider.sessions.values()) {
+            yield* Context.get(
+              pipelineContext,
+              AgentControlInitialPlanningHandoffStore,
+            ).observeProviderStarted({
+              threadId: session.threadId,
+              providerTurnId: String(session.activeTurnId),
+              acceptedAt: session.updatedAt,
+            });
+          }
           const worktrees = yield* sql<{
             branch: string;
             worktreePath: string;
@@ -1274,75 +1365,220 @@ it.live.each([
               .length,
             2,
           );
-          const guard = Context.get(context, AgentControlTaskConsumerGuard);
-          const taskId = AgentControlTaskId.make(
-            (yield* sql<{
-              taskId: string;
-            }>`SELECT task_id AS "taskId" FROM agent_control_epic_task_executions WHERE project_id=${projectId} LIMIT 1`)[0]!
-              .taskId,
-          );
-          const providerBoundary = guard.useTaskForProviderEffectInTransaction!;
-          assert.equal(
-            yield* sql.withTransaction(
-              providerBoundary(projectId, taskId, () => Effect.succeed("entered")),
-            ),
-            "entered",
-          );
-          const epic = (yield* loadSelectedEpic(sql, projectId))!;
-          yield* publishSources(
-            projectId,
-            issues.map((entry) => ({
-              ...entry,
-              body: "Edited semantic scope after dependency approval",
-            })),
-            2,
-          );
-          assert.isTrue(
-            Exit.isFailure(
-              yield* Effect.exit(
-                sql.withTransaction(
-                  providerBoundary(projectId, taskId, () =>
-                    Effect.succeed("changed-content-entry"),
+          if (!parallelPolling && !sourceBeforeIntegration && !revokeDuringIntegration) {
+            const guard = Context.get(context, AgentControlTaskConsumerGuard);
+            const taskId = AgentControlTaskId.make(
+              (yield* sql<{
+                taskId: string;
+              }>`SELECT task_id AS "taskId" FROM agent_control_epic_task_executions WHERE project_id=${projectId} LIMIT 1`)[0]!
+                .taskId,
+            );
+            const providerBoundary = guard.useTaskForProviderEffectInTransaction!;
+            assert.equal(
+              yield* sql.withTransaction(
+                providerBoundary(projectId, taskId, () => Effect.succeed("entered")),
+              ),
+              "entered",
+            );
+            const epic = (yield* loadSelectedEpic(sql, projectId))!;
+            if (
+              sourceChange === "epic-parallel-human-takeover" ||
+              sourceChange === "epic-parallel-project-paused"
+            ) {
+              yield* engine.dispatchHuman({
+                commandId: CommandId.make("parallel-human-takeover"),
+                projectId,
+                expectedRevision: (yield* engine.getProjectState({ projectId })).revision,
+                mode: sourceChange === "epic-parallel-project-paused" ? "paused" : "manual",
+              });
+            } else {
+              yield* publishSources(
+                projectId,
+                issues.map((entry) => ({
+                  ...entry,
+                  ...(sourceChange === "epic-parallel-paused"
+                    ? { paused: true, eligible: false, eligibilityReason: "paused" as const }
+                    : sourceChange === "epic-parallel-ready-withdrawn"
+                      ? {
+                          ready: false,
+                          eligible: false,
+                          eligibilityReason: "ready-inactive" as const,
+                        }
+                      : sourceChange === "epic-parallel-closed"
+                        ? {
+                            state: "closed" as const,
+                            eligible: false,
+                            eligibilityReason: "closed" as const,
+                          }
+                        : { body: "Edited semantic scope after dependency approval" }),
+                })),
+                2,
+              );
+            }
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  sql.withTransaction(
+                    providerBoundary(projectId, taskId, () =>
+                      Effect.succeed("changed-content-entry"),
+                    ),
                   ),
                 ),
               ),
-            ),
-          );
-          yield* sql.withTransaction(saveEpicRun(sql, epic, { status: "stopped" }));
-          assert.isTrue(
-            Exit.isFailure(
-              yield* Effect.exit(
-                sql.withTransaction(
-                  providerBoundary(projectId, taskId, () => Effect.succeed("late-entry")),
+            );
+            yield* sql.withTransaction(saveEpicRun(sql, epic, { status: "stopped" }));
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  sql.withTransaction(
+                    providerBoundary(projectId, taskId, () => Effect.succeed("late-entry")),
+                  ),
                 ),
               ),
-            ),
-          );
-          assert.equal(
-            (yield* sql`SELECT 1 FROM agent_control_task_execution_authority WHERE project_id=${projectId}`)
-              .length,
-            0,
-          );
-          yield* sql`DELETE FROM agent_control_epic_targets WHERE project_id=${projectId}`;
-          assert.isTrue(
-            Exit.isFailure(
-              yield* Effect.exit(
-                sql.withTransaction(
-                  providerBoundary(projectId, taskId, () => Effect.succeed("cleared-entry")),
+            );
+            assert.equal(
+              (yield* sql`SELECT 1 FROM agent_control_task_execution_authority WHERE project_id=${projectId}`)
+                .length,
+              0,
+            );
+            yield* sql`DELETE FROM agent_control_epic_targets WHERE project_id=${projectId}`;
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  sql.withTransaction(
+                    providerBoundary(projectId, taskId, () => Effect.succeed("cleared-entry")),
+                  ),
                 ),
               ),
-            ),
+            );
+            assert.deepEqual(yield* sql`PRAGMA foreign_key_check`, []);
+            return;
+          }
+          const acceptedExecutions =
+            yield* sql`SELECT * FROM agent_control_epic_task_executions WHERE project_id=${projectId} ORDER BY task_id`;
+          yield* publishSources(projectId, issues, parallelPollVersion++);
+          assert.equal(preparationPolls, sourceChange === "epic-parallel-preparation-poll" ? 1 : 0);
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_epic_task_executions WHERE project_id=${projectId} ORDER BY task_id`,
+            acceptedExecutions,
           );
-          assert.deepEqual(yield* sql`PRAGMA foreign_key_check`, []);
-          return;
+          const refreshedAuthorities = yield* sql<{
+            taskRevision: number;
+            executionRevision: number;
+            currentSequence: number;
+            executionSequence: number;
+          }>`
+            SELECT task.revision AS "taskRevision", stage.task_revision AS "executionRevision",
+              task.github_intake_sequence AS "currentSequence", stage.github_intake_sequence AS "executionSequence"
+            FROM agent_control_epic_task_executions execution
+            JOIN agent_control_task_states task ON task.task_id=execution.task_id
+            JOIN agent_control_stage_run_states stage ON stage.stage_run_id=execution.stage_run_id
+            WHERE execution.project_id=${projectId}`;
+          assert.lengthOf(refreshedAuthorities, 2);
+          for (const authority of refreshedAuthorities) {
+            assert.isAbove(authority.taskRevision, authority.executionRevision);
+            assert.isAbove(authority.currentSequence, authority.executionSequence);
+          }
+          if (sourceChange === "epic-parallel-polls") {
+            // Upgrade while both provider turns are still active and intake has advanced.
+            yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, sql));
+            assert.deepStrictEqual(
+              yield* sql`SELECT * FROM agent_control_epic_task_executions WHERE project_id=${projectId} ORDER BY task_id`,
+              acceptedExecutions,
+            );
+          }
+          yield* restartRecovery();
+          yield* planningConsumerService.drain;
+          assert.equal(fakeProvider.turnCount(), 2);
         }
+        let integrationChecks = 0;
+        let revokedIssueNodeId: string | undefined;
+        const epicResults = yield* makeEpicResults.pipe(
+          Effect.provide(context),
+          Effect.provideService(EpicCheckExecutor, {
+            execute: ({ cwd }) =>
+              Effect.gen(function* () {
+                integrationChecks++;
+                const result = yield* git(cwd, ["diff", "--check"]).pipe(Effect.provide(gitLayer));
+                if (
+                  sourceChange === "epic-parallel-integration-incomplete" &&
+                  integrationChecks === 1
+                ) {
+                  yield* publishSources(projectId, issues, parallelPollVersion++, false);
+                }
+                if (revokeDuringIntegration && integrationChecks === 1) {
+                  const [completedTask] = yield* sql<{
+                    issueNodeId: string;
+                  }>`SELECT issue_node_id AS "issueNodeId" FROM agent_control_task_states WHERE project_id=${projectId} AND status='succeeded'`;
+                  assert.isDefined(completedTask);
+                  revokedIssueNodeId = completedTask!.issueNodeId;
+                  const changedIssues = issues.map((entry) =>
+                    entry.issueNodeId !== revokedIssueNodeId
+                      ? entry
+                      : {
+                          ...entry,
+                          ...(sourceChange === "epic-parallel-integration-paused"
+                            ? {
+                                paused: true,
+                                eligible: false,
+                                eligibilityReason: "paused" as const,
+                              }
+                            : sourceChange === "epic-parallel-integration-content"
+                              ? { body: "Scope changed while integration checks were running" }
+                              : {}),
+                        },
+                  );
+                  if (sourceChange !== "epic-parallel-integration-paused") {
+                    epicSource = {
+                      ...epicSource!,
+                      tasks: epicSource!.tasks.map((task) =>
+                        task.issue.issueNodeId !== revokedIssueNodeId
+                          ? task
+                          : {
+                              ...task,
+                              ...(sourceChange === "epic-parallel-integration-dependency"
+                                ? { dependencies: [epicSource!.tasks[2]!.issue] }
+                                : {
+                                    issue: {
+                                      ...task.issue,
+                                      contentFingerprint: epicIssueContentFingerprint(
+                                        changedIssues.find(
+                                          (issue) => issue.issueNodeId === revokedIssueNodeId,
+                                        )!,
+                                      ),
+                                    },
+                                  }),
+                            },
+                      ),
+                    };
+                  }
+                  yield* publishSources(projectId, changedIssues, parallelPollVersion++);
+                }
+                return { exitCode: 0, stdout: result.stdout, stderr: result.stderr };
+              }).pipe(Effect.orDie),
+          }),
+        );
+        const epicService = yield* makeAgentControlEpic.pipe(
+          Effect.provide(context),
+          Effect.provideService(AgentControlEpicResultHooks, epicResults),
+          Effect.provideService(GithubIssueTrackerClient, {
+            resolveRepository: () => Effect.die("unexpected resolveRepository"),
+            pollIssues: () => Effect.die("unexpected pollIssues"),
+            inspectEpic: () =>
+              epicSource ? Effect.succeed(epicSource) : Effect.die("missing Epic source"),
+          }),
+        );
+        const unchangedParallelPoll = Effect.fn("unchangedParallelPoll")(function* () {
+          if (!parallelPolling && !sourceBeforeIntegration && !revokeDuringIntegration) return;
+          yield* publishSources(projectId, issues, parallelPollVersion++);
+        });
         const completeActiveTask = Effect.fn("completeArmedProductionActiveTask")(function* (
           runOrdinal: number,
         ) {
           const [accepted] = yield* sql<{ readonly handoffId: string }>`
             SELECT handoff_id AS "handoffId"
             FROM agent_control_initial_planning_deliveries
-            WHERE state IN ('pending', 'provider-started')
+            WHERE state IN ('pending', 'turn-accepted', 'delivery-attempted', 'provider-started')
             ORDER BY rowid DESC
             LIMIT 1
           `;
@@ -1441,14 +1677,66 @@ it.live.each([
             planningDelivery!.handoffId,
           );
           assert.equal(planningFinalized._tag, "Finalized");
+          yield* unchangedParallelPoll();
 
-          const implementationAdmitted = yield* implementationAdmissionService.processHandoff(
-            planningDelivery!.handoffId,
-          );
-          assert.equal(implementationAdmitted._tag, "Admitted");
-          const implementationMaterialized = yield* implementationCoordinatorService.processHandoff(
-            planningDelivery!.handoffId,
-          );
+          const implementationMaterialized = yield* Effect.gen(function* () {
+            if (sourceChange === "epic-parallel-polls" && runOrdinal === 1) {
+              yield* publishSources(projectId, issues, parallelPollVersion++, false);
+              const failed = yield* implementationCoordinatorService
+                .processHandoff(planningDelivery!.handoffId)
+                .pipe(Effect.flip);
+              assert.equal(failed.reason, "admission-corrupt");
+              assert.equal(fakeProvider.turnCount(), 2);
+              assert.deepStrictEqual(
+                yield* sql`SELECT * FROM agent_control_implementation_materialization_evidence`,
+                [],
+              );
+              return yield* Effect.scoped(
+                Effect.gen(function* () {
+                  const publications = yield* Stream.toPull(
+                    implementationCoordinatorService.streamPublications.pipe(
+                      Stream.filter(
+                        (publication) => publication.handoffId === planningDelivery!.handoffId,
+                      ),
+                    ),
+                  );
+                  const resumedRunOnce = yield* Layer.build(
+                    Layer.fresh(AgentControlRunOnceControllerLive).pipe(
+                      Layer.provide(Layer.succeedContext(pipelineContext)),
+                    ),
+                  );
+                  const resumedScheduler = yield* Layer.build(
+                    Layer.fresh(AgentControlArmedSchedulerLive).pipe(
+                      Layer.provide(Layer.succeed(AgentControlEpicProgress, epicService)),
+                      Layer.provide(
+                        Layer.succeedContext(Context.merge(pipelineContext, resumedRunOnce)),
+                      ),
+                    ),
+                  );
+                  const activation = yield* makeReactorStartupActivation;
+                  yield* Context.get(resumedScheduler, AgentControlArmedScheduler).prepare(
+                    activation,
+                  );
+                  yield* activation.open;
+                  yield* taskIntake.reconcileObservedProject({ projectId });
+                  const [publication] = yield* publications;
+                  assert.deepStrictEqual(
+                    yield* sql`SELECT receipt.status FROM agent_control_implementation_materialization_receipts receipt JOIN agent_control_implementation_materialization_evidence evidence USING (materialization_evidence_id) WHERE evidence.admission_handoff_id=${publication.handoffId}`,
+                    [{ status: "accepted" }],
+                  );
+                  assert.equal(fakeProvider.turnCount(), 2);
+                  return { _tag: "Materialized" as const, publication };
+                }),
+              );
+            }
+            const admitted = yield* implementationAdmissionService.processHandoff(
+              planningDelivery!.handoffId,
+            );
+            assert.equal(admitted._tag, "Admitted");
+            return yield* implementationCoordinatorService.processHandoff(
+              planningDelivery!.handoffId,
+            );
+          });
           assert.equal(implementationMaterialized._tag, "Materialized");
           if (implementationMaterialized._tag !== "Materialized") {
             return yield* Effect.die("implementation was not materialized");
@@ -1488,6 +1776,26 @@ it.live.each([
             (yield* implementationStarterService.processHandoff(implementationHandoffId))._tag,
             "Started",
           );
+          if (epicParallel) {
+            const implementationCwd = fakeProvider.sessions.get(
+              ThreadId.make(implementationDelivery!.threadId),
+            )!.cwd;
+            if (runOrdinal === 3) {
+              assert.equal(
+                yield* fs.readFileString(`${implementationCwd}/task-1.md`),
+                "Task 1 completed.\n",
+              );
+              assert.equal(
+                yield* fs.readFileString(`${implementationCwd}/task-2.md`),
+                "Task 2 completed.\n",
+              );
+            }
+            yield* fs.writeFileString(
+              `${implementationCwd}/task-${runOrdinal}.md`,
+              `Task ${runOrdinal} completed.\n`,
+            );
+          }
+          yield* unchangedParallelPoll();
           const implementationTerminal = yield* publishTerminal({
             prefix: `armed-production-implementation-${runOrdinal}`,
             threadId: ThreadId.make(implementationDelivery!.threadId),
@@ -1508,6 +1816,7 @@ it.live.each([
           }
 
           const resultEvidenceId = implementationFinalized.resultEvidenceId;
+          yield* unchangedParallelPoll();
           if (sourceChange === "paused" || sourceChange === "replaced") {
             const refreshedAt = DateTime.formatIso(yield* DateTime.now);
             const changedSource: AgentControlGithubIssueSnapshot =
@@ -1545,7 +1854,10 @@ it.live.each([
             );
             return;
           }
-          if (intakeRefreshes === 3 && runOrdinal === 1) {
+          if (
+            (intakeRefreshes === 3 || sourceChange === "epic-parallel-polls") &&
+            runOrdinal === 1
+          ) {
             const beforeCrash = fakeProvider.turnCount();
             const committedAdmission = yield* Effect.scoped(
               Effect.gen(function* () {
@@ -1767,6 +2079,7 @@ it.live.each([
           assert.equal((yield* runCheck).exitCode, 0);
           assert.equal((yield* runCheck).exitCode, 0);
           assert.equal(checkExecutions, 1);
+          yield* unchangedParallelPoll();
           const outputAt = DateTime.formatIso(yield* DateTime.now);
           const messageId = MessageId.make(`verification-output-${runOrdinal}`);
           const outputEventId = EventId.make(`verification-output-event-${runOrdinal}`);
@@ -1859,6 +2172,141 @@ it.live.each([
         });
 
         yield* completeActiveTask(1);
+        if (revokeDuringIntegration) {
+          yield* epicService.processProject(projectId);
+          const revoked = (yield* loadSelectedEpic(sql, projectId))!;
+          const revokedMember = revoked.members.find(
+            (member) => member.issueNodeId === revokedIssueNodeId,
+          )!;
+          assert.equal(revokedMember.status, "failed");
+          assert.isNotEmpty(revokedMember.blocker);
+          assert.isNotEmpty(revoked.blockers);
+          assert.equal(integrationChecks, 1);
+          assert.equal(revoked.acceptedCommitSha, null);
+          assert.isFalse(revoked.members.some((member) => member.status === "accepted"));
+          assert.equal(revoked.members[2]!.status, "pending");
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_epic_integration_results`,
+            [],
+          );
+          yield* restartRecovery();
+          yield* epicService.processProject(projectId);
+          const recovered = (yield* loadSelectedEpic(sql, projectId))!;
+          const recoveredMember = recovered.members.find(
+            (member) => member.issueNodeId === revokedIssueNodeId,
+          )!;
+          assert.equal(recoveredMember.status, "failed");
+          assert.isNotEmpty(recoveredMember.blocker);
+          assert.equal(recovered.acceptedCommitSha, null);
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_epic_integration_results`,
+            [],
+          );
+          assert.equal(fakeProvider.turnCount(), 4);
+          return;
+        }
+        if (sourceBeforeIntegration) {
+          assert.isDefined(epicSource);
+          epicSource = {
+            ...epicSource!,
+            tasks: epicSource!.tasks.map((task, index) =>
+              index === 1
+                ? {
+                    ...task,
+                    ...(sourceChange === "epic-parallel-dependency-before-integration"
+                      ? { dependencies: [epicSource!.tasks[2]!.issue] }
+                      : { issue: { ...task.issue, contentFingerprint: "changed-scope" } }),
+                  }
+                : task,
+            ),
+          };
+          yield* epicService.processProject(projectId);
+          const blockedEpic = (yield* loadSelectedEpic(sql, projectId))!;
+          assert.equal(blockedEpic.status, "blocked");
+          assert.isNotEmpty(blockedEpic.blockers);
+          assert.equal(integrationChecks, 0);
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_epic_integration_results`,
+            [],
+          );
+          yield* restartRecovery();
+          yield* epicService.processProject(projectId);
+          assert.deepStrictEqual(yield* loadSelectedEpic(sql, projectId), blockedEpic);
+          assert.equal(fakeProvider.turnCount(), 4);
+          return;
+        }
+        if (sourceChange === "epic-parallel-integration-incomplete") {
+          yield* epicService.processProject(projectId);
+          const waiting = (yield* loadSelectedEpic(sql, projectId))!;
+          assert.equal(waiting.status, "running");
+          assert.isEmpty(waiting.blockers);
+          assert.isFalse(
+            waiting.members.some(
+              (member) => member.status === "failed" || member.status === "accepted",
+            ),
+          );
+          assert.equal(integrationChecks, 1);
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_epic_integration_results`,
+            [],
+          );
+          assert.equal(fakeProvider.turnCount(), 4);
+          yield* taskIntake.reconcileObservedProject({ projectId });
+        }
+        if (parallelPolling) {
+          yield* epicService.processProject(projectId);
+          let epic = (yield* loadSelectedEpic(sql, projectId))!;
+          assert.equal(epic.members.filter((member) => member.status === "accepted").length, 1);
+          assert.equal(epic.members[2]!.status, "pending");
+          assert.equal(epic.members[2]!.childRunId, null);
+          assert.equal(integrationChecks, 1);
+          yield* restartRecovery();
+          yield* unchangedParallelPoll();
+          yield* completeActiveTask(2);
+          yield* epicService.processProject(projectId);
+          epic = (yield* loadSelectedEpic(sql, projectId))!;
+          assert.equal(epic.members.filter((member) => member.status === "accepted").length, 2);
+          assert.isTrue(
+            epic.members
+              .slice(0, 2)
+              .every((member) => member.integrationVerification?.status === "passed"),
+          );
+          assert.equal(integrationChecks, 2);
+          assert.equal(epic.members[2]!.status, "running");
+          yield* scheduler.processProject(projectId);
+          yield* completeActiveTask(3);
+          yield* epicService.processProject(projectId);
+          epic = (yield* loadSelectedEpic(sql, projectId))!;
+          assert.equal(epic.status, "succeeded");
+          assert.equal(fakeProvider.turnCount(), 9);
+          const completedEpic = epic;
+          const completedChecks =
+            yield* sql`SELECT * FROM agent_control_verification_check_results`;
+          const completedIntegrations =
+            yield* sql`SELECT * FROM agent_control_epic_integration_results`;
+          assert.lengthOf(
+            completedChecks.filter((check) => check.check_id === "clean-diff"),
+            3,
+          );
+          assert.lengthOf(completedIntegrations, 3);
+          const completedIntegrationChecks = integrationChecks;
+          yield* unchangedParallelPoll();
+          yield* restartRecovery();
+          yield* epicService.processProject(projectId);
+          assert.deepStrictEqual(yield* loadSelectedEpic(sql, projectId), completedEpic);
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_verification_check_results`,
+            completedChecks,
+          );
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM agent_control_epic_integration_results`,
+            completedIntegrations,
+          );
+          assert.equal(integrationChecks, completedIntegrationChecks);
+          assert.equal(fakeProvider.turnCount(), 9);
+          assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+          return;
+        }
         if (terminalRetry) {
           yield* controller.processProject(projectId);
           assert.deepStrictEqual(

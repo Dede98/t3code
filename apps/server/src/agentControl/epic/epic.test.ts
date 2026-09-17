@@ -1169,3 +1169,87 @@ describe("Epic integrated dependency progress", () => {
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
 });
+
+for (const reason of ["closed", "dependency", "approval"] as const)
+  it.effect(`blocks an active child before accepting its result after ${reason} changes`, () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      f.setMode("armed");
+      const planned = plannedState(2);
+      yield* seedRun(f.sql, {
+        ...planned,
+        members: planned.members.map((member) =>
+          member.issueNumber === 2
+            ? {
+                ...member,
+                status: "running",
+                taskId: AgentControlTaskId.make("task-2"),
+                childRunId: "active-child",
+                reservationId: "retained-worktree",
+              }
+            : member,
+        ),
+      });
+      if (reason === "approval")
+        yield* f.sql`UPDATE agent_control_task_states SET source_gate='not-ready' WHERE task_id='task-2'`;
+      else
+        f.setSource({
+          ...source,
+          tasks: source.tasks.map((task) =>
+            task.issue.number !== 2
+              ? task
+              : reason === "closed"
+                ? {
+                    ...task,
+                    issue: { ...task.issue, state: "closed" },
+                  }
+                : { ...task, dependencies: [issue(90)] },
+          ),
+        });
+      const service = yield* f.make();
+      yield* service.processProject(projectId);
+      const blocked = (yield* service.get(projectId))!;
+      assert.equal(blocked.status, "blocked");
+      assert.equal(
+        blocked.blockers[0]?.code,
+        reason === "approval"
+          ? "task-not-approved"
+          : reason === "closed"
+            ? "closed-during-run"
+            : "scope-changed",
+      );
+      assert.equal(
+        blocked.members.find((member) => member.issueNumber === 2)?.reservationId,
+        "retained-worktree",
+      );
+      const restarted = yield* f.make();
+      yield* restarted.processProject(projectId);
+      assert.deepEqual(yield* restarted.get(projectId), blocked);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+it.effect("waits for in-progress intake reconciliation without blocking an active Epic", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    f.setMode("armed");
+    const planned = plannedState(2);
+    const state: AgentControlEpicRuntimeView = {
+      ...planned,
+      members: planned.members.map((member) =>
+        member.issueNumber === 2
+          ? {
+              ...member,
+              status: "running",
+              taskId: AgentControlTaskId.make("task-2"),
+              childRunId: "active-child",
+            }
+          : member,
+      ),
+    };
+    yield* seedRun(f.sql, state);
+    yield* f.sql`UPDATE agent_control_task_reconcile_states SET target_sequence=30 WHERE project_id=${projectId}`;
+    const service = yield* f.make();
+    yield* service.processProject(projectId);
+    assert.deepEqual(yield* service.get(projectId), state);
+  }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+);

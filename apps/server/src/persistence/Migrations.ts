@@ -1,3 +1,4 @@
+import AgentMigration0092 from "./Migrations/092_AgentControlEpicFrozenTaskMaterialization.ts";
 import AgentMigration0091 from "./Migrations/091_AgentControlProviderAuthorityLanes.ts";
 import AgentMigration0090 from "./Migrations/090_AgentControlEpicIntegration.ts";
 import AgentMigration0087 from "./Migrations/087_AgentControlVerificationInspectionPages.ts";
@@ -199,6 +200,7 @@ const agentMigrationEntries = [
   [89, "AgentControlEpicTaskExecutions", AgentMigration0089],
   [90, "AgentControlEpicIntegration", AgentMigration0090],
   [91, "AgentControlProviderAuthorityLanes", AgentMigration0091],
+  [92, "AgentControlEpicFrozenTaskMaterialization", AgentMigration0092],
 ] as const;
 
 const migrationEntries = [

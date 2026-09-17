@@ -13,6 +13,14 @@ import { AgentControlStageRun } from "../stageRun/Services/AgentControlStageRun.
 import { deriveAgentControlStageRunLeaseId } from "../stageRunLease/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
 import { AgentControlWorktreeController } from "../worktree/Services/AgentControlWorktreeController.ts";
+import { AgentControlImplementationTurnCoordinator } from "../implementationTurn/Services/AgentControlImplementationTurnCoordinator.ts";
+import { AgentControlVerificationTurnCoordinator } from "../verificationTurn/Services/AgentControlVerificationTurnCoordinator.ts";
+import {
+  epicPreparationBlockerCode,
+  persistImplementationEpicDiagnostic,
+  persistVerificationRunOnceDiagnostic,
+} from "./diagnostics.ts";
+import { AgentControlRunOnceReadNotifications } from "./readNotifications.ts";
 import {
   makeAgentControlRunOnceKeyedFence,
   withAgentControlRunOnceProjectFence,
@@ -26,6 +34,8 @@ export const makeEpicTaskExecution = Effect.fn("makeEpicTaskExecution")(function
   const leases = yield* AgentControlStageRunLeaseEngine;
   const worktrees = yield* AgentControlWorktreeController;
   const threads = yield* AgentControlControlledThreadActivation;
+  const implementation = yield* AgentControlImplementationTurnCoordinator;
+  const verification = yield* AgentControlVerificationTurnCoordinator;
   const locks = makeAgentControlRunOnceKeyedFence<string>();
 
   const current = Effect.fn("EpicTaskExecution.current")(function* (
@@ -135,6 +145,47 @@ export const makeEpicTaskExecution = Effect.fn("makeEpicTaskExecution")(function
     if (binding.phase === "thread-activated") {
       if (binding.worktreeReservationId)
         yield* publishActivation(projectId, taskId, binding.worktreeReservationId);
+      // Intake completion and Epic resume already wake this scheduler. Retry only
+      // this member's unfinished transitions through the receipt-first coordinators.
+      const planningResults = yield* sql<{ handoffId: string }>`
+        SELECT result.handoff_id AS "handoffId" FROM agent_control_initial_planning_result_evidence result
+        JOIN agent_control_initial_planning_handoff_intents intent ON intent.handoff_id=result.handoff_id
+        WHERE result.project_id=${projectId} AND result.task_id=${taskId}
+          AND intent.worktree_reservation_id=${binding.worktreeReservationId}
+          AND result.outcome='succeeded'
+          AND NOT EXISTS (SELECT 1 FROM agent_control_implementation_materialization_evidence materialized
+            JOIN agent_control_implementation_materialization_markers marker
+              ON marker.materialization_evidence_id=materialized.materialization_evidence_id
+            WHERE materialized.admission_handoff_id=result.handoff_id)`;
+      for (const result of planningResults) {
+        if (!(yield* current(projectId, taskId))) return;
+        yield* implementation
+          .processHandoff(result.handoffId)
+          .pipe(
+            Effect.catch((failure) =>
+              persistImplementationEpicDiagnostic(sql, result.handoffId, failure),
+            ),
+          );
+      }
+      const implementationResults = yield* sql<{ resultEvidenceId: string }>`
+        SELECT result.result_evidence_id AS "resultEvidenceId" FROM agent_control_implementation_result_evidence result
+        WHERE result.project_id=${projectId} AND result.task_id=${taskId}
+          AND result.worktree_reservation_id=${binding.worktreeReservationId}
+          AND result.outcome='succeeded'
+          AND NOT EXISTS (SELECT 1 FROM agent_control_verification_materialization_evidence materialized
+            JOIN agent_control_verification_materialization_markers marker
+              ON marker.materialization_evidence_id=materialized.materialization_evidence_id
+            WHERE materialized.implementation_result_evidence_id=result.result_evidence_id)`;
+      for (const result of implementationResults) {
+        if (!(yield* current(projectId, taskId))) return;
+        yield* verification
+          .processHandoff(result.resultEvidenceId)
+          .pipe(
+            Effect.catch((failure) =>
+              persistVerificationRunOnceDiagnostic(sql, result.resultEvidenceId, failure),
+            ),
+          );
+      }
       return;
     }
     const command = (step: string) =>
@@ -212,15 +263,43 @@ export const makeEpicTaskExecution = Effect.fn("makeEpicTaskExecution")(function
                 Effect.gen(function* () {
                   const state = yield* current(projectId, member.taskId!);
                   if (!state) return;
+                  const code = epicPreparationBlockerCode(failure);
+                  const message =
+                    code === null
+                      ? String(failure)
+                      : `Task #${member.issueNumber} could not prepare its execution (${code}). Inspect its source approval, lease and worktree ownership; resolve the cause and resume, or stop this Epic. Existing execution evidence is retained.`;
+                  const blockers = [
+                    ...state.epic.blockers,
+                    {
+                      code: `preparation:${code}`,
+                      issueNumber: member.issueNumber,
+                      message,
+                    },
+                  ];
                   yield* saveEpicRun(sql, state.epic, {
+                    ...(code === null
+                      ? {}
+                      : {
+                          status: "blocked" as const,
+                          blockers,
+                          blockerHistory: [
+                            ...state.epic.blockerHistory,
+                            {
+                              recordedAt: DateTime.formatIso(yield* DateTime.now),
+                              blockers,
+                            },
+                          ],
+                        }),
                     members: state.epic.members.map((item) =>
                       item.taskId === member.taskId
-                        ? { ...item, waitReason: "blocker" as const, blocker: String(failure) }
+                        ? { ...item, waitReason: "blocker" as const, blocker: message }
                         : item,
                     ),
                   });
                 }),
               );
+              const notifications = yield* AgentControlRunOnceReadNotifications;
+              yield* notifications.publishProject(projectId);
             }),
           ),
         ),

@@ -24403,6 +24403,67 @@ it.effect.each<{ readonly phase: "defect" | "interrupt" }>([
   ),
 );
 
+it.effect.each([undefined, 91])(
+  "retains admitted results and source withdrawal checks across migration 092 from %s",
+  (initialMigration) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const database = yield* makeSharedDatabase(initialMigration);
+          const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
+          const { setup, claim, implementation } =
+            yield* prepareSucceededImplementationFinalization(
+              database,
+              planningFinalizer,
+              "verification-admission-source-withdrawn",
+            );
+          const original = yield* database.sqlA`
+          SELECT * FROM agent_control_implementation_result_evidence ORDER BY result_evidence_id`;
+          const receipts = yield* database.sqlA`
+          SELECT * FROM agent_control_implementation_stage_finalization_receipts ORDER BY receipt_id`;
+          yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, database.sqlA));
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+          SELECT * FROM agent_control_implementation_result_evidence ORDER BY result_evidence_id`,
+            original,
+          );
+          assert.deepStrictEqual(
+            yield* database.sqlA`
+          SELECT * FROM agent_control_implementation_stage_finalization_receipts ORDER BY receipt_id`,
+            receipts,
+          );
+          const verification = yield* buildVerificationAdmission({
+            sql: database.sqlA,
+            scope: database.scopeA,
+            planningFinalizer,
+            implementationFinalizer: setup.finalizer.finalizer,
+            handoffStore: setup.coordinator.handoffStore,
+            admissionHarness: setup.candidate.admissionHarness,
+          });
+          yield* appendLegitimateTaskHistorySuffix(
+            verification,
+            AgentControlTaskId.make(claim.evidence.taskId),
+            "verification-admission-source-withdrawn",
+          );
+          const result = yield* Effect.result(
+            verification.admission.processResultEvidence(implementation.resultEvidenceId),
+          );
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure")
+            assert.equal(result.failure.reason, "task-history-corrupt");
+          assert.deepStrictEqual(yield* verificationAdmissionCounts(database.sqlB), {
+            stageEvents: 0,
+            leaseEvents: 0,
+            reservationEvents: 0,
+            evidence: 0,
+            receipts: 0,
+            markers: 0,
+          });
+        }),
+      ),
+    ),
+);
+
 it.effect("replays accepted verification after a legitimate task history suffix", () =>
   withNode(
     Effect.scoped(

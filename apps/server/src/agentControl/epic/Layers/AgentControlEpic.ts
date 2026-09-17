@@ -5,6 +5,7 @@ import { AgentControlPolicyService } from "../../AgentControlPolicyService.ts";
 import { makeEpicQueue, mapEpicQueueError } from "../queue.ts";
 import { loadEnabledEpicQueue } from "../queueAuthority.ts";
 import { GithubIssueTrackerClientError } from "../../github/Services/GithubIssueTrackerClient.ts";
+import { epicIssueContentFingerprint } from "../../github/githubEpicSource.ts";
 import { createEpicRun, insertEpicRun } from "../runState.ts";
 import {
   AgentControlEpicRpcError,
@@ -571,9 +572,68 @@ export const makeAgentControlEpic = Effect.gen(function* () {
               "authority-conflict",
               "The approved dependency plan changed during execution.",
             );
+          const project = yield* engine.getProjectState({ projectId });
+          if (project.mode !== "armed" || project.pausedFromMode !== null) return;
+          const inspected = yield* inspect({
+            projectId,
+            epicNumber: state.source.epic.number,
+          }).pipe(
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                const error = mapError(cause);
+                if (
+                  ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
+                    error.code,
+                  )
+                )
+                  return yield* error;
+                yield* block(state!, [
+                  { code: error.code, issueNumber: null, message: error.message },
+                ]);
+                return null;
+              }),
+            ),
+          );
+          if (!inspected) return;
+          const changes = epicSourceChanges(state, inspected);
+          if (changes.length) {
+            yield* block(state, changes);
+            return;
+          }
+          const availableTasks = yield* sourceTasks(projectId).pipe(
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                const error = mapError(cause);
+                if (error.code === "intake-incomplete") return null;
+                if (
+                  ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
+                    error.code,
+                  )
+                )
+                  return yield* error;
+                yield* block(state!, [
+                  { code: error.code, issueNumber: null, message: error.message },
+                ]);
+                return null;
+              }),
+            ),
+          );
+          if (!availableTasks) return;
           const activeMembers = state.members.filter((member) => member.status === "running");
           for (const active of activeMembers) {
             if (!active.childRunId) continue;
+            const currentTask = availableTasks.find((task) => task.taskId === active.taskId);
+            if (!currentTask || currentTask.sourceGate !== "eligible") {
+              yield* block(state, [
+                {
+                  code: "task-not-approved",
+                  issueNumber: active.issueNumber,
+                  message:
+                    "The active task lost its current source approval. Restore approval and resume, or stop this Epic. Its result and worktree are retained.",
+                },
+              ]);
+              return;
+            }
             const terminal: ReadonlyArray<{
               status: string;
               evidenceId: string;
@@ -746,14 +806,70 @@ export const makeAgentControlEpic = Effect.gen(function* () {
                   lastAccepted: member,
                   checks: state.checks,
                   attempt: state.verificationAttempt,
+                  refreshSource: Effect.gen(function* () {
+                    const observed = yield* inspect({
+                      projectId,
+                      epicNumber: expectedState.source.epic.number,
+                    });
+                    const changes = epicSourceChanges(expectedState, observed);
+                    if (changes.length)
+                      return yield* epicError(
+                        "scope-changed",
+                        changes.map((change) => change.message).join(" "),
+                      );
+                  }).pipe(Effect.mapError(mapError)),
                   authorize: Effect.gen(function* () {
                     const selected = yield* get(projectId);
                     yield* requireEpicIntegrationAuthority(expectedState, selected);
-                  }),
+                  }).pipe(Effect.mapError(mapError)),
+                  authorizePublication: Effect.gen(function* () {
+                    const project = yield* engine.getProjectState({ projectId });
+                    const current = (yield* sourceTasks(projectId)).find(
+                      (task) => task.taskId === active.taskId,
+                    );
+                    const snapshot = yield* github.getCompletedSnapshot(projectId);
+                    if (
+                      Option.isNone(snapshot) ||
+                      (current &&
+                        current.sequence !== snapshot.value.sourcePrecondition.githubIntakeSequence)
+                    )
+                      return yield* epicError(
+                        "intake-incomplete",
+                        "Wait for current GitHub reconciliation before accepting integration.",
+                      );
+                    const issue = snapshot.value.issues.find(
+                      (issue) => issue.issueNodeId === active.issueNodeId,
+                    );
+                    const frozen = expectedState.source.tasks.find(
+                      (task) => task.issue.issueNodeId === active.issueNodeId,
+                    )?.issue;
+                    if (
+                      project.mode !== "armed" ||
+                      project.pausedFromMode !== null ||
+                      !current ||
+                      current.sourceGate !== "eligible" ||
+                      !issue ||
+                      issue.state !== "open" ||
+                      !issue.ready ||
+                      issue.paused ||
+                      !issue.eligible ||
+                      !issue.timelineComplete ||
+                      issue.eligibilityReason !== "eligible" ||
+                      !frozen ||
+                      issue.repositoryNodeId !== frozen.repositoryNodeId ||
+                      (frozen.contentFingerprint !== undefined &&
+                        epicIssueContentFingerprint(issue) !== frozen.contentFingerprint)
+                    )
+                      return yield* epicError(
+                        "task-not-approved",
+                        "Task source approval or content changed during integration. Restore the approved source and resume, or stop this Epic. The captured result is retained.",
+                      );
+                  }).pipe(Effect.mapError(mapError)),
                 })
                 .pipe(
                   Effect.catch((error) =>
                     Effect.gen(function* () {
+                      if (error.code === "intake-incomplete") return null;
                       if (
                         ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
                           error.code,
@@ -844,34 +960,6 @@ export const makeAgentControlEpic = Effect.gen(function* () {
               }),
             });
           }
-          const project = yield* engine.getProjectState({ projectId });
-          if (project.mode !== "armed" || project.pausedFromMode !== null) return;
-          const inspected = yield* inspect({
-            projectId,
-            epicNumber: state.source.epic.number,
-          }).pipe(
-            Effect.catch((cause) =>
-              Effect.gen(function* () {
-                const error = mapError(cause);
-                if (
-                  ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
-                    error.code,
-                  )
-                )
-                  return yield* error;
-                yield* block(state!, [
-                  { code: error.code, issueNumber: null, message: error.message },
-                ]);
-                return null;
-              }),
-            ),
-          );
-          if (!inspected) return;
-          const changes = epicSourceChanges(state, inspected);
-          if (changes.length) {
-            yield* block(state, changes);
-            return;
-          }
           const externalPrerequisites = [...(state.externalPrerequisites ?? [])];
           for (const task of inspected.tasks) {
             for (const dependency of task.dependencies) {
@@ -901,24 +989,6 @@ export const makeAgentControlEpic = Effect.gen(function* () {
             ]);
             return;
           }
-          const availableTasks = yield* sourceTasks(projectId).pipe(
-            Effect.catch((cause) =>
-              Effect.gen(function* () {
-                const error = mapError(cause);
-                if (
-                  ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
-                    error.code,
-                  )
-                )
-                  return yield* error;
-                yield* block(state!, [
-                  { code: error.code, issueNumber: null, message: error.message },
-                ]);
-                return null;
-              }),
-            ),
-          );
-          if (!availableTasks) return;
           if (!state.dependencyPlan && state.activeTaskId !== null) {
             const selected = availableTasks.find((task) => task.taskId === state!.activeTaskId);
             if (

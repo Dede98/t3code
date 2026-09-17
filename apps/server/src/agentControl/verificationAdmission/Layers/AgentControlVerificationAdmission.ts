@@ -78,6 +78,7 @@ import { AgentControlControlledThreadReservationEventStore } from "../../control
 import { AgentControlControlledThreadReservationProjection } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationProjection.ts";
 import { AgentControlControlledThreadReservationStateRepository } from "../../controlledThreadReservation/Services/AgentControlControlledThreadReservationStateRepository.ts";
 import { loadAuthoritativeTaskProjectHistory } from "../../task/authoritative.ts";
+import { loadEpicTaskExecutionAuthority } from "../../task/executionAuthority.ts";
 import { AgentControlTaskEventStore } from "../../task/Services/AgentControlTaskEventStore.ts";
 import { AgentControlTaskStateRepository } from "../../task/Services/AgentControlTaskStateRepository.ts";
 import { loadAuthoritativeWorktreeReservation } from "../../worktree/authoritative.ts";
@@ -969,7 +970,24 @@ const make = Effect.gen(function* () {
         failure(candidate.resultEvidenceId, "load-task-history", "task-history-corrupt", cause),
       ),
     );
-    const task = taskProjectHistory.filter((state) => state.taskId === candidate.taskId);
+    const currentTasks = taskProjectHistory.filter((state) => state.taskId === candidate.taskId);
+    if (
+      currentTasks.length !== 1 ||
+      currentTasks[0]?.status !== "candidate" ||
+      currentTasks[0].stage !== "intake" ||
+      currentTasks[0].sourceGate !== "eligible"
+    ) {
+      return yield* failure(
+        candidate.resultEvidenceId,
+        "validate-task-history",
+        "task-history-corrupt",
+      );
+    }
+    const task = yield* loadEpicTaskExecutionAuthority(sql, currentTasks[0]!).pipe(
+      Effect.mapError((cause) =>
+        failure(candidate.resultEvidenceId, "validate-task-history", "task-history-corrupt", cause),
+      ),
+    );
     const allTaskEvents = yield* collectGlobal((after, limit) =>
       taskEvents.readGlobal(after, limit),
     ).pipe(
@@ -978,15 +996,14 @@ const make = Effect.gen(function* () {
       ),
     );
     const authoritativeTaskEvents = allTaskEvents.filter(
-      (event) => event.aggregateId === candidate.taskId,
+      (event) => event.aggregateId === candidate.taskId && event.streamVersion <= task.revision,
     );
     const taskSourceEvent = authoritativeTaskEvents.find(
       (event) => event.eventId === claim.evidence.taskSourceEventId,
     );
     if (
-      task.length !== 1 ||
-      task[0]?.revision !== candidate.taskRevision ||
-      task[0].githubIntakeSequence !== candidate.githubIntakeSequence ||
+      task.revision !== candidate.taskRevision ||
+      task.githubIntakeSequence !== candidate.githubIntakeSequence ||
       taskSourceEvent?.sequence !== claim.evidence.taskSourceEventSequence ||
       taskSourceEvent.streamVersion !== claim.evidence.taskSourceEventStreamVersion
     ) {
@@ -1258,7 +1275,7 @@ const make = Effect.gen(function* () {
 
     return {
       claim,
-      taskState: task[0]!,
+      taskState: task,
       worktree: worktree.value,
       stageStates: stageHistory,
       lease: lease.value,
