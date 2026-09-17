@@ -44,6 +44,17 @@ const makeServerSettingsLayer = () =>
     ),
   );
 
+// Reuse only the temporary config and database; start a new service with its own cache.
+const readRestartedSettings = Effect.gen(function* () {
+  const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+  yield* serverSettings.start;
+  return yield* serverSettings.getSettings;
+}).pipe(
+  Effect.provide(
+    Layer.fresh(ServerSettingsModule.layer).pipe(Layer.provide(ServerSecretStore.layer)),
+  ),
+);
+
 const makeFailingSecretStoreLayer = (cause: ServerSecretStore.SecretStoreError) =>
   Layer.succeed(
     ServerSecretStore.ServerSecretStore,
@@ -78,6 +89,224 @@ const recordProviderUsage = (provider: string, instanceId: string | null = provi
   });
 
 it.layer(NodeServices.layer)("server settings", (it) => {
+  it.effect("persists resource admission limits of 3/1/1", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const expected = {
+        ...DEFAULT_SERVER_SETTINGS.resourceAdmission,
+        providerMaxConcurrent: 3,
+      };
+
+      const updated = yield* serverSettings.updateSettings({
+        resourceAdmission: {
+          providerMaxConcurrent: 3,
+          interactiveReserve: 1,
+          localCheckMaxConcurrent: 1,
+        },
+      });
+
+      assert.deepEqual(updated.resourceAdmission, expected);
+      assert.deepEqual((yield* serverSettings.getSettings).resourceAdmission, expected);
+      const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
+      // Inspect the file before decoding can restore missing default fields.
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const persisted = JSON.parse(raw);
+      assert.deepEqual(persisted.resourceAdmission, expected);
+      assert.deepEqual(yield* readRestartedSettings, updated);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("preserves and broadcasts resource admission partial patches", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+        const initial = yield* serverSettings.updateSettings({
+          addProjectBaseDirectory: "~/ResourceProjects",
+          providers: { codex: { binaryPath: "/tmp/resource-codex" } },
+          resourceAdmission: {
+            providerMaxConcurrent: 3,
+            interactiveReserve: 1,
+            localCheckMaxConcurrent: 1,
+            providerAccountScopes: {
+              [ProviderInstanceId.make("codex-work")]: "shared-work-account",
+            },
+          },
+        });
+        const changes = yield* serverSettings.subscribeChanges;
+        const updated = yield* serverSettings.updateSettings({
+          resourceAdmission: { localCheckMaxConcurrent: 2 },
+        });
+        const expected = {
+          ...initial,
+          resourceAdmission: { ...initial.resourceAdmission, localCheckMaxConcurrent: 2 },
+        };
+
+        assert.deepEqual(updated, expected);
+        assert.deepEqual(yield* serverSettings.getSettings, expected);
+        assert.deepEqual(Option.getOrUndefined(yield* Stream.runHead(changes)), expected);
+        assert.deepEqual(yield* readRestartedSettings, expected);
+
+        const reset = yield* serverSettings.updateSettings({
+          resourceAdmission: DEFAULT_SERVER_SETTINGS.resourceAdmission,
+        });
+        assert.deepEqual(reset, {
+          ...initial,
+          resourceAdmission: {
+            ...DEFAULT_SERVER_SETTINGS.resourceAdmission,
+            providerAccountScopes: initial.resourceAdmission.providerAccountScopes,
+          },
+        });
+        assert.deepEqual(yield* readRestartedSettings, reset);
+      }),
+    ).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("resets resource admission limits to defaults and omits the default block", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const initial = yield* serverSettings.updateSettings({ addProjectBaseDirectory: "~/Keep" });
+      yield* serverSettings.updateSettings({
+        resourceAdmission: {
+          providerMaxConcurrent: 3,
+          interactiveReserve: 0,
+          localCheckMaxConcurrent: 2,
+          cpuPauseThreshold: 0.9,
+          availableMemoryResumeBytes: 3 * 1024 ** 3,
+        },
+      });
+
+      const reset = yield* serverSettings.updateSettings({
+        resourceAdmission: DEFAULT_SERVER_SETTINGS.resourceAdmission,
+      });
+      assert.deepEqual(reset, initial);
+      assert.deepEqual(yield* serverSettings.getSettings, initial);
+      const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      assert.notProperty(JSON.parse(raw), "resourceAdmission");
+      assert.deepEqual(yield* readRestartedSettings, initial);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  for (const [label, resourceAdmission] of [
+    [
+      "custom pause CPU and resume RAM",
+      { cpuPauseThreshold: 0.9, availableMemoryResumeBytes: 3 * 1024 ** 3 },
+    ],
+    [
+      "custom resume CPU and pause RAM",
+      { cpuResumeThreshold: 0.6, availableMemoryPauseBytes: 1024 ** 3 },
+    ],
+    [
+      "valid boundaries",
+      {
+        providerMaxConcurrent: 3,
+        interactiveReserve: 3,
+        cpuPauseThreshold: 0.71,
+        availableMemoryPauseBytes:
+          DEFAULT_SERVER_SETTINGS.resourceAdmission.availableMemoryResumeBytes - 1,
+      },
+    ],
+  ] as const) {
+    it.effect(`persists resource admission with ${label}`, () =>
+      Effect.gen(function* () {
+        const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+        const updated = yield* serverSettings.updateSettings({ resourceAdmission });
+
+        assert.deepEqual(updated.resourceAdmission, {
+          ...DEFAULT_SERVER_SETTINGS.resourceAdmission,
+          ...resourceAdmission,
+        });
+        assert.deepEqual(yield* serverSettings.getSettings, updated);
+        assert.deepEqual(yield* readRestartedSettings, updated);
+      }).pipe(Effect.provide(makeServerSettingsLayer())),
+    );
+  }
+
+  for (const [label, resourceAdmission, message] of [
+    [
+      "reserve exceeds capacity",
+      { interactiveReserve: 4 },
+      "interactiveReserve must not exceed providerMaxConcurrent",
+    ],
+    [
+      "equal CPU thresholds",
+      { cpuResumeThreshold: 0.85 },
+      "cpuResumeThreshold must be lower than cpuPauseThreshold",
+    ],
+    [
+      "reversed CPU thresholds",
+      { cpuPauseThreshold: 0.6 },
+      "cpuResumeThreshold must be lower than cpuPauseThreshold",
+    ],
+    [
+      "equal RAM thresholds",
+      { availableMemoryResumeBytes: 1.5 * 1024 ** 3 },
+      "availableMemoryResumeBytes must exceed availableMemoryPauseBytes",
+    ],
+    [
+      "reversed RAM thresholds",
+      { availableMemoryPauseBytes: 3 * 1024 ** 3 },
+      "availableMemoryResumeBytes must exceed availableMemoryPauseBytes",
+    ],
+  ] as const) {
+    it.effect(`rejects resource admission when ${label} without changing saved settings`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+          const serverConfig = yield* ServerConfig.ServerConfig;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const initial = yield* serverSettings.updateSettings({
+            addProjectBaseDirectory: "~/Keep",
+            resourceAdmission: { providerMaxConcurrent: 3 },
+          });
+          const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
+          const changes = yield* serverSettings.subscribeChanges;
+
+          const error = yield* Effect.flip(serverSettings.updateSettings({ resourceAdmission }));
+          assert.deepInclude(error, { _tag: "ServerSettingsError", operation: "normalize" });
+          assert.include(String(error.cause), message);
+          assert.equal(yield* fileSystem.readFileString(serverConfig.settingsPath), raw);
+          assert.deepEqual(yield* serverSettings.getSettings, initial);
+          assert.deepEqual(yield* readRestartedSettings, initial);
+
+          // A following successful write is the stream barrier: no rejected value may precede it.
+          const next = yield* serverSettings.updateSettings({
+            resourceAdmission: { localCheckMaxConcurrent: 2 },
+          });
+          assert.deepEqual(Option.getOrUndefined(yield* Stream.runHead(changes)), next);
+        }),
+      ).pipe(Effect.provide(makeServerSettingsLayer())),
+    );
+  }
+
+  for (const resourceAdmission of [undefined, { providerMaxConcurrent: 3 }]) {
+    it.effect(
+      `loads legacy settings with ${resourceAdmission ? "sparse" : "missing"} resource admission`,
+      () =>
+        Effect.gen(function* () {
+          const serverConfig = yield* ServerConfig.ServerConfig;
+          const fileSystem = yield* FileSystem.FileSystem;
+          yield* fileSystem.writeFileString(
+            serverConfig.settingsPath,
+            resourceAdmission
+              ? '{"addProjectBaseDirectory":"~/Legacy","resourceAdmission":{"providerMaxConcurrent":3}}'
+              : '{"addProjectBaseDirectory":"~/Legacy"}',
+          );
+
+          const loaded = yield* readRestartedSettings;
+          assert.equal(loaded.addProjectBaseDirectory, "~/Legacy");
+          assert.deepEqual(loaded.resourceAdmission, {
+            ...DEFAULT_SERVER_SETTINGS.resourceAdmission,
+            ...resourceAdmission,
+          });
+        }).pipe(Effect.provide(makeServerSettingsLayer())),
+    );
+  }
+
   it.effect("coalesces pre-subscription updates to the latest snapshot", () =>
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
