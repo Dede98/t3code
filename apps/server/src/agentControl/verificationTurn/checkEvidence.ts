@@ -404,28 +404,25 @@ export const executeVerificationCheck = Effect.fn("executeVerificationCheck")(fu
   // interruptible, while grant-to-start persistence is an atomic bracket. A DB
   // failure before the start record releases the provisional local authority.
   const claim = yield* Effect.uninterruptibleMask((restore) =>
-    restore(acquireAdmission).pipe(
-      Effect.flatMap((admission) =>
-        admission?._tag === "Rejected" && admission.reason === "ownership-conflict"
-          ? Effect.succeed({ _tag: "ownership-conflict" } as const)
-          : now.pipe(
-              Effect.flatMap(
-                (startedAt) => sql`INSERT INTO agent_control_verification_check_starts
+    Effect.gen(function* () {
+      const admission = yield* restore(acquireAdmission);
+      if (admission?._tag === "Rejected" && admission.reason === "ownership-conflict")
+        return { _tag: "ownership-conflict" } as const;
+      return yield* now.pipe(
+        Effect.flatMap(
+          (startedAt) => sql`INSERT INTO agent_control_verification_check_starts
               (provider_delivery_id,check_id,provider_turn_id,manifest_digest,started_at)
               VALUES (${manifest.providerDeliveryId},${input.checkId},${input.providerTurnId},${manifest.manifestDigest},${startedAt})
               ON CONFLICT(provider_delivery_id,check_id) DO NOTHING RETURNING check_id`,
-              ),
-              Effect.map((inserted) => ({ _tag: "claimed" as const, admission, inserted })),
-              Effect.onError(() =>
-                admission?._tag === "Admitted" && localAdmission !== null
-                  ? localAdmission
-                      .observeActivity(admission.authority, "inactive")
-                      .pipe(Effect.ignore)
-                  : Effect.void,
-              ),
-            ),
-      ),
-    ),
+        ),
+        Effect.map((inserted) => ({ _tag: "claimed" as const, admission, inserted })),
+        Effect.onError(() =>
+          admission?._tag === "Admitted" && localAdmission !== null
+            ? localAdmission.observeActivity(admission.authority, "inactive").pipe(Effect.ignore)
+            : Effect.void,
+        ),
+      );
+    }),
   );
   // A competing invocation can observe the stable request while its admitted
   // owner has not persisted the execution claim yet. The fenced loser must
