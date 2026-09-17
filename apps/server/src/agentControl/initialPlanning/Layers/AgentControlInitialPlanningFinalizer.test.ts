@@ -13,6 +13,9 @@ import { AgentControlTaskVerificationFinalizer } from "../../task/Services/Agent
 import { AgentControlTaskVerificationFinalizerHooks } from "../../task/Services/AgentControlTaskVerificationFinalizerHooks.ts";
 import { AgentControlTaskEngine } from "../../task/Services/AgentControlTaskEngine.ts";
 import { layer as RepairTaskProjectionLive } from "../../task/Layers/AgentControlTaskProjection.ts";
+import { createEpicRun, insertEpicRun } from "../../epic/runState.ts";
+import { epicDigest, loadSelectedEpic, saveEpicRun } from "../../epic/authority.ts";
+import { epicIssueContentFingerprint } from "../../github/githubEpicSource.ts";
 import { makeProviderTerminalSessionCommand } from "../../../orchestration/providerTerminalSessionCommand.ts";
 import { ProjectionTurnRepository } from "../../../persistence/Services/ProjectionTurns.ts";
 import * as Queue from "effect/Queue";
@@ -29,6 +32,8 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeSqlite from "node:sqlite";
 import {
   AgentControlAttemptId,
+  AgentControlStageRunPrepareInitialInput,
+  type AgentControlEpicSource,
   AgentControlControlledThreadReservationId,
   AgentControlRoleId,
   AgentControlStageRunId,
@@ -651,6 +656,8 @@ const makeSharedDatabase = Effect.fn("makeInitialPlanningFinalizerDatabase")(fun
 });
 
 interface FinalizerHarness {
+  readonly planningPrepareCommandId?: CommandId;
+  readonly commandReceipts: AgentControlCommandReceiptRepository["Service"];
   readonly finalizer: AgentControlInitialPlanningFinalizerShape;
   readonly store: AgentControlInitialPlanningHandoffStore["Service"];
   readonly stageEvents: AgentControlStageRunEventStore["Service"];
@@ -782,6 +789,7 @@ const buildFinalizer = Effect.fn("buildInitialPlanningFinalizerHarness")(functio
   return {
     finalizer: Context.get(finalizerContext, AgentControlInitialPlanningFinalizer),
     store,
+    commandReceipts: Context.get(receiptContext, AgentControlCommandReceiptRepository),
     stageEvents,
     stageStates,
     stageProjection,
@@ -1555,6 +1563,10 @@ const appendPlan = Effect.fn("appendInitialPlanningPlanEvidence")(function* (
   return event;
 });
 
+const encodePlanningPrepareInput = Schema.encodeEffect(
+  Schema.fromJsonString(AgentControlStageRunPrepareInitialInput),
+);
+
 const seedPlanning = Effect.fn("seedInitialPlanningFinalization")(function* (
   sql: SqlClient.SqlClient,
   harness: FinalizerHarness,
@@ -1762,9 +1774,9 @@ const seedPlanning = Effect.fn("seedInitialPlanningFinalization")(function* (
     aggregateKind: "stage-run",
     aggregateId: stageRunId,
     occurredAt: createdAt,
-    commandId: CommandId.make(`stage-prepare-${suffix}`),
+    commandId: harness.planningPrepareCommandId ?? CommandId.make(`stage-prepare-${suffix}`),
     causationEventId: null,
-    correlationId: CommandId.make(`stage-prepare-${suffix}`),
+    correlationId: harness.planningPrepareCommandId ?? CommandId.make(`stage-prepare-${suffix}`),
     authority: "controller",
     payload: {
       projectId,
@@ -1789,6 +1801,26 @@ const seedPlanning = Effect.fn("seedInitialPlanningFinalization")(function* (
     events: [preparedDraft],
   });
   yield* harness.stageProjection.projectEvent(prepared!);
+  if (harness.planningPrepareCommandId)
+    yield* harness.commandReceipts.insert({
+      commandId: harness.planningPrepareCommandId,
+      commandFingerprint: sha256Utf8(
+        yield* encodePlanningPrepareInput({
+          commandId: harness.planningPrepareCommandId,
+          projectId,
+          taskId,
+        }),
+      ),
+      authority: "controller",
+      aggregateKind: "stage-run",
+      aggregateId: stageRunId,
+      status: "accepted",
+      resultSequence: prepared!.sequence,
+      resultStreamVersion: prepared!.streamVersion,
+      eventCreated: true,
+      acceptedAt: createdAt,
+      errorCode: null,
+    });
   const reservedDraft: AgentControlStageRunLeaseEventDraft = {
     eventId: EventId.make(`lease-reserved-${suffix}`),
     type: "agentControl.stageRunLease.reserved",
@@ -30712,13 +30744,63 @@ const settleRepairVerification = Effect.fn("settleRepairVerification")(function*
   assert.equal((yield* finalizer.processHandoff(handoffId))._tag, "Finalized");
 });
 
-// Only Run-once activation or the Epic execution binding is synthesized here.
-// The source task, plan, delivery,
-// output capture, verdict, stage finalization and repair admission use their real
-// services. Activation/lineage and actual provider slots have separate integration
-// coverage; these fixtures isolate the Verification -> Repair transaction.
-const seedRepairRun = (database: SharedDatabase, task: AgentControlTaskState, epic = false) =>
-  Effect.sync(() => {
+const repairEpicFixture = Effect.fn("repairEpicFixture")(function* (task: AgentControlTaskState) {
+  const issue = {
+    repositoryNodeId: task.source.repositoryNodeId,
+    nameWithOwner: "owner/repository",
+    issueNodeId: task.source.issueNodeId,
+    number: task.source.issueNumber,
+    url: task.source.issueUrl,
+    title: task.sourceSnapshot.title,
+    contentFingerprint: epicIssueContentFingerprint(task.sourceSnapshot),
+    state: "open" as const,
+    subIssueCount: 0,
+  };
+  const source: AgentControlEpicSource = {
+    format: "github-native-sub-issues-v1",
+    repository: { repositoryNodeId: issue.repositoryNodeId, nameWithOwner: issue.nameWithOwner },
+    epic: { ...issue, issueNodeId: `epic-${issue.issueNodeId}`, number: 1, subIssueCount: 1 },
+    tasks: [{ issue, position: 0, dependencies: [] }],
+    blockers: [],
+    fingerprint: epicDigest(issue),
+    inspectedAt: createdAt,
+  };
+  const epic = yield* createEpicRun({
+    projectId: task.source.projectId,
+    commandId: "repair-epic",
+    source,
+    checks: [],
+    dependencyPlan: {
+      version: 1,
+      sourceFingerprint: source.fingerprint,
+      rationale: "One independently approved repair fixture task.",
+      tasks: [{ issueNodeId: issue.issueNodeId, dependsOn: [] }],
+    },
+    initialBase: { commitSha: "a".repeat(40), targetBranch: "main" },
+  });
+  const executionId = `epic-task-${epicDigest({
+    epicRunId: epic.epicRunId,
+    taskId: yield* deriveAgentControlTaskId(task.source),
+    plan: epic.dependencyPlanDigest,
+  })}`;
+  return {
+    epic,
+    executionId,
+    planningPrepareCommandId: CommandId.make(
+      `epic-task-${epicDigest({ executionId, step: "stage" })}`,
+    ),
+  };
+});
+
+// Activation is synthesized; Epic state/history and its complete execution binding
+// retain the original Planning command receipt. The source, stage finalization and
+// repair admission use real services to isolate Verification -> Repair.
+const seedRepairRun = Effect.fn("seedRepairRun")(function* (
+  database: SharedDatabase,
+  task: AgentControlTaskState,
+  epicCandidate?: Effect.Success<ReturnType<typeof prepareImplementationAdmissionCandidate>>,
+) {
+  yield* Effect.sync(() => {
     const native = new NodeSqlite.DatabaseSync(database.filename);
     NodeSqliteClient.registerNodeSqliteFunctions(native);
     native.exec("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON; BEGIN IMMEDIATE");
@@ -30729,36 +30811,8 @@ const seedRepairRun = (database: SharedDatabase, task: AgentControlTaskState, ep
       .all() as Array<{ name: string; sql: string }>;
     try {
       for (const trigger of triggers) native.exec(`DROP TRIGGER "${trigger.name}"`);
-      const runId = `${epic ? "epic-task" : "run-once"}-${"a".repeat(64)}`;
-      if (epic) {
-        const state = canonicalJson({
-          status: "running",
-          dependencyPlanDigest: "a".repeat(64),
-          members: [{ taskId: task.taskId, childRunId: runId, status: "running" }],
-        });
-        native
-          .prepare(
-            "INSERT INTO agent_control_epic_runs(epic_run_id,project_id,revision,state_json,state_digest) VALUES (?,?,1,?,?)",
-          )
-          .run("repair-epic", task.source.projectId, state, "a".repeat(64));
-        native
-          .prepare("INSERT INTO agent_control_epic_targets(project_id,epic_run_id) VALUES (?,?)")
-          .run(task.source.projectId, "repair-epic");
-        native
-          .prepare(
-            "INSERT INTO agent_control_epic_task_executions(execution_id,epic_run_id,project_id,task_id,plan_digest,base_commit_sha,project_revision,phase,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'thread-activated',?,?)",
-          )
-          .run(
-            runId,
-            "repair-epic",
-            task.source.projectId,
-            task.taskId,
-            "a".repeat(64),
-            "b".repeat(40),
-            createdAt,
-            createdAt,
-          );
-      } else {
+      const runId = `run-once-${"a".repeat(64)}`;
+      if (!epicCandidate) {
         const columns = native
           .prepare("PRAGMA table_info(agent_control_run_once_activations)")
           .all() as Array<{ name: string; type: string; notnull: number }>;
@@ -30793,7 +30847,7 @@ const seedRepairRun = (database: SharedDatabase, task: AgentControlTaskState, ep
           "INSERT INTO agent_control_project_states (project_id,mode,paused_from_mode,revision,last_event_sequence,updated_at) VALUES (?,'run-once',NULL,1,1,?) ON CONFLICT(project_id) DO UPDATE SET mode='run-once',paused_from_mode=NULL",
         )
         .run(task.source.projectId, createdAt);
-      if (epic)
+      if (epicCandidate)
         native
           .prepare("UPDATE agent_control_project_states SET mode='armed' WHERE project_id=?")
           .run(task.source.projectId);
@@ -30803,6 +30857,34 @@ const seedRepairRun = (database: SharedDatabase, task: AgentControlTaskState, ep
       native.close();
     }
   });
+  if (!epicCandidate) return;
+  const { epic, executionId } = yield* repairEpicFixture(task);
+  const { seeded, worktree } = epicCandidate;
+  yield* database.sqlA.withTransaction(
+    Effect.gen(function* () {
+      yield* insertEpicRun(database.sqlA, epic);
+      yield* saveEpicRun(database.sqlA, epic, {
+        members: epic.members.map((member) => ({
+          ...member,
+          taskId: task.taskId,
+          childRunId: executionId,
+          status: "running" as const,
+          baseCommitSha: worktree.baseCommitSha,
+          reservationId: seeded.evidence.worktreeReservationId,
+        })),
+      });
+      yield* database.sqlA`INSERT INTO agent_control_epic_task_executions
+        (execution_id,epic_run_id,project_id,task_id,plan_digest,base_commit_sha,
+         project_revision,stage_run_id,lease_id,worktree_reservation_id,
+         controlled_thread_reservation_id,thread_id,phase,created_at,updated_at)
+        VALUES (${executionId},${epic.epicRunId},${task.source.projectId},${task.taskId},
+          ${epic.dependencyPlanDigest},${worktree.baseCommitSha},1,${seeded.stageRunId},
+          ${seeded.leaseId},${seeded.evidence.worktreeReservationId},
+          ${seeded.evidence.controlledThreadReservationId},${seeded.evidence.threadId},
+          'thread-activated',${createdAt},${createdAt})`;
+    }),
+  );
+});
 
 const setRepairFixtureMode = (
   database: SharedDatabase,
@@ -30918,9 +31000,18 @@ it.effect.each([
             initialDatabase.sqlA,
             initialDatabase.scopeA,
           );
+          const epicFixture =
+            scenario === "epic-passed"
+              ? yield* repairEpicFixture(admissionTask(suffix))
+              : undefined;
           const prepared = yield* prepareVerificationTurnDelivery(suffix, true, {
             database: initialDatabase,
-            planningFinalizer: initialPlanning,
+            planningFinalizer: {
+              ...initialPlanning,
+              ...(epicFixture
+                ? { planningPrepareCommandId: epicFixture.planningPrepareCommandId }
+                : {}),
+            },
             ...(large ? { taskBody: "x".repeat(55_000) } : {}),
             beforeVerification: runMigrations().pipe(
               Effect.provideService(SqlClient.SqlClient, initialDatabase.sqlA),
@@ -30934,7 +31025,7 @@ it.effect.each([
           });
           const { database, setup, planningFinalizer } = prepared;
           const task = setup.candidate.task;
-          yield* seedRepairRun(database, task, scenario === "epic-passed");
+          yield* seedRepairRun(database, task, epicFixture ? setup.candidate : undefined);
           const output = (verdict: "passed" | "failed") =>
             canonicalJson({
               schemaVersion: "agent-control-verification-result-v1",
@@ -31296,28 +31387,44 @@ it.effect.each([
       Effect.gen(function* () {
         const database = yield* makeSharedDatabase(59);
         const planningFinalizer = yield* buildFinalizer(database.sqlA, database.scopeA);
-        const prepared = yield* prepareVerificationTurnDelivery(
-          `no-repair-${name.replaceAll(" ", "-")}`,
-          true,
-          {
-            database,
-            planningFinalizer,
-            beforeVerification: runMigrations().pipe(
-              Effect.provideService(SqlClient.SqlClient, database.sqlA),
-              Effect.asVoid,
-              Effect.orDie,
-            ),
-            verificationCoordinatorHooks: {
-              ...noopVerificationCoordinatorHooks,
-              promptTemplateVersion: "agent-control-verification-prompt-v2",
-            },
-          },
-        );
+        const suffix = `no-repair-${name.replaceAll(" ", "-")}`;
         const epic = name === "epic stopped" || name === "epic disarmed";
-        yield* seedRepairRun(database, prepared.setup.candidate.task, epic);
+        const epicFixture = epic ? yield* repairEpicFixture(admissionTask(suffix)) : undefined;
+        const prepared = yield* prepareVerificationTurnDelivery(suffix, true, {
+          database,
+          planningFinalizer: {
+            ...planningFinalizer,
+            ...(epicFixture
+              ? { planningPrepareCommandId: epicFixture.planningPrepareCommandId }
+              : {}),
+          },
+          beforeVerification: runMigrations().pipe(
+            Effect.provideService(SqlClient.SqlClient, database.sqlA),
+            Effect.asVoid,
+            Effect.orDie,
+          ),
+          verificationCoordinatorHooks: {
+            ...noopVerificationCoordinatorHooks,
+            promptTemplateVersion: "agent-control-verification-prompt-v2",
+          },
+        });
+        yield* seedRepairRun(
+          database,
+          prepared.setup.candidate.task,
+          epic ? prepared.setup.candidate : undefined,
+        );
         yield* settleRepairVerification(prepared, name, output, state);
         if (name === "epic stopped")
-          yield* database.sqlA`UPDATE agent_control_epic_runs SET revision=revision+1,state_json=json_set(state_json,'$.status','stopped') WHERE epic_run_id='repair-epic'`;
+          yield* database.sqlA.withTransaction(
+            Effect.gen(function* () {
+              const selected = yield* loadSelectedEpic(
+                database.sqlA,
+                prepared.setup.candidate.task.source.projectId,
+              );
+              assert.isNotNull(selected);
+              yield* saveEpicRun(database.sqlA, selected!, { status: "stopped" });
+            }),
+          );
         if (name === "epic disarmed")
           yield* database.sqlA`UPDATE agent_control_project_states SET mode='observe' WHERE project_id=${prepared.setup.candidate.task.source.projectId}`;
         const finalizer = yield* buildRepairTaskFinalizer(prepared);
