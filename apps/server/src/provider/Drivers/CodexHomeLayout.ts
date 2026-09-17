@@ -20,6 +20,7 @@ const KNOWN_SHARED_DIRECTORIES = [
   "sessions",
   "archived_sessions",
   "sqlite",
+  "memories",
   "shell_snapshots",
   "worktrees",
   "skills",
@@ -30,7 +31,7 @@ const KNOWN_SHARED_DIRECTORIES = [
 ] as const;
 
 const PRIVATE_ENTRY_NAMES = new Set(["auth.json", "models_cache.json"]);
-const SHADOW_LOCAL_ENTRY_NAMES = new Set(["log", "memories", "tmp"]);
+const SHADOW_LOCAL_ENTRY_NAMES = new Set(["log", "tmp"]);
 const REPLACEABLE_SHARED_RUNTIME_DIRECTORIES = new Set(["mcp-oauth-locks"]);
 
 function resolveHomePath(path: Path.Path, value: string | undefined): string {
@@ -122,6 +123,9 @@ export class CodexShadowHomeEntryConflictError extends Schema.TaggedError<CodexS
   },
 ) {
   override get message(): string {
+    if (this.entryName === "memories") {
+      return `Cannot share Codex memories because '${this.linkPath}' already exists and is not a symlink. Stop Codex sessions using these homes, back up and reconcile its contents with '${this.targetPath}', then move the local memories entry out of the shadow home and retry. T3 Code has not moved or overwritten either memory collection.`;
+    }
     return `Cannot create Codex shadow home entry '${this.entryName}' because '${this.linkPath}' already exists and is not a symlink.`;
   }
 }
@@ -348,6 +352,27 @@ export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome"
 
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+
+  // Older shadow homes kept generated memories local. Detect those before
+  // changing any links: choosing one collection would discard the other's
+  // effective context, and active Codex processes may still be writing it.
+  const memoriesPath = path.join(effectiveHomePath, "memories");
+  const memoriesState = yield* readLinkState({
+    fileSystem,
+    sharedHomePath: layout.sharedHomePath,
+    effectiveHomePath,
+    entryName: "memories",
+    linkPath: memoriesPath,
+  });
+  if (memoriesState._tag === "NotSymlink") {
+    return yield* new CodexShadowHomeEntryConflictError({
+      sharedHomePath: layout.sharedHomePath,
+      effectiveHomePath,
+      entryName: "memories",
+      linkPath: memoriesPath,
+      targetPath: path.join(layout.sharedHomePath, "memories"),
+    });
+  }
 
   const makeDirectory = (directoryPath: string) =>
     fileSystem.makeDirectory(directoryPath, { recursive: true }).pipe(

@@ -115,6 +115,7 @@ const makeClaudeConfig = (overrides: Partial<ClaudeSettings>): ClaudeSettings =>
   crossAccountContinuationEnabled: false,
   binaryPath: "claude",
   configDirPath: "",
+  sharedHomePath: "",
   homePath: "",
   customModels: [],
   launchArgs: "",

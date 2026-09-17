@@ -193,6 +193,24 @@ describe("custom model settings", () => {
   });
 });
 
+describe("ClaudeSettings shared memory", () => {
+  it("defaults existing profiles to private memory and accepts clearing the shared directory", () => {
+    expect(decodeClaudeSettings({}).sharedHomePath).toBe("");
+    expect(decodeClaudeSettings({ sharedHomePath: " ~/.claude-shared " }).sharedHomePath).toBe(
+      "~/.claude-shared",
+    );
+    expect(
+      decodeServerSettingsPatch({ providers: { claudeAgent: { sharedHomePath: "" } } }).providers
+        ?.claudeAgent?.sharedHomePath,
+    ).toBe("");
+    expect(
+      decodeServerSettingsPatch({
+        providers: { claudeAgent: { sharedHomePath: "~/.claude-shared" } },
+      }).providers?.claudeAgent?.sharedHomePath,
+    ).toBe("~/.claude-shared");
+  });
+});
+
 describe("ClaudeSettings auto-compaction", () => {
   it("uses Claude's default threshold when no override is configured", () => {
     expect(decodeClaudeSettings({}).autoCompactWindow).toBe("");

@@ -24,6 +24,7 @@ describe("ProviderSettingsForm helpers", () => {
     expect(deriveProviderSettingsFields(claude!).map((field) => field.key)).toEqual([
       "binaryPath",
       "configDirPath",
+      "sharedHomePath",
       "homePath",
       "autoCompactWindow",
       "launchArgs",
@@ -75,6 +76,7 @@ describe("ProviderSettingsForm helpers", () => {
     expect(deriveProviderSettingsFields(claude!).map((field) => field.key)).toEqual([
       "binaryPath",
       "configDirPath",
+      "sharedHomePath",
       "homePath",
       "autoCompactWindow",
       "launchArgs",

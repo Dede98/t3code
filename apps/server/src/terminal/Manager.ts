@@ -62,6 +62,7 @@ import * as ServerConfig from "../config.ts";
 import { mergeProviderInstanceEnvironment } from "../provider/ProviderInstanceEnvironment.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { makeClaudeEnvironment } from "../provider/Drivers/ClaudeHome.ts";
+import { materializeClaudeSharedHome } from "../provider/Drivers/ClaudeSharedHome.ts";
 import { deriveProviderInstanceConfigMap } from "../provider/Layers/ProviderInstanceRegistryHydration.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import {
@@ -1375,6 +1376,12 @@ export const resolveProviderInstanceTerminalEnvironment = Effect.fn(
   } else if (instance.driver === "claudeAgent") {
     const config = decodeClaudeSettings(instance.config ?? {});
     if (Option.isSome(config)) {
+      yield* materializeClaudeSharedHome(config.value, resolved).pipe(
+        Effect.provideService(Path.Path, input.path),
+        Effect.mapError(
+          (cause) => new TerminalProviderEnvironmentError({ providerInstanceId, cause }),
+        ),
+      );
       resolved = yield* makeClaudeEnvironment(config.value, resolved).pipe(
         Effect.provideService(Path.Path, input.path),
       );
@@ -1394,6 +1401,7 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
   const nativeTelemetry = yield* NativeTelemetryClient.NativeTelemetryClient;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const path = yield* Path.Path;
+  const fileSystem = yield* FileSystem.FileSystem;
   const resolveProviderInstanceEnvironment = Effect.fn(
     "terminal.resolveProviderInstanceEnvironment",
   )((rawProviderInstanceId: string, env: Record<string, string> | undefined) =>
@@ -1402,7 +1410,7 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
       path,
       rawProviderInstanceId,
       env,
-    }),
+    }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem)),
   );
   return yield* makeWithOptions({
     logsDir: terminalLogsDir,

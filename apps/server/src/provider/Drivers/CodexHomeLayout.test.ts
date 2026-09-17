@@ -102,6 +102,129 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
 
   describe("materializeCodexShadowHome", () => {
     it.effect.skipIf(!symlinksSupported)(
+      "shares memory writes and atomic replacements across two shadow accounts",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const root = yield* makeTempDir("t3code-codex-memory-");
+          const sharedHome = path.join(root, "shared");
+          const firstHome = path.join(root, "first");
+          const secondHome = path.join(root, "second");
+          yield* writeTextFile(path.join(firstHome, "auth.json"), "first-account");
+          yield* writeTextFile(path.join(secondHome, "auth.json"), "second-account");
+          const layouts = yield* Effect.forEach([firstHome, secondHome], (shadowHomePath) =>
+            resolveCodexHomeLayout(decodeCodexSettings({ homePath: sharedHome, shadowHomePath })),
+          );
+
+          // Start from a home without a memories directory, as on first use.
+          yield* Effect.forEach(layouts, materializeCodexShadowHome, { concurrency: "unbounded" });
+          const sharedMemories = path.join(sharedHome, "memories");
+          for (const home of [firstHome, secondHome]) {
+            expect(yield* fileSystem.readLink(path.join(home, "memories"))).toBe(sharedMemories);
+          }
+
+          yield* writeTextFile(path.join(firstHome, "memories", "MEMORY.md"), "first memory");
+          expect(
+            yield* fileSystem.readFileString(path.join(secondHome, "memories", "MEMORY.md")),
+          ).toBe("first memory");
+          yield* writeTextFile(
+            path.join(secondHome, "memories", "rollout_summaries", "entry.md"),
+            "supporting evidence",
+          );
+          expect(
+            yield* fileSystem.readFileString(
+              path.join(sharedMemories, "rollout_summaries", "entry.md"),
+            ),
+          ).toBe("supporting evidence");
+
+          yield* writeTextFile(path.join(sharedMemories, "memory_summary.md"), "old summary");
+          yield* writeTextFile(path.join(firstHome, "memories", "summary.next"), "new summary");
+          yield* fileSystem.rename(
+            path.join(firstHome, "memories", "summary.next"),
+            path.join(firstHome, "memories", "memory_summary.md"),
+          );
+          yield* Effect.forEach(layouts, materializeCodexShadowHome);
+          for (const home of [sharedHome, firstHome, secondHome]) {
+            expect(
+              yield* fileSystem.readFileString(path.join(home, "memories", "memory_summary.md")),
+            ).toBe("new summary");
+          }
+          expect(yield* fileSystem.readFileString(path.join(firstHome, "auth.json"))).toBe(
+            "first-account",
+          );
+          expect(yield* fileSystem.readFileString(path.join(secondHome, "auth.json"))).toBe(
+            "second-account",
+          );
+          expect(
+            (yield* fileSystem.readLink(path.join(firstHome, "auth.json")).pipe(Effect.result))
+              ._tag,
+          ).toBe("Failure");
+          expect(
+            (yield* fileSystem.readLink(path.join(secondHome, "auth.json")).pipe(Effect.result))
+              ._tag,
+          ).toBe("Failure");
+        }),
+    );
+
+    it.effect.each(["populated directory", "empty directory", "file"] as const)(
+      "preserves a legacy memories %s and reports the conflict before changing the home",
+      (entryKind) =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const root = yield* makeTempDir("t3code-codex-memory-conflict-");
+          const sharedHome = path.join(root, "shared");
+          const shadowHome = path.join(root, "shadow");
+          const localMemories = path.join(shadowHome, "memories");
+          yield* writeTextFile(path.join(sharedHome, "memories", "MEMORY.md"), "shared memory");
+          yield* writeTextFile(path.join(shadowHome, "auth.json"), "private auth");
+          if (entryKind === "file") {
+            yield* writeTextFile(localMemories, "local file");
+          } else {
+            yield* fileSystem.makeDirectory(localMemories);
+            if (entryKind === "populated directory") {
+              yield* writeTextFile(path.join(localMemories, "MEMORY.md"), "local memory");
+            }
+          }
+          const before = yield* fileSystem.readDirectory(shadowHome);
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({
+              homePath: sharedHome,
+              shadowHomePath: shadowHome,
+            }),
+          );
+          const error = yield* materializeCodexShadowHome(layout).pipe(Effect.flip);
+
+          expect(error).toBeInstanceOf(CodexShadowHomeEntryConflictError);
+          expect(error).toMatchObject({
+            entryName: "memories",
+            linkPath: localMemories,
+            targetPath: path.join(sharedHome, "memories"),
+          });
+          expect(error.message).toContain("Stop Codex sessions");
+          expect(error.message).toContain("back up and reconcile");
+          expect(yield* fileSystem.readDirectory(shadowHome)).toEqual(before);
+          expect(yield* fileSystem.exists(path.join(sharedHome, "sessions"))).toBe(false);
+          expect(
+            yield* fileSystem.readFileString(path.join(sharedHome, "memories", "MEMORY.md")),
+          ).toBe("shared memory");
+          expect(yield* fileSystem.readFileString(path.join(shadowHome, "auth.json"))).toBe(
+            "private auth",
+          );
+          if (entryKind === "file") {
+            expect(yield* fileSystem.readFileString(localMemories)).toBe("local file");
+          } else if (entryKind === "populated directory") {
+            expect(yield* fileSystem.readFileString(path.join(localMemories, "MEMORY.md"))).toBe(
+              "local memory",
+            );
+          } else {
+            expect(yield* fileSystem.readDirectory(localMemories)).toEqual([]);
+          }
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
       "materializes a shadow home with shared state links and private auth",
       () =>
         Effect.gen(function* () {
@@ -113,6 +236,15 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
 
           yield* fileSystem.makeDirectory(path.join(sharedHome, "sessions"));
           yield* writeTextFile(path.join(sharedHome, "config.toml"), 'model = "gpt-5-codex"\n');
+          yield* writeTextFile(path.join(sharedHome, "AGENTS.md"), "Global Codex instructions");
+          yield* writeTextFile(
+            path.join(sharedHome, "AGENTS.override.md"),
+            "Global Codex override",
+          );
+          yield* writeTextFile(
+            path.join(sharedHome, "skills", "example", "SKILL.md"),
+            "Codex skill",
+          );
           yield* writeTextFile(
             path.join(sharedHome, "models_cache.json"),
             '{"models":["shared"]}\n',
@@ -149,6 +281,21 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
 
           expect(sessionsTarget).toBe(path.join(sharedHome, "sessions"));
           expect(configTarget).toBe(path.join(sharedHome, "config.toml"));
+          expect(yield* fileSystem.readFileString(path.join(shadowHome, "AGENTS.md"))).toBe(
+            "Global Codex instructions",
+          );
+          expect(
+            yield* fileSystem.readFileString(path.join(shadowHome, "AGENTS.override.md")),
+          ).toBe("Global Codex override");
+          yield* fileSystem.writeFileString(
+            path.join(shadowHome, "skills", "example", "SKILL.md"),
+            "Updated Codex skill",
+          );
+          expect(
+            yield* fileSystem.readFileString(
+              path.join(sharedHome, "skills", "example", "SKILL.md"),
+            ),
+          ).toBe("Updated Codex skill");
           expect(mcpOauthLocksTarget).toBe(path.join(sharedHome, "mcp-oauth-locks"));
           expect(modelsCacheExists).toBe(false);
           expect(authLinkResult._tag).toBe("Failure");
@@ -201,12 +348,10 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           const shadowHome = path.join(shadowRoot, "shadow");
 
           yield* fileSystem.makeDirectory(path.join(sharedHome, "log"));
-          yield* fileSystem.makeDirectory(path.join(sharedHome, "memories"));
           yield* fileSystem.makeDirectory(path.join(sharedHome, "tmp"));
           yield* writeTextFile(path.join(sharedHome, "config.toml"), 'model = "gpt-5-codex"\n');
           yield* writeTextFile(path.join(shadowHome, "auth.json"), '{"shadow":true}\n');
           yield* fileSystem.makeDirectory(path.join(shadowHome, "log"), { recursive: true });
-          yield* fileSystem.makeDirectory(path.join(shadowHome, "memories"), { recursive: true });
           yield* fileSystem.makeDirectory(path.join(shadowHome, "tmp"), { recursive: true });
 
           const layout = yield* resolveCodexHomeLayout(
@@ -222,16 +367,12 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           const logLinkResult = yield* fileSystem
             .readLink(path.join(shadowHome, "log"))
             .pipe(Effect.result);
-          const memoriesLinkResult = yield* fileSystem
-            .readLink(path.join(shadowHome, "memories"))
-            .pipe(Effect.result);
           const tmpLinkResult = yield* fileSystem
             .readLink(path.join(shadowHome, "tmp"))
             .pipe(Effect.result);
 
           expect(configTarget).toBe(path.join(sharedHome, "config.toml"));
           expect(logLinkResult._tag).toBe("Failure");
-          expect(memoriesLinkResult._tag).toBe("Failure");
           expect(tmpLinkResult._tag).toBe("Failure");
         }),
     );

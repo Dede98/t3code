@@ -19,6 +19,65 @@ import {
 
 it.layer(NodeServices.layer)("ClaudeHome", (it) => {
   describe("Claude home resolution", () => {
+    it.effect(
+      "shares the native memory root while keeping account and continuation identities private",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const baseEnv = { HOME: NodeOS.homedir(), KEEP: "unchanged" };
+          const first = {
+            configDirPath: "~/.claude-a",
+            homePath: "",
+            sharedHomePath: "~/.claude-shared",
+          };
+          const second = { ...first, configDirPath: "~/.claude-b" };
+          const firstEnv = yield* makeClaudeEnvironment(first, baseEnv);
+          const secondEnv = yield* makeClaudeEnvironment(second, baseEnv);
+
+          expect(firstEnv.CLAUDE_CODE_REMOTE_MEMORY_DIR).toBe(
+            path.join(NodeOS.homedir(), ".claude-shared"),
+          );
+          expect(secondEnv.CLAUDE_CODE_REMOTE_MEMORY_DIR).toBe(
+            firstEnv.CLAUDE_CODE_REMOTE_MEMORY_DIR,
+          );
+          expect(firstEnv.CLAUDE_CONFIG_DIR).not.toBe(secondEnv.CLAUDE_CONFIG_DIR);
+          expect(firstEnv.HOME).toBe(baseEnv.HOME);
+          expect(firstEnv.KEEP).toBe("unchanged");
+          expect(baseEnv).not.toHaveProperty("CLAUDE_CODE_REMOTE_MEMORY_DIR");
+          expect(yield* makeClaudeContinuationGroupKey(first, baseEnv)).not.toBe(
+            yield* makeClaudeContinuationGroupKey(second, baseEnv),
+          );
+        }),
+    );
+
+    it.effect("clears the memory override without changing default account lookup", () =>
+      Effect.gen(function* () {
+        const config = { configDirPath: "", homePath: "", sharedHomePath: "~/.claude-shared" };
+        const baseEnv = { HOME: NodeOS.homedir() };
+        const shared = yield* makeClaudeEnvironment(config, baseEnv);
+        expect(shared.CLAUDE_CONFIG_DIR).toBeUndefined();
+        expect(shared.CLAUDE_CODE_REMOTE_MEMORY_DIR).toBeDefined();
+        expect(yield* makeClaudeEnvironment({ ...config, sharedHomePath: "" }, baseEnv)).toBe(
+          baseEnv,
+        );
+      }),
+    );
+
+    it.effect("prefers the configured memory root and expands an inherited fallback", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const config = { configDirPath: "", homePath: "", sharedHomePath: "~/.claude-shared" };
+        const baseEnv = { CLAUDE_CODE_REMOTE_MEMORY_DIR: "~/.claude-inherited" };
+        expect((yield* makeClaudeEnvironment(config, baseEnv)).CLAUDE_CODE_REMOTE_MEMORY_DIR).toBe(
+          path.join(NodeOS.homedir(), ".claude-shared"),
+        );
+        expect(
+          (yield* makeClaudeEnvironment({ ...config, sharedHomePath: "" }, baseEnv))
+            .CLAUDE_CODE_REMOTE_MEMORY_DIR,
+        ).toBe(path.join(NodeOS.homedir(), ".claude-inherited"));
+      }),
+    );
+
     it.effect("uses the process home when no Claude home override is configured", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;

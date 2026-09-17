@@ -32,8 +32,7 @@ instead can put credentials where this provider will not find them.
 Check the account reported in provider settings after signing in. By default,
 existing threads can switch only between Claude instances with the same config
 directory. Separate account directories stay isolated, including their local
-conversation state. Claude does not have Codex's shared-home and shadow-home
-arrangement.
+conversation state. Memory sharing is configured separately below.
 
 For presets that differ only in API keys or endpoints, use the instance's
 **Environment variables**. Variable assignments do not belong in **Launch arguments**.
@@ -41,6 +40,43 @@ For presets that differ only in API keys or endpoints, use the instance's
 Claude Code's verbose mode can stay enabled when you use Claude for text generation, including
 thread titles, branch names, commit messages, and pull request descriptions. On a remote connection,
 T3 Code uses the Claude configuration on the connected server.
+
+## Share memories, skills, and global instructions
+
+Set **Shared Claude directory** to the same path on each Claude instance, for
+example `~/.claude-shared`. Keep a different **Claude config directory** for each
+account. The shared directory holds:
+
+- Project memories, separated by repository and shared across its worktrees.
+- User-scoped subagent memories.
+- Personal skills in `skills/<name>/SKILL.md`, available in the composer and Claude.
+- Global instructions in `CLAUDE.md` and Markdown files in `rules/`.
+
+Account logins, settings, and conversation histories stay in their existing
+directories. Repository instructions and project skills keep their normal scope.
+Use a separate shared directory for Claude and Codex: their instructions, tools,
+and skill behavior can differ.
+
+The directory belongs to the connected environment's machine, including when
+you use T3 Code remotely or from mobile. Provider terminals use the same shared
+directory. Restart existing Claude sessions and provider terminals after changing
+it. Clearing the field removes only the links T3 Code created, returning skills
+and instructions to account-local locations. Shared files remain intact; they
+are not copied back. Pre-existing links you created are left as they are. Memories
+return to Claude's default, or an explicit `CLAUDE_CODE_REMOTE_MEMORY_DIR` from the
+instance's environment.
+
+To reuse one account's existing files, select its Claude config directory as the
+shared directory, such as `~/.claude`. Other account directories must be outside
+that directory. If another account already has a local `skills`, `CLAUDE.md`, or
+`rules` entry, setup stops with a conflict. Stop its Claude sessions, back up and
+reconcile the files into the shared directory, then move the conflicting local
+entry to a backup location and retry. Existing files are never merged or
+overwritten automatically. An explicit Claude `autoMemoryDirectory`
+setting still overrides the default project-memory location.
+
+This integration uses Claude Code's native memory-root support, verified with
+Claude Code 2.1.274. It is independent of cross-account thread continuation.
 
 ## Cross-account thread continuation
 
@@ -87,7 +123,8 @@ timestamp shows when the displayed wait started.
 
 ## Skills
 
-Claude skills come from the config directory's `skills` folder and the project's
+Claude skills come from the config directory's `skills` folder (linked to the
+shared directory when configured) and the project's
 `.claude/skills` folder. If both define the same name, the config-directory copy
 wins. Skills disabled in Claude's settings do not appear in the composer.
 

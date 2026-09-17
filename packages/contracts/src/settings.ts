@@ -646,7 +646,7 @@ export const CodexSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Shadow home path",
         description:
-          "Account-specific Codex home. Keeps auth.json separate while sharing state from CODEX_HOME.",
+          "Account-specific Codex home. Keeps auth.json separate while sharing sessions, memories, and configuration from CODEX_HOME.",
         providerSettingsForm: {
           placeholder: "~/.codex-t3/personal",
           clearWhenEmpty: "omit",
@@ -704,6 +704,18 @@ export const ClaudeSettings = makeProviderSettingsSchema(
         },
       }),
     ),
+    sharedHomePath: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Shared Claude directory",
+        description:
+          "Share memories, skills, CLAUDE.md, and rules across Claude accounts. Logins, settings, and conversations stay separate. Leave empty for account-local files.",
+        providerSettingsForm: {
+          placeholder: "~/.claude-shared",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
     homePath: TrimmedString.pipe(
       Schema.withDecodingDefault(Effect.succeed("")),
       Schema.annotateKey({
@@ -744,7 +756,14 @@ export const ClaudeSettings = makeProviderSettingsSchema(
     ),
   },
   {
-    order: ["binaryPath", "configDirPath", "homePath", "autoCompactWindow", "launchArgs"],
+    order: [
+      "binaryPath",
+      "configDirPath",
+      "sharedHomePath",
+      "homePath",
+      "autoCompactWindow",
+      "launchArgs",
+    ],
   },
 );
 export type ClaudeSettings = typeof ClaudeSettings.Type;
@@ -1438,6 +1457,7 @@ const ClaudeSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   binaryPath: Schema.optionalKey(TrimmedString),
   configDirPath: Schema.optionalKey(TrimmedString),
+  sharedHomePath: Schema.optionalKey(TrimmedString),
   homePath: Schema.optionalKey(TrimmedString),
   customModels: Schema.optionalKey(Schema.Array(CustomModelSetting)),
   launchArgs: Schema.optionalKey(TrimmedString),

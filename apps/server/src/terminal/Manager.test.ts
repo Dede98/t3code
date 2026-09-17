@@ -13,6 +13,7 @@ import {
   TerminalProviderInstanceNotFoundError,
 } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as Data from "effect/Data";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
@@ -2093,6 +2094,54 @@ it.layer(
     ),
   );
 
+  it.effect.skipIf(!symlinksSupported)(
+    "prepares shared Claude skills and instructions for provider terminals",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs
+          .makeTempDirectoryScoped({ prefix: "t3-terminal-shared-claude-" })
+          .pipe(Effect.flatMap(fs.realPath));
+        const configDirPath = path.join(root, "account");
+        const sharedHomePath = path.join(root, "shared");
+        const environment = yield* Effect.gen(function* () {
+          const serverSettings = yield* ServerSettings.ServerSettingsService;
+          return yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
+            serverSettings,
+            path,
+            rawProviderInstanceId: "shared_claude",
+            env: undefined,
+          });
+        }).pipe(
+          Effect.provide(
+            ServerSettings.layerTest({
+              providerInstances: {
+                [ProviderInstanceId.make("shared_claude")]: {
+                  driver: ProviderDriverKind.make("claudeAgent"),
+                  environment: [
+                    {
+                      name: "CLAUDE_CODE_REMOTE_MEMORY_DIR",
+                      value: path.join(root, "inherited"),
+                      sensitive: false,
+                    },
+                  ],
+                  config: { configDirPath, sharedHomePath },
+                },
+              },
+            }),
+          ),
+        );
+        expect(environment.CLAUDE_CONFIG_DIR).toBe(configDirPath);
+        expect(environment.CLAUDE_CODE_REMOTE_MEMORY_DIR).toBe(sharedHomePath);
+        for (const name of ["skills", "rules", "CLAUDE.md"]) {
+          expect(yield* fs.readLink(path.join(configDirPath, name))).toBe(
+            path.join(sharedHomePath, name),
+          );
+        }
+      }),
+  );
+
   it.effect("resolves the legacy Codex default instance", () =>
     Effect.gen(function* () {
       const path = yield* Path.Path;
@@ -2205,6 +2254,7 @@ it.layer(
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       const path = yield* Path.Path;
+      const fileSystem = yield* FileSystem.FileSystem;
       const providerInstanceId = ProviderInstanceId.make("codex_restart");
       const { manager, ptyAdapter, logsDir } = yield* createManager(2, {
         historyByteLimit: 8,
@@ -2214,7 +2264,7 @@ it.layer(
             path,
             rawProviderInstanceId,
             env,
-          }),
+          }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem)),
       });
       const homePath = path.join(logsDir, "codex");
       const updateSecret = (value: string) =>

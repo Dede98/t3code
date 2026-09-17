@@ -59,20 +59,35 @@ export const resolveClaudeTranscriptDirPath = Effect.fn("resolveClaudeTranscript
 );
 
 export const makeClaudeEnvironment = Effect.fn("makeClaudeEnvironment")(function* (
-  config: Pick<ClaudeSettings, "configDirPath" | "homePath">,
+  config: Pick<ClaudeSettings, "configDirPath" | "homePath"> &
+    Partial<Pick<ClaudeSettings, "sharedHomePath">>,
   baseEnv?: NodeJS.ProcessEnv,
 ): Effect.fn.Return<NodeJS.ProcessEnv, never, Path.Path> {
   const resolvedBaseEnv = baseEnv ?? process.env;
   const homePath = config.homePath.trim();
   const configDirPath = config.configDirPath.trim();
   const inheritedConfigDirPath = resolvedBaseEnv.CLAUDE_CONFIG_DIR?.trim();
-  if (homePath.length === 0 && configDirPath.length === 0 && !inheritedConfigDirPath) {
+  const sharedHomePath = config.sharedHomePath?.trim();
+  const memoryRoot = sharedHomePath || resolvedBaseEnv.CLAUDE_CODE_REMOTE_MEMORY_DIR?.trim();
+  const hasConfigDir = homePath.length > 0 || configDirPath.length > 0 || inheritedConfigDirPath;
+  if (!hasConfigDir && !memoryRoot) {
     return resolvedBaseEnv;
   }
 
   return {
     ...resolvedBaseEnv,
-    CLAUDE_CONFIG_DIR: yield* resolveClaudeConfigDirPath(config, resolvedBaseEnv),
+    ...(hasConfigDir
+      ? { CLAUDE_CONFIG_DIR: yield* resolveClaudeConfigDirPath(config, resolvedBaseEnv) }
+      : {}),
+    // Claude's native memory root preserves its repository/worktree mapping and
+    // user-subagent memory layout without sharing transcripts or credentials.
+    // This CLI-owned variable is not a public SDK option; the opt-in native
+    // compatibility test exercises it against an actual Claude executable.
+    ...(memoryRoot
+      ? {
+          CLAUDE_CODE_REMOTE_MEMORY_DIR: (yield* Path.Path).resolve(expandHomePath(memoryRoot)),
+        }
+      : {}),
   };
 });
 

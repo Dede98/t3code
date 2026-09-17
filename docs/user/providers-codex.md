@@ -7,7 +7,7 @@ and custom binaries or environment variables.
 ## Use multiple accounts
 
 A shared Codex home with a shadow home lets work and personal accounts continue
-the same threads. The accounts share Codex sessions and configuration while keeping
+the same threads. The accounts share Codex sessions, memories, and configuration while keeping
 their own login and available models.
 
 Keep your first account in `~/.codex`. On the environment's machine, sign the
@@ -36,6 +36,37 @@ store, configure file storage for this setup. See
 Use a completely separate **CODEX_HOME path**, with no shadow home, when you want
 separate Codex sessions and configuration. That instance cannot continue threads
 from the other home.
+
+## Shared skills and global instructions
+
+Shadow accounts share `skills/` from the common **CODEX_HOME path**. Global
+`AGENTS.md` and `AGENTS.override.md` files in that home are shared too when present.
+Restart the provider after adding a new global instruction file. Repository
+instructions and project skills retain their normal scope.
+
+Keep this collection separate from Claude's shared directory. Review any skill
+or instruction you deliberately reuse across providers for differences in tools
+and behavior.
+
+## Shared memories
+
+Instances using the same **CODEX_HOME path** share the complete `memories/`
+directory, including summaries, durable entries, and supporting files. An update
+through either account is visible through the other account's home. Memory
+generation and use still follow your Codex memory settings; an active conversation
+may already have loaded an earlier summary.
+
+Older T3 Code versions kept `memories/` separate in each shadow home. If that
+directory already exists, T3 Code reports a memory conflict and leaves both
+collections untouched. The affected shadow provider cannot start until you
+resolve it. Stop Codex sessions using those homes, back up both memory directories,
+and reconcile the files into `<CODEX_HOME>/memories/`. Move the old shadow
+`memories` directory to a backup location outside the Codex homes, then retry the
+provider. T3 Code creates the shared link. Do not replace `auth.json`.
+
+These paths belong to the environment running Codex, including when connecting
+from web, desktop, or mobile. To keep memories separate, use independent
+**CODEX_HOME paths** without shadow homes.
 
 ## Switch accounts in an existing thread
 
