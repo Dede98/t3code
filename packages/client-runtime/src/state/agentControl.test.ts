@@ -45,6 +45,11 @@ import {
   agentControlEpicHandoffPermissionBlocker,
   agentControlEpicHandoffBlockers,
   agentControlEpicPublishHandoffInput,
+  agentControlEpicActiveReviewRework,
+  agentControlEpicReviewReworkPermissionBlocker,
+  agentControlEpicReviewReworkBlockers,
+  agentControlEpicReviewReworkInput,
+  agentControlEpicReviewReworkStatus,
   agentControlEndPausedInput,
   agentControlCommandErrorMessage,
   agentControlErrorMessage,
@@ -1502,6 +1507,191 @@ describe("Epic human review handoff", () => {
         epic: { ...epic, handoff: { ...epic.handoff, status: "publishing" } },
       }),
     ).not.toEqual([]);
+  });
+
+  it("allows an explicitly reviewed update of an existing draft PR after re-verification", () => {
+    const commitSha = "repaired-common";
+    const verificationEvidenceId = "review-evidence";
+    const epic = {
+      ...verifiedEpic,
+      acceptedCommitSha: commitSha,
+      finalVerification: {
+        ...verifiedEpic.finalVerification!,
+        commitSha,
+        evidenceId: verificationEvidenceId,
+      },
+      handoff: {
+        ...publishedHandoff,
+        status: "update-required" as const,
+        commitSha,
+        verificationEvidenceId,
+      },
+    };
+    const preview = {
+      ...handoffPreview,
+      commitSha,
+      branchName: publishedHandoff.branchName,
+      handoff: epic.handoff,
+    };
+    expect(agentControlEpicHandoffBlockers({ ...handoffReadiness, epic, preview })).toEqual([]);
+    expect(agentControlEpicPublishHandoffInput(epic, preview).expectedCommitSha).toBe(commitSha);
+  });
+});
+
+describe("Epic review repair requests", () => {
+  const findings = [
+    {
+      findingId: "finding-1",
+      summary: "Sidebar selection is lost",
+      correctionCriteria: "Keep the selected item after the repair refresh.",
+      acceptanceCriteria: "The focused regression test passes for two refreshes.",
+    },
+  ];
+  const activeRework = {
+    requestId: "review-request-1",
+    idempotencyKey: "review-idempotency-1",
+    reviewedCommitSha: "common",
+    reviewedVerificationEvidenceId: "common-evidence",
+    findings,
+    status: "repairing" as const,
+    previousAcceptedCommitSha: "common",
+    previousVerificationEvidenceId: "common-evidence",
+    repairAttempts: [
+      {
+        attempt: 1,
+        providerInstanceId: "provider-1",
+        model: "model-1",
+        threadId: "repair-thread-1",
+        status: "running" as const,
+        startedAt: timestamp,
+        completedAt: null,
+        error: null,
+      },
+    ],
+    candidateCommitSha: null,
+    verification: null,
+    blocker: null,
+    requestedAt: timestamp,
+    updatedAt: timestamp,
+    completedAt: null,
+  };
+
+  it("fails closed when selected-environment write permission is unknown or absent", () => {
+    const { scopes: _scopes, ...unknownScopes } = adminSession;
+    for (const session of [
+      AsyncResult.initial<AuthSessionState>(),
+      AsyncResult.waiting(AsyncResult.success(adminSession)),
+      AsyncResult.fail(new Error("offline")),
+      AsyncResult.success(unknownScopes),
+      AsyncResult.success({ ...adminSession, authenticated: false }),
+      AsyncResult.success({ ...adminSession, scopes: AuthStandardClientScopes }),
+    ]) {
+      const permissionBlocker = agentControlEpicReviewReworkPermissionBlocker(session);
+      expect(permissionBlocker).not.toBeNull();
+      expect(
+        agentControlEpicReviewReworkBlockers({
+          epic: verifiedEpic,
+          findings,
+          connected: true,
+          pending: false,
+          permissionBlocker,
+        }),
+      ).toContain(permissionBlocker);
+    }
+    expect(
+      agentControlEpicReviewReworkPermissionBlocker(AsyncResult.success(adminSession)),
+    ).toBeNull();
+  });
+
+  it("binds a normalized request to exact reviewed evidence with stable semantic idempotency", () => {
+    const input = agentControlEpicReviewReworkInput(verifiedEpic, [
+      {
+        ...findings[0]!,
+        summary: `  ${findings[0]!.summary}  `,
+      },
+    ]);
+    expect(input).toMatchObject({
+      projectId: verifiedEpic.projectId,
+      epicRunId: verifiedEpic.epicRunId,
+      expectedRevision: verifiedEpic.revision,
+      reviewedCommitSha: "common",
+      reviewedVerificationEvidenceId: "common-evidence",
+      findings,
+    });
+    const retried = agentControlEpicReviewReworkInput(
+      { ...verifiedEpic, revision: verifiedEpic.revision + 1 },
+      findings,
+    );
+    expect(retried.idempotencyKey).toBe(input.idempotencyKey);
+    expect(retried.commandId).toBe(input.commandId);
+    expect(retried.expectedRevision).toBe(input.expectedRevision + 1);
+  });
+
+  it("requires concrete criteria and blocks conflicting work or terminal pull requests", () => {
+    for (const invalid of [
+      [],
+      [{ ...findings[0]!, summary: " " }],
+      [{ ...findings[0]!, correctionCriteria: " " }],
+      [{ ...findings[0]!, acceptanceCriteria: " " }],
+    ]) {
+      expect(
+        agentControlEpicReviewReworkBlockers({
+          epic: verifiedEpic,
+          findings: invalid,
+          connected: true,
+          pending: false,
+          permissionBlocker: null,
+        }).length,
+      ).toBeGreaterThan(0);
+    }
+    const active = {
+      ...verifiedEpic,
+      activeReviewReworkId: activeRework.requestId,
+      reviewReworks: [activeRework],
+    };
+    expect(agentControlEpicActiveReviewRework(active)).toEqual(activeRework);
+    expect(
+      agentControlEpicReviewReworkBlockers({
+        epic: active,
+        findings,
+        connected: true,
+        pending: false,
+        permissionBlocker: null,
+      }),
+    ).toContain("This Epic already has an active review repair request.");
+    expect(agentControlEpicReviewReworkStatus(activeRework).tone).toBe("running");
+    const recoveringProjection = {
+      ...verifiedEpic,
+      activeReviewReworkId: activeRework.requestId,
+      reviewReworks: [],
+    };
+    expect(
+      agentControlEpicReviewReworkBlockers({
+        epic: recoveringProjection,
+        findings,
+        connected: true,
+        pending: false,
+        permissionBlocker: null,
+      }),
+    ).toContain("This Epic already has an active review repair request.");
+    expect(
+      agentControlEpicHandoffBlockers({ ...handoffReadiness, epic: recoveringProjection }),
+    ).toContain("Publication is unavailable while review repair is active.");
+    for (const state of ["closed", "merged"] as const) {
+      const epic = {
+        ...verifiedEpic,
+        handoff: { ...publishedHandoff, pullRequest: { ...publishedHandoff.pullRequest!, state } },
+      };
+      expect(
+        agentControlEpicReviewReworkBlockers({
+          epic,
+          findings,
+          connected: true,
+          pending: false,
+          permissionBlocker: null,
+        }).length,
+      ).toBeGreaterThan(0);
+    }
   });
 });
 

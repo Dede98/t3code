@@ -85,6 +85,12 @@ export interface ProviderRuntimeEventSourceActivation {
 }
 
 export interface ProviderInvocationBoundary {
+  /**
+   * Optional durable ownership CAS executed immediately before the adapter
+   * effect is forked. Once it commits, later revocation must interrupt rather
+   * than reclassify the invocation as never authorized.
+   */
+  readonly beforeInvocation?: () => Effect.Effect<void, ProviderServiceError>;
   readonly onInvocationStarted: () => void;
 }
 

@@ -25,6 +25,9 @@ import {
   type AgentControlEpicControlInput,
   type AgentControlEpicHandoffPreview,
   type AgentControlEpicHandoffPublishInput,
+  type AgentControlEpicReviewFinding,
+  type AgentControlEpicReviewRework,
+  type AgentControlEpicReviewReworkInput,
   type EnvironmentId,
   type ProjectId,
   type ResourceAdmissionWait,
@@ -115,6 +118,17 @@ export function createAgentControlEnvironmentAtoms<R, E>(
           mode: "singleFlight",
           key: ({ environmentId, input }) =>
             JSON.stringify([environmentId, input.projectId, input.epicRunId]),
+        },
+      }),
+    ),
+    epicRequestReviewRework: withPending(
+      createEnvironmentRpcCommand(runtime, {
+        label: "agent-control-epic:request-review-rework",
+        tag: AGENT_CONTROL_EPIC_RPC_METHODS.requestReviewRework,
+        concurrency: {
+          mode: "singleFlight",
+          key: ({ environmentId, input }) =>
+            JSON.stringify([environmentId, input.projectId, input.epicRunId, input.idempotencyKey]),
         },
       }),
     ),
@@ -216,6 +230,19 @@ export function agentControlEpicHandoffPermissionBlocker<E>(
   }
   if (!session.value.authenticated || !session.value.scopes?.includes(AuthAccessWriteScope)) {
     return "Publishing requires administrative permission (access:write) in this environment. Ask its administrator for an admin pairing link.";
+  }
+  return null;
+}
+
+/** Review repair spends autonomous execution authority, so unknown rights fail closed. */
+export function agentControlEpicReviewReworkPermissionBlocker<E>(
+  session: AsyncResult.AsyncResult<AuthSessionState, E>,
+): string | null {
+  if (session._tag !== "Success" || session.waiting) {
+    return "Verify your permissions in this environment before requesting review repair. Reconnect if the permission check failed.";
+  }
+  if (!session.value.authenticated || !session.value.scopes?.includes(AuthAccessWriteScope)) {
+    return "Requesting review repair requires administrative permission (access:write) in this environment. Ask its administrator for an admin pairing link.";
   }
   return null;
 }
@@ -743,6 +770,7 @@ export function agentControlEpicControlAllowed(
             (entry) => entry.epicRunId === epic.epicRunId && entry.status === "active",
           ) === true))
     );
+  if (epic.reviewReworks?.at(-1)?.status === "blocked") return false;
   return (
     !epic.members.some(
       (member) => member.status === "failed" && (!epic.dependencyPlan || !member.captured),
@@ -786,6 +814,134 @@ export function agentControlEpicStatus(epic: AgentControlEpicRuntimeView): Agent
   return { label: "Epic in progress", tone: "running" };
 }
 
+export function agentControlEpicActiveReviewRework(
+  epic: AgentControlEpicRuntimeView,
+): AgentControlEpicReviewRework | null {
+  if (!epic.activeReviewReworkId) return null;
+  return (
+    epic.reviewReworks?.find((rework) => rework.requestId === epic.activeReviewReworkId) ?? null
+  );
+}
+
+export function agentControlEpicReviewReworkStatus(
+  rework: AgentControlEpicReviewRework,
+): AgentControlStatusView {
+  switch (rework.status) {
+    case "accepted":
+      return { label: "Review repair accepted · waiting to start", tone: "neutral" };
+    case "repairing":
+      return { label: "Repairing reviewed findings", tone: "running" };
+    case "verifying":
+      return { label: "Verifying repaired Epic result", tone: "running" };
+    case "blocked":
+      return { label: "Review repair blocked · action required", tone: "warning" };
+    case "succeeded":
+      return { label: "Review repair succeeded · new result verified", tone: "success" };
+    case "stopped":
+      return { label: "Review repair ended · evidence retained", tone: "neutral" };
+  }
+}
+
+type EpicReviewFindingDraft = Pick<
+  AgentControlEpicReviewFinding,
+  "findingId" | "summary" | "correctionCriteria" | "acceptanceCriteria"
+>;
+
+function normalizeEpicReviewFindings(
+  findings: readonly EpicReviewFindingDraft[],
+): AgentControlEpicReviewFinding[] {
+  return findings.map((finding) => ({
+    findingId: finding.findingId.trim(),
+    summary: finding.summary.trim(),
+    correctionCriteria: finding.correctionCriteria.trim(),
+    acceptanceCriteria: finding.acceptanceCriteria.trim(),
+  }));
+}
+
+export function agentControlEpicReviewReworkBlockers(input: {
+  epic: AgentControlEpicRuntimeView;
+  findings: readonly EpicReviewFindingDraft[];
+  connected: boolean;
+  pending: boolean;
+  permissionBlocker: string | null;
+}): string[] {
+  const blockers: string[] = [];
+  if (input.permissionBlocker !== null) blockers.push(input.permissionBlocker);
+  if (!input.connected) blockers.push("Reconnect to this environment before requesting repair.");
+  if (input.pending) blockers.push("A request is in progress. Wait for the server response.");
+  if (agentControlEpicStatus(input.epic).tone !== "success")
+    blockers.push("Review repair requires a successfully verified Epic result.");
+  const verification = input.epic.finalVerification;
+  if (
+    !verification ||
+    verification.status !== "passed" ||
+    verification.commitSha !== input.epic.acceptedCommitSha
+  )
+    blockers.push("The reviewed commit does not have current passing verification evidence.");
+  if (input.epic.activeReviewReworkId != null)
+    blockers.push("This Epic already has an active review repair request.");
+  if (input.epic.handoff?.status === "publishing")
+    blockers.push("Wait for the current handoff update to finish before requesting repair.");
+  if (input.epic.handoff?.status === "update-required")
+    blockers.push("Publish the current verified PR update before requesting another repair.");
+  const pullRequestState = input.epic.handoff?.pullRequest?.state;
+  if (pullRequestState === "merged")
+    blockers.push("The saved pull request is already merged and cannot be repaired in place.");
+  if (pullRequestState === "closed")
+    blockers.push("The saved pull request is closed. Reopen it before requesting repair.");
+
+  const findings = normalizeEpicReviewFindings(input.findings);
+  if (findings.length === 0) blockers.push("Add at least one concrete review finding.");
+  if (findings.length > 20)
+    blockers.push("A review repair request can contain at most 20 findings.");
+  if (findings.some((finding) => !finding.findingId))
+    blockers.push("Each review finding needs a stable identifier.");
+  if (new Set(findings.map((finding) => finding.findingId)).size !== findings.length)
+    blockers.push("Each review finding needs a unique identifier.");
+  if (findings.some((finding) => !finding.summary))
+    blockers.push("Summarize every review finding.");
+  if (findings.some((finding) => !finding.correctionCriteria))
+    blockers.push("Describe the required correction for every finding.");
+  if (findings.some((finding) => !finding.acceptanceCriteria))
+    blockers.push("Describe verifiable acceptance criteria for every finding.");
+  return [...new Set(blockers)];
+}
+
+/** Semantic request identity remains stable when the server revision advances after acceptance. */
+export function agentControlEpicReviewReworkInput(
+  epic: AgentControlEpicRuntimeView,
+  findingsInput: readonly EpicReviewFindingDraft[],
+): AgentControlEpicReviewReworkInput {
+  const findings = normalizeEpicReviewFindings(findingsInput);
+  const blockers = agentControlEpicReviewReworkBlockers({
+    epic,
+    findings,
+    connected: true,
+    pending: false,
+    permissionBlocker: null,
+  });
+  const verification = epic.finalVerification;
+  if (blockers.length > 0 || !epic.acceptedCommitSha || !verification)
+    throw new Error(blockers[0] ?? "Review a verified Epic result before requesting repair.");
+  const idempotencyKey = `t3auto-epic-review-rework:${JSON.stringify([
+    epic.projectId,
+    epic.epicRunId,
+    epic.acceptedCommitSha,
+    verification.evidenceId,
+    findings,
+  ])}`;
+  return {
+    projectId: epic.projectId,
+    epicRunId: epic.epicRunId,
+    expectedRevision: epic.revision,
+    reviewedCommitSha: epic.acceptedCommitSha,
+    reviewedVerificationEvidenceId: verification.evidenceId,
+    findings,
+    idempotencyKey,
+    commandId: CommandId.make(idempotencyKey),
+  };
+}
+
 /** A server preview is usable only for the displayed project, run and accepted commit. */
 export function agentControlEpicHandoffBlockers(input: {
   epic: AgentControlEpicRuntimeView;
@@ -801,7 +957,9 @@ export function agentControlEpicHandoffBlockers(input: {
   if (input.pending) blockers.push("A request is in progress. Wait for the server response.");
   if (agentControlEpicStatus(epic).tone !== "success")
     blockers.push("Publication requires successful verification of the accepted common commit.");
-  if (epic.handoff?.pullRequest)
+  if (epic.activeReviewReworkId != null)
+    blockers.push("Publication is unavailable while review repair is active.");
+  if (epic.handoff?.pullRequest && epic.handoff.status !== "update-required")
     blockers.push(
       "This Epic already has a pull request. Open the saved pull request to review it.",
     );
@@ -841,7 +999,7 @@ export function agentControlEpicPublishHandoffInput(
     !preview.commitSha ||
     !preview.targetBranch
   )
-    throw new Error("Review a valid publication preview before creating the Draft PR.");
+    throw new Error("Review a valid publication preview before publishing the Draft PR handoff.");
   return {
     projectId: epic.projectId,
     epicRunId: epic.epicRunId,

@@ -22,27 +22,32 @@ import {
   agentControlEpicStatus,
   agentControlEpicHandoffBlockers,
   agentControlEpicPublishHandoffInput,
+  agentControlEpicReviewReworkBlockers,
+  agentControlEpicReviewReworkInput,
+  agentControlEpicReviewReworkStatus,
   type AgentControlReadiness,
 } from "@t3tools/client-runtime/state/agent-control";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import type {
-  AgentControlEpicPreview,
-  AgentControlEpicHandoffPreview,
-  AgentControlEpicRuntimeView,
-  EnvironmentId,
-  ProjectId,
+import {
   ThreadId,
+  type AgentControlEpicPreview,
+  type AgentControlEpicHandoffPreview,
+  type AgentControlEpicRuntimeView,
+  type EnvironmentId,
+  type ProjectId,
 } from "@t3tools/contracts";
 import { agentControlEnvironment } from "../../state/agentControl";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { Textarea } from "../ui/textarea";
 
 type Props = {
   environmentId: EnvironmentId;
   projectId: ProjectId;
   readiness: AgentControlReadiness;
   handoffPermissionBlocker: string | null;
+  reviewReworkPermissionBlocker: string | null;
   onRefresh: () => void;
   onOpenRun: (runId: string) => void;
   onOpenThread: (threadId: ThreadId, changes?: boolean) => void;
@@ -54,6 +59,7 @@ export function AgentControlEpicPanel({
   projectId,
   readiness,
   handoffPermissionBlocker,
+  reviewReworkPermissionBlocker,
   onRefresh,
   onOpenRun,
   onOpenThread,
@@ -721,7 +727,9 @@ export function AgentControlEpicPanel({
                   connected={readiness.connected}
                   pending={readiness.pending}
                   permissionBlocker={handoffPermissionBlocker}
+                  reviewReworkPermissionBlocker={reviewReworkPermissionBlocker}
                   onRefresh={onRefresh}
+                  onOpenThread={onOpenThread}
                 />
                 {!epic.finalVerification ? (
                   <p className="text-sm text-muted-foreground">
@@ -747,6 +755,7 @@ export function AgentControlEpicPanel({
                 projectId={projectId}
                 readOnly
                 handoffPermissionBlocker={handoffPermissionBlocker}
+                reviewReworkPermissionBlocker={reviewReworkPermissionBlocker}
                 readiness={{
                   ...readiness,
                   snapshot: {
@@ -911,7 +920,16 @@ type HandoffProps = {
   connected: boolean;
   pending: boolean;
   permissionBlocker: string | null;
+  reviewReworkPermissionBlocker: string | null;
   onRefresh: () => void;
+  onOpenThread: (threadId: ThreadId, changes?: boolean) => void;
+};
+
+type ReviewFindingDraft = {
+  findingId: string;
+  summary: string;
+  correctionCriteria: string;
+  acceptanceCriteria: string;
 };
 
 function EpicHandoff({
@@ -920,12 +938,23 @@ function EpicHandoff({
   connected,
   pending,
   permissionBlocker,
+  reviewReworkPermissionBlocker,
   onRefresh,
+  onOpenThread,
 }: HandoffProps) {
   const [preview, setPreview] = useState<AgentControlEpicHandoffPreview | null>(null);
   const [observed, setObserved] = useState<AgentControlEpicRuntimeView | null>(null);
-  const [busy, setBusy] = useState<"inspect" | "publish" | "refresh" | null>(null);
+  const [busy, setBusy] = useState<"inspect" | "publish" | "refresh" | "rework" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const nextFindingId = useRef(2);
+  const [findings, setFindings] = useState<ReviewFindingDraft[]>([
+    {
+      findingId: `${savedEpic.epicRunId}:review-finding:1`,
+      summary: "",
+      correctionCriteria: "",
+      acceptanceCriteria: "",
+    },
+  ]);
   const mounted = useRef(true);
   const inFlight = useRef(false);
   useEffect(() => {
@@ -938,6 +967,9 @@ function EpicHandoff({
     reportFailure: false,
   });
   const publish = useAtomCommand(agentControlEnvironment.epicPublishHandoff, {
+    reportFailure: false,
+  });
+  const requestReviewRework = useAtomCommand(agentControlEnvironment.epicRequestReviewRework, {
     reportFailure: false,
   });
   const epic = observed && observed.revision > savedEpic.revision ? observed : savedEpic;
@@ -959,8 +991,53 @@ function EpicHandoff({
     permissionBlocker,
     preview,
   });
-  const pullRequest = handoff?.pullRequest;
-  const target = handoff ?? preview;
+  const reviewReworkActive = epic.activeReviewReworkId != null;
+  const handoffUpdateRequired = handoff?.status === "update-required";
+  const pullRequest = reviewReworkActive ? null : handoff?.pullRequest;
+  const target = reviewReworkActive ? null : (handoff ?? preview);
+  const reviewReworkBlockers = agentControlEpicReviewReworkBlockers({
+    epic,
+    findings,
+    connected,
+    pending: pending || busy !== null,
+    permissionBlocker: reviewReworkPermissionBlocker,
+  });
+
+  function updateFinding(
+    findingId: string,
+    field: "summary" | "correctionCriteria" | "acceptanceCriteria",
+    value: string,
+  ) {
+    setFindings((current) =>
+      current.map((finding) =>
+        finding.findingId === findingId ? { ...finding, [field]: value } : finding,
+      ),
+    );
+  }
+
+  async function submitReviewRework() {
+    if (inFlight.current || reviewReworkBlockers.length > 0) return;
+    inFlight.current = true;
+    setBusy("rework");
+    setError(null);
+    try {
+      const result = await requestReviewRework({
+        environmentId,
+        input: agentControlEpicReviewReworkInput(epic, findings),
+      });
+      if (!mounted.current) return;
+      if (result._tag === "Success") {
+        setPreview(null);
+        setObserved(result.value);
+      } else setError(agentControlCommandErrorMessage(squashAtomCommandFailure(result)));
+      onRefresh();
+    } catch (cause) {
+      if (mounted.current) setError(agentControlCommandErrorMessage(cause));
+    } finally {
+      inFlight.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  }
 
   async function execute(action: "inspect" | "publish" | "refresh") {
     if (inFlight.current) return;
@@ -1013,7 +1090,190 @@ function EpicHandoff({
   return (
     <section className="space-y-2 rounded border p-3" aria-label="Epic review handoff">
       <h4 className="text-sm font-medium">Human review</h4>
-      {target ? (
+      {epic.reviewReworks?.length ? (
+        <div className="space-y-2">
+          <h5 className="text-sm font-medium">Review repair history</h5>
+          {epic.reviewReworks.map((rework) => (
+            <details
+              key={rework.requestId}
+              open={rework.requestId === epic.activeReviewReworkId}
+              className="space-y-2 rounded border p-2 text-sm"
+            >
+              <summary>{agentControlEpicReviewReworkStatus(rework).label}</summary>
+              <p className="break-all text-xs">
+                Previously reviewed: {rework.reviewedCommitSha} · Evidence:{" "}
+                {rework.reviewedVerificationEvidenceId}
+              </p>
+              {rework.candidateCommitSha ? (
+                <p className="break-all text-xs">Repair candidate: {rework.candidateCommitSha}</p>
+              ) : null}
+              {rework.verification ? (
+                <p className="break-all text-xs">
+                  {rework.verification.status === "passed"
+                    ? "New verified commit"
+                    : "Checked candidate"}
+                  : {rework.verification.commitSha} · Evidence: {rework.verification.evidenceId}
+                </p>
+              ) : null}
+              {rework.blocker ? (
+                <p role="alert" className="text-amber-600">
+                  {rework.blocker.message}
+                </p>
+              ) : null}
+              <ol className="space-y-1">
+                {rework.findings.map((finding) => (
+                  <li key={finding.findingId} className="rounded border p-2">
+                    <p className="font-medium">{finding.summary}</p>
+                    <p>Required correction: {finding.correctionCriteria}</p>
+                    <p>Acceptance: {finding.acceptanceCriteria}</p>
+                  </li>
+                ))}
+              </ol>
+              {rework.repairAttempts.map((attempt) => (
+                <div key={attempt.attempt} className="space-y-1 rounded border p-2">
+                  <p>
+                    Repair {attempt.attempt} · {attempt.status} · {attempt.providerInstanceId} /{" "}
+                    {attempt.model}
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() => onOpenThread(ThreadId.make(attempt.threadId))}
+                    >
+                      Open repair thread
+                    </Button>
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() => onOpenThread(ThreadId.make(attempt.threadId), true)}
+                    >
+                      Open repair changes
+                    </Button>
+                  </div>
+                  {attempt.error ? <p role="alert">{attempt.error.message}</p> : null}
+                </div>
+              ))}
+            </details>
+          ))}
+        </div>
+      ) : null}
+      {epic.handoffHistory?.length ? (
+        <details className="space-y-2 text-sm">
+          <summary>Previous review handoffs</summary>
+          {epic.handoffHistory.map((entry) => (
+            <div key={entry.handoff.intentId} className="rounded border p-2">
+              <p className="break-all">
+                Previous verified commit: {entry.handoff.commitSha} · Evidence:{" "}
+                {entry.handoff.verificationEvidenceId}
+              </p>
+              <p>Superseded when review repair was requested at {entry.supersededAt}.</p>
+              {entry.handoff.pullRequest ? (
+                <a
+                  href={entry.handoff.pullRequest.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline"
+                >
+                  Open previous PR #{entry.handoff.pullRequest.number} ·{" "}
+                  {entry.handoff.pullRequest.state}
+                </a>
+              ) : null}
+            </div>
+          ))}
+        </details>
+      ) : null}
+      {epic.status === "succeeded" && !reviewReworkActive ? (
+        <details className="space-y-2 rounded border p-2">
+          <summary className="text-sm font-medium">Report review findings</summary>
+          <p className="break-all text-xs">
+            Findings apply to verified commit {epic.acceptedCommitSha ?? "Unavailable"}.
+          </p>
+          {findings.map((finding, index) => (
+            <div key={finding.findingId} className="space-y-2 rounded border p-2">
+              <p className="text-sm font-medium">Finding {index + 1}</p>
+              <Textarea
+                size="sm"
+                aria-label={`Finding ${index + 1} summary`}
+                placeholder="What is wrong?"
+                value={finding.summary}
+                onChange={(event) =>
+                  updateFinding(finding.findingId, "summary", event.target.value)
+                }
+              />
+              <Textarea
+                size="sm"
+                aria-label={`Finding ${index + 1} required correction`}
+                placeholder="What must change?"
+                value={finding.correctionCriteria}
+                onChange={(event) =>
+                  updateFinding(finding.findingId, "correctionCriteria", event.target.value)
+                }
+              />
+              <Textarea
+                size="sm"
+                aria-label={`Finding ${index + 1} acceptance criteria`}
+                placeholder="How can the correction be verified?"
+                value={finding.acceptanceCriteria}
+                onChange={(event) =>
+                  updateFinding(finding.findingId, "acceptanceCriteria", event.target.value)
+                }
+              />
+              {findings.length > 1 ? (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() =>
+                    setFindings((current) =>
+                      current.filter((item) => item.findingId !== finding.findingId),
+                    )
+                  }
+                >
+                  Remove finding
+                </Button>
+              ) : null}
+            </div>
+          ))}
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={findings.length >= 20}
+              onClick={() => {
+                const id = nextFindingId.current++;
+                setFindings((current) => [
+                  ...current,
+                  {
+                    findingId: `${epic.epicRunId}:review-finding:${id}`,
+                    summary: "",
+                    correctionCriteria: "",
+                    acceptanceCriteria: "",
+                  },
+                ]);
+              }}
+            >
+              Add finding
+            </Button>
+            <Button
+              size="sm"
+              disabled={reviewReworkBlockers.length > 0}
+              onClick={() => void submitReviewRework()}
+            >
+              Request repair and re-verification
+            </Button>
+          </div>
+          {reviewReworkBlockers.map((blocker) => (
+            <p key={blocker} className="text-sm text-amber-600">
+              {blocker}
+            </p>
+          ))}
+        </details>
+      ) : null}
+      {reviewReworkActive ? (
+        <p className="text-sm text-muted-foreground">
+          The previous handoff is historical while repair and re-verification are in progress.
+        </p>
+      ) : target ? (
         <div className="space-y-1 text-xs">
           <p>Repository: {target.repository.nameWithOwner}</p>
           <p className="break-all">Target branch: {target.targetBranch ?? "Unavailable"}</p>
@@ -1030,14 +1290,16 @@ function EpicHandoff({
       )}
       {busy || handoff?.status === "publishing" ? (
         <p role="status" className="text-sm">
-          {busy === "refresh"
-            ? "Refreshing PR state…"
-            : busy === "inspect"
-              ? "Checking publication…"
-              : "Handoff in progress…"}
+          {busy === "rework"
+            ? "Submitting review findings…"
+            : busy === "refresh"
+              ? "Refreshing PR state…"
+              : busy === "inspect"
+                ? "Checking publication…"
+                : "Handoff in progress…"}
         </p>
       ) : null}
-      {pullRequest ? (
+      {pullRequest && !handoffUpdateRequired ? (
         <>
           <div className="flex flex-wrap items-center gap-2">
             <a
@@ -1080,7 +1342,11 @@ function EpicHandoff({
               disabled={blockers.length > 0}
               onClick={() => void execute("inspect")}
             >
-              {handoff || error ? "Review and retry handoff" : "Review publication"}
+              {handoffUpdateRequired
+                ? "Review PR update"
+                : handoff || error
+                  ? "Review and retry handoff"
+                  : "Review publication"}
             </Button>
             {preview ? (
               <Button
@@ -1088,7 +1354,11 @@ function EpicHandoff({
                 disabled={publishBlockers.length > 0}
                 onClick={() => void execute("publish")}
               >
-                {handoff ? "Retry Draft PR handoff" : "Create Draft PR"}
+                {handoffUpdateRequired
+                  ? "Update Draft PR"
+                  : handoff
+                    ? "Retry Draft PR handoff"
+                    : "Create Draft PR"}
               </Button>
             ) : null}
           </div>

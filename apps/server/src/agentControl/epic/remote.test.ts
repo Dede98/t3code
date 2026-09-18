@@ -17,6 +17,9 @@ const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeRefRequest = Schema.decodeUnknownSync(
   Schema.fromJsonString(Schema.Struct({ ref: Schema.String, sha: Schema.String })),
 );
+const decodeRefUpdateRequest = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.Struct({ sha: Schema.String, force: Schema.Boolean })),
+);
 const decodePrRequest = Schema.decodeUnknownSync(
   Schema.fromJsonString(
     Schema.Struct({
@@ -26,6 +29,9 @@ const decodePrRequest = Schema.decodeUnknownSync(
       draft: Schema.Boolean,
     }),
   ),
+);
+const decodePrUpdateRequest = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.Struct({ title: Schema.String, body: Schema.String })),
 );
 const exec = NodeUtil.promisify(NodeChildProcess.execFile);
 const output = (stdout: string, exitCode = 0): VcsProcessOutput => ({
@@ -124,7 +130,9 @@ const setup = Effect.gen(function* () {
     attempted: false,
     tagPushes: 0,
     branchCreates: 0,
+    branchUpdates: 0,
     prCreates: 0,
+    prUpdates: 0,
     vcsCalls: 0,
     apiCalls: [] as { endpoint: string; cwd: string; method: string }[],
     failPrRead: false,
@@ -135,6 +143,7 @@ const setup = Effect.gen(function* () {
     loseTagReply: false,
     loseBranchReply: false,
     losePrReply: false,
+    losePrUpdateReply: false,
     denyWrite: false,
     repositoryId: "repo-node",
     collisionOnCreate: false,
@@ -197,7 +206,7 @@ const setup = Effect.gen(function* () {
           if (args.includes("push")) {
             state.tagPushes++;
             expect(args.some((arg) => arg.includes("--force"))).toBe(false);
-            expect(args.at(-1)).toMatch(/^[0-9a-f]+:refs\/tags\/t3auto-handoff\//);
+            expect(args.at(-1)).toMatch(/^[0-9a-f]+:refs\/tags\/t3auto-handoff(?:-version)?\//);
             if (state.loseTagReply) {
               state.loseTagReply = false;
               throw new Error("lost");
@@ -213,12 +222,35 @@ const setup = Effect.gen(function* () {
       Effect.tryPromise({
         try: async () => {
           const endpoint = request.args[3]!;
+          const methodIndex = request.args.indexOf("--method");
+          const method =
+            methodIndex === -1 ? (request.stdin ? "POST" : "GET") : request.args[methodIndex + 1]!;
           state.apiCalls.push({
             endpoint,
             cwd: request.cwd,
-            method: request.stdin ? "POST" : "GET",
+            method,
           });
           if (endpoint.includes("/pulls?")) return output(encodeJson([state.prs]));
+          if (endpoint.includes("/git/refs/heads/") && method === "PATCH") {
+            state.branchUpdates++;
+            const body = decodeRefUpdateRequest(request.stdin!);
+            expect(body.force).toBe(false);
+            await runGit(bare, ["update-ref", `refs/heads/${input.branchName}`, body.sha]);
+            if (state.prs[0]) state.prs[0].head.sha = body.sha;
+            return output(
+              encodeJson({ ref: `refs/heads/${input.branchName}`, object: { sha: body.sha } }),
+            );
+          }
+          if (/\/pulls\/\d+$/.test(endpoint) && method === "PATCH") {
+            state.prUpdates++;
+            const body = decodePrUpdateRequest(request.stdin!);
+            state.prs[0]!.body = body.body;
+            if (state.losePrUpdateReply) {
+              state.losePrUpdateReply = false;
+              throw new Error("lost PR update response");
+            }
+            return output(encodeJson(state.prs[0]));
+          }
           if (/\/pulls\/\d+$/.test(endpoint)) {
             if (state.failPrRead) throw new Error("read unavailable /Users/private TOKEN");
             return output(encodeJson(state.prs[0]));
@@ -276,6 +308,17 @@ const setup = Effect.gen(function* () {
           }),
       },
     );
+  const update = (nextCommitSha: string, previousCommitSha = input.commitSha) =>
+    remote.publish(
+      {
+        ...input,
+        commitSha: nextCommitSha,
+        branchCreationAttempted: true,
+        expectedPreviousCommitSha: previousCommitSha,
+        ownershipCommitSha: input.commitSha,
+      },
+      { beforeBranchCreate: () => Effect.die("An existing handoff branch must not be created") },
+    );
   const remoteGit = (args: ReadonlyArray<string>) =>
     io(async () => (await runGit(bare, args)).trim());
   const read = () =>
@@ -306,7 +349,7 @@ const setup = Effect.gen(function* () {
     pullRequest,
     error: null,
   });
-  return { input, state, remote, publish, read, refresh, handoff, git, remoteGit, cwd };
+  return { input, state, remote, publish, update, read, refresh, handoff, git, remoteGit, cwd };
 });
 
 it.layer(NodeServices.layer)("Epic handoff remote", (it) => {
@@ -554,6 +597,115 @@ it.layer(NodeServices.layer)("Epic handoff remote", (it) => {
       expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([1, 1, 1]);
     }),
   );
+  it.effect(
+    "fast-forwards the existing draft twice without force, replacement PR, merge, or ownership-tag change",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* setup;
+        const original = yield* f.publish();
+        const ownershipTag = yield* f.remoteGit([
+          "rev-parse",
+          `refs/tags/t3auto-handoff/${f.input.ownershipToken}`,
+        ]);
+        const firstRepair = yield* f.git(["rev-parse", "HEAD"]);
+        const firstUpdate = yield* f.update(firstRepair);
+        expect(firstUpdate).toMatchObject({
+          number: original.number,
+          url: original.url,
+          state: "open",
+          isDraft: true,
+          headSha: firstRepair,
+        });
+        const tree = yield* f.git(["rev-parse", `${firstRepair}^{tree}`]);
+        const secondRepair = yield* f.git([
+          "commit-tree",
+          tree,
+          "-p",
+          firstRepair,
+          "-m",
+          "second reviewed repair",
+        ]);
+        const secondUpdate = yield* f.update(secondRepair, firstRepair);
+        expect(secondUpdate).toMatchObject({
+          number: original.number,
+          url: original.url,
+          state: "open",
+          isDraft: true,
+          headSha: secondRepair,
+        });
+        expect(yield* f.remoteGit(["rev-parse", `refs/heads/${f.input.branchName}`])).toBe(
+          secondRepair,
+        );
+        expect(
+          yield* f.remoteGit(["rev-parse", `refs/tags/t3auto-handoff/${f.input.ownershipToken}`]),
+        ).toBe(ownershipTag);
+        expect(f.state.prs).toHaveLength(1);
+        expect(f.state.prs[0]!.body).toContain(`Verified result commit: \`${secondRepair}\``);
+        expect([
+          f.state.tagPushes,
+          f.state.branchCreates,
+          f.state.branchUpdates,
+          f.state.prCreates,
+          f.state.prUpdates,
+        ]).toEqual([3, 1, 2, 1, 2]);
+        expect(f.state.apiCalls.some((call) => call.endpoint.includes("/merges"))).toBe(false);
+      }),
+  );
+  it.effect("recovers an update whose remote head already reached the newly verified commit", () =>
+    Effect.gen(function* () {
+      const f = yield* setup;
+      const original = yield* f.publish();
+      const repaired = yield* f.git(["rev-parse", "HEAD"]);
+      f.state.losePrUpdateReply = true;
+      expect((yield* Effect.flip(f.update(repaired))).code).toBe("remote-unavailable");
+      expect(yield* f.remoteGit(["rev-parse", `refs/heads/${f.input.branchName}`])).toBe(repaired);
+      const recovered = yield* f.update(repaired);
+      expect(recovered).toMatchObject({
+        number: original.number,
+        url: original.url,
+        headSha: repaired,
+        state: "open",
+        isDraft: true,
+      });
+      expect(f.state.branchUpdates).toBe(1);
+      expect(f.state.prUpdates).toBe(2);
+      expect([f.state.tagPushes, f.state.branchCreates, f.state.prCreates]).toEqual([2, 1, 1]);
+    }),
+  );
+  for (const condition of ["foreign-head", "closed", "merged", "not-draft"] as const)
+    it.effect(`rejects an existing draft update after ${condition} without remote writes`, () =>
+      Effect.gen(function* () {
+        const f = yield* setup;
+        yield* f.publish();
+        const repaired = yield* f.git(["rev-parse", "HEAD"]);
+        if (condition === "foreign-head") {
+          yield* f.remoteGit([
+            "update-ref",
+            `refs/heads/${f.input.branchName}`,
+            f.input.baseCommitSha,
+          ]);
+          f.state.prs[0]!.head.sha = f.input.baseCommitSha;
+        }
+        if (condition === "closed") f.state.prs[0]!.state = "closed";
+        if (condition === "merged") {
+          f.state.prs[0]!.state = "closed";
+          f.state.prs[0]!.merged_at = "2026-09-18T08:00:00Z";
+        }
+        if (condition === "not-draft") f.state.prs[0]!.draft = false;
+        const failure = yield* Effect.flip(f.update(repaired));
+        expect(failure.code).toBe(
+          {
+            "foreign-head": "handoff-head-changed",
+            closed: "handoff-pr-closed",
+            merged: "handoff-pr-merged",
+            "not-draft": "handoff-pr-not-draft",
+          }[condition],
+        );
+        expect(f.state.branchUpdates).toBe(0);
+        expect(f.state.prUpdates).toBe(0);
+        expect(f.state.prCreates).toBe(1);
+      }),
+    );
   for (const boundary of ["loseTagReply", "loseBranchReply", "losePrReply"] as const) {
     it.effect(`recovers ${boundary} from actual remote state without duplicate effects`, () =>
       Effect.gen(function* () {

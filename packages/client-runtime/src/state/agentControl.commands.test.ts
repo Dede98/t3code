@@ -12,6 +12,7 @@ import {
   AgentControlEpicRpcError,
   type AgentControlEpicStartInput,
   type AgentControlEpicHandoffPublishInput,
+  type AgentControlEpicReviewReworkInput,
   AgentControlCommandPreviouslyRejectedError,
   AgentControlProjectRevisionConflictError,
   CommandId,
@@ -84,6 +85,12 @@ type HandoffCall = {
   response: Deferred.Deferred<never, AgentControlEpicRpcError>;
 };
 
+type ReviewReworkCall = {
+  environmentId: EnvironmentId;
+  input: AgentControlEpicReviewReworkInput;
+  response: Deferred.Deferred<never, AgentControlEpicRpcError>;
+};
+
 function confirmed(input: AgentControlSetProjectModeInput): AgentControlSetProjectModeResult {
   return {
     state: {
@@ -110,6 +117,8 @@ const makeHarness = Effect.fn("makeAgentControlCommandHarness")(function* () {
   const savedRunArrivals = yield* Queue.unbounded<SavedRunCall>();
   const handoffArrivals = yield* Queue.unbounded<HandoffCall>();
   const handoffCalls: HandoffCall[] = [];
+  const reviewReworkArrivals = yield* Queue.unbounded<ReviewReworkCall>();
+  const reviewReworkCalls: ReviewReworkCall[] = [];
   const supervisors = new Map<EnvironmentId, EnvironmentSupervisor["Service"]>();
   for (const id of [environmentId, otherEnvironmentId]) {
     const client = {
@@ -129,6 +138,15 @@ const makeHarness = Effect.fn("makeAgentControlCommandHarness")(function* () {
         const call = { environmentId: id, input, response };
         handoffCalls.push(call);
         yield* Queue.offer(handoffArrivals, call);
+        return yield* Deferred.await(response);
+      }),
+      [AGENT_CONTROL_EPIC_RPC_METHODS.requestReviewRework]: Effect.fn(function* (
+        input: AgentControlEpicReviewReworkInput,
+      ) {
+        const response = yield* Deferred.make<never, AgentControlEpicRpcError>();
+        const call = { environmentId: id, input, response };
+        reviewReworkCalls.push(call);
+        yield* Queue.offer(reviewReworkArrivals, call);
         return yield* Deferred.await(response);
       }),
       [AGENT_CONTROL_RUN_ONCE_RPC_METHODS.getSnapshot]: Effect.fn(function* (
@@ -217,6 +235,8 @@ const makeHarness = Effect.fn("makeAgentControlCommandHarness")(function* () {
     savedRunArrivals,
     handoffArrivals,
     handoffCalls,
+    reviewReworkArrivals,
+    reviewReworkCalls,
   };
 });
 
@@ -465,6 +485,74 @@ it.effect(
         yield* Effect.promise(() => retry);
         expect(registry.get(atoms.pending(publication))).toBe(false);
         remount();
+      }),
+    ),
+);
+
+it.effect(
+  "deduplicates identical review repair requests without collapsing conflicting idempotency keys",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { registry, atoms, reviewReworkArrivals, reviewReworkCalls } = yield* makeHarness();
+        const review = {
+          environmentId,
+          input: {
+            projectId: target.input.projectId,
+            commandId: CommandId.make("review-rework-a"),
+            expectedRevision: 7,
+            epicRunId: "epic-a",
+            reviewedCommitSha: "verified-commit",
+            reviewedVerificationEvidenceId: "verification-a",
+            findings: [
+              {
+                findingId: "finding-a",
+                summary: "Broken behavior",
+                correctionCriteria: "Repair the behavior",
+                acceptanceCriteria: "Focused regression passes",
+              },
+            ],
+            idempotencyKey: "review-rework-a",
+          },
+        };
+        const first = atoms.epicRequestReviewRework.run(registry, review);
+        const firstCall = yield* Queue.take(reviewReworkArrivals);
+        const duplicate = atoms.epicRequestReviewRework.run(registry, { ...review });
+        expect(reviewReworkCalls).toHaveLength(1);
+        expect(registry.get(atoms.pending(review))).toBe(true);
+
+        const conflicting = {
+          ...review,
+          input: {
+            ...review.input,
+            commandId: CommandId.make("review-rework-b"),
+            idempotencyKey: "review-rework-b",
+            findings: [{ ...review.input.findings[0]!, findingId: "finding-b" }],
+          },
+        };
+        const conflictRequest = atoms.epicRequestReviewRework.run(registry, conflicting);
+        const conflictCall = yield* Queue.take(reviewReworkArrivals);
+        expect(reviewReworkCalls).toHaveLength(2);
+        expect(conflictCall.input.idempotencyKey).toBe("review-rework-b");
+
+        const failure = new AgentControlEpicRpcError({
+          code: "review-rework-conflict",
+          message: "A different review repair request is already active.",
+        });
+        yield* Deferred.fail(conflictCall.response, failure);
+        expect((yield* Effect.promise(() => conflictRequest))._tag).toBe("Failure");
+        expect(registry.get(atoms.pending(review))).toBe(true);
+        yield* Deferred.fail(firstCall.response, failure);
+        const duplicateResults = yield* Effect.promise(() => Promise.all([first, duplicate]));
+        expect(duplicateResults.every((result) => result._tag === "Failure")).toBe(true);
+        expect(registry.get(atoms.pending(review))).toBe(false);
+
+        const otherEnvironment = { ...review, environmentId: otherEnvironmentId };
+        const isolated = atoms.epicRequestReviewRework.run(registry, otherEnvironment);
+        const isolatedCall = yield* Queue.take(reviewReworkArrivals);
+        expect(isolatedCall.environmentId).toBe(otherEnvironmentId);
+        yield* Deferred.fail(isolatedCall.response, failure);
+        yield* Effect.promise(() => isolated);
       }),
     ),
 );

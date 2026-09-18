@@ -20,7 +20,10 @@ export const AgentControlEpicQueueEntry = Schema.Struct({
   blockers: Schema.Array(AgentControlEpicBlocker),
 });
 export type AgentControlEpicQueueEntry = typeof AgentControlEpicQueueEntry.Type;
-/** Array order is admission priority; active and completed entries cannot be edited. */
+/**
+ * Array order is admission priority; active and completed entries cannot be edited.
+ * The active limit applies to executing runs, not retained entries awaiting review or merge.
+ */
 export const AgentControlEpicQueue = Schema.Struct({
   projectId: ProjectId,
   /** Omitted on existing queues means serial execution. */

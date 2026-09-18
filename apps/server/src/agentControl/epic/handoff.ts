@@ -114,7 +114,46 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
                   "The pull request state could not be refreshed. Retry to update its last known state.",
               };
       } else {
-        const outcome = pullRequestOutcome(refreshed.success);
+        const previousCommitSha = state.handoffHistory?.findLast(
+          (entry) =>
+            entry.handoff.intentId === handoff.intentId &&
+            entry.handoff.branchName === handoff.branchName,
+        )?.handoff.commitSha;
+        const outcome =
+          handoff.status === "update-required"
+            ? {
+                status: "update-required" as const,
+                pullRequest: refreshed.success,
+                error:
+                  refreshed.success.state === "merged"
+                    ? {
+                        code: "handoff-pr-merged",
+                        message:
+                          "The pull request was merged before its verified repair could be published.",
+                      }
+                    : refreshed.success.state === "closed"
+                      ? {
+                          code: "handoff-pr-closed",
+                          message:
+                            "The pull request is closed. Reopen it as a draft before publishing the verified repair.",
+                        }
+                      : !refreshed.success.isDraft
+                        ? {
+                            code: "handoff-pr-not-draft",
+                            message:
+                              "Return the pull request to draft before publishing the verified repair.",
+                          }
+                        : !previousCommitSha ||
+                            (refreshed.success.headSha !== previousCommitSha &&
+                              refreshed.success.headSha !== handoff.commitSha)
+                          ? {
+                              code: "handoff-head-changed",
+                              message:
+                                "The pull request branch changed outside T3Auto. The verified repair was not published.",
+                            }
+                          : null,
+              }
+            : pullRequestOutcome(refreshed.success);
         if (
           epicDigest(outcome) !==
           epicDigest({
@@ -138,7 +177,7 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
       handoff: state.handoff ?? null,
     };
     if (
-      state.handoff?.pullRequest ||
+      (state.handoff?.pullRequest && state.handoff.status !== "update-required") ||
       (state.handoff?.status === "blocked" &&
         ["remote-branch-collision", "pull-request-collision"].includes(
           state.handoff.error?.code ?? "",
@@ -153,6 +192,35 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
             ? [{ ...state.handoff.error, issueNumber: null }]
             : [],
       };
+    if (state.handoff?.status === "update-required") {
+      if (refreshError)
+        return {
+          ...base,
+          canPublish: false,
+          blockers: [{ ...refreshError, issueNumber: null }],
+        };
+      if (state.handoff.error)
+        return {
+          ...base,
+          canPublish: false,
+          blockers: [{ ...state.handoff.error, issueNumber: null }],
+        };
+      const checked = yield* Effect.result(evidence.verify(state));
+      if (checked._tag === "Failure")
+        return {
+          ...base,
+          canPublish: false,
+          blockers: [
+            { code: checked.failure.code, message: checked.failure.message, issueNumber: null },
+          ],
+        };
+      return {
+        ...base,
+        targetBranch: checked.success.authority.targetBranch,
+        canPublish: true,
+        blockers: [],
+      };
+    }
     const checked = yield* Effect.result(
       Effect.gen(function* () {
         const proof = yield* evidence.verify(state);
@@ -192,6 +260,11 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
     return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         let state = yield* load(input);
+        const updatingExistingHandoff =
+          state.handoff?.pullRequest != null &&
+          (state.handoff.status === "update-required" ||
+            (state.handoff.status === "publishing" &&
+              state.handoff.pullRequest.headSha !== state.handoff.commitSha));
         if (
           state.acceptedCommitSha !== input.expectedCommitSha ||
           (state.handoff &&
@@ -203,7 +276,7 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
             "The confirmed commit or target branch no longer matches this Epic handoff.",
           );
         if (
-          state.handoff?.pullRequest ||
+          (state.handoff?.pullRequest && !updatingExistingHandoff) ||
           (state.handoff?.status === "blocked" &&
             ["remote-branch-collision", "pull-request-collision"].includes(
               state.handoff.error?.code ?? "",
@@ -216,6 +289,27 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
             "Epic progress changed; review the publication details again.",
           );
         let handoff = state.handoff;
+        const matchingHandoffs = state.handoffHistory?.filter(
+          (entry) =>
+            entry.handoff.intentId === handoff?.intentId &&
+            entry.handoff.branchName === handoff?.branchName,
+        );
+        const previousHandoff = matchingHandoffs?.at(-1)?.handoff;
+        const originalHandoff = matchingHandoffs?.[0]?.handoff;
+        if (
+          updatingExistingHandoff &&
+          (!previousHandoff ||
+            !originalHandoff ||
+            previousHandoff.pullRequest?.number !== handoff?.pullRequest?.number ||
+            originalHandoff.pullRequest?.number !== handoff?.pullRequest?.number)
+        )
+          return yield* epicError(
+            "handoff-evidence-invalid",
+            "The existing pull request has no complete retained handoff history for this update.",
+          );
+        const expectedPreviousCommitSha = updatingExistingHandoff
+          ? previousHandoff?.commitSha
+          : undefined;
         const result = yield* Effect.result(
           Effect.gen(function* () {
             const proof = yield* restore(evidence.verify(state));
@@ -274,6 +368,12 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
                     .map((member) => member.issueNumber),
                   childCheckCount: proof.childCheckCount,
                   finalCheckCount: proof.finalCheckCount,
+                  ...(expectedPreviousCommitSha
+                    ? {
+                        expectedPreviousCommitSha,
+                        ownershipCommitSha: originalHandoff!.commitSha,
+                      }
+                    : {}),
                 },
                 {
                   beforeBranchCreate: () =>
@@ -318,18 +418,28 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
         if (!handoff) return yield* epicError(failure.code, failure.message);
         // Preserve the local successful result even if push/PR response or persistence was lost.
         const current = yield* load(input);
-        if (current.handoff?.pullRequest) return current;
+        if (
+          current.handoff?.pullRequest &&
+          current.handoff.pullRequest.headSha === current.handoff.commitSha
+        )
+          return current;
         return yield* persist(current, {
           ...handoff,
-          status: [
-            "remote-unavailable",
-            "remote-branch-rejected",
-            "remote-response-invalid",
-            "handoff-unavailable",
-            "handoff-persistence-failed",
-          ].includes(failure.code)
-            ? "failed"
-            : "blocked",
+          status:
+            expectedPreviousCommitSha &&
+            ["remote-unavailable", "remote-response-invalid", "handoff-unavailable"].includes(
+              failure.code,
+            )
+              ? "update-required"
+              : [
+                    "remote-unavailable",
+                    "remote-branch-rejected",
+                    "remote-response-invalid",
+                    "handoff-unavailable",
+                    "handoff-persistence-failed",
+                  ].includes(failure.code)
+                ? "failed"
+                : "blocked",
           // A known rejection cannot authorize adopting a branch that appears later.
           branchCreationAttempted:
             failure.code === "remote-branch-rejected" ||
@@ -353,7 +463,11 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
             if (state.handoff?.status !== "publishing") return;
             yield* persist(state, {
               ...state.handoff,
-              status: "failed",
+              status:
+                state.handoff.pullRequest &&
+                state.handoff.pullRequest.headSha !== state.handoff.commitSha
+                  ? "update-required"
+                  : "failed",
               updatedAt: yield* now,
               error: {
                 code: "handoff-interrupted",

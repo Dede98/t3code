@@ -43,6 +43,16 @@ const decodeIntegrated = Schema.decodeUnknownEffect(
     }),
   ),
 );
+const decodeReviewRepairResult = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      status: Schema.Literals(["succeeded", "failed", "blocked"]),
+      candidateCommitSha: Schema.NullOr(Schema.String),
+      code: Schema.NullOr(Schema.String),
+      message: Schema.NullOr(Schema.String),
+    }),
+  ),
+);
 
 export interface EpicHandoffProof {
   readonly authority: Omit<EpicHandoffRemoteAuthority, "branchName" | "ownershipToken">;
@@ -64,7 +74,7 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
   const events = yield* AgentControlWorktreeEventStore;
   const states = yield* AgentControlWorktreeStateRepository;
   const github = yield* AgentControlGithubStateRepository;
-  const verify = Effect.fn("EpicHandoffEvidence.verify")(
+  const verifyOriginal = Effect.fn("EpicHandoffEvidence.verifyOriginal")(
     function* (state: AgentControlEpicRuntimeView) {
       const final = state.finalVerification;
       if (
@@ -415,6 +425,242 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
     },
     Effect.mapError((cause) =>
       isEpicError(cause) ? cause : invalid("The retained Epic authority could not be verified."),
+    ),
+  );
+  const verify: (
+    state: AgentControlEpicRuntimeView,
+  ) => Effect.Effect<EpicHandoffProof, AgentControlEpicRpcError> = Effect.fn(
+    "EpicHandoffEvidence.verify",
+  )(
+    function* (state: AgentControlEpicRuntimeView) {
+      const rework = state.reviewReworks?.findLast((item) => item.status === "succeeded");
+      if (!rework) return yield* verifyOriginal(state);
+      const final = state.finalVerification;
+      if (
+        state.status !== "succeeded" ||
+        state.activeReviewReworkId != null ||
+        !state.acceptedCommitSha ||
+        state.acceptedCommitSha !== rework.candidateCommitSha ||
+        !final ||
+        final.status !== "passed" ||
+        final.commitSha !== state.acceptedCommitSha ||
+        final.evidenceId !== `epic-review-final:${rework.requestId}` ||
+        !rework.verification ||
+        epicDigest(rework.verification) !== epicDigest(final) ||
+        !state.finalVerificationHistory.some((item) => epicDigest(item) === epicDigest(final))
+      )
+        return yield* invalid(
+          "The repaired Epic has no complete successful review verification authority.",
+        );
+      const previousFinal = state.finalVerificationHistory.find(
+        (item) => item.evidenceId === rework.previousVerificationEvidenceId,
+      );
+      if (
+        !previousFinal ||
+        previousFinal.status !== "passed" ||
+        previousFinal.commitSha !== rework.previousAcceptedCommitSha ||
+        rework.reviewedCommitSha !== rework.previousAcceptedCommitSha ||
+        rework.reviewedVerificationEvidenceId !== previousFinal.evidenceId
+      )
+        return yield* invalid("The reviewed predecessor evidence is missing or inconsistent.");
+      const requests = yield* sql<{
+        requestJson: string;
+        requestDigest: string;
+        reviewedCommitSha: string;
+        reviewedVerificationEvidenceId: string;
+        idempotencyKey: string;
+        acceptedRevision: number;
+      }>`SELECT request_json AS "requestJson",request_digest AS "requestDigest",
+      reviewed_commit_sha AS "reviewedCommitSha",
+      reviewed_verification_evidence_id AS "reviewedVerificationEvidenceId",
+      idempotency_key AS "idempotencyKey",accepted_revision AS "acceptedRevision"
+      FROM main.agent_control_epic_review_requests
+      WHERE request_id=${rework.requestId} AND project_id=${state.projectId}
+        AND epic_run_id=${state.epicRunId}`;
+      if (
+        requests.length !== 1 ||
+        requests[0]!.requestDigest !== sha256Utf8(requests[0]!.requestJson) ||
+        requests[0]!.requestJson !==
+          epicJson({
+            projectId: state.projectId,
+            epicRunId: state.epicRunId,
+            expectedRevision: requests[0]!.acceptedRevision - 1,
+            reviewedCommitSha: rework.reviewedCommitSha,
+            reviewedVerificationEvidenceId: rework.reviewedVerificationEvidenceId,
+            findings: rework.findings,
+            idempotencyKey: rework.idempotencyKey,
+          }) ||
+        requests[0]!.idempotencyKey !== rework.idempotencyKey ||
+        requests[0]!.reviewedCommitSha !== rework.reviewedCommitSha ||
+        requests[0]!.reviewedVerificationEvidenceId !== rework.reviewedVerificationEvidenceId
+      )
+        return yield* invalid("The immutable review request evidence is missing or corrupt.");
+      const acceptedHistory = yield* sql<{
+        stateJson: string;
+        stateDigest: string;
+        activeRequestId: string | null;
+      }>`SELECT state_json AS "stateJson",state_digest AS "stateDigest",
+      json_extract(state_json,'$.activeReviewReworkId') AS "activeRequestId"
+      FROM main.agent_control_epic_history
+      WHERE epic_run_id=${state.epicRunId} AND revision=${requests[0]!.acceptedRevision}`;
+      if (
+        acceptedHistory.length !== 1 ||
+        acceptedHistory[0]!.stateDigest !== sha256Utf8(acceptedHistory[0]!.stateJson) ||
+        acceptedHistory[0]!.activeRequestId !== rework.requestId
+      )
+        return yield* invalid("The accepted review request history is missing or corrupt.");
+      const repairResults = yield* sql<{
+        attempt: number;
+        intentJson: string;
+        intentDigest: string;
+        providerInstanceId: string;
+        model: string;
+        threadId: string;
+        turnRequestCommandId: string;
+        messageId: string;
+        claimedAt: string | null;
+        receiptTurnId: string | null;
+        projectedTurnId: string | null;
+        pendingMessageId: string | null;
+        turnState: string | null;
+        checkpointRef: string | null;
+        checkpointStatus: string | null;
+        resultJson: string;
+        resultDigest: string;
+      }>`SELECT result.attempt,intent.intent_json AS "intentJson",
+      intent.intent_digest AS "intentDigest",
+      intent.provider_instance_id AS "providerInstanceId",intent.model,
+      intent.thread_id AS "threadId",intent.turn_request_command_id AS "turnRequestCommandId",
+      intent.message_id AS "messageId",claim.claimed_at AS "claimedAt",
+      receipt.provider_turn_id AS "receiptTurnId",turn.turn_id AS "projectedTurnId",
+      turn.pending_message_id AS "pendingMessageId",turn.state AS "turnState",
+      turn.checkpoint_ref AS "checkpointRef",turn.checkpoint_status AS "checkpointStatus",
+      result.result_json AS "resultJson",result.result_digest AS "resultDigest"
+      FROM main.agent_control_epic_review_repair_results result
+      JOIN main.agent_control_epic_review_repair_intents intent
+        ON intent.request_id=result.request_id AND intent.attempt=result.attempt
+      LEFT JOIN main.agent_control_epic_review_repair_delivery_claims claim
+        ON claim.request_id=intent.request_id AND claim.attempt=intent.attempt
+      LEFT JOIN main.agent_control_epic_review_repair_delivery_receipts receipt
+        ON receipt.request_id=intent.request_id AND receipt.attempt=intent.attempt
+      LEFT JOIN main.projection_turns turn
+        ON turn.thread_id=intent.thread_id AND turn.pending_message_id=intent.message_id
+      WHERE result.request_id=${rework.requestId}
+      ORDER BY result.attempt DESC LIMIT 1`;
+      if (
+        repairResults.length !== 1 ||
+        repairResults[0]!.intentDigest !== sha256Utf8(repairResults[0]!.intentJson) ||
+        repairResults[0]!.resultDigest !== sha256Utf8(repairResults[0]!.resultJson) ||
+        repairResults[0]!.turnRequestCommandId !==
+          `epic-review-turn:${rework.requestId}:${repairResults[0]!.attempt}` ||
+        repairResults[0]!.messageId !==
+          `epic-review-message:${rework.requestId}:${repairResults[0]!.attempt}` ||
+        !repairResults[0]!.claimedAt ||
+        !repairResults[0]!.receiptTurnId ||
+        repairResults[0]!.receiptTurnId !== repairResults[0]!.projectedTurnId ||
+        repairResults[0]!.pendingMessageId !== repairResults[0]!.messageId ||
+        repairResults[0]!.turnState !== "completed" ||
+        !repairResults[0]!.checkpointRef ||
+        repairResults[0]!.checkpointStatus !== "ready"
+      )
+        return yield* invalid(
+          "The accepted repair result is not bound to its authorized provider turn and checkpoint.",
+        );
+      const repairAttempt = rework.repairAttempts.find(
+        (attempt) => attempt.attempt === repairResults[0]!.attempt,
+      );
+      if (
+        !repairAttempt ||
+        repairAttempt.status !== "succeeded" ||
+        repairAttempt.providerInstanceId !== repairResults[0]!.providerInstanceId ||
+        repairAttempt.model !== repairResults[0]!.model ||
+        repairAttempt.threadId !== repairResults[0]!.threadId
+      )
+        return yield* invalid("The accepted repair attempt does not match its immutable intent.");
+      const repairResult = yield* decodeReviewRepairResult(repairResults[0]!.resultJson);
+      if (
+        repairResult.status !== "succeeded" ||
+        repairResult.candidateCommitSha !== state.acceptedCommitSha
+      )
+        return yield* invalid("The accepted repair result does not match the current commit.");
+      const required = state.checks.filter((check) => check.required);
+      if (
+        !required.length ||
+        required.some(
+          (check) =>
+            !final.checks.some(
+              (result) =>
+                result.id === check.id && result.status === "passed" && result.exitCode === 0,
+            ),
+        )
+      )
+        return yield* invalid("Required repaired-result checks are missing or did not pass.");
+      const manifests = yield* sql<{
+        fenceToken: number;
+        worktreePath: string;
+        codeDigest: string;
+        checksJson: string;
+        manifestDigest: string;
+      }>`SELECT fence_token AS "fenceToken",worktree_path AS "worktreePath",
+      code_digest AS "codeDigest",checks_json AS "checksJson",
+      manifest_digest AS "manifestDigest"
+      FROM main.agent_control_verification_check_manifests
+      WHERE provider_delivery_id=${final.evidenceId}`;
+      const manifest = manifests[0];
+      if (
+        !manifest ||
+        manifests.length !== 1 ||
+        manifest.fenceToken !== state.verificationAttempt ||
+        manifest.checksJson !== epicJson(state.checks) ||
+        manifest.manifestDigest !== final.manifestDigest ||
+        !rawVerificationCodeDigest(manifest.codeDigest).startsWith(
+          VERIFICATION_CODE_SNAPSHOT_PREFIX,
+        )
+      )
+        return yield* invalid("The repaired-result verification manifest is invalid.");
+      const assessment = yield* assessVerificationChecks(
+        sql,
+        {
+          evidence: {
+            providerDeliveryId: final.evidenceId,
+            handoffId: final.evidenceId,
+            fenceToken: state.verificationAttempt,
+            worktreePath: manifest.worktreePath,
+          },
+          delivery: { providerTurnId: final.evidenceId },
+        },
+        { checkCurrentCode: false },
+      );
+      if (assessment.code !== null)
+        return yield* invalid(
+          "The repaired-result verification receipts are incomplete or unsuccessful.",
+        );
+      const previousAttempt = Math.max(1, state.verificationAttempt - 1);
+      const reworkIndex = state.reviewReworks?.findLastIndex(
+        (item) => item.requestId === rework.requestId,
+      );
+      const previousProof = yield* verify({
+        ...state,
+        status: "succeeded",
+        acceptedCommitSha: rework.previousAcceptedCommitSha,
+        verificationAttempt: previousAttempt,
+        finalVerification: previousFinal,
+        activeReviewReworkId: null,
+        reviewReworks:
+          reworkIndex === undefined || reworkIndex < 0
+            ? []
+            : (state.reviewReworks ?? []).slice(0, reworkIndex),
+      });
+      return {
+        ...previousProof,
+        authority: { ...previousProof.authority, commitSha: state.acceptedCommitSha },
+        finalCheckCount: required.length,
+      };
+    },
+    Effect.mapError((cause) =>
+      isEpicError(cause)
+        ? cause
+        : invalid("The retained review repair authority could not be verified."),
     ),
   );
   return { verify };

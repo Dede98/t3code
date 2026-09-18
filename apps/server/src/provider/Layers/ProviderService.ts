@@ -2516,6 +2516,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               ? invoke
               : Effect.uninterruptibleMask((restore) =>
                   Effect.gen(function* () {
+                    if (invocationBoundary.beforeInvocation !== undefined)
+                      yield* invocationBoundary.beforeInvocation();
                     const fiber = yield* invoke.pipe(
                       Effect.forkChild({ startImmediately: true, uninterruptible: false }),
                     );

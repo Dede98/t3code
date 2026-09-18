@@ -2,6 +2,7 @@ import { AgentControlEpic } from "./agentControl/epic/Services/AgentControlEpic.
 import { AgentControlEpicProgress } from "./agentControl/epic/Services/AgentControlEpicProgress.ts";
 import { AgentControlEpicLive } from "./agentControl/epic/Layers/AgentControlEpic.ts";
 import { EpicResultsLive, EpicCheckExecutorLive } from "./agentControl/epic/results.ts";
+import { EpicReviewRepairLive } from "./agentControl/epic/reviewRepair.ts";
 import {
   EpicHandoffEvidence,
   makeEpicHandoffEvidence,
@@ -894,6 +895,7 @@ const AgentControlRunOnceControllerServiceLayerLive = AgentControlRunOnceControl
 
 const AgentControlEpicServiceLive = AgentControlEpicLive.pipe(
   Layer.provide(AgentControlPolicyLayerLive),
+  Layer.provide(OrchestrationLayerLive),
   Layer.provide(
     Layer.effect(EpicHandoffEvidence, makeEpicHandoffEvidence).pipe(
       Layer.provide(AgentControlRuntimeServicesLayerLive),
@@ -911,6 +913,13 @@ const AgentControlEpicServiceLive = AgentControlEpicLive.pipe(
     EpicResultsLive.pipe(
       Layer.provide(EpicCheckExecutorLive),
       Layer.provide(AgentControlWorktreeControllerServiceLayerLive),
+      Layer.provide(RuntimeCoreDependenciesBaseLive),
+    ),
+  ),
+  Layer.provide(
+    EpicReviewRepairLive.pipe(
+      Layer.provide(AgentControlPolicyLayerLive),
+      Layer.provide(OrchestrationLayerLive),
       Layer.provide(RuntimeCoreDependenciesBaseLive),
     ),
   ),

@@ -335,6 +335,58 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
     // startup reconciliation with an active session snapshot.
     assert.deepStrictEqual(calls, []);
 
+    calls.length = 0;
+    currentProviderPermit = {
+      ...providerPermit,
+      requestId: "provider-proven-orphan",
+      idempotencyKey: "automatic:epic-review:request:1",
+    };
+    activeRows = [
+      {
+        ...currentProviderPermit,
+        providerTurnId: null,
+        status: "entered",
+        waitReason: null,
+        lastObservedActivity: "unknown",
+        lastObservedAt: "2026-09-16T10:09:00.000Z",
+        permit: currentProviderPermit,
+      },
+    ];
+    yield* coordinator.retireOrphaned!(currentProviderPermit.idempotencyKey);
+    assert.deepStrictEqual(calls, [
+      "provider-reconcile:active",
+      "host-adopt",
+      "provider-release",
+      "host-release",
+    ]);
+
+    calls.length = 0;
+    currentProviderPermit = {
+      ...providerPermit,
+      requestId: "provider-proven-running",
+      idempotencyKey: "automatic:epic-review:request:2",
+    };
+    activeRows = [
+      {
+        ...currentProviderPermit,
+        providerTurnId: null,
+        status: "entered",
+        waitReason: null,
+        lastObservedActivity: "unknown",
+        lastObservedAt: "2026-09-16T10:10:00.000Z",
+        permit: currentProviderPermit,
+      },
+    ];
+    yield* coordinator.bindOrphaned!(currentProviderPermit.idempotencyKey, "recovered-turn");
+    yield* coordinator.bindOrphaned!(currentProviderPermit.idempotencyKey, "recovered-turn");
+    assert.deepStrictEqual(calls, [
+      "provider-reconcile:active",
+      "host-adopt",
+      "host-active",
+      "provider-enter:recovered-turn",
+    ]);
+
+    calls.length = 0;
     hostActivityAllowed = false;
     const staleHostEnter = yield* coordinator.enter(permit).pipe(Effect.exit);
     assert.equal(staleHostEnter._tag, "Failure");

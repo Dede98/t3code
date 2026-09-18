@@ -3129,10 +3129,15 @@ routing.layer("ProviderServiceLive routing", (it) => {
           Effect.as({ threadId: input.threadId, turnId: asTurnId("turn-manual-boundary") }),
         ),
       );
+      let firstPreInvocationPassed = false;
       let firstInvocationStarted = false;
       const first = yield* provider.sendTurnWithInvocationBoundary!(
         { threadId, input: "first", modelSelection },
         {
+          beforeInvocation: () =>
+            Effect.sync(() => {
+              firstPreInvocationPassed = true;
+            }),
           onInvocationStarted: () => {
             firstInvocationStarted = true;
           },
@@ -3140,12 +3145,18 @@ routing.layer("ProviderServiceLive routing", (it) => {
       ).pipe(Effect.forkChild);
       yield* Deferred.await(adapterInvoked);
       yield* Effect.yieldNow;
+      assert.isTrue(firstPreInvocationPassed);
       assert.isTrue(firstInvocationStarted);
 
+      let queuedPreInvocationPassed = false;
       let queuedInvocationStarted = false;
       const queued = yield* provider.sendTurnWithInvocationBoundary!(
         { threadId, input: "queued", modelSelection },
         {
+          beforeInvocation: () =>
+            Effect.sync(() => {
+              queuedPreInvocationPassed = true;
+            }),
           onInvocationStarted: () => {
             queuedInvocationStarted = true;
           },
@@ -3153,6 +3164,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       ).pipe(Effect.forkChild);
       yield* Effect.yieldNow;
       yield* Fiber.interrupt(queued);
+      assert.isFalse(queuedPreInvocationPassed);
       assert.isFalse(queuedInvocationStarted);
       assert.equal(routing.codex.sendTurn.mock.calls.length, callsBefore + 1);
 

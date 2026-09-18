@@ -52,6 +52,7 @@ import {
 } from "../../resourceAdmission/ProviderResourceCoordinator.ts";
 import { AgentControlInitialPlanningHandoffStoreLive } from "../../agentControl/initialPlanning/Layers/AgentControlInitialPlanningHandoffStore.ts";
 import { AgentControlInitialPlanningHandoffStore } from "../../agentControl/initialPlanning/Services/AgentControlInitialPlanningHandoffStore.ts";
+import { canonicalJson, sha256Utf8 } from "../../agentControl/initialPlanning/eventEvidence.ts";
 import { ProviderTurnRequestExecutorLive } from "./ProviderTurnRequestExecutor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -326,6 +327,74 @@ export const isImplementationOrVerificationOwnedTurnRequest = Effect.fn(
     );
   }
   return count === 1;
+});
+
+interface EpicReviewRepairTurnOwnership {
+  readonly requestId: string;
+  readonly attempt: number;
+  readonly projectId: string;
+  readonly epicRunId: string;
+  readonly threadId: string;
+  readonly messageId: string;
+  readonly providerInstanceId: string;
+  readonly model: string;
+  readonly mayStart: boolean;
+}
+
+/**
+ * Review repair is autonomous ownership even after revocation. Returning the
+ * retained row prevents a cancelled/replayed command from falling through to
+ * the manual interactive lane.
+ */
+export const loadEpicReviewRepairTurnOwnership = Effect.fn(
+  "ProviderCommandReactor.loadEpicReviewRepairTurnOwnership",
+)(function* (sql: SqlClient.SqlClient, commandId: CommandId) {
+  const rows = yield* sql<{
+    requestId: string;
+    attempt: number;
+    projectId: string;
+    epicRunId: string;
+    threadId: string;
+    messageId: string;
+    providerInstanceId: string;
+    model: string;
+    mayStart: number;
+  }>`SELECT intent.request_id AS "requestId",intent.attempt,
+      request.project_id AS "projectId",request.epic_run_id AS "epicRunId",
+      intent.thread_id AS "threadId",intent.message_id AS "messageId",
+      intent.provider_instance_id AS "providerInstanceId",intent.model,
+      CASE WHEN cancellation.request_id IS NULL AND claim.request_id IS NULL
+        AND result.request_id IS NULL AND run.epic_run_id IS NOT NULL
+        AND json_extract(run.state_json,'$.status')='verifying'
+        AND json_extract(run.state_json,'$.activeReviewReworkId')=intent.request_id
+        AND project.mode IN ('armed','run-once') AND project.paused_from_mode IS NULL
+        AND EXISTS (
+          SELECT 1 FROM json_each(json_extract(run.state_json,'$.reviewReworks')) rework
+          WHERE json_extract(rework.value,'$.requestId')=intent.request_id
+            AND json_extract(rework.value,'$.status') IN ('accepted','repairing')
+        ) THEN 1 ELSE 0 END AS "mayStart"
+    FROM main.agent_control_epic_review_repair_intents intent
+    JOIN main.agent_control_epic_review_requests request
+      ON request.request_id=intent.request_id
+    LEFT JOIN main.agent_control_epic_runs run
+      ON run.epic_run_id=request.epic_run_id AND run.project_id=request.project_id
+    LEFT JOIN main.agent_control_project_states project
+      ON project.project_id=request.project_id
+    LEFT JOIN main.agent_control_epic_review_repair_delivery_claims claim
+      ON claim.request_id=intent.request_id AND claim.attempt=intent.attempt
+    LEFT JOIN main.agent_control_epic_review_repair_cancellations cancellation
+      ON cancellation.request_id=intent.request_id AND cancellation.attempt=intent.attempt
+    LEFT JOIN main.agent_control_epic_review_repair_results result
+      ON result.request_id=intent.request_id AND result.attempt=intent.attempt
+    WHERE intent.turn_request_command_id=${commandId}`;
+  if (rows.length > 1)
+    return yield* Effect.die(
+      new Error(`Epic review repair turn ownership is non-unique for '${commandId}'.`),
+    );
+  const row = rows[0];
+  return row
+    ? ({ ...row, mayStart: row.mayStart === 1 } satisfies EpicReviewRepairTurnOwnership)
+    : null;
 });
 
 const make = Effect.gen(function* () {
@@ -1269,6 +1338,8 @@ const make = Effect.gen(function* () {
   const processTurnStartRequested = Effect.fn("processTurnStartRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
   ) {
+    let reviewRepairOwnership: EpicReviewRepairTurnOwnership | null = null;
+    let sealedReviewRepairThread = false;
     if (event.commandId !== null) {
       const commandId = event.commandId;
       yield* hooks.beforeInitialPlanningOwnershipRead(commandId);
@@ -1287,6 +1358,15 @@ const make = Effect.gen(function* () {
       if (yield* isImplementationOrVerificationOwnedTurnRequest(sql, commandId)) {
         return;
       }
+      reviewRepairOwnership = yield* loadEpicReviewRepairTurnOwnership(sql, commandId);
+      if (reviewRepairOwnership && !reviewRepairOwnership.mayStart) return;
+    }
+    if (reviewRepairOwnership === null) {
+      const sealed = yield* sql`SELECT 1
+        FROM main.agent_control_epic_review_repair_intents
+        WHERE thread_id=${event.payload.threadId}
+        LIMIT 1`;
+      sealedReviewRepairThread = sealed.length === 1;
     }
     const key = turnStartKeyForEvent(event);
     if (yield* hasHandledTurnStartRecently(key)) {
@@ -1297,6 +1377,15 @@ const make = Effect.gen(function* () {
     if (!thread) {
       return;
     }
+    if (
+      reviewRepairOwnership &&
+      (reviewRepairOwnership.threadId !== event.payload.threadId ||
+        reviewRepairOwnership.messageId !== event.payload.messageId ||
+        thread.projectId !== reviewRepairOwnership.projectId)
+    )
+      return yield* Effect.die(
+        new Error("Epic review repair turn event does not match its durable ownership."),
+      );
     const turnStart = yield* projectionSnapshotQuery.getTurnStartMessage({
       threadId: thread.id,
       messageId: event.payload.messageId,
@@ -1324,6 +1413,17 @@ const make = Effect.gen(function* () {
         createdAt: event.payload.createdAt,
         requestId: event.payload.messageId,
       });
+    if (sealedReviewRepairThread) {
+      const detail =
+        "This retained review-repair thread accepts only its immutable findings-bound turn.";
+      yield* setThreadSessionErrorOnTurnStartFailure({
+        threadId: event.payload.threadId,
+        detail,
+        createdAt: event.payload.createdAt,
+      });
+      yield* appendTurnStartFailure("Review repair thread is sealed", detail);
+      return;
+    }
 
     const handleTurnStartFailure = (cause: Cause.Cause<unknown>) => {
       if (Cause.hasInterruptsOnly(cause)) {
@@ -1643,7 +1743,20 @@ const make = Effect.gen(function* () {
       return;
     }
     const request = sendTurnRequest.value;
+    if (
+      reviewRepairOwnership &&
+      (request.modelSelection?.instanceId !== reviewRepairOwnership.providerInstanceId ||
+        request.modelSelection.model !== reviewRepairOwnership.model)
+    )
+      return yield* Effect.die(
+        new Error("Epic review repair turn model does not match its immutable intent."),
+      );
     if (Option.isNone(providerResourceCoordinator)) {
+      if (reviewRepairOwnership)
+        return yield* appendTurnStartFailure(
+          "Review repair could not start",
+          "Shared automatic provider admission is unavailable.",
+        );
       yield* providerService
         .sendTurn(request)
         .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
@@ -1680,20 +1793,85 @@ const make = Effect.gen(function* () {
         });
       });
     let providerInvocationStarted = false;
+    const claimReviewRepairInvocation = reviewRepairOwnership
+      ? () =>
+          sql
+            .withTransaction(
+              sql<{
+                requestId: string;
+              }>`INSERT INTO main.agent_control_epic_review_repair_delivery_claims(
+                request_id,attempt,claimed_at)
+                SELECT intent.request_id,intent.attempt,${event.payload.createdAt}
+                FROM main.agent_control_epic_review_repair_intents intent
+                JOIN main.agent_control_epic_review_requests request
+                  ON request.request_id=intent.request_id
+                JOIN main.agent_control_epic_runs run
+                  ON run.epic_run_id=request.epic_run_id AND run.project_id=request.project_id
+                JOIN main.agent_control_project_states project
+                  ON project.project_id=request.project_id
+                LEFT JOIN main.agent_control_epic_review_repair_cancellations cancellation
+                  ON cancellation.request_id=intent.request_id AND cancellation.attempt=intent.attempt
+                LEFT JOIN main.agent_control_epic_review_repair_results result
+                  ON result.request_id=intent.request_id AND result.attempt=intent.attempt
+                WHERE intent.request_id=${reviewRepairOwnership.requestId}
+                  AND intent.attempt=${reviewRepairOwnership.attempt}
+                  AND intent.turn_request_command_id=${event.commandId}
+                  AND intent.thread_id=${event.payload.threadId}
+                  AND intent.message_id=${event.payload.messageId}
+                  AND cancellation.request_id IS NULL AND result.request_id IS NULL
+                  AND json_extract(run.state_json,'$.status')='verifying'
+                  AND json_extract(run.state_json,'$.activeReviewReworkId')=intent.request_id
+                  AND project.mode IN ('armed','run-once') AND project.paused_from_mode IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM json_each(json_extract(run.state_json,'$.reviewReworks')) rework
+                    WHERE json_extract(rework.value,'$.requestId')=intent.request_id
+                      AND json_extract(rework.value,'$.status') IN ('accepted','repairing')
+                  )
+                RETURNING request_id AS "requestId"`,
+            )
+            .pipe(
+              Effect.filterOrFail(
+                (claimed) => claimed.length === 1,
+                () =>
+                  new ProviderAdapterRequestError({
+                    provider: "review-repair",
+                    method: "thread.turn.start",
+                    detail:
+                      "Epic review repair lost authority before the provider invocation boundary.",
+                  }),
+              ),
+              Effect.asVoid,
+              Effect.mapError((cause) =>
+                isProviderAdapterRequestError(cause)
+                  ? cause
+                  : new ProviderAdapterRequestError({
+                      provider: "review-repair",
+                      method: "thread.turn.start",
+                      detail: "Epic review repair delivery authority could not be persisted.",
+                      cause,
+                    }),
+              ),
+            )
+      : undefined;
     const start = Effect.gen(function* () {
       const permit = yield* Effect.uninterruptibleMask((restore) =>
         Effect.flatMap(
           restore(
             resourceCoordinator.acquire({
-              idempotencyKey: `manual:${key}`,
+              idempotencyKey: reviewRepairOwnership
+                ? `automatic:epic-review:${reviewRepairOwnership.requestId}:${reviewRepairOwnership.attempt}`
+                : `manual:${key}`,
               providerInstanceId: instanceId,
               // Provider instances are not assumed to be separate paid accounts.
               // Settings may explicitly split or join these conservative driver scopes.
               continuationKey: String(instanceInfo.value.driverKind),
               threadId: String(event.payload.threadId),
               requestedAt: event.payload.createdAt,
-              workloadClass: "interactive",
-              source: "manual",
+              workloadClass: reviewRepairOwnership ? "background" : "interactive",
+              source: reviewRepairOwnership ? "automatic" : "manual",
+              ...(reviewRepairOwnership
+                ? { stage: "implementation" as const, handoffId: reviewRepairOwnership.requestId }
+                : {}),
               onWait: (wait) => setAdmissionWait(wait).pipe(Effect.ignore),
             }),
           ),
@@ -1706,6 +1884,12 @@ const make = Effect.gen(function* () {
       yield* setAdmissionWait(undefined);
       yield* resourceCoordinator.enter(permit);
       const sendTurnWithInvocationBoundary = providerService.sendTurnWithInvocationBoundary;
+      if (reviewRepairOwnership && sendTurnWithInvocationBoundary === undefined)
+        return yield* new ProviderAdapterRequestError({
+          provider: "review-repair",
+          method: "thread.turn.start",
+          detail: "The durable provider invocation boundary is unavailable.",
+        });
       const result = yield* sendTurnWithInvocationBoundary === undefined
         ? Effect.sync(() => {
             // Older injected services cannot expose the boundary. Preserve
@@ -1714,10 +1898,30 @@ const make = Effect.gen(function* () {
             return providerService.sendTurn(request);
           }).pipe(Effect.flatten)
         : sendTurnWithInvocationBoundary(request, {
+            ...(claimReviewRepairInvocation
+              ? { beforeInvocation: claimReviewRepairInvocation }
+              : {}),
             onInvocationStarted: () => {
               providerInvocationStarted = true;
             },
           });
+      if (reviewRepairOwnership) {
+        yield* sql`INSERT INTO main.agent_control_epic_review_repair_delivery_receipts(
+          request_id,attempt,provider_turn_id,accepted_at)
+          VALUES (${reviewRepairOwnership.requestId},${reviewRepairOwnership.attempt},
+            ${String(result.turnId)},${event.payload.createdAt})
+          ON CONFLICT(request_id,attempt) DO NOTHING`;
+        const receipt = yield* sql<{
+          providerTurnId: string;
+        }>`SELECT provider_turn_id AS "providerTurnId"
+          FROM main.agent_control_epic_review_repair_delivery_receipts
+          WHERE request_id=${reviewRepairOwnership.requestId}
+            AND attempt=${reviewRepairOwnership.attempt}`;
+        if (receipt.length !== 1 || receipt[0]!.providerTurnId !== String(result.turnId))
+          return yield* Effect.die(
+            new Error("Epic review repair provider receipt conflicts with its accepted turn."),
+          );
+      }
       yield* resourceCoordinator.enter(permit, String(result.turnId));
     }).pipe(
       Effect.onError(() => {
@@ -2110,6 +2314,202 @@ const make = Effect.gen(function* () {
 
   const worker = yield* makeDrainableWorker(processDomainEventSafely);
 
+  const recoverEpicReviewRepairDeliveries = Effect.fn(
+    "ProviderCommandReactor.recoverEpicReviewRepairDeliveries",
+  )(function* () {
+    const recoveredAt = DateTime.formatIso(yield* DateTime.now);
+    const rows = yield* sql<{
+      requestId: string;
+      attempt: number;
+      threadId: string;
+      messageId: string;
+      providerInstanceId: string;
+      claimedAt: string | null;
+      cancellationAt: string | null;
+      resultStatus: string | null;
+      receiptTurnId: string | null;
+      projectedTurnId: string | null;
+      turnState: string | null;
+    }>`SELECT intent.request_id AS "requestId",intent.attempt,
+      intent.thread_id AS "threadId",intent.message_id AS "messageId",
+      intent.provider_instance_id AS "providerInstanceId",
+      claim.claimed_at AS "claimedAt",
+      cancellation.cancelled_at AS "cancellationAt",
+      json_extract(result.result_json,'$.status') AS "resultStatus",
+      receipt.provider_turn_id AS "receiptTurnId",turn.turn_id AS "projectedTurnId",
+      turn.state AS "turnState"
+      FROM main.agent_control_epic_review_repair_intents intent
+      LEFT JOIN main.agent_control_epic_review_repair_delivery_claims claim
+        ON claim.request_id=intent.request_id AND claim.attempt=intent.attempt
+      LEFT JOIN main.agent_control_epic_review_repair_delivery_receipts receipt
+        ON receipt.request_id=intent.request_id AND receipt.attempt=intent.attempt
+      LEFT JOIN main.agent_control_epic_review_repair_cancellations cancellation
+        ON cancellation.request_id=intent.request_id AND cancellation.attempt=intent.attempt
+      LEFT JOIN main.agent_control_epic_review_repair_results result
+        ON result.request_id=intent.request_id AND result.attempt=intent.attempt
+      LEFT JOIN main.projection_turns turn
+        ON turn.thread_id=intent.thread_id AND turn.pending_message_id=intent.message_id
+      WHERE (result.request_id IS NULL OR json_extract(result.result_json,'$.status')='blocked')
+        AND (claim.request_id IS NOT NULL OR cancellation.request_id IS NOT NULL)
+      ORDER BY intent.request_id,intent.attempt`;
+    const sessions = yield* providerService.listSessions();
+    yield* Effect.forEach(
+      rows,
+      (row) =>
+        Effect.gen(function* () {
+          const activeSession = sessions.find(
+            (session) =>
+              String(session.threadId) === row.threadId && session.activeTurnId !== undefined,
+          );
+          const retainReceipt = Effect.fn("ProviderCommandReactor.retainRecoveredReviewReceipt")(
+            function* (providerTurnId: string) {
+              yield* sql`INSERT INTO main.agent_control_epic_review_repair_delivery_receipts(
+                request_id,attempt,provider_turn_id,accepted_at)
+                VALUES (${row.requestId},${row.attempt},${providerTurnId},${recoveredAt})
+                ON CONFLICT(request_id,attempt) DO NOTHING`;
+              const retained = yield* sql<{
+                providerTurnId: string;
+              }>`SELECT provider_turn_id AS "providerTurnId"
+                FROM main.agent_control_epic_review_repair_delivery_receipts
+                WHERE request_id=${row.requestId} AND attempt=${row.attempt}`;
+              if (retained.length !== 1 || retained[0]!.providerTurnId !== providerTurnId)
+                return yield* Effect.die(
+                  new Error("Recovered Epic review repair turn conflicts with its receipt."),
+                );
+              return providerTurnId;
+            },
+          );
+          let acceptedTurnId = row.receiptTurnId;
+          if (acceptedTurnId === null && row.projectedTurnId !== null)
+            acceptedTurnId = yield* retainReceipt(row.projectedTurnId);
+          // Review repair threads are sealed to their one immutable command.
+          // Before any terminal result exists, a live turn on the claimed
+          // provider instance is therefore the adapter-accepted review turn
+          // whose post-invocation receipt was lost to the crash.
+          if (
+            acceptedTurnId === null &&
+            row.resultStatus === null &&
+            row.claimedAt !== null &&
+            activeSession?.providerInstanceId === row.providerInstanceId
+          )
+            acceptedTurnId = yield* retainReceipt(String(activeSession.activeTurnId!));
+          const hasExactActiveSession =
+            acceptedTurnId !== null &&
+            activeSession !== undefined &&
+            activeSession.providerInstanceId === row.providerInstanceId &&
+            String(activeSession.activeTurnId) === acceptedTurnId;
+          const retireOrphaned = () => {
+            const retire = Option.isSome(providerResourceCoordinator)
+              ? providerResourceCoordinator.value.retireOrphaned
+              : undefined;
+            if (retire === undefined)
+              return Effect.die(new Error("Shared provider orphan retirement is unavailable."));
+            return retire(`automatic:epic-review:${row.requestId}:${row.attempt}`);
+          };
+          const bindOrphaned = () => {
+            const bind = Option.isSome(providerResourceCoordinator)
+              ? providerResourceCoordinator.value.bindOrphaned
+              : undefined;
+            if (bind === undefined) return Effect.void;
+            return bind(
+              `automatic:epic-review:${row.requestId}:${row.attempt}`,
+              acceptedTurnId!,
+            ).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning(
+                  "Epic review recovery could not bind retained capacity to its proven turn",
+                  { threadId: row.threadId, cause: Cause.pretty(cause) },
+                ),
+              ),
+            );
+          };
+          const interrupt = () =>
+            orchestrationEngine.dispatch({
+              type: "thread.turn.interrupt",
+              commandId: CommandId.make(`epic-review-interrupt:${row.requestId}:${row.attempt}`),
+              threadId: ThreadId.make(row.threadId),
+              createdAt: row.cancellationAt ?? row.claimedAt ?? recoveredAt,
+            });
+          const interruptProvider = () =>
+            !hasExactActiveSession || activeSession === undefined
+              ? Effect.void
+              : providerService.interruptTurn({ threadId: ThreadId.make(row.threadId) }).pipe(
+                  Effect.catchCause((interruptCause) =>
+                    providerService.stopSession({ threadId: ThreadId.make(row.threadId) }).pipe(
+                      Effect.catchCause((stopCause) =>
+                        Effect.logWarning(
+                          "Epic review recovery could not stop the ambiguous provider session",
+                          {
+                            threadId: row.threadId,
+                            interruptCause: Cause.pretty(interruptCause),
+                            stopCause: Cause.pretty(stopCause),
+                          },
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+          const recordInterrupt = () =>
+            hasExactActiveSession
+              ? interrupt().pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.logWarning(
+                      "Epic review recovery could not retain its interrupt command",
+                      {
+                        threadId: row.threadId,
+                        cause: Cause.pretty(cause),
+                      },
+                    ),
+                  ),
+                )
+              : Effect.void;
+          const terminalProjection =
+            row.turnState === "completed" ||
+            row.turnState === "error" ||
+            row.turnState === "interrupted";
+          if (hasExactActiveSession) yield* bindOrphaned();
+          if (row.cancellationAt !== null) {
+            yield* interruptProvider();
+            yield* recordInterrupt();
+            if (
+              !hasExactActiveSession &&
+              (terminalProjection || (row.claimedAt === null && acceptedTurnId === null))
+            )
+              yield* retireOrphaned();
+            return;
+          }
+          if (acceptedTurnId !== null) {
+            if (hasExactActiveSession) return;
+            if (terminalProjection) {
+              yield* retireOrphaned();
+              return;
+            }
+          }
+          const result = {
+            status: "blocked" as const,
+            candidateCommitSha: null,
+            code: "review-repair-delivery-ambiguous",
+            message:
+              "The server restarted without terminal proof for the authorized provider turn. The attempt is fenced and requires explicit recovery before retrying.",
+          };
+          const resultJson = canonicalJson(result);
+          yield* interruptProvider();
+          yield* recordInterrupt();
+          yield* sql`INSERT INTO main.agent_control_epic_review_repair_results(
+            request_id,attempt,result_json,result_digest,completed_at)
+            VALUES (${row.requestId},${row.attempt},${resultJson},${sha256Utf8(resultJson)},${recoveredAt})
+            ON CONFLICT(request_id,attempt) DO NOTHING`;
+          if (activeSession === undefined)
+            yield* setThreadSessionErrorOnTurnStartFailure({
+              threadId: ThreadId.make(row.threadId),
+              detail: result.message,
+              createdAt: recoveredAt,
+            });
+        }),
+      { concurrency: 1, discard: true },
+    );
+  });
+
   const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
     const interruptedTitleRegenerations = yield* findInterruptedThreadTitleRegenerations().pipe(
       Effect.catchCause((cause) => {
@@ -2142,6 +2542,16 @@ const make = Effect.gen(function* () {
     yield* Effect.addFinalizer(() => hooks.onDomainEventSubscriptionRelease?.() ?? Effect.void);
     yield* hooks.afterDomainEventSubscription?.() ?? Effect.void;
     yield* forkParked(Stream.runForEach(domainEvents, processEvent));
+
+    yield* recoverEpicReviewRepairDeliveries().pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("provider command reactor could not recover Epic review repair", {
+              cause: Cause.pretty(cause),
+            }),
+      ),
+    );
 
     // The domain event stream is hot, so work pending before this reactor
     // starts cannot be resumed. Correlated completions only clear the request

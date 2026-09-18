@@ -144,6 +144,15 @@ If interrupted, retry the same handoff; T3 Code checks the existing branch and p
 The saved PR remains available after reload and under previous Epics. A closed or merged PR is
 never replaced automatically, and a publication failure retains the local result and its evidence.
 
+If independent review finds a problem in a successfully verified Epic, expand **Report review
+findings** while Armed remains enabled. Record each concrete correction and how it will be accepted,
+then request repair and re-verification. The repair uses the configured repair route and its bounded
+fallbacks; the previous commit, verification and PR remain in history while the candidate is repaired
+and all required checks run again. A failed repair or check stays blocked and is not publishable.
+After the new result passes, choose **Review PR update**, verify the old and new commits, then
+**Update Draft PR**. T3 Code only fast-forwards the same owned open Draft PR through the normal
+publication permission; a changed branch, non-draft, closed or merged PR is not overwritten.
+
 ### Queue approved Epics
 
 Inspect each Epic and choose **Approve for queue**, then put waiting entries in the desired order.

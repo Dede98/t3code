@@ -14,6 +14,7 @@ import {
   AgentControlEpicHandoffPreviewInput,
   AgentControlEpicHandoffPreview,
   AgentControlEpicHandoffPublishInput,
+  AgentControlEpicReviewReworkInput,
 } from "./agentControlEpicRuntime.ts";
 import {
   AGENT_CONTROL_RUN_ONCE_RPC_METHODS,
@@ -506,6 +507,14 @@ export const WsAgentControlEpicHandoffPublishRpc = Rpc.make(
   AGENT_CONTROL_EPIC_RPC_METHODS.publishHandoff,
   {
     payload: AgentControlEpicHandoffPublishInput,
+    success: AgentControlEpicRuntimeView,
+    error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
+  },
+);
+export const WsAgentControlEpicReviewReworkRpc = Rpc.make(
+  AGENT_CONTROL_EPIC_RPC_METHODS.requestReviewRework,
+  {
+    payload: AgentControlEpicReviewReworkInput,
     success: AgentControlEpicRuntimeView,
     error: Schema.Union([AgentControlEpicRpcError, EnvironmentAuthorizationError]),
   },
@@ -1636,6 +1645,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentControlEpicPreviewRpc,
   WsAgentControlEpicHandoffPreviewRpc,
   WsAgentControlEpicHandoffPublishRpc,
+  WsAgentControlEpicReviewReworkRpc,
   WsAgentControlEpicStartRpc,
   WsAgentControlEpicResumeRpc,
   WsAgentControlEpicStopRpc,

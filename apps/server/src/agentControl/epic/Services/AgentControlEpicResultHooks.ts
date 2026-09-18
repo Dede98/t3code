@@ -29,6 +29,11 @@ export interface AgentControlEpicVerifyInput {
   /** A failed/incomplete attempt is retained; explicit resume creates a new identity. */
   readonly attempt: number;
 }
+export interface AgentControlEpicReviewVerifyInput extends AgentControlEpicVerifyInput {
+  readonly reviewRequestId: string;
+  readonly previousCommitSha: string;
+  readonly authorize: Effect.Effect<void, AgentControlEpicRpcError>;
+}
 export interface AgentControlEpicResultHooksShape {
   readonly integratePrerequisite?: (
     input: AgentControlEpicVerifyInput & {
@@ -67,6 +72,9 @@ export interface AgentControlEpicResultHooksShape {
   ) => Effect.Effect<AgentControlEpicAcceptedResult, AgentControlEpicRpcError>;
   readonly verify: (
     input: AgentControlEpicVerifyInput,
+  ) => Effect.Effect<AgentControlEpicFinalVerification, AgentControlEpicRpcError>;
+  readonly verifyReview?: (
+    input: AgentControlEpicReviewVerifyInput,
   ) => Effect.Effect<AgentControlEpicFinalVerification, AgentControlEpicRpcError>;
 }
 const unavailable = () =>

@@ -42,6 +42,7 @@ const repository = { repositoryNodeId: "queue-repository", nameWithOwner: "owner
 const initialSha = "a".repeat(40);
 const resultSha = "b".repeat(40);
 const mergedSha = "c".repeat(40);
+const repairedSha = "d".repeat(40);
 const issue = (number: number) => ({
   ...repository,
   issueNodeId: `issue-${number}`,
@@ -239,6 +240,9 @@ const fixture = Effect.fn("epicQueueFixture")(function* (id = projectId, migrati
         state,
         mergeCommitSha: state === "merged" ? mergedSha : null,
       };
+    },
+    setPullRequestObservation: (next: AgentControlEpicHandoffPullRequest) => {
+      observation = next;
     },
     setReadError: (error?: EpicHandoffRemoteError) => {
       readError = error;
@@ -618,6 +622,102 @@ describe("durable Epic queue", () => {
         assert.equal((yield* f.runs()).length, 2);
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
+
+  it.effect(
+    "does not overwrite an update-required handoff or release its successor from an observed old merge",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.approve(10);
+        yield* f.approve(20);
+        f.setMode("armed");
+        yield* f.process();
+        const updateRequired: AgentControlEpicHandoff = {
+          ...handoff,
+          status: "update-required",
+          commitSha: repairedSha,
+          verificationEvidenceId: "review-repair-check",
+        };
+        const succeeded = yield* f.succeed(true, updateRequired);
+        yield* f.sql.withTransaction(
+          saveEpicRun(f.sql, succeeded, {
+            acceptedCommitSha: repairedSha,
+            finalVerification: {
+              status: "passed",
+              commitSha: repairedSha,
+              evidenceId: "review-repair-check",
+              detail: "Review repair passed",
+              checks: [],
+            },
+          }),
+        );
+        f.setObservation("merged");
+        yield* TestClock.adjust("60 seconds");
+        yield* f.process();
+
+        const queue = (yield* f.read())!;
+        const retained = (yield* f.selected())!;
+        assert.deepEqual(
+          queue.entries.map((entry) => entry.status),
+          ["active", "pending"],
+        );
+        assert.include(queue.waitReason!, "Explicitly update the existing draft pull request");
+        assert.equal(retained.handoff?.status, "update-required");
+        assert.equal(retained.handoff?.commitSha, repairedSha);
+        assert.equal(retained.handoff?.pullRequest?.headSha, resultSha);
+        assert.equal((yield* f.runs()).length, 1);
+        assert.equal(f.reads(), 1);
+        assert.equal(f.fetched.length, 1);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  for (const mismatch of [
+    { label: "open foreign head", state: "open" as const, headSha: initialSha, baseBranch: "main" },
+    {
+      label: "closed foreign base",
+      state: "closed" as const,
+      headSha: resultSha,
+      baseBranch: "review",
+    },
+    {
+      label: "merged foreign head",
+      state: "merged" as const,
+      headSha: initialSha,
+      baseBranch: "main",
+    },
+    {
+      label: "merged foreign base",
+      state: "merged" as const,
+      headSha: resultSha,
+      baseBranch: "review",
+    },
+  ])
+    it.effect(`never releases the serial queue for a ${mismatch.label}`, () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.approve(10);
+        yield* f.approve(20);
+        f.setMode("armed");
+        yield* f.process();
+        yield* f.succeed(true);
+        f.setPullRequestObservation({
+          ...pullRequest,
+          state: mismatch.state,
+          headSha: mismatch.headSha,
+          baseBranch: mismatch.baseBranch,
+          mergeCommitSha: mismatch.state === "merged" ? mergedSha : null,
+        });
+        yield* TestClock.adjust("60 seconds");
+        yield* f.process();
+
+        assert.deepEqual(
+          (yield* f.read())!.entries.map((entry) => entry.status),
+          ["active", "pending"],
+        );
+        assert.equal((yield* f.runs()).length, 1);
+        assert.equal(f.fetched.length, 1);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+    );
 
   it.effect(
     "adopts an existing selected Epic without replacing it and survives close/reopen before merge",

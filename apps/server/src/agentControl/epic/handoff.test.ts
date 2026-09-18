@@ -20,6 +20,7 @@ import { EpicHandoffRemote, EpicHandoffRemoteError } from "./remote.ts";
 
 const projectId = ProjectId.make("project");
 const commitSha = "a".repeat(40);
+const updatedCommitSha = "c".repeat(40);
 const at = "2026-09-14T08:00:00.000Z";
 const repository = { repositoryNodeId: "repo", nameWithOwner: "owner/repo" };
 const issue = (number: number) => ({
@@ -111,6 +112,60 @@ const request = (epicRunId = "run"): AgentControlEpicHandoffPublishInput => ({
   expectedCommitSha: commitSha,
   expectedTargetBranch: "main",
 });
+const updateRequired = (epicRunId = "run"): AgentControlEpicRuntimeView => {
+  const state = initial(epicRunId);
+  const published = {
+    intentId: "retained-review-handoff",
+    status: "published" as const,
+    repository,
+    targetBranch: "main",
+    baseCommitSha: proof.authority.baseCommitSha,
+    commitSha,
+    branchName: "t3auto/epic-1-retained",
+    verificationEvidenceId: state.finalVerification!.evidenceId,
+    branchCreationAttempted: true,
+    requestedAt: at,
+    updatedAt: at,
+    pullRequest: pr,
+    error: null,
+  };
+  const verification = {
+    status: "passed" as const,
+    commitSha: updatedCommitSha,
+    evidenceId: `epic-review-final:${epicRunId}:2`,
+    detail: "review repair passed",
+    checks: [],
+  };
+  return {
+    ...state,
+    acceptedCommitSha: updatedCommitSha,
+    verificationAttempt: 2,
+    finalVerification: verification,
+    finalVerificationHistory: [state.finalVerification!, verification],
+    handoff: {
+      ...published,
+      status: "update-required",
+      commitSha: updatedCommitSha,
+      verificationEvidenceId: verification.evidenceId,
+    },
+    handoffHistory: [
+      {
+        handoff: published,
+        supersededByReviewRequestId: "review-request-1",
+        supersededAt: at,
+      },
+    ],
+  };
+};
+const updateRequest = (state = updateRequired()): AgentControlEpicHandoffPublishInput => ({
+  ...request(state.epicRunId),
+  expectedRevision: state.revision,
+  expectedCommitSha: updatedCommitSha,
+});
+const updateProof: EpicHandoffProof = {
+  ...proof,
+  authority: { ...proof.authority, commitSha: updatedCommitSha },
+};
 const seed = Effect.fn("seedHandoff")(function* (state: AgentControlEpicRuntimeView) {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`CREATE TABLE IF NOT EXISTS projection_projects(project_id TEXT PRIMARY KEY, workspace_root TEXT, deleted_at TEXT)`;
@@ -141,6 +196,145 @@ const build = (
   });
 
 describe("Epic handoff persistence and recovery", () => {
+  it.effect(
+    "previews and serializes an update-required publication onto the retained pull request",
+    () =>
+      Effect.gen(function* () {
+        const state = updateRequired();
+        yield* seed(state);
+        let publishes = 0;
+        let reads = 0;
+        const updatedPr = { ...pr, headSha: updatedCommitSha };
+        const service = yield* build(
+          {
+            prepare: () => Effect.die("An existing pull request update must not prepare a new PR"),
+            readPullRequest: () => {
+              reads++;
+              return Effect.succeed(pr);
+            },
+            publish: (input) =>
+              Effect.sync(() => {
+                publishes++;
+                assert.equal(input.commitSha, updatedCommitSha);
+                assert.equal(input.expectedPreviousCommitSha, commitSha);
+                assert.equal(input.ownershipCommitSha, commitSha);
+                assert.equal(input.branchName, state.handoff?.branchName);
+                return updatedPr;
+              }),
+          },
+          () => Effect.succeed(updateProof),
+        );
+        const preview = yield* service.previewHandoff(updateRequest(state));
+        assert.isTrue(preview.canPublish);
+        assert.equal(preview.handoff?.status, "update-required");
+        assert.equal(preview.handoff?.pullRequest?.headSha, commitSha);
+        const results = yield* Effect.all(
+          [
+            service.publishHandoff(updateRequest(state)),
+            service.publishHandoff({
+              ...updateRequest(state),
+              commandId: CommandId.make("concurrent-update"),
+            }),
+          ],
+          { concurrency: "unbounded" },
+        );
+        assert.deepEqual(results[0], results[1]);
+        assert.equal(results[0]?.handoff?.status, "published");
+        assert.equal(results[0]?.handoff?.pullRequest?.number, pr.number);
+        assert.equal(results[0]?.handoff?.pullRequest?.headSha, updatedCommitSha);
+        assert.equal(results[0]?.handoffHistory?.[0]?.handoff.commitSha, commitSha);
+        assert.equal(publishes, 1);
+        assert.equal(reads, 1);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("recovers a persisted update publication after a process restart", () =>
+    Effect.gen(function* () {
+      const state = updateRequired();
+      yield* seed(state);
+      let crashed = false;
+      let publishes = 0;
+      const updatedPr = { ...pr, headSha: updatedCommitSha };
+      const remote: TestRemote = {
+        prepare: () => Effect.die("An existing pull request update must not prepare a new PR"),
+        readPullRequest: () => Effect.succeed(pr),
+        publish: (input) => {
+          publishes++;
+          assert.equal(input.expectedPreviousCommitSha, commitSha);
+          if (!crashed) {
+            crashed = true;
+            return Effect.die("Simulated process crash after the update intent was persisted");
+          }
+          return Effect.succeed(updatedPr);
+        },
+      };
+      const first = yield* build(remote, () => Effect.succeed(updateProof));
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(first.publishHandoff(updateRequest(state)))));
+      assert.equal(
+        (yield* loadEpicRun(yield* SqlClient.SqlClient, state.epicRunId))?.handoff?.status,
+        "publishing",
+      );
+      const restarted = yield* build(remote, () => Effect.succeed(updateProof));
+      yield* restarted.recoverPending();
+      const recovered = yield* loadEpicRun(yield* SqlClient.SqlClient, state.epicRunId);
+      assert.equal(recovered?.handoff?.status, "published");
+      assert.equal(recovered?.handoff?.pullRequest?.headSha, updatedCommitSha);
+      assert.equal(publishes, 2);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  for (const condition of ["closed", "merged", "not-draft"] as const)
+    it.effect(`retains the update intent through ${condition} and a later draft reopen`, () =>
+      Effect.gen(function* () {
+        const state = updateRequired(`update-${condition}`);
+        yield* seed(state);
+        let observed: AgentControlEpicHandoffPullRequest = {
+          ...pr,
+          ...(condition === "closed" ? { state: "closed" as const } : {}),
+          ...(condition === "merged"
+            ? {
+                state: "merged" as const,
+                isDraft: false,
+                mergeCommitSha: "d".repeat(40),
+              }
+            : {}),
+          ...(condition === "not-draft" ? { isDraft: false } : {}),
+        };
+        const service = yield* build(
+          {
+            prepare: () => Effect.die("An update intent must not prepare a replacement PR"),
+            publish: () => Effect.die("Preview must not publish the retained update"),
+            readPullRequest: () => Effect.succeed(observed),
+          },
+          () => Effect.succeed(updateProof),
+        );
+
+        const unavailable = yield* service.previewHandoff(updateRequest(state));
+        assert.equal(unavailable.handoff?.status, "update-required");
+        assert.notEqual(unavailable.handoff?.status, "published");
+        assert.isFalse(unavailable.canPublish);
+        assert.equal(unavailable.handoff?.pullRequest?.state, observed.state);
+        assert.equal(
+          (yield* loadEpicRun(yield* SqlClient.SqlClient, state.epicRunId))?.handoffHistory?.[0]
+            ?.handoff.commitSha,
+          commitSha,
+        );
+
+        observed = { ...pr, state: "open", isDraft: true };
+        const reopened = yield* service.previewHandoff(updateRequest(state));
+        assert.equal(reopened.handoff?.status, "update-required");
+        assert.notEqual(reopened.handoff?.status, "published");
+        assert.isTrue(reopened.canPublish);
+        assert.isNull(reopened.handoff?.error);
+        assert.equal(reopened.handoff?.pullRequest?.headSha, commitSha);
+        assert.equal(
+          (yield* loadEpicRun(yield* SqlClient.SqlClient, state.epicRunId))?.handoffHistory?.[0]
+            ?.handoff.commitSha,
+          commitSha,
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+    );
+
   for (const state of ["closed", "merged"] as const)
     it.effect(
       `refreshes a published PR to ${state} after restart without creating a replacement`,

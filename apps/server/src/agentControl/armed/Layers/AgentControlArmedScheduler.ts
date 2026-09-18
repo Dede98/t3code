@@ -575,7 +575,7 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
         projectEngine.subscribeDomainEvents,
         catchUp,
         (event) =>
-          event.type === "agentControl.project.mode.changed" && event.payload.mode === "armed"
+          event.type === "agentControl.project.mode.changed"
             ? schedule(event.aggregateId)
             : Effect.void,
         "project",

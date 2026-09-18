@@ -37,6 +37,10 @@ export interface EpicHandoffRemotePublishInput extends EpicHandoffRemoteAuthorit
   readonly childIssueNumbers: ReadonlyArray<number>;
   readonly childCheckCount: number;
   readonly finalCheckCount: number;
+  /** Present only when updating the one already-owned draft PR by fast-forward. */
+  readonly expectedPreviousCommitSha?: string;
+  /** The immutable commit used by the original ownership tag for repeated updates. */
+  readonly ownershipCommitSha?: string;
 }
 export interface EpicHandoffRemoteReadInput {
   readonly cwd: string;
@@ -123,6 +127,8 @@ const marker = (input: EpicHandoffRemoteAuthority) =>
   `<!-- t3auto-epic-handoff:${input.ownershipToken} -->`;
 const tagRef = (input: EpicHandoffRemoteAuthority) =>
   `refs/tags/t3auto-handoff/${input.ownershipToken}`;
+const versionTagRef = (input: EpicHandoffRemoteAuthority) =>
+  `refs/tags/t3auto-handoff-version/${input.ownershipToken}/${input.commitSha}`;
 const tagContent = (input: EpicHandoffRemoteAuthority) =>
   `object ${input.commitSha}\ntype commit\ntag t3auto-handoff/${input.ownershipToken}\ntagger T3Auto <t3auto@localhost> 0 +0000\n\n${marker(input)}\nBranch: ${input.branchName}\nBase: ${input.baseCommitSha}\nRepository: ${input.repository.repositoryNodeId}\n`;
 
@@ -594,6 +600,7 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
       `refs/heads/${input.targetBranch}`,
       `refs/heads/${input.branchName}`,
       tagRef(input),
+      versionTagRef(input),
     ])).stdout;
     const refs = new Map<string, string>();
     for (const line of output.trim().split("\n").filter(Boolean)) {
@@ -618,6 +625,7 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
         );
   const findPullRequest = Effect.fn("EpicHandoffRemote.findPullRequest")(function* (
     input: EpicHandoffRemoteAuthority,
+    expectedHeadSha = input.commitSha,
   ) {
     const owner = input.repository.nameWithOwner.split("/")[0]!;
     const pages = yield* decode(
@@ -642,7 +650,7 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
     if (!pr) return null;
     if (
       pr.head.ref !== input.branchName ||
-      pr.head.sha !== input.commitSha ||
+      pr.head.sha !== expectedHeadSha ||
       pr.base.ref !== input.targetBranch ||
       pr.head.repo?.node_id !== input.repository.repositoryNodeId ||
       pr.base.repo.node_id !== input.repository.repositoryNodeId ||
@@ -692,6 +700,169 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
   const publish: EpicHandoffRemote["Service"]["publish"] = Effect.fn("EpicHandoffRemote.publish")(
     function* (input, hooks) {
       yield* validate(input);
+      if (input.expectedPreviousCommitSha !== undefined) {
+        const ownershipCommitSha = input.ownershipCommitSha ?? input.expectedPreviousCommitSha;
+        if (
+          !objectId.test(input.expectedPreviousCommitSha) ||
+          !objectId.test(ownershipCommitSha) ||
+          input.expectedPreviousCommitSha === input.commitSha
+        )
+          return yield* failure(
+            "handoff-authority-invalid",
+            "The pull request update is missing its previous verified head.",
+          );
+        yield* git(input, [
+          "merge-base",
+          "--is-ancestor",
+          input.expectedPreviousCommitSha,
+          input.commitSha,
+        ]);
+        yield* git(input, [
+          "merge-base",
+          "--is-ancestor",
+          ownershipCommitSha,
+          input.expectedPreviousCommitSha,
+        ]);
+        const ownershipAuthority = {
+          ...input,
+          commitSha: ownershipCommitSha,
+        };
+        const ownershipTagObject = (yield* git(
+          input,
+          ["hash-object", "-t", "tag", "--stdin"],
+          tagContent(ownershipAuthority),
+        )).stdout.trim();
+        const candidateTagObject = (yield* git(
+          input,
+          ["hash-object", "-t", "tag", "--stdin"],
+          tagContent(input),
+        )).stdout.trim();
+        let { refs, remoteUrl } = yield* remoteRefs(input);
+        let remoteHead = refs.get(`refs/heads/${input.branchName}`);
+        if (
+          (remoteHead !== input.expectedPreviousCommitSha && remoteHead !== input.commitSha) ||
+          refs.get(tagRef(input)) !== ownershipTagObject ||
+          (refs.has(versionTagRef(input)) &&
+            refs.get(versionTagRef(input)) !== candidateTagObject) ||
+          !input.branchCreationAttempted
+        )
+          return yield* failure(
+            "handoff-head-changed",
+            "The pull request branch changed after review. The verified update was not published.",
+          );
+        const existing = yield* findPullRequest(input, remoteHead);
+        if (!existing || existing.state !== "open" || !existing.isDraft)
+          return yield* failure(
+            existing?.state === "merged"
+              ? "handoff-pr-merged"
+              : existing?.state === "closed"
+                ? "handoff-pr-closed"
+                : "handoff-pr-not-draft",
+            "Only the existing open draft pull request can receive a reviewed repair.",
+          );
+        if (!refs.has(versionTagRef(input))) {
+          yield* git(input, ["mktag"], tagContent(input));
+          // Upload the verified candidate graph through a new immutable version
+          // tag. The owned branch is advanced separately through GitHub's
+          // non-force update API after its old head is rechecked.
+          yield* git(input, [
+            "-c",
+            "push.followTags=false",
+            "push",
+            "--no-follow-tags",
+            remoteUrl,
+            `${candidateTagObject}:${versionTagRef(input)}`,
+          ]);
+          refs = (yield* remoteRefs(input)).refs;
+          remoteHead = refs.get(`refs/heads/${input.branchName}`);
+          if (
+            (remoteHead !== input.expectedPreviousCommitSha && remoteHead !== input.commitSha) ||
+            refs.get(tagRef(input)) !== ownershipTagObject ||
+            refs.get(versionTagRef(input)) !== candidateTagObject
+          )
+            return yield* failure(
+              "handoff-head-changed",
+              "The pull request branch changed while its verified objects were uploaded.",
+            );
+        }
+        if (remoteHead === input.expectedPreviousCommitSha) {
+          const update = yield* github
+            .execute({
+              cwd: input.cwd,
+              args: [
+                "api",
+                "--hostname",
+                "github.com",
+                endpoint(input, `/git/refs/heads/${input.branchName}`),
+                "--method",
+                "PATCH",
+                "--input",
+                "-",
+              ],
+              stdin: yield* encodeBody({ sha: input.commitSha, force: false }),
+              maxOutputBytes: 1_000_000,
+            })
+            .pipe(
+              Effect.mapError(() =>
+                failure(
+                  "handoff-head-changed",
+                  "GitHub rejected the fast-forward because the pull request branch changed.",
+                ),
+              ),
+            );
+          const updatedRef = yield* decode(CreatedRef, update.stdout);
+          if (
+            updatedRef.ref !== `refs/heads/${input.branchName}` ||
+            updatedRef.object.sha !== input.commitSha
+          )
+            return yield* failure(
+              "remote-response-invalid",
+              "GitHub returned an unexpected updated branch.",
+            );
+        }
+        refs = (yield* remoteRefs(input)).refs;
+        if (
+          refs.get(`refs/heads/${input.branchName}`) !== input.commitSha ||
+          refs.get(tagRef(input)) !== ownershipTagObject ||
+          refs.get(versionTagRef(input)) !== candidateTagObject
+        )
+          return yield* failure(
+            "handoff-head-changed",
+            "The pull request branch changed while its verified update was being confirmed.",
+          );
+        const text = buildEpicHandoffPullRequest(input);
+        yield* github
+          .execute({
+            cwd: input.cwd,
+            args: [
+              "api",
+              "--hostname",
+              "github.com",
+              endpoint(input, `/pulls/${existing.number}`),
+              "--method",
+              "PATCH",
+              "--input",
+              "-",
+            ],
+            stdin: yield* encodeBody({ title: text.title, body: text.body }),
+            maxOutputBytes: 1_000_000,
+          })
+          .pipe(
+            Effect.mapError(() =>
+              failure(
+                "remote-unavailable",
+                "The branch was updated, but GitHub did not confirm the refreshed review text. Retry to reconcile the same pull request.",
+              ),
+            ),
+          );
+        const confirmed = yield* findPullRequest(input);
+        if (!confirmed || confirmed.state !== "open" || !confirmed.isDraft)
+          return yield* failure(
+            "handoff-unavailable",
+            "GitHub did not confirm the updated draft pull request.",
+          );
+        return confirmed;
+      }
       const tagObject = (yield* git(
         input,
         ["hash-object", "-t", "tag", "--stdin"],

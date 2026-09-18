@@ -32,6 +32,12 @@ describe("RPC authorization scopes", () => {
       AuthOrchestrationReadScope,
     );
   });
+  it("requires explicit environment write access to request Epic review repair", () => {
+    const scope = requiredScopeForRpcMethod(AGENT_CONTROL_EPIC_RPC_METHODS.requestReviewRework);
+    expect(scope).toBe(AuthAccessWriteScope);
+    expect(new Set<string>(AuthStandardClientScopes).has(scope)).toBe(false);
+    expect(new Set<string>(AuthAdministrativeScopes).has(scope)).toBe(true);
+  });
   it("keeps Run Once and intake changes administrative while standard clients can read runs", () => {
     const required = requiredScopeForRpcMethod(AGENT_CONTROL_RUNTIME_RPC_METHODS.setProjectMode);
     expect(required).toBe(AuthAccessWriteScope);

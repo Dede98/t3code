@@ -401,13 +401,27 @@ export const makeEpicQueue = Effect.gen(function* () {
         yield* wait(observed.message);
         return true;
       }
-      if (epicDigest(observed) !== epicDigest(selected.handoff.pullRequest)) {
+      const handoffUpdatePending =
+        selected.handoff.status === "update-required" ||
+        (selected.handoff.status === "publishing" &&
+          selected.handoff.pullRequest.headSha !== selected.handoff.commitSha);
+      // An update-required handoff still names the old remote PR until the
+      // explicit publication path performs its fast-forward. Queue observation
+      // must not turn that retained PR into a current published handoff.
+      if (
+        !handoffUpdatePending &&
+        epicDigest(observed) !== epicDigest(selected.handoff.pullRequest)
+      ) {
+        const matchesPublishedAuthority =
+          observed.headSha === selected.handoff.commitSha &&
+          observed.baseBranch === selected.handoff.targetBranch;
         previousRun = yield* sql.withTransaction(
           saveEpicRun(sql, selected, {
             handoff: {
               ...selected.handoff,
               pullRequest: observed,
-              status: observed.state === "closed" ? "blocked" : "published",
+              status:
+                observed.state === "closed" || !matchesPublishedAuthority ? "blocked" : "published",
               error:
                 observed.state === "closed"
                   ? {
@@ -415,17 +429,36 @@ export const makeEpicQueue = Effect.gen(function* () {
                       message:
                         "The pull request was closed without merge. Reopen it or confirm its later merge on GitHub.",
                     }
-                  : null,
+                  : !matchesPublishedAuthority
+                    ? {
+                        code: "handoff-head-changed",
+                        message:
+                          "The pull request head or base no longer matches the verified Epic handoff.",
+                      }
+                    : null,
               updatedAt: DateTime.formatIso(now),
             },
           }),
         );
       }
-      if (observed.state !== "merged") {
+      if (handoffUpdatePending) {
+        yield* wait(
+          "Verification passed. Explicitly update the existing draft pull request to continue.",
+        );
+        return true;
+      }
+      if (
+        observed.state !== "merged" ||
+        observed.headSha !== selected.handoff.commitSha ||
+        observed.baseBranch !== selected.handoff.targetBranch
+      ) {
         yield* wait(
           observed.state === "closed"
             ? "The pull request was closed without merge. Reopen it on GitHub; the queue will check again."
-            : "Waiting for human review and merge of the published pull request.",
+            : observed.headSha !== selected.handoff.commitSha ||
+                observed.baseBranch !== selected.handoff.targetBranch
+              ? "The pull request head or base no longer matches the verified Epic handoff."
+              : "Waiting for human review and merge of the published pull request.",
         );
         return true;
       }

@@ -66,6 +66,15 @@ export interface ProviderResourceCoordinatorShape {
   readonly release: (
     permit: CoordinatedProviderPermit,
   ) => Effect.Effect<void, ProviderResourceCoordinatorError>;
+  /** Retires one persisted orphan after its caller has proved no provider turn was accepted. */
+  readonly retireOrphaned?: (
+    idempotencyKey: string,
+  ) => Effect.Effect<void, ProviderResourceCoordinatorError>;
+  /** Binds one persisted entered permit after its dedicated session proves the accepted turn. */
+  readonly bindOrphaned?: (
+    idempotencyKey: string,
+    providerTurnId: string,
+  ) => Effect.Effect<void, ProviderResourceCoordinatorError>;
   readonly observeRuntimeEvent: (
     event: ProviderRuntimeEvent,
     currentSession?: ProviderSession,
@@ -472,6 +481,85 @@ const make = Effect.gen(function* () {
     return permit;
   });
 
+  const retireOrphaned: NonNullable<ProviderResourceCoordinatorShape["retireOrphaned"]> = Effect.fn(
+    "ProviderResourceCoordinator.retireOrphaned",
+  )(
+    function* (idempotencyKey) {
+      const listResourceActive = requiredProviderMethod(providerAdmission, "listResourceActive");
+      const matching = (yield* listResourceActive).filter(
+        (row) => row.idempotencyKey === idempotencyKey,
+      );
+      if (matching.length === 0) return;
+      if (matching.length !== 1)
+        return yield* new ProviderResourceCoordinatorError({
+          operation: "retire-orphaned",
+          message: `Provider resource identity '${idempotencyKey}' is not unique.`,
+        });
+      yield* release(yield* adopt(matching[0]!));
+    },
+    Effect.mapError((cause) =>
+      isProviderResourceCoordinatorError(cause)
+        ? cause
+        : new ProviderResourceCoordinatorError({
+            operation: "retire-orphaned",
+            message: "Orphaned provider capacity could not be retired.",
+            cause,
+          }),
+    ),
+  );
+
+  const bindOrphaned: NonNullable<ProviderResourceCoordinatorShape["bindOrphaned"]> = Effect.fn(
+    "ProviderResourceCoordinator.bindOrphaned",
+  )(
+    function* (idempotencyKey, providerTurnId) {
+      const listResourceActive = requiredProviderMethod(providerAdmission, "listResourceActive");
+      const matching = (yield* listResourceActive).filter(
+        (row) => row.idempotencyKey === idempotencyKey,
+      );
+      if (matching.length !== 1)
+        return yield* new ProviderResourceCoordinatorError({
+          operation: "bind-orphaned",
+          message: `Provider resource identity '${idempotencyKey}' is not uniquely active.`,
+        });
+      const row = matching[0]!;
+      if (row.status !== "entered")
+        return yield* new ProviderResourceCoordinatorError({
+          operation: "bind-orphaned",
+          message: `Provider resource identity '${idempotencyKey}' was not entered.`,
+        });
+      if (row.providerTurnId !== null && row.providerTurnId !== providerTurnId)
+        return yield* new ProviderResourceCoordinatorError({
+          operation: "bind-orphaned",
+          message: `Provider resource identity '${idempotencyKey}' is bound to another turn.`,
+        });
+      const requestId = row.requestId;
+      const existingBinding = boundTurnByRequest.get(requestId);
+      const expectedKey = turnKey(row.providerInstanceId, row.threadId, providerTurnId);
+      if (existingBinding !== undefined) {
+        if (existingBinding === expectedKey) return;
+        return yield* new ProviderResourceCoordinatorError({
+          operation: "bind-orphaned",
+          message: `Provider resource identity '${idempotencyKey}' has conflicting runtime authority.`,
+        });
+      }
+      if (row.providerTurnId === providerTurnId) {
+        yield* adopt(row);
+        return;
+      }
+      const retained = pendingByThread.get(row.threadId)?.get(requestId);
+      yield* enter(retained ?? (yield* adopt(row)), providerTurnId);
+    },
+    Effect.mapError((cause) =>
+      isProviderResourceCoordinatorError(cause)
+        ? cause
+        : new ProviderResourceCoordinatorError({
+            operation: "bind-orphaned",
+            message: "Orphaned provider capacity could not be bound to its proven turn.",
+            cause,
+          }),
+    ),
+  );
+
   const observeRuntimeEvent: ProviderResourceCoordinatorShape["observeRuntimeEvent"] = Effect.fn(
     "ProviderResourceCoordinator.observeRuntimeEvent",
   )(
@@ -676,6 +764,8 @@ const make = Effect.gen(function* () {
     acquire,
     enter,
     release,
+    retireOrphaned,
+    bindOrphaned,
     observeRuntimeEvent,
     reconcile,
   });

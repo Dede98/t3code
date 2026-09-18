@@ -1018,11 +1018,148 @@ export const makeEpicResults = Effect.gen(function* () {
       Effect.mapError((cause) => resultError(cause, "Final Epic checks could not be completed.")),
     );
   };
+  const verifyReview: NonNullable<AgentControlEpicResultHooksShape["verifyReview"]> = (input) => {
+    const member = input.lastAccepted;
+    if (
+      !member.taskId ||
+      !member.childRunId ||
+      !member.reservationId ||
+      !member.taskFinalizationEvidenceId ||
+      !member.accepted
+    )
+      return Effect.fail(authorityFailure("The reviewed accepted result is incomplete."));
+    const captureInput = {
+      epicRunId: input.epicRunId,
+      projectId: input.projectId,
+      taskId: member.taskId,
+      childRunId: member.childRunId,
+      reservationId: member.reservationId,
+      taskFinalizationEvidenceId: member.taskFinalizationEvidenceId,
+      previousCommitSha: member.baseCommitSha,
+    };
+    const first = input.firstAccepted;
+    if (
+      !first.taskId ||
+      !first.childRunId ||
+      !first.reservationId ||
+      !first.taskFinalizationEvidenceId
+    )
+      return Effect.fail(authorityFailure("The original accepted Epic result is incomplete."));
+    const firstCaptureInput = {
+      epicRunId: input.epicRunId,
+      projectId: input.projectId,
+      taskId: first.taskId,
+      childRunId: first.childRunId,
+      reservationId: first.reservationId,
+      taskFinalizationEvidenceId: first.taskFinalizationEvidenceId,
+      previousCommitSha: first.baseCommitSha,
+    };
+    return owned(captureInput, (state) =>
+      Effect.gen(function* () {
+        yield* input.authorize;
+        const proof = (yield* verification(captureInput))[0];
+        if (!proof)
+          return yield* authorityFailure("Review verification has no accepted provider evidence.");
+        const initialBaseCommitSha =
+          input.initialBaseCommitSha ??
+          (yield* owned(firstCaptureInput, (firstState) =>
+            Effect.succeed(firstState.baseCommitSha),
+          ));
+        yield* git(state.internalWorktreePath, [
+          "merge-base",
+          "--is-ancestor",
+          member.accepted!.commitSha,
+          input.previousCommitSha,
+        ]).pipe(
+          Effect.mapError(() =>
+            authorityFailure(
+              "The reviewed result no longer descends from its accepted Epic member evidence.",
+            ),
+          ),
+        );
+        yield* git(state.internalWorktreePath, [
+          "merge-base",
+          "--is-ancestor",
+          input.previousCommitSha,
+          input.commitSha,
+        ]).pipe(
+          Effect.mapError(() =>
+            authorityFailure(
+              "The repaired candidate does not descend from the reviewed accepted commit.",
+            ),
+          ),
+        );
+        const worktreePath = NodePath.join(
+          state.repositoryCommonDir,
+          "t3-epic-review-verification",
+          sha256Utf8(input.reviewRequestId).slice(0, 24),
+        );
+        const exists = yield* Effect.tryPromise(() =>
+          NodeFSP.lstat(worktreePath).then(
+            () => true,
+            (error: NodeJS.ErrnoException) => {
+              if (error.code === "ENOENT") return false;
+              throw error;
+            },
+          ),
+        );
+        if (!exists) {
+          yield* Effect.tryPromise(() =>
+            NodeFSP.mkdir(NodePath.dirname(worktreePath), { recursive: true }),
+          );
+          yield* git(state.internalWorktreePath, [
+            "worktree",
+            "add",
+            "--detach",
+            worktreePath,
+            input.commitSha,
+          ]);
+        }
+        const repositoryCommonDir = yield* Effect.tryPromise(() =>
+          NodeFSP.realpath(state.repositoryCommonDir),
+        );
+        const authorize = Effect.gen(function* () {
+          yield* input.authorize;
+          const observedCommonDir = yield* git(worktreePath, [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+          ]);
+          const canonicalCommonDir = yield* Effect.tryPromise(() =>
+            NodeFSP.realpath(observedCommonDir),
+          ).pipe(Effect.mapError(() => fail("The review verification repository is unavailable.")));
+          if (
+            canonicalCommonDir !== repositoryCommonDir ||
+            (yield* git(worktreePath, ["rev-parse", "HEAD"])) !== input.commitSha ||
+            (yield* git(worktreePath, ["status", "--porcelain", "--untracked-files=all"]))
+          )
+            return yield* authorityFailure(
+              "The repaired candidate changed during review verification.",
+            );
+        });
+        yield* authorize;
+        return yield* verifyAt(
+          input,
+          worktreePath,
+          proof.providerInstanceId,
+          initialBaseCommitSha,
+          `epic-review-final:${input.reviewRequestId}`,
+          authorize,
+        );
+      }),
+    ).pipe(
+      Effect.scoped,
+      Effect.mapError((cause) =>
+        resultError(cause, "The repaired Epic candidate could not be verified."),
+      ),
+    );
+  };
   return {
     capture,
     integrate,
     integratePrerequisite,
     verify,
+    verifyReview,
   } satisfies AgentControlEpicResultHooksShape;
 });
 export const EpicResultsLive = Layer.effect(AgentControlEpicResultHooks, makeEpicResults);

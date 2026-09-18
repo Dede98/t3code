@@ -5,6 +5,7 @@ import {
   type AgentControlEpicQueueEntry,
   type AgentControlEpicProjectDependencyPlan,
   type AgentControlEpicRpcError,
+  type AgentControlEpicRuntimeView,
   type AgentControlProjectState,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -56,6 +57,13 @@ export const prioritizePendingEpics = (
     .map((entry) => ({ entry, depth: depth(entry.entryId) }))
     .toSorted((a, b) => a.depth - b.depth)
     .map(({ entry }) => entry);
+};
+
+const occupiesExecutionSlot = (run: AgentControlEpicRuntimeView) => {
+  if (run.status === "running" || run.status === "verifying") return true;
+  if (run.status !== "blocked") return false;
+  const latestReviewRework = run.reviewReworks?.at(-1);
+  return !(run.activeReviewReworkId === null && latestReviewRework?.status === "blocked");
 };
 
 /** The existing project lock serializes admission; each admitted run retains its own authority. */
@@ -133,26 +141,45 @@ export const makeParallelEpicQueue = Effect.gen(function* () {
             ];
           } else {
             const observed = observation.success;
-            if (epicDigest(observed) !== epicDigest(handoff.pullRequest)) {
+            const handoffUpdatePending =
+              handoff.status === "update-required" ||
+              (handoff.status === "publishing" &&
+                handoff.pullRequest.headSha !== handoff.commitSha);
+            // Only the authorized handoff publisher may reconcile an existing
+            // PR to a newly verified review-repair commit.
+            if (!handoffUpdatePending && epicDigest(observed) !== epicDigest(handoff.pullRequest)) {
+              const matchesPublishedAuthority =
+                observed.headSha === handoff.commitSha &&
+                observed.baseBranch === handoff.targetBranch;
               run = yield* sql.withTransaction(
                 saveEpicRun(sql, run, {
                   handoff: {
                     ...handoff,
                     pullRequest: observed,
-                    status: observed.state === "closed" ? "blocked" : "published",
+                    status:
+                      observed.state === "closed" || !matchesPublishedAuthority
+                        ? "blocked"
+                        : "published",
                     error:
                       observed.state === "closed"
                         ? {
                             code: "pull-request-closed",
                             message: "The pull request was closed without merge.",
                           }
-                        : null,
+                        : !matchesPublishedAuthority
+                          ? {
+                              code: "handoff-head-changed",
+                              message:
+                                "The pull request head or base no longer matches the verified Epic handoff.",
+                            }
+                          : null,
                     updatedAt: DateTime.formatIso(now),
                   },
                 }),
               );
             }
             if (
+              !handoffUpdatePending &&
               observed.state === "merged" &&
               observed.headSha === handoff.commitSha &&
               observed.baseBranch === handoff.targetBranch &&
@@ -165,10 +192,11 @@ export const makeParallelEpicQueue = Effect.gen(function* () {
             }
             blockers = [
               {
-                code: "awaiting-merge",
+                code: handoffUpdatePending ? "handoff-update-required" : "awaiting-merge",
                 issueNumber: run.source.epic.number,
-                message:
-                  "Waiting for human review and a confirmed merge of the verified result into its target branch.",
+                message: handoffUpdatePending
+                  ? "Verification passed. Explicitly update the existing draft pull request before this Epic can satisfy dependencies."
+                  : "Waiting for human review and a confirmed merge of the verified result into its target branch.",
               },
             ];
           }
@@ -197,10 +225,9 @@ export const makeParallelEpicQueue = Effect.gen(function* () {
           : item,
       );
     }
-    // Completed review handoffs and stopped runs release execution slots, not their evidence.
-    let occupied = runs.filter((run) =>
-      ["running", "blocked", "verifying"].includes(run.status),
-    ).length;
+    // Completed handoffs, stopped runs, and terminal review-rework failures release
+    // execution slots without releasing their queue entry or historical evidence.
+    let occupied = runs.filter(occupiesExecutionSlot).length;
     const plan = queue.projectDependencyPlan!;
     const pending = prioritizePendingEpics(entries, plan);
     for (const entry of pending) {

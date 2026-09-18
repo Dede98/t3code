@@ -6,15 +6,21 @@ import {
   ProjectId,
   ProviderInstanceId,
   ProviderDriverKind,
-  type AgentControlEpicRuntimeView,
+  type AgentControlEpicFinalVerification,
+  type AgentControlEpicHandoffPullRequest,
+  AgentControlEpicRuntimeView,
+  type AgentControlEpicReviewReworkInput,
   type AgentControlEpicSource,
   type AgentControlProjectState,
   type AgentControlPreflightRuntimeResult,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../../persistence/Migrations.ts";
@@ -38,11 +44,22 @@ import { createEpicRun, insertEpicRun } from "./runState.ts";
 import { EpicHandoffRemote } from "./remote.ts";
 import { epicSourceChanges, selectEpicMember } from "./model.ts";
 import { makeAgentControlEpic } from "./Layers/AgentControlEpic.ts";
-import { AgentControlEpicResultHooks } from "./Services/AgentControlEpicResultHooks.ts";
+import {
+  AgentControlEpicResultHooks,
+  type AgentControlEpicReviewVerifyInput,
+} from "./Services/AgentControlEpicResultHooks.ts";
+import {
+  AgentControlEpicReviewRepair,
+  type AgentControlEpicReviewRepairInput,
+  type AgentControlEpicReviewRepairProgress,
+} from "./Services/AgentControlEpicReviewRepair.ts";
 
 const projectId = ProjectId.make("epic-unit-project");
 const at = "2026-09-14T08:00:00.000Z";
 const repository = { repositoryNodeId: "epic-repository", nameWithOwner: "owner/repo" };
+const decodeEpicState = Schema.decodeUnknownSync(
+  Schema.fromJsonString(AgentControlEpicRuntimeView),
+);
 const issue = (number: number) => ({
   ...repository,
   issueNodeId: `issue-${number}`,
@@ -453,6 +470,26 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
     inspectEpic: (input) => Effect.sync(() => sources.get(input.epicNumber) ?? currentSource),
   });
   const attempts: number[] = [];
+  const reviewRepairCalls: AgentControlEpicReviewRepairInput[] = [];
+  const reviewVerificationCalls: AgentControlEpicReviewVerifyInput[] = [];
+  let reviewProgress: (
+    input: AgentControlEpicReviewRepairInput,
+  ) => Effect.Effect<AgentControlEpicReviewRepairProgress, AgentControlEpicRpcError> = () =>
+    Effect.fail(
+      new AgentControlEpicRpcError({
+        code: "unexpected-review-repair",
+        message: "No review repair expected in this fixture.",
+      }),
+    );
+  let reviewVerification: (
+    input: AgentControlEpicReviewVerifyInput,
+  ) => Effect.Effect<AgentControlEpicFinalVerification, AgentControlEpicRpcError> = () =>
+    Effect.fail(
+      new AgentControlEpicRpcError({
+        code: "unexpected-review-verification",
+        message: "No review verification expected in this fixture.",
+      }),
+    );
   let runtime: AgentControlPreflightRuntimeResult = {
     ok: true,
     staticPreflight: { ok: true, roles: [] },
@@ -470,6 +507,13 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
       }),
       Effect.provideService(AgentControlGithubStateRepository, github),
       Effect.provideService(GithubIssueTrackerClient, client),
+      Effect.provideService(AgentControlEpicReviewRepair, {
+        progress: (input) => {
+          reviewRepairCalls.push(input);
+          return reviewProgress(input);
+        },
+        cancel: () => Effect.void,
+      }),
       Effect.provideService(AgentControlEpicResultHooks, {
         capture: () =>
           Effect.fail(
@@ -489,12 +533,40 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
               checks: [],
             };
           }),
+        verifyReview: (input) => {
+          reviewVerificationCalls.push(input);
+          return reviewVerification(input);
+        },
+      }),
+    );
+  const makeWithHandoffObservation = (observation: AgentControlEpicHandoffPullRequest) =>
+    make().pipe(
+      Effect.provideService(EpicHandoffRemote, {
+        readPullRequest: () => Effect.succeed(observation),
+        prepare: () => Effect.die("Review-request preflight must not prepare a handoff"),
+        publish: () => Effect.die("Review-request preflight must not publish a handoff"),
       }),
     );
   return {
     sql,
     make,
     attempts,
+    reviewRepairCalls,
+    reviewVerificationCalls,
+    setReviewProgress: (
+      next: (
+        input: AgentControlEpicReviewRepairInput,
+      ) => Effect.Effect<AgentControlEpicReviewRepairProgress, AgentControlEpicRpcError>,
+    ) => {
+      reviewProgress = next;
+    },
+    setReviewVerification: (
+      next: (
+        input: AgentControlEpicReviewVerifyInput,
+      ) => Effect.Effect<AgentControlEpicFinalVerification, AgentControlEpicRpcError>,
+    ) => {
+      reviewVerification = next;
+    },
     setRuntime: (next: AgentControlPreflightRuntimeResult) => {
       runtime = next;
     },
@@ -507,6 +579,7 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
     setMode: (mode: AgentControlProjectState["mode"]) => {
       project = { ...project, mode, revision: project.revision + 1 };
     },
+    makeWithHandoffObservation,
   };
 });
 
@@ -913,6 +986,754 @@ describe("Epic service lifecycle", () => {
         assert.deepEqual(f.attempts, [1, 2]);
         assert.equal(current.finalVerificationHistory.length, 2);
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+});
+
+const reviewedCommitSha = "a".repeat(40);
+const repairedCommitSha = "b".repeat(40);
+const reviewBaseCommitSha = "c".repeat(40);
+const secondRepairedCommitSha = "e".repeat(40);
+const reviewedVerification = {
+  status: "passed" as const,
+  commitSha: reviewedCommitSha,
+  evidenceId: "reviewed-final-proof",
+  detail: "The original combined result passed.",
+  checks: [],
+};
+const reviewFinding = {
+  findingId: "sidebar-keyboard-navigation",
+  summary: "Keyboard navigation skips nested sidebar items.",
+  correctionCriteria: "Nested items participate in the same ordered keyboard traversal.",
+  acceptanceCriteria: "The focused behavior test reaches every visible nested item in order.",
+};
+const reviewAttempt = (status: "running" | "succeeded" = "running") => ({
+  attempt: 1,
+  providerInstanceId: "repair-provider",
+  model: "repair-model",
+  threadId: "review-repair-thread",
+  status,
+  startedAt: at,
+  completedAt: status === "succeeded" ? at : null,
+  error: null,
+});
+const reviewedPullRequest: AgentControlEpicHandoffPullRequest = {
+  number: 42,
+  url: "https://github.com/owner/repo/pull/42",
+  state: "open",
+  isDraft: true,
+  headSha: reviewedCommitSha,
+  baseBranch: "main",
+  mergeCommitSha: null,
+};
+const succeededReviewState = (): AgentControlEpicRuntimeView => ({
+  ...initial(),
+  status: "succeeded",
+  initialBase: { commitSha: reviewBaseCommitSha, targetBranch: "main" },
+  acceptedCommitSha: reviewedCommitSha,
+  members: initial().members.map((member) => ({
+    ...member,
+    taskId: AgentControlTaskId.make(`task-${member.issueNumber}`),
+    childRunId: `reviewed-run-${member.issueNumber}`,
+    status: "accepted" as const,
+    baseCommitSha: reviewBaseCommitSha,
+    reservationId: `reviewed-reservation-${member.issueNumber}`,
+    taskFinalizationEvidenceId: `reviewed-finalization-${member.issueNumber}`,
+    accepted: {
+      commitSha: reviewedCommitSha,
+      treeSha: "d".repeat(40),
+      codeDigest: `reviewed-code-${member.issueNumber}`,
+      evidenceId: `reviewed-result-${member.issueNumber}`,
+    },
+  })),
+  finalVerification: reviewedVerification,
+  finalVerificationHistory: [reviewedVerification],
+  handoff: {
+    intentId: "reviewed-handoff",
+    status: "published",
+    repository,
+    targetBranch: "main",
+    baseCommitSha: reviewBaseCommitSha,
+    commitSha: reviewedCommitSha,
+    branchName: "t3auto/epic-10-reviewed",
+    verificationEvidenceId: reviewedVerification.evidenceId,
+    requestedAt: at,
+    updatedAt: at,
+    pullRequest: null,
+    error: null,
+  },
+});
+const reviewRequest = (
+  state: AgentControlEpicRuntimeView,
+  overrides: Partial<AgentControlEpicReviewReworkInput> = {},
+): AgentControlEpicReviewReworkInput => ({
+  projectId,
+  epicRunId: state.epicRunId,
+  commandId: CommandId.make("review-rework-command"),
+  expectedRevision: state.revision,
+  reviewedCommitSha: reviewedCommitSha,
+  reviewedVerificationEvidenceId: reviewedVerification.evidenceId,
+  findings: [reviewFinding],
+  idempotencyKey: "independent-review-1",
+  ...overrides,
+});
+
+describe("Epic review rework", () => {
+  for (const status of ["failed", "blocked", "publishing"] as const)
+    it.effect(`rejects feedback for an unconfirmed ${status} handoff without a saved PR`, () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* runMigrations({ toMigrationInclusive: 94 });
+        const original = succeededReviewState();
+        const unconfirmed = {
+          ...original,
+          handoff: {
+            ...original.handoff!,
+            status,
+            pullRequest: null,
+            error:
+              status === "publishing"
+                ? null
+                : { code: `handoff-${status}`, message: "The handoff was not confirmed." },
+          },
+        };
+        f.setMode("armed");
+        yield* seedRun(f.sql, unconfirmed);
+        const service = yield* f.make();
+        assert.propertyVal(
+          yield* service.requestReviewRework(reviewRequest(unconfirmed)).pipe(Effect.flip),
+          "code",
+          status === "publishing" ? "review-publication-unsettled" : "review-handoff-unconfirmed",
+        );
+        assert.deepEqual(
+          yield* f.sql`SELECT count(*) AS count FROM agent_control_epic_review_requests`,
+          [{ count: 0 }],
+        );
+        assert.lengthOf(f.reviewRepairCalls, 0);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+    );
+
+  for (const status of ["publishing", "update-required"] as const)
+    it.effect(`rejects feedback while the retained handoff is ${status}`, () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* runMigrations({ toMigrationInclusive: 94 });
+        const original = succeededReviewState();
+        const unsettled = {
+          ...original,
+          handoff: { ...original.handoff!, status, pullRequest: reviewedPullRequest },
+        };
+        f.setMode("armed");
+        yield* seedRun(f.sql, unsettled);
+        const service = yield* f.makeWithHandoffObservation(reviewedPullRequest);
+        assert.propertyVal(
+          yield* service.requestReviewRework(reviewRequest(unsettled)).pipe(Effect.flip),
+          "code",
+          "review-publication-unsettled",
+        );
+        assert.deepEqual(
+          yield* f.sql`SELECT count(*) AS count FROM agent_control_epic_review_requests`,
+          [{ count: 0 }],
+        );
+        assert.lengthOf(f.reviewRepairCalls, 0);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+    );
+
+  for (const condition of ["closed", "merged", "not-draft", "foreign-head"] as const)
+    it.effect(
+      `rejects feedback before persistence when the retained pull request is ${condition}`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          yield* runMigrations({ toMigrationInclusive: 94 });
+          const original = succeededReviewState();
+          const withPullRequest = {
+            ...original,
+            handoff: { ...original.handoff!, pullRequest: reviewedPullRequest },
+          };
+          const observation: AgentControlEpicHandoffPullRequest = {
+            ...reviewedPullRequest,
+            ...(condition === "closed" ? { state: "closed" as const } : {}),
+            ...(condition === "merged"
+              ? { state: "merged" as const, isDraft: false, mergeCommitSha: "f".repeat(40) }
+              : {}),
+            ...(condition === "not-draft" ? { isDraft: false } : {}),
+            ...(condition === "foreign-head" ? { headSha: "f".repeat(40) } : {}),
+          };
+          f.setMode("armed");
+          yield* seedRun(f.sql, withPullRequest);
+          const service = yield* f.makeWithHandoffObservation(observation);
+          assert.propertyVal(
+            yield* service.requestReviewRework(reviewRequest(withPullRequest)).pipe(Effect.flip),
+            "code",
+            {
+              closed: "review-pr-closed",
+              merged: "review-pr-merged",
+              "not-draft": "review-pr-not-draft",
+              "foreign-head": "review-pr-head-changed",
+            }[condition],
+          );
+          assert.deepEqual(
+            yield* f.sql`SELECT count(*) AS count FROM agent_control_epic_review_requests`,
+            [{ count: 0 }],
+          );
+          assert.lengthOf(f.reviewRepairCalls, 0);
+        }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+    );
+
+  it.effect(
+    "moves durable feedback through repair and fresh verification to a new handoff while retaining history",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* runMigrations({ toMigrationInclusive: 94 });
+        const original = succeededReviewState();
+        f.setMode("armed");
+        yield* seedRun(f.sql, original);
+        let progress = 0;
+        f.setReviewProgress((input) =>
+          Effect.gen(function* () {
+            yield* input.authorize;
+            progress++;
+            return progress === 1
+              ? { kind: "repairing" as const, attempts: [reviewAttempt()] }
+              : {
+                  kind: "candidate" as const,
+                  attempts: [reviewAttempt("succeeded")],
+                  commitSha: repairedCommitSha,
+                };
+          }),
+        );
+        f.setReviewVerification((input) =>
+          input.authorize.pipe(
+            Effect.as({
+              status: "passed" as const,
+              commitSha: input.commitSha,
+              evidenceId: "review-rework-final-proof",
+              detail: "The repaired combined result passed.",
+              checks: [],
+            }),
+          ),
+        );
+        const service = yield* f.make();
+        const accepted = yield* service.requestReviewRework(reviewRequest(original));
+        assert.equal(accepted.reviewReworks?.[0]?.status, "accepted");
+        assert.equal(accepted.acceptedCommitSha, reviewedCommitSha);
+
+        yield* service.processProject(projectId);
+        assert.equal((yield* service.get(projectId))?.reviewReworks?.[0]?.status, "repairing");
+        yield* service.processProject(projectId);
+        assert.equal((yield* service.get(projectId))?.reviewReworks?.[0]?.status, "verifying");
+        yield* service.processProject(projectId);
+
+        const completed = (yield* service.get(projectId))!;
+        assert.equal(completed.status, "succeeded");
+        assert.equal(completed.acceptedCommitSha, repairedCommitSha);
+        assert.equal(completed.finalVerification?.commitSha, repairedCommitSha);
+        assert.equal(completed.finalVerification?.evidenceId, "review-rework-final-proof");
+        assert.deepEqual(
+          completed.finalVerificationHistory.map((proof) => proof.evidenceId),
+          [reviewedVerification.evidenceId, "review-rework-final-proof"],
+        );
+        assert.equal(completed.reviewReworks?.[0]?.status, "succeeded");
+        assert.equal(completed.reviewReworks?.[0]?.previousAcceptedCommitSha, reviewedCommitSha);
+        assert.equal(completed.handoff?.status, "update-required");
+        assert.equal(completed.handoff?.commitSha, repairedCommitSha);
+        assert.equal(completed.handoff?.verificationEvidenceId, "review-rework-final-proof");
+        assert.equal(completed.handoffHistory?.[0]?.handoff.commitSha, reviewedCommitSha);
+        assert.equal(
+          completed.handoffHistory?.[0]?.supersededByReviewRequestId,
+          completed.reviewReworks?.[0]?.requestId,
+        );
+        assert.lengthOf(f.reviewRepairCalls, 2);
+        assert.lengthOf(f.reviewVerificationCalls, 1);
+        assert.deepEqual(
+          yield* f.sql`SELECT reviewed_commit_sha,reviewed_verification_evidence_id
+            FROM agent_control_epic_review_requests`,
+          [
+            {
+              reviewed_commit_sha: reviewedCommitSha,
+              reviewed_verification_evidence_id: reviewedVerification.evidenceId,
+            },
+          ],
+        );
+        const oldest = yield* f.sql<{ stateJson: string }>`SELECT state_json AS "stateJson"
+          FROM agent_control_epic_history WHERE epic_run_id=${original.epicRunId} AND revision=1`;
+        assert.deepEqual(decodeEpicState(oldest[0]!.stateJson), original);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect(
+    "replays command and idempotency identities without duplicate repair or verification",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* runMigrations({ toMigrationInclusive: 94 });
+        const original = succeededReviewState();
+        f.setMode("armed");
+        yield* seedRun(f.sql, original);
+        f.setReviewProgress((input) =>
+          input.authorize.pipe(
+            Effect.as({
+              kind: "candidate" as const,
+              attempts: [reviewAttempt("succeeded")],
+              commitSha: repairedCommitSha,
+            }),
+          ),
+        );
+        f.setReviewVerification((input) =>
+          input.authorize.pipe(
+            Effect.as({
+              status: "passed" as const,
+              commitSha: input.commitSha,
+              evidenceId: "idempotent-review-proof",
+              detail: "Passed once.",
+              checks: [],
+            }),
+          ),
+        );
+        const service = yield* f.make();
+        const input = reviewRequest(original);
+        const accepted = yield* service.requestReviewRework(input);
+        assert.equal((yield* service.requestReviewRework(input)).revision, accepted.revision);
+        assert.equal(
+          (yield* service.requestReviewRework({
+            ...input,
+            commandId: CommandId.make("review-rework-retry-command"),
+          })).revision,
+          accepted.revision,
+        );
+        assert.propertyVal(
+          yield* service
+            .requestReviewRework({
+              ...input,
+              findings: [{ ...reviewFinding, acceptanceCriteria: "Different requested scope." }],
+            })
+            .pipe(Effect.flip),
+          "code",
+          "command-conflict",
+        );
+        assert.propertyVal(
+          yield* service
+            .requestReviewRework({
+              ...input,
+              commandId: CommandId.make("review-rework-conflicting-key-command"),
+              findings: [{ ...reviewFinding, acceptanceCriteria: "Different requested scope." }],
+            })
+            .pipe(Effect.flip),
+          "code",
+          "idempotency-conflict",
+        );
+        yield* service.processProject(projectId);
+        yield* service.processProject(projectId);
+        yield* service.processProject(projectId);
+        assert.lengthOf(f.reviewRepairCalls, 1);
+        assert.lengthOf(f.reviewVerificationCalls, 1);
+        assert.deepEqual(
+          yield* f.sql`SELECT count(*) AS count FROM agent_control_epic_review_requests`,
+          [{ count: 1 }],
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect(
+    "verifies a second reviewed repair from the retained original member evidence after the intermediate handoff is published",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* runMigrations({ toMigrationInclusive: 94 });
+        const original = succeededReviewState();
+        f.setMode("armed");
+        yield* seedRun(f.sql, original);
+        f.setReviewProgress((input) =>
+          input.authorize.pipe(
+            Effect.as({
+              kind: "candidate" as const,
+              attempts: [reviewAttempt("succeeded")],
+              commitSha:
+                input.rework.reviewedCommitSha === reviewedCommitSha
+                  ? repairedCommitSha
+                  : secondRepairedCommitSha,
+            }),
+          ),
+        );
+        f.setReviewVerification((input) =>
+          input.authorize.pipe(
+            Effect.as({
+              status: "passed" as const,
+              commitSha: input.commitSha,
+              evidenceId:
+                input.commitSha === repairedCommitSha
+                  ? "first-review-repair-proof"
+                  : "second-review-repair-proof",
+              detail: "The sequential reviewed repair passed.",
+              checks: [],
+            }),
+          ),
+        );
+        const service = yield* f.make();
+        yield* service.requestReviewRework(reviewRequest(original));
+        yield* service.processProject(projectId);
+        yield* service.processProject(projectId);
+        const first = (yield* service.get(projectId))!;
+        assert.equal(first.acceptedCommitSha, repairedCommitSha);
+        assert.equal(first.handoff?.status, "update-required");
+
+        const published = yield* f.sql.withTransaction(
+          saveEpicRun(f.sql, first, {
+            handoff: { ...first.handoff!, status: "published" },
+          }),
+        );
+        yield* service.requestReviewRework(
+          reviewRequest(published, {
+            commandId: CommandId.make("second-review-rework-command"),
+            expectedRevision: published.revision,
+            reviewedCommitSha: repairedCommitSha,
+            reviewedVerificationEvidenceId: "first-review-repair-proof",
+            idempotencyKey: "independent-review-2",
+            findings: [
+              {
+                ...reviewFinding,
+                findingId: "sidebar-focus-return",
+                summary: "Focus is not restored after the nested item closes.",
+              },
+            ],
+          }),
+        );
+        yield* service.processProject(projectId);
+        yield* service.processProject(projectId);
+
+        const completed = (yield* service.get(projectId))!;
+        assert.equal(completed.acceptedCommitSha, secondRepairedCommitSha);
+        assert.equal(completed.finalVerification?.evidenceId, "second-review-repair-proof");
+        assert.deepEqual(
+          completed.finalVerificationHistory.map((verification) => verification.evidenceId),
+          [
+            reviewedVerification.evidenceId,
+            "first-review-repair-proof",
+            "second-review-repair-proof",
+          ],
+        );
+        assert.deepEqual(
+          completed.reviewReworks?.map((rework) => [
+            rework.previousAcceptedCommitSha,
+            rework.candidateCommitSha,
+            rework.status,
+          ]),
+          [
+            [reviewedCommitSha, repairedCommitSha, "succeeded"],
+            [repairedCommitSha, secondRepairedCommitSha, "succeeded"],
+          ],
+        );
+        assert.lengthOf(completed.handoffHistory ?? [], 2);
+        assert.equal(completed.handoffHistory?.[0]?.handoff.commitSha, reviewedCommitSha);
+        assert.equal(completed.handoffHistory?.[1]?.handoff.commitSha, repairedCommitSha);
+        assert.lengthOf(f.reviewVerificationCalls, 2);
+        assert.equal(f.reviewVerificationCalls[1]?.previousCommitSha, repairedCommitSha);
+        assert.equal(
+          f.reviewVerificationCalls[1]?.firstAccepted.accepted?.commitSha,
+          reviewedCommitSha,
+        );
+        assert.equal(
+          f.reviewVerificationCalls[1]?.lastAccepted.accepted?.commitSha,
+          reviewedCommitSha,
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("rejects stale reviewed commits and evidence plus a competing active request", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* runMigrations({ toMigrationInclusive: 94 });
+      const original = succeededReviewState();
+      f.setMode("armed");
+      yield* seedRun(f.sql, original);
+      const service = yield* f.make();
+      assert.propertyVal(
+        yield* service
+          .requestReviewRework(reviewRequest(original, { reviewedCommitSha: "e".repeat(40) }))
+          .pipe(Effect.flip),
+        "code",
+        "review-revision-stale",
+      );
+      assert.propertyVal(
+        yield* service
+          .requestReviewRework(
+            reviewRequest(original, { reviewedVerificationEvidenceId: "older-proof" }),
+          )
+          .pipe(Effect.flip),
+        "code",
+        "review-revision-stale",
+      );
+      const accepted = yield* service.requestReviewRework(reviewRequest(original));
+      assert.propertyVal(
+        yield* service
+          .requestReviewRework(
+            reviewRequest(original, {
+              commandId: CommandId.make("competing-review-command"),
+              expectedRevision: accepted.revision,
+              idempotencyKey: "independent-review-2",
+            }),
+          )
+          .pipe(Effect.flip),
+        "code",
+        "review-rework-unavailable",
+      );
+      assert.lengthOf(f.reviewRepairCalls, 0);
+      assert.deepEqual(
+        yield* f.sql`SELECT count(*) AS count FROM agent_control_epic_review_requests`,
+        [{ count: 1 }],
+      );
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("accepts only one of two concurrent review requests across service instances", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* runMigrations({ toMigrationInclusive: 94 });
+      const original = succeededReviewState();
+      f.setMode("armed");
+      yield* seedRun(f.sql, original);
+      const first = yield* f.make();
+      const second = yield* f.make();
+      const outcomes = yield* Effect.all(
+        [
+          first.requestReviewRework(
+            reviewRequest(original, {
+              commandId: CommandId.make("concurrent-review-a"),
+              idempotencyKey: "concurrent-review-key-a",
+            }),
+          ),
+          second.requestReviewRework(
+            reviewRequest(original, {
+              commandId: CommandId.make("concurrent-review-b"),
+              idempotencyKey: "concurrent-review-key-b",
+            }),
+          ),
+        ].map(Effect.exit),
+        { concurrency: 2 },
+      );
+      assert.equal(outcomes.filter(Exit.isSuccess).length, 1);
+      assert.equal(outcomes.filter(Exit.isFailure).length, 1);
+      assert.deepEqual(
+        yield* f.sql`SELECT count(*) AS count FROM agent_control_epic_review_requests`,
+        [{ count: 1 }],
+      );
+      const current = (yield* first.get(projectId))!;
+      assert.equal(current.reviewReworks?.length, 1);
+      assert.equal(current.reviewReworks?.[0]?.status, "accepted");
+      assert.lengthOf(f.reviewRepairCalls, 0);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("keeps the reviewed authority and handoff current when fresh verification fails", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* runMigrations({ toMigrationInclusive: 94 });
+      const original = succeededReviewState();
+      f.setMode("armed");
+      yield* seedRun(f.sql, original);
+      f.setReviewProgress((input) =>
+        input.authorize.pipe(
+          Effect.as({
+            kind: "candidate" as const,
+            attempts: [reviewAttempt("succeeded")],
+            commitSha: repairedCommitSha,
+          }),
+        ),
+      );
+      f.setReviewVerification((input) =>
+        input.authorize.pipe(
+          Effect.as({
+            status: "failed" as const,
+            commitSha: input.commitSha,
+            evidenceId: "failed-review-proof",
+            detail: "The repaired combined result failed its required check.",
+            checks: [],
+          }),
+        ),
+      );
+      const service = yield* f.make();
+      yield* service.requestReviewRework(reviewRequest(original));
+      yield* service.processProject(projectId);
+      yield* service.processProject(projectId);
+      const blocked = (yield* service.get(projectId))!;
+      assert.equal(blocked.status, "blocked");
+      assert.equal(blocked.activeReviewReworkId, null);
+      assert.equal(blocked.acceptedCommitSha, reviewedCommitSha);
+      assert.deepEqual(blocked.finalVerification, reviewedVerification);
+      assert.equal(blocked.finalVerificationHistory.at(-1)?.evidenceId, "failed-review-proof");
+      assert.equal(blocked.handoff?.commitSha, reviewedCommitSha);
+      assert.equal(blocked.handoff?.verificationEvidenceId, reviewedVerification.evidenceId);
+      assert.equal(blocked.reviewReworks?.[0]?.candidateCommitSha, repairedCommitSha);
+      assert.equal(blocked.reviewReworks?.[0]?.status, "blocked");
+      assert.equal(blocked.blockers[0]?.code, "review-verification-failed");
+      assert.propertyVal(
+        yield* service
+          .resume({
+            projectId,
+            epicRunId: blocked.epicRunId,
+            expectedRevision: blocked.revision,
+            commandId: CommandId.make("resume-terminal-review-rework"),
+          })
+          .pipe(Effect.flip),
+        "code",
+        "review-rework-terminal",
+      );
+      assert.deepEqual(yield* service.get(projectId), blocked);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("fences a late repair result after the active review request is stopped", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* runMigrations({ toMigrationInclusive: 94 });
+      const original = succeededReviewState();
+      f.setMode("armed");
+      yield* seedRun(f.sql, original);
+      const progressStarted = yield* Deferred.make<void>();
+      const releaseProgress = yield* Deferred.make<void>();
+      f.setReviewProgress((input) =>
+        Effect.gen(function* () {
+          yield* input.authorize;
+          yield* Deferred.succeed(progressStarted, undefined);
+          yield* Deferred.await(releaseProgress);
+          yield* input.authorize;
+          return {
+            kind: "candidate" as const,
+            attempts: [reviewAttempt("succeeded")],
+            commitSha: repairedCommitSha,
+          };
+        }),
+      );
+      const service = yield* f.make();
+      const accepted = yield* service.requestReviewRework(reviewRequest(original));
+      const processing = yield* service.processProject(projectId).pipe(Effect.forkChild);
+      yield* Deferred.await(progressStarted);
+      // A reconstructed service has an independent in-memory lock but must still
+      // fence the late worker through the durable Epic revision.
+      const stopper = yield* f.make();
+      const stopped = yield* stopper.stop({
+        projectId,
+        epicRunId: original.epicRunId,
+        expectedRevision: accepted.revision,
+        commandId: CommandId.make("stop-review-rework"),
+      });
+      assert.equal(stopped.status, "stopped");
+      yield* Deferred.succeed(releaseProgress, undefined);
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(Fiber.join(processing))));
+      const current = (yield* service.get(projectId))!;
+      assert.equal(current.status, "stopped");
+      assert.equal(current.activeReviewReworkId, null);
+      assert.equal(current.reviewReworks?.[0]?.status, "stopped");
+      assert.equal(current.reviewReworks?.[0]?.candidateCommitSha, null);
+      assert.equal(current.acceptedCommitSha, reviewedCommitSha);
+      assert.deepEqual(current.finalVerification, reviewedVerification);
+      assert.lengthOf(f.reviewVerificationCalls, 0);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("blocks a late repair result after Armed authority is revoked", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* runMigrations({ toMigrationInclusive: 94 });
+      const original = succeededReviewState();
+      f.setMode("armed");
+      yield* seedRun(f.sql, original);
+      const progressStarted = yield* Deferred.make<void>();
+      const releaseProgress = yield* Deferred.make<void>();
+      f.setReviewProgress((input) =>
+        Effect.gen(function* () {
+          yield* input.authorize;
+          yield* Deferred.succeed(progressStarted, undefined);
+          yield* Deferred.await(releaseProgress);
+          yield* input.authorize;
+          return {
+            kind: "candidate" as const,
+            attempts: [reviewAttempt("succeeded")],
+            commitSha: repairedCommitSha,
+          };
+        }),
+      );
+      const service = yield* f.make();
+      yield* service.requestReviewRework(reviewRequest(original));
+      const processing = yield* service.processProject(projectId).pipe(Effect.forkChild);
+      yield* Deferred.await(progressStarted);
+      f.setMode("observe");
+      yield* Deferred.succeed(releaseProgress, undefined);
+      yield* Fiber.join(processing);
+
+      const blocked = (yield* service.get(projectId))!;
+      assert.equal(blocked.status, "blocked");
+      assert.equal(blocked.activeReviewReworkId, null);
+      assert.equal(blocked.reviewReworks?.[0]?.status, "blocked");
+      assert.equal(blocked.reviewReworks?.[0]?.candidateCommitSha, null);
+      assert.equal(blocked.reviewReworks?.[0]?.blocker?.code, "review-authority-revoked");
+      assert.equal(blocked.acceptedCommitSha, reviewedCommitSha);
+      assert.deepEqual(blocked.finalVerification, reviewedVerification);
+      assert.equal(blocked.handoff?.commitSha, reviewedCommitSha);
+      assert.lengthOf(f.reviewVerificationCalls, 0);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect("recovers accepted, repairing, and verifying review work across service restarts", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* runMigrations({ toMigrationInclusive: 94 });
+      const original = succeededReviewState();
+      f.setMode("armed");
+      yield* seedRun(f.sql, original);
+      let candidateReady = false;
+      f.setReviewProgress((input) =>
+        input.authorize.pipe(
+          Effect.as(
+            candidateReady
+              ? {
+                  kind: "candidate" as const,
+                  attempts: [reviewAttempt("succeeded")],
+                  commitSha: repairedCommitSha,
+                }
+              : { kind: "repairing" as const, attempts: [reviewAttempt()] },
+          ),
+        ),
+      );
+      f.setReviewVerification((input) =>
+        input.authorize.pipe(
+          Effect.as({
+            status: "passed" as const,
+            commitSha: input.commitSha,
+            evidenceId: "recovered-review-proof",
+            detail: "Recovered verification passed.",
+            checks: [],
+          }),
+        ),
+      );
+      const accepting = yield* f.make();
+      yield* accepting.requestReviewRework(reviewRequest(original));
+
+      const repairStarter = yield* f.make();
+      yield* repairStarter.processProject(projectId);
+      const repairing = (yield* repairStarter.get(projectId))!;
+      assert.equal(repairing.reviewReworks?.[0]?.status, "repairing");
+      const repairingRevision = repairing.revision;
+
+      const repairRecovery = yield* f.make();
+      yield* repairRecovery.processProject(projectId);
+      assert.equal((yield* repairRecovery.get(projectId))?.revision, repairingRevision);
+      candidateReady = true;
+      const candidateRecovery = yield* f.make();
+      yield* candidateRecovery.processProject(projectId);
+      assert.equal(
+        (yield* candidateRecovery.get(projectId))?.reviewReworks?.[0]?.status,
+        "verifying",
+      );
+
+      const verificationRecovery = yield* f.make();
+      yield* verificationRecovery.processProject(projectId);
+      assert.equal((yield* verificationRecovery.get(projectId))?.status, "succeeded");
+      yield* verificationRecovery.processProject(projectId);
+      assert.lengthOf(f.reviewRepairCalls, 3);
+      assert.lengthOf(f.reviewVerificationCalls, 1);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
 });
 

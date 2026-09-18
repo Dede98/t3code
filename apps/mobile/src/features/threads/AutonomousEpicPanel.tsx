@@ -24,11 +24,15 @@ import {
   agentControlEpicStatus,
   agentControlEpicHandoffBlockers,
   agentControlEpicPublishHandoffInput,
+  agentControlEpicReviewReworkBlockers,
+  agentControlEpicReviewReworkInput,
+  agentControlEpicReviewReworkStatus,
   type AgentControlReadiness,
 } from "@t3tools/client-runtime/state/agent-control";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   AgentControlRunOnceId,
+  ThreadId,
   type AgentControlRunOnceView,
   type AgentControlEpicPreview,
   type AgentControlEpicHandoffPreview,
@@ -68,6 +72,7 @@ type Props = {
   projectId: ProjectId;
   readiness: AgentControlReadiness;
   handoffPermissionBlocker: string | null;
+  reviewReworkPermissionBlocker: string | null;
   onRefresh: () => void;
   readOnly?: boolean;
   renderRun: (run: AgentControlRunOnceView) => ReactNode;
@@ -78,6 +83,7 @@ export function AutonomousEpicPanel({
   projectId,
   readiness,
   handoffPermissionBlocker,
+  reviewReworkPermissionBlocker,
   onRefresh,
   readOnly = false,
   renderRun,
@@ -743,7 +749,12 @@ export function AutonomousEpicPanel({
                   connected={readiness.connected}
                   pending={readiness.pending}
                   permissionBlocker={handoffPermissionBlocker}
+                  reviewReworkPermissionBlocker={reviewReworkPermissionBlocker}
                   onRefresh={onRefresh}
+                  onOpenThread={(threadId, changes) => {
+                    if (changes) navigation.navigate("ThreadReview", { environmentId, threadId });
+                    else navigation.navigate("Thread", { environmentId, threadId });
+                  }}
                 />
                 {!epic.finalVerification ? (
                   <Text className="text-sm text-foreground-muted">
@@ -773,6 +784,7 @@ export function AutonomousEpicPanel({
                   projectId={projectId}
                   readOnly
                   handoffPermissionBlocker={handoffPermissionBlocker}
+                  reviewReworkPermissionBlocker={reviewReworkPermissionBlocker}
                   readiness={{
                     ...readiness,
                     snapshot: {
@@ -930,7 +942,16 @@ type HandoffProps = {
   connected: boolean;
   pending: boolean;
   permissionBlocker: string | null;
+  reviewReworkPermissionBlocker: string | null;
   onRefresh: () => void;
+  onOpenThread: (threadId: ThreadId, changes?: boolean) => void;
+};
+
+type ReviewFindingDraft = {
+  findingId: string;
+  summary: string;
+  correctionCriteria: string;
+  acceptanceCriteria: string;
 };
 
 function EpicHandoff({
@@ -939,12 +960,23 @@ function EpicHandoff({
   connected,
   pending,
   permissionBlocker,
+  reviewReworkPermissionBlocker,
   onRefresh,
+  onOpenThread,
 }: HandoffProps) {
   const [preview, setPreview] = useState<AgentControlEpicHandoffPreview | null>(null);
   const [observed, setObserved] = useState<AgentControlEpicRuntimeView | null>(null);
-  const [busy, setBusy] = useState<"inspect" | "publish" | "refresh" | null>(null);
+  const [busy, setBusy] = useState<"inspect" | "publish" | "refresh" | "rework" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const nextFindingId = useRef(2);
+  const [findings, setFindings] = useState<ReviewFindingDraft[]>([
+    {
+      findingId: `${savedEpic.epicRunId}:review-finding:1`,
+      summary: "",
+      correctionCriteria: "",
+      acceptanceCriteria: "",
+    },
+  ]);
   const mounted = useRef(true);
   const inFlight = useRef(false);
   useEffect(() => {
@@ -957,6 +989,9 @@ function EpicHandoff({
     reportFailure: false,
   });
   const publish = useAtomCommand(agentControlEnvironment.epicPublishHandoff, {
+    reportFailure: false,
+  });
+  const requestReviewRework = useAtomCommand(agentControlEnvironment.epicRequestReviewRework, {
     reportFailure: false,
   });
   const epic = observed && observed.revision > savedEpic.revision ? observed : savedEpic;
@@ -978,8 +1013,53 @@ function EpicHandoff({
     permissionBlocker,
     preview,
   });
-  const pullRequest = handoff?.pullRequest;
-  const target = handoff ?? preview;
+  const reviewReworkActive = epic.activeReviewReworkId != null;
+  const handoffUpdateRequired = handoff?.status === "update-required";
+  const pullRequest = reviewReworkActive ? null : handoff?.pullRequest;
+  const target = reviewReworkActive ? null : (handoff ?? preview);
+  const reviewReworkBlockers = agentControlEpicReviewReworkBlockers({
+    epic,
+    findings,
+    connected,
+    pending: pending || busy !== null,
+    permissionBlocker: reviewReworkPermissionBlocker,
+  });
+
+  function updateFinding(
+    findingId: string,
+    field: "summary" | "correctionCriteria" | "acceptanceCriteria",
+    value: string,
+  ) {
+    setFindings((current) =>
+      current.map((finding) =>
+        finding.findingId === findingId ? { ...finding, [field]: value } : finding,
+      ),
+    );
+  }
+
+  async function submitReviewRework() {
+    if (inFlight.current || reviewReworkBlockers.length > 0) return;
+    inFlight.current = true;
+    setBusy("rework");
+    setError(null);
+    try {
+      const result = await requestReviewRework({
+        environmentId,
+        input: agentControlEpicReviewReworkInput(epic, findings),
+      });
+      if (!mounted.current) return;
+      if (result._tag === "Success") {
+        setPreview(null);
+        setObserved(result.value);
+      } else setError(agentControlCommandErrorMessage(squashAtomCommandFailure(result)));
+      onRefresh();
+    } catch (cause) {
+      if (mounted.current) setError(agentControlCommandErrorMessage(cause));
+    } finally {
+      inFlight.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  }
 
   async function execute(action: "inspect" | "publish" | "refresh") {
     if (inFlight.current) return;
@@ -1032,7 +1112,182 @@ function EpicHandoff({
   return (
     <View className="gap-2 rounded-xl border border-border-subtle p-3">
       <Text className="text-sm font-t3-bold">Human review</Text>
-      {target ? (
+      {epic.reviewReworks?.length ? (
+        <View className="gap-2">
+          <Text className="text-sm font-t3-bold">Review repair history</Text>
+          {epic.reviewReworks.map((rework) => (
+            <View
+              key={rework.requestId}
+              className="gap-2 rounded-xl border border-border-subtle p-3"
+            >
+              <Text accessibilityRole="summary" className="text-sm font-t3-bold">
+                {agentControlEpicReviewReworkStatus(rework).label}
+              </Text>
+              <Text selectable className="text-xs">
+                Previously reviewed: {rework.reviewedCommitSha} · Evidence:{" "}
+                {rework.reviewedVerificationEvidenceId}
+              </Text>
+              {rework.candidateCommitSha ? (
+                <Text selectable className="text-xs">
+                  Repair candidate: {rework.candidateCommitSha}
+                </Text>
+              ) : null}
+              {rework.verification ? (
+                <Text selectable className="text-xs">
+                  {rework.verification.status === "passed"
+                    ? "New verified commit"
+                    : "Checked candidate"}
+                  : {rework.verification.commitSha} · Evidence: {rework.verification.evidenceId}
+                </Text>
+              ) : null}
+              {rework.blocker ? (
+                <Text accessibilityRole="alert" className="text-sm text-destructive">
+                  {rework.blocker.message}
+                </Text>
+              ) : null}
+              {rework.findings.map((finding) => (
+                <View key={finding.findingId} className="gap-1 rounded-xl bg-card p-3">
+                  <Text className="text-sm font-t3-bold">{finding.summary}</Text>
+                  <Text className="text-sm">Required correction: {finding.correctionCriteria}</Text>
+                  <Text className="text-sm">Acceptance: {finding.acceptanceCriteria}</Text>
+                </View>
+              ))}
+              {rework.repairAttempts.map((attempt) => (
+                <View key={attempt.attempt} className="gap-2 rounded-xl bg-card p-3">
+                  <Text className="text-sm">
+                    Repair {attempt.attempt} · {attempt.status} · {attempt.providerInstanceId} /{" "}
+                    {attempt.model}
+                  </Text>
+                  <Action onPress={() => onOpenThread(ThreadId.make(attempt.threadId))}>
+                    Open repair thread
+                  </Action>
+                  <Action onPress={() => onOpenThread(ThreadId.make(attempt.threadId), true)}>
+                    Open repair changes
+                  </Action>
+                  {attempt.error ? (
+                    <Text accessibilityRole="alert" className="text-sm text-destructive">
+                      {attempt.error.message}
+                    </Text>
+                  ) : null}
+                </View>
+              ))}
+            </View>
+          ))}
+        </View>
+      ) : null}
+      {epic.handoffHistory?.length ? (
+        <View className="gap-2">
+          <Text className="text-sm font-t3-bold">Previous review handoffs</Text>
+          {epic.handoffHistory.map((entry) => (
+            <View
+              key={entry.handoff.intentId}
+              className="gap-1 rounded-xl border border-border-subtle p-3"
+            >
+              <Text selectable className="text-xs">
+                Previous verified commit: {entry.handoff.commitSha} · Evidence:{" "}
+                {entry.handoff.verificationEvidenceId}
+              </Text>
+              <Text className="text-xs text-foreground-muted">
+                Superseded when review repair was requested at {entry.supersededAt}.
+              </Text>
+              {entry.handoff.pullRequest ? (
+                <Action
+                  onPress={() => {
+                    void tryOpenExternalUrl(entry.handoff.pullRequest!.url, "pull-request");
+                  }}
+                >
+                  {`Open previous PR #${entry.handoff.pullRequest.number} · ${entry.handoff.pullRequest.state}`}
+                </Action>
+              ) : null}
+            </View>
+          ))}
+        </View>
+      ) : null}
+      {epic.status === "succeeded" && !reviewReworkActive ? (
+        <View className="gap-2 rounded-xl border border-border-subtle p-3">
+          <Text className="text-sm font-t3-bold">Report review findings</Text>
+          <Text selectable className="text-xs">
+            Findings apply to verified commit {epic.acceptedCommitSha ?? "Unavailable"}.
+          </Text>
+          {findings.map((finding, index) => (
+            <View key={finding.findingId} className="gap-2 rounded-xl bg-card p-3">
+              <Text className="text-sm font-t3-bold">Finding {index + 1}</Text>
+              <TextInput
+                accessibilityLabel={`Finding ${index + 1} summary`}
+                placeholder="What is wrong?"
+                multiline
+                value={finding.summary}
+                onChangeText={(value) => updateFinding(finding.findingId, "summary", value)}
+                className="min-h-20"
+              />
+              <TextInput
+                accessibilityLabel={`Finding ${index + 1} required correction`}
+                placeholder="What must change?"
+                multiline
+                value={finding.correctionCriteria}
+                onChangeText={(value) =>
+                  updateFinding(finding.findingId, "correctionCriteria", value)
+                }
+                className="min-h-20"
+              />
+              <TextInput
+                accessibilityLabel={`Finding ${index + 1} acceptance criteria`}
+                placeholder="How can the correction be verified?"
+                multiline
+                value={finding.acceptanceCriteria}
+                onChangeText={(value) =>
+                  updateFinding(finding.findingId, "acceptanceCriteria", value)
+                }
+                className="min-h-20"
+              />
+              {findings.length > 1 ? (
+                <Action
+                  onPress={() =>
+                    setFindings((current) =>
+                      current.filter((item) => item.findingId !== finding.findingId),
+                    )
+                  }
+                >
+                  Remove finding
+                </Action>
+              ) : null}
+            </View>
+          ))}
+          <Action
+            disabled={findings.length >= 20}
+            onPress={() => {
+              const id = nextFindingId.current++;
+              setFindings((current) => [
+                ...current,
+                {
+                  findingId: `${epic.epicRunId}:review-finding:${id}`,
+                  summary: "",
+                  correctionCriteria: "",
+                  acceptanceCriteria: "",
+                },
+              ]);
+            }}
+          >
+            Add finding
+          </Action>
+          <Action
+            disabled={reviewReworkBlockers.length > 0}
+            onPress={() => void submitReviewRework()}
+          >
+            Request repair and re-verification
+          </Action>
+          {reviewReworkBlockers.map((blocker) => (
+            <Text key={blocker} className="text-sm text-destructive">
+              {blocker}
+            </Text>
+          ))}
+        </View>
+      ) : null}
+      {reviewReworkActive ? (
+        <Text className="text-sm text-foreground-muted">
+          The previous handoff is historical while repair and re-verification are in progress.
+        </Text>
+      ) : target ? (
         <View className="gap-1">
           <Text selectable className="text-xs">
             Repository: {target.repository.nameWithOwner}
@@ -1055,14 +1310,16 @@ function EpicHandoff({
       )}
       {busy || handoff?.status === "publishing" ? (
         <Text accessibilityLiveRegion="polite" className="text-sm">
-          {busy === "refresh"
-            ? "Refreshing PR state…"
-            : busy === "inspect"
-              ? "Checking publication…"
-              : "Handoff in progress…"}
+          {busy === "rework"
+            ? "Submitting review findings…"
+            : busy === "refresh"
+              ? "Refreshing PR state…"
+              : busy === "inspect"
+                ? "Checking publication…"
+                : "Handoff in progress…"}
         </Text>
       ) : null}
-      {pullRequest ? (
+      {pullRequest && !handoffUpdateRequired ? (
         <>
           <Action
             onPress={() => {
@@ -1097,11 +1354,19 @@ function EpicHandoff({
             </Text>
           ))}
           <Action disabled={blockers.length > 0} onPress={() => void execute("inspect")}>
-            {handoff || error ? "Review and retry handoff" : "Review publication"}
+            {handoffUpdateRequired
+              ? "Review PR update"
+              : handoff || error
+                ? "Review and retry handoff"
+                : "Review publication"}
           </Action>
           {preview ? (
             <Action disabled={publishBlockers.length > 0} onPress={() => void execute("publish")}>
-              {handoff ? "Retry Draft PR handoff" : "Create Draft PR"}
+              {handoffUpdateRequired
+                ? "Update Draft PR"
+                : handoff
+                  ? "Retry Draft PR handoff"
+                  : "Create Draft PR"}
             </Action>
           ) : null}
         </>

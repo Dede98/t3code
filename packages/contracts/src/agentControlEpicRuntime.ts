@@ -15,6 +15,7 @@ import {
   NonNegativeInt,
   PositiveInt,
   ProjectId,
+  TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 
 export const AgentControlEpicBlocker = Schema.Struct({
@@ -88,7 +89,7 @@ export const AgentControlEpicHandoffPullRequest = Schema.Struct({
 export type AgentControlEpicHandoffPullRequest = typeof AgentControlEpicHandoffPullRequest.Type;
 export const AgentControlEpicHandoff = Schema.Struct({
   intentId: Schema.String,
-  status: Schema.Literals(["publishing", "published", "blocked", "failed"]),
+  status: Schema.Literals(["publishing", "published", "update-required", "blocked", "failed"]),
   repository: AgentControlGithubRepositoryBinding,
   targetBranch: Schema.String,
   baseCommitSha: Schema.String,
@@ -102,6 +103,55 @@ export const AgentControlEpicHandoff = Schema.Struct({
   error: Schema.NullOr(Schema.Struct({ code: Schema.String, message: Schema.String })),
 });
 export type AgentControlEpicHandoff = typeof AgentControlEpicHandoff.Type;
+export const AgentControlEpicReviewFinding = Schema.Struct({
+  findingId: TrimmedNonEmptyString,
+  summary: TrimmedNonEmptyString,
+  correctionCriteria: TrimmedNonEmptyString,
+  acceptanceCriteria: TrimmedNonEmptyString,
+});
+export type AgentControlEpicReviewFinding = typeof AgentControlEpicReviewFinding.Type;
+export const AgentControlEpicReviewRepairAttempt = Schema.Struct({
+  attempt: PositiveInt,
+  providerInstanceId: TrimmedNonEmptyString,
+  model: TrimmedNonEmptyString,
+  threadId: TrimmedNonEmptyString,
+  status: Schema.Literals(["requested", "running", "succeeded", "failed", "stopped"]),
+  startedAt: IsoDateTime,
+  completedAt: Schema.NullOr(IsoDateTime),
+  error: Schema.NullOr(Schema.Struct({ code: Schema.String, message: Schema.String })),
+});
+export type AgentControlEpicReviewRepairAttempt = typeof AgentControlEpicReviewRepairAttempt.Type;
+export const AgentControlEpicReviewRework = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+  idempotencyKey: TrimmedNonEmptyString,
+  reviewedCommitSha: TrimmedNonEmptyString,
+  reviewedVerificationEvidenceId: TrimmedNonEmptyString,
+  findings: Schema.Array(AgentControlEpicReviewFinding),
+  status: Schema.Literals([
+    "accepted",
+    "repairing",
+    "verifying",
+    "blocked",
+    "succeeded",
+    "stopped",
+  ]),
+  previousAcceptedCommitSha: TrimmedNonEmptyString,
+  previousVerificationEvidenceId: TrimmedNonEmptyString,
+  repairAttempts: Schema.Array(AgentControlEpicReviewRepairAttempt),
+  candidateCommitSha: Schema.NullOr(Schema.String),
+  verification: Schema.NullOr(AgentControlEpicFinalVerification),
+  blocker: Schema.NullOr(AgentControlEpicBlocker),
+  requestedAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  completedAt: Schema.NullOr(IsoDateTime),
+});
+export type AgentControlEpicReviewRework = typeof AgentControlEpicReviewRework.Type;
+export const AgentControlEpicHandoffHistoryEntry = Schema.Struct({
+  handoff: AgentControlEpicHandoff,
+  supersededByReviewRequestId: TrimmedNonEmptyString,
+  supersededAt: IsoDateTime,
+});
+export type AgentControlEpicHandoffHistoryEntry = typeof AgentControlEpicHandoffHistoryEntry.Type;
 export const AgentControlEpicRuntimeView = Schema.Struct({
   epicRunId: Schema.String,
   projectId: ProjectId,
@@ -141,6 +191,9 @@ export const AgentControlEpicRuntimeView = Schema.Struct({
   finalVerification: Schema.NullOr(AgentControlEpicFinalVerification),
   finalVerificationHistory: Schema.Array(AgentControlEpicFinalVerification),
   handoff: Schema.optionalKey(AgentControlEpicHandoff),
+  handoffHistory: Schema.optionalKey(Schema.Array(AgentControlEpicHandoffHistoryEntry)),
+  reviewReworks: Schema.optionalKey(Schema.Array(AgentControlEpicReviewRework)),
+  activeReviewReworkId: Schema.optionalKey(Schema.NullOr(TrimmedNonEmptyString)),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -188,6 +241,17 @@ export const AgentControlEpicHandoffPublishInput = Schema.Struct({
   expectedTargetBranch: Schema.String,
 });
 export type AgentControlEpicHandoffPublishInput = typeof AgentControlEpicHandoffPublishInput.Type;
+export const AgentControlEpicReviewReworkInput = Schema.Struct({
+  ...AgentControlEpicControlInput.fields,
+  reviewedCommitSha: TrimmedNonEmptyString,
+  reviewedVerificationEvidenceId: TrimmedNonEmptyString,
+  findings: Schema.Array(AgentControlEpicReviewFinding).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(20),
+  ),
+  idempotencyKey: TrimmedNonEmptyString,
+});
+export type AgentControlEpicReviewReworkInput = typeof AgentControlEpicReviewReworkInput.Type;
 export const AGENT_CONTROL_EPIC_RPC_METHODS = {
   preview: "agentControlEpic.preview",
   start: "agentControlEpic.start",
@@ -196,6 +260,7 @@ export const AGENT_CONTROL_EPIC_RPC_METHODS = {
   clear: "agentControlEpic.clear",
   previewHandoff: "agentControlEpic.previewHandoff",
   publishHandoff: "agentControlEpic.publishHandoff",
+  requestReviewRework: "agentControlEpic.requestReviewRework",
 } as const;
 export class AgentControlEpicRpcError extends Schema.TaggedError<AgentControlEpicRpcError>()(
   "AgentControlEpicRpcError",

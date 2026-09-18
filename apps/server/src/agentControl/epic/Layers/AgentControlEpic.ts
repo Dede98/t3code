@@ -22,8 +22,11 @@ import {
   type AgentControlEpicControlInput,
   type AgentControlEpicStartInput,
   type AgentControlEpicPreviewInput,
+  type AgentControlEpicReviewRework,
+  type AgentControlEpicReviewReworkInput,
   type ProjectId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -38,9 +41,11 @@ import { AgentControlRunOnceReadNotifications } from "../../runOnce/readNotifica
 import { makeAgentControlRunOnceKeyedFence } from "../../runOnce/context.ts";
 import { AgentControlEpic } from "../Services/AgentControlEpic.ts";
 import { AgentControlEpicResultHooks } from "../Services/AgentControlEpicResultHooks.ts";
+import { AgentControlEpicReviewRepair } from "../Services/AgentControlEpicReviewRepair.ts";
 import {
   epicDigest,
   epicError,
+  epicJson,
   loadEpicRun,
   loadProjectEpic,
   loadProjectEpics,
@@ -52,6 +57,7 @@ import { epicSourceChanges, selectEpicMember } from "../model.ts";
 import { makeEpicHandoff } from "../handoff.ts";
 import { EpicHandoffEvidence } from "../handoffAuthority.ts";
 import { EpicHandoffRemote } from "../remote.ts";
+import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 
 const isEpicError = Schema.is(AgentControlEpicRpcError);
 const isGithubError = Schema.is(GithubIssueTrackerClientError);
@@ -76,6 +82,9 @@ export const makeAgentControlEpic = Effect.gen(function* () {
   const engine = yield* AgentControlEngine;
   const policyService = yield* AgentControlPolicyService;
   const results = yield* AgentControlEpicResultHooks;
+  const reviewRepair = yield* AgentControlEpicReviewRepair;
+  const handoffEvidence = yield* Effect.serviceOption(EpicHandoffEvidence);
+  const handoffRemote = yield* Effect.serviceOption(EpicHandoffRemote);
   const notifications = yield* AgentControlRunOnceReadNotifications;
   const changes = yield* PubSub.unbounded<ProjectId>();
   const publish = (projectId: ProjectId) =>
@@ -425,6 +434,17 @@ export const makeAgentControlEpic = Effect.gen(function* () {
         Effect.gen(function* () {
           const replay = yield* replayCommand(kind, input);
           if (replay) {
+            const stoppedReview = replay.reviewReworks?.findLast(
+              (rework) => rework.status === "stopped",
+            );
+            if (kind === "stop" && stoppedReview)
+              yield* reviewRepair
+                .cancel({ state: replay, rework: stoppedReview })
+                .pipe(
+                  Effect.catch((cause) =>
+                    Effect.logWarning("Could not reconcile stopped Epic review repair", { cause }),
+                  ),
+                );
             yield* recoverModeIntent(replay);
             return replay;
           }
@@ -452,6 +472,11 @@ export const makeAgentControlEpic = Effect.gen(function* () {
             return yield* epicError(
               "epic-terminal",
               "A completed or stopped Epic run cannot be resumed.",
+            );
+          if (kind === "resume" && current.reviewReworks?.at(-1)?.status === "blocked")
+            return yield* epicError(
+              "review-rework-terminal",
+              "A failed review repair remains blocked with its evidence retained; end this Epic instead of resuming its completed tasks.",
             );
           if (kind === "clear" && (yield* loadEnabledEpicQueue(sql, input.projectId)))
             return yield* epicError(
@@ -497,15 +522,36 @@ export const makeAgentControlEpic = Effect.gen(function* () {
           }
           const queued = (yield* loadEnabledEpicQueue(sql, input.projectId)) !== null;
           const modeState = yield* engine.getProjectState({ projectId: input.projectId });
+          const controlAt = DateTime.formatIso(yield* DateTime.now);
           const updated = yield* sql.withTransaction(
             Effect.gen(function* () {
               const updated = yield* saveEpicRun(
                 sql,
                 current,
                 kind === "stop"
-                  ? queued && !current.projectDependencyPlan
+                  ? queued && !current.projectDependencyPlan && !current.activeReviewReworkId
                     ? {}
-                    : { status: "stopped" }
+                    : {
+                        status: "stopped",
+                        activeReviewReworkId: null,
+                        ...(current.reviewReworks
+                          ? {
+                              reviewReworks: current.reviewReworks.map((rework) =>
+                                rework.requestId === current.activeReviewReworkId &&
+                                (rework.status === "accepted" ||
+                                  rework.status === "repairing" ||
+                                  rework.status === "verifying")
+                                  ? {
+                                      ...rework,
+                                      status: "stopped" as const,
+                                      completedAt: controlAt,
+                                      updatedAt: controlAt,
+                                    }
+                                  : rework,
+                              ),
+                            }
+                          : {}),
+                      }
                   : {
                       status: "running",
                       blockers: [],
@@ -556,6 +602,19 @@ export const makeAgentControlEpic = Effect.gen(function* () {
               return updated;
             }),
           );
+          if (kind === "stop" && current.activeReviewReworkId) {
+            const stoppedReview = updated.reviewReworks?.find(
+              (rework) => rework.requestId === current.activeReviewReworkId,
+            );
+            if (stoppedReview)
+              yield* reviewRepair
+                .cancel({ state: updated, rework: stoppedReview })
+                .pipe(
+                  Effect.catch((cause) =>
+                    Effect.logWarning("Could not interrupt stopped Epic review repair", { cause }),
+                  ),
+                );
+          }
           yield* publish(input.projectId);
           yield* recoverModeIntent(updated);
           return updated;
@@ -563,10 +622,424 @@ export const makeAgentControlEpic = Effect.gen(function* () {
       )
       .pipe(Effect.mapError(mapError));
 
+  const requestReviewRework = (input: AgentControlEpicReviewReworkInput) =>
+    locks
+      .withPermit(
+        input.projectId,
+        Effect.gen(function* () {
+          const { commandId: _commandId, ...requestIdentity } = input;
+          const requestDigest = epicDigest(requestIdentity);
+          const commandReplay = yield* sql<{
+            requestId: string;
+            digest: string;
+            epicRunId: string;
+          }>`SELECT request_id AS "requestId",request_digest AS digest,epic_run_id AS "epicRunId"
+            FROM main.agent_control_epic_review_requests WHERE command_id=${input.commandId}`;
+          if (commandReplay[0]) {
+            if (
+              commandReplay[0].digest !== requestDigest ||
+              commandReplay[0].epicRunId !== input.epicRunId
+            )
+              return yield* epicError(
+                "command-conflict",
+                "This command identity was already used for another review request.",
+              );
+            const replayed = yield* loadEpicRun(sql, input.epicRunId);
+            if (!replayed || replayed.projectId !== input.projectId)
+              return yield* epicError("authority-conflict", "Review request authority is missing.");
+            return replayed;
+          }
+          const keyReplay = yield* sql<{
+            digest: string;
+            epicRunId: string;
+          }>`SELECT request_digest AS digest,epic_run_id AS "epicRunId"
+            FROM main.agent_control_epic_review_requests
+            WHERE project_id=${input.projectId} AND epic_run_id=${input.epicRunId}
+              AND idempotency_key=${input.idempotencyKey}`;
+          if (keyReplay[0]) {
+            if (keyReplay[0].digest !== requestDigest)
+              return yield* epicError(
+                "idempotency-conflict",
+                "This idempotency key already identifies different review feedback.",
+              );
+            const replayed = yield* loadEpicRun(sql, input.epicRunId);
+            if (!replayed)
+              return yield* epicError("authority-conflict", "Epic evidence is missing.");
+            return replayed;
+          }
+          const current = yield* loadProjectEpic(sql, input.projectId, input.epicRunId);
+          if (!current)
+            return yield* epicError(
+              "epic-missing",
+              "This Epic run does not belong to the selected project and environment.",
+            );
+          if (current.revision !== input.expectedRevision)
+            return yield* epicError(
+              "revision-conflict",
+              "Epic progress changed. Reload the reviewed result before requesting repair.",
+            );
+          const projectAuthority = yield* engine.getProjectState({ projectId: input.projectId });
+          if (
+            (projectAuthority.mode !== "armed" && projectAuthority.mode !== "run-once") ||
+            projectAuthority.pausedFromMode !== null
+          )
+            return yield* epicError(
+              "review-authority-unavailable",
+              "Enable unpaused Armed automation in this project before requesting review repair.",
+            );
+          if (
+            current.status !== "succeeded" ||
+            current.activeReviewReworkId != null ||
+            !current.acceptedCommitSha ||
+            !current.finalVerification ||
+            current.finalVerification.status !== "passed"
+          )
+            return yield* epicError(
+              "review-rework-unavailable",
+              "Review repair requires an idle, successfully verified Epic result.",
+            );
+          if (
+            current.handoff?.status === "publishing" ||
+            current.handoff?.status === "update-required"
+          )
+            return yield* epicError(
+              "review-publication-unsettled",
+              "Finish or reconcile the current pull request publication before requesting another review repair.",
+            );
+          if (
+            (current.handoff?.status === "failed" || current.handoff?.status === "blocked") &&
+            !current.handoff.pullRequest
+          )
+            return yield* epicError(
+              "review-handoff-unconfirmed",
+              "The previous handoff has no confirmed pull request. Reconcile or end that publication attempt before requesting repair.",
+            );
+          if (
+            input.reviewedCommitSha !== current.acceptedCommitSha ||
+            input.reviewedVerificationEvidenceId !== current.finalVerification.evidenceId ||
+            current.finalVerification.commitSha !== current.acceptedCommitSha
+          )
+            return yield* epicError(
+              "review-revision-stale",
+              "The feedback refers to an older or different verified Epic result.",
+            );
+          const findingIds = new Set(input.findings.map((finding) => finding.findingId));
+          const encodedFindings = new TextEncoder().encode(epicJson(input.findings));
+          if (findingIds.size !== input.findings.length || encodedFindings.byteLength > 64 * 1024)
+            return yield* epicError(
+              "review-findings-invalid",
+              "Findings need unique identities and must fit within the bounded review request.",
+            );
+          if (current.handoff?.pullRequest) {
+            if (Option.isNone(handoffRemote))
+              return yield* epicError(
+                "handoff-unavailable",
+                "The existing pull request cannot be checked before starting repair.",
+              );
+            const projects = yield* sql<{ cwd: string }>`SELECT workspace_root AS cwd
+              FROM main.projection_projects WHERE project_id=${input.projectId} AND deleted_at IS NULL`;
+            if (!projects[0])
+              return yield* epicError("epic-unavailable", "The project workspace is unavailable.");
+            const observed = yield* handoffRemote.value.readPullRequest({
+              cwd: projects[0].cwd,
+              repository: current.handoff.repository,
+              pullRequest: current.handoff.pullRequest,
+            });
+            if (
+              observed.state !== "open" ||
+              !observed.isDraft ||
+              observed.headSha !== current.handoff.commitSha ||
+              observed.headSha !== current.acceptedCommitSha
+            )
+              return yield* epicError(
+                observed.state === "merged"
+                  ? "review-pr-merged"
+                  : observed.state === "closed"
+                    ? "review-pr-closed"
+                    : !observed.isDraft
+                      ? "review-pr-not-draft"
+                      : "review-pr-head-changed",
+                observed.state === "merged"
+                  ? "The reviewed pull request was already merged; its dependency evidence is final."
+                  : observed.state === "closed"
+                    ? "The reviewed pull request is closed. Reopen it before requesting repair."
+                    : !observed.isDraft
+                      ? "Return the pull request to draft before requesting automated repair."
+                      : "The pull request branch changed outside T3Auto. Review that head before continuing.",
+              );
+          }
+          const timestamp = DateTime.formatIso(yield* DateTime.now);
+          const requestId = `epic-review:${epicDigest({
+            projectId: input.projectId,
+            epicRunId: input.epicRunId,
+            idempotencyKey: input.idempotencyKey,
+          })}`;
+          const rework: AgentControlEpicReviewRework = {
+            requestId,
+            idempotencyKey: input.idempotencyKey,
+            reviewedCommitSha: input.reviewedCommitSha,
+            reviewedVerificationEvidenceId: input.reviewedVerificationEvidenceId,
+            findings: input.findings,
+            status: "accepted",
+            previousAcceptedCommitSha: current.acceptedCommitSha,
+            previousVerificationEvidenceId: current.finalVerification.evidenceId,
+            repairAttempts: [],
+            candidateCommitSha: null,
+            verification: null,
+            blocker: null,
+            requestedAt: timestamp,
+            updatedAt: timestamp,
+            completedAt: null,
+          };
+          const updated = yield* sql.withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO main.agent_control_epic_review_requests(
+                request_id,project_id,epic_run_id,idempotency_key,command_id,request_digest,
+                request_json,reviewed_commit_sha,reviewed_verification_evidence_id,
+                accepted_revision,accepted_at) VALUES (
+                ${requestId},${input.projectId},${input.epicRunId},${input.idempotencyKey},
+                ${input.commandId},${requestDigest},${epicJson(requestIdentity)},${input.reviewedCommitSha},
+                ${input.reviewedVerificationEvidenceId},${current.revision + 1},${timestamp})`;
+              return yield* saveEpicRun(sql, current, {
+                status: "verifying",
+                activeReviewReworkId: requestId,
+                reviewReworks: [...(current.reviewReworks ?? []), rework],
+                blockers: [],
+              });
+            }),
+          );
+          yield* publish(input.projectId);
+          return updated;
+        }),
+      )
+      .pipe(Effect.mapError(mapError));
+
+  const processReviewRework = Effect.fn("AgentControlEpic.processReviewRework")(function* (
+    state: AgentControlEpicRuntimeView,
+  ) {
+    const requestId = state.activeReviewReworkId;
+    if (!requestId) return false;
+    const rework = state.reviewReworks?.find((item) => item.requestId === requestId);
+    if (
+      !rework ||
+      (rework.status !== "accepted" &&
+        rework.status !== "repairing" &&
+        rework.status !== "verifying")
+    )
+      return yield* epicError(
+        "authority-conflict",
+        "The active Epic review request has incomplete execution authority.",
+      );
+    const replaceRework = (next: AgentControlEpicReviewRework) =>
+      state.reviewReworks?.map((item) => (item.requestId === requestId ? next : item)) ?? [next];
+    const authorize = Effect.gen(function* () {
+      const selected = yield* loadProjectEpic(sql, state.projectId, state.epicRunId);
+      if (
+        !selected ||
+        selected.revision !== state.revision ||
+        selected.status !== "verifying" ||
+        selected.activeReviewReworkId !== requestId ||
+        selected.acceptedCommitSha !== rework.previousAcceptedCommitSha ||
+        selected.finalVerification?.evidenceId !== rework.previousVerificationEvidenceId
+      )
+        return yield* epicError(
+          "authority-conflict",
+          "Epic review repair lost its accepted revision or execution fence.",
+        );
+      const projectAuthority = yield* engine.getProjectState({ projectId: state.projectId });
+      if (
+        (projectAuthority.mode !== "armed" && projectAuthority.mode !== "run-once") ||
+        projectAuthority.pausedFromMode !== null
+      )
+        return yield* epicError(
+          "review-authority-revoked",
+          "Armed automation authority was removed while review repair was running.",
+        );
+    }).pipe(Effect.mapError(mapError), Effect.asVoid);
+    if (rework.status === "accepted" || rework.status === "repairing") {
+      const progress = yield* reviewRepair.progress({ state, rework, authorize }).pipe(
+        Effect.catch((error) =>
+          ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(error.code)
+            ? Effect.fail(error)
+            : Effect.succeed({
+                kind: "blocked" as const,
+                attempts: rework.repairAttempts,
+                code: error.code,
+                message: error.message,
+              }),
+        ),
+      );
+      const timestamp = DateTime.formatIso(yield* DateTime.now);
+      if (progress.kind === "blocked") {
+        const blocker = { code: progress.code, issueNumber: null, message: progress.message };
+        const blockedState = yield* persist(state, {
+          status: "blocked",
+          activeReviewReworkId: null,
+          blockers: [blocker],
+          blockerHistory: [...state.blockerHistory, { recordedAt: timestamp, blockers: [blocker] }],
+          reviewReworks: replaceRework({
+            ...rework,
+            status: "blocked",
+            repairAttempts: progress.attempts,
+            blocker,
+            completedAt: timestamp,
+            updatedAt: timestamp,
+          }),
+        });
+        yield* reviewRepair
+          .cancel({ state: blockedState, rework })
+          .pipe(
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not interrupt blocked Epic review repair", { cause }),
+            ),
+          );
+        return true;
+      }
+      const nextRework: AgentControlEpicReviewRework = {
+        ...rework,
+        status: progress.kind === "candidate" ? "verifying" : "repairing",
+        repairAttempts: progress.attempts,
+        candidateCommitSha:
+          progress.kind === "candidate" ? progress.commitSha : rework.candidateCommitSha,
+        updatedAt: timestamp,
+      };
+      if (
+        rework.status !== nextRework.status ||
+        rework.candidateCommitSha !== nextRework.candidateCommitSha ||
+        epicDigest(rework.repairAttempts) !== epicDigest(nextRework.repairAttempts)
+      )
+        yield* persist(state, { reviewReworks: replaceRework(nextRework) });
+      return true;
+    }
+    if (!rework.candidateCommitSha || !results.verifyReview)
+      return yield* epicError(
+        "review-verification-unavailable",
+        "The repaired candidate cannot be verified by this server.",
+      );
+    // Member capture evidence anchors the original combined result. Later
+    // successful review repairs form a separately verified descendant chain,
+    // so repeated reviews still use the latest original member proof.
+    const lastAccepted = state.members.toReversed().find((member) => member.accepted);
+    const firstAccepted = state.members.find(
+      (member) =>
+        member.accepted &&
+        (state.dependencyPlan !== undefined ||
+          member.baseCommitSha === (state.initialBase?.commitSha ?? null)),
+    );
+    if (!firstAccepted || !lastAccepted)
+      return yield* epicError(
+        "authority-conflict",
+        "The accepted Epic chain required for review verification is incomplete.",
+      );
+    const attempt = state.verificationAttempt + 1;
+    const verification = yield* results
+      .verifyReview({
+        epicRunId: state.epicRunId,
+        projectId: state.projectId,
+        reviewRequestId: rework.requestId,
+        previousCommitSha: rework.previousAcceptedCommitSha,
+        commitSha: rework.candidateCommitSha,
+        initialBaseCommitSha: state.initialBase?.commitSha ?? null,
+        firstAccepted,
+        checks: state.checks,
+        lastAccepted,
+        attempt,
+        authorize,
+      })
+      .pipe(
+        Effect.catch((error) =>
+          ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(error.code)
+            ? Effect.fail(error)
+            : Effect.succeed({
+                status: "blocked" as const,
+                commitSha: rework.candidateCommitSha!,
+                evidenceId: `epic-review-final:${rework.requestId}`,
+                detail: error.message,
+                checks: [],
+              }),
+        ),
+      );
+    if (verification.commitSha !== rework.candidateCommitSha)
+      return yield* epicError(
+        "authority-conflict",
+        "Review verification checked a different candidate commit.",
+      );
+    const timestamp = DateTime.formatIso(yield* DateTime.now);
+    if (verification.status !== "passed") {
+      const blocker = {
+        code: "review-verification-failed",
+        issueNumber: null,
+        message: verification.detail,
+      };
+      yield* persist(state, {
+        status: "blocked",
+        activeReviewReworkId: null,
+        blockers: [blocker],
+        blockerHistory: [...state.blockerHistory, { recordedAt: timestamp, blockers: [blocker] }],
+        finalVerificationHistory: [...state.finalVerificationHistory, verification],
+        reviewReworks: replaceRework({
+          ...rework,
+          status: "blocked",
+          verification,
+          blocker,
+          completedAt: timestamp,
+          updatedAt: timestamp,
+        }),
+      });
+      return true;
+    }
+    const previousHandoff = state.handoff;
+    const nextHandoff = previousHandoff
+      ? {
+          ...previousHandoff,
+          status: "update-required" as const,
+          commitSha: rework.candidateCommitSha,
+          verificationEvidenceId: verification.evidenceId,
+          updatedAt: timestamp,
+          error: null,
+        }
+      : undefined;
+    yield* persist(state, {
+      status: "succeeded",
+      acceptedCommitSha: rework.candidateCommitSha,
+      verificationAttempt: attempt,
+      finalVerification: verification,
+      finalVerificationHistory: [...state.finalVerificationHistory, verification],
+      activeReviewReworkId: null,
+      blockers: [],
+      ...(nextHandoff ? { handoff: nextHandoff } : {}),
+      ...(previousHandoff
+        ? {
+            handoffHistory: [
+              ...(state.handoffHistory ?? []),
+              {
+                handoff: previousHandoff,
+                supersededByReviewRequestId: rework.requestId,
+                supersededAt: timestamp,
+              },
+            ],
+          }
+        : {}),
+      reviewReworks: replaceRework({
+        ...rework,
+        status: "succeeded",
+        verification,
+        blocker: null,
+        completedAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    });
+    return true;
+  });
+
   const processEpic = (projectId: ProjectId, epicRunId: string) =>
     Effect.gen(function* () {
       let state = yield* loadProjectEpic(sql, projectId, epicRunId);
       if (state) yield* recoverModeIntent(state);
+      if (state?.activeReviewReworkId) {
+        yield* processReviewRework(state);
+        return;
+      }
       if (
         !state ||
         state.status === "succeeded" ||
@@ -1385,8 +1858,6 @@ export const makeAgentControlEpic = Effect.gen(function* () {
       )
       .pipe(Effect.mapError(mapError));
 
-  const handoffEvidence = yield* Effect.serviceOption(EpicHandoffEvidence);
-  const handoffRemote = yield* Effect.serviceOption(EpicHandoffRemote);
   const unavailableHandoff = () =>
     Effect.fail(
       epicError("handoff-unavailable", "Epic publication is unavailable on this server."),
@@ -1408,6 +1879,32 @@ export const makeAgentControlEpic = Effect.gen(function* () {
     ),
     Effect.forkScoped,
   );
+  const orchestration = yield* Effect.serviceOption(OrchestrationEngineService);
+  if (Option.isSome(orchestration)) {
+    const events = yield* orchestration.value.subscribeDomainEvents;
+    yield* events.pipe(
+      Stream.runForEach((event) => {
+        if (event.type !== "thread.session-set" && event.type !== "thread.turn-diff-completed")
+          return Effect.void;
+        return Effect.gen(function* () {
+          const rows = yield* sql<{ projectId: ProjectId }>`
+            SELECT DISTINCT run.project_id AS "projectId"
+            FROM main.agent_control_epic_runs run,
+              json_each(json_extract(run.state_json,'$.reviewReworks')) rework,
+              json_each(json_extract(rework.value,'$.repairAttempts')) attempt
+            WHERE json_extract(run.state_json,'$.activeReviewReworkId') IS NOT NULL
+              AND json_extract(attempt.value,'$.threadId')=${event.payload.threadId}`;
+          yield* Effect.forEach(rows, (row) => processProject(row.projectId), {
+            concurrency: 1,
+            discard: true,
+          });
+        }).pipe(
+          Effect.catch((cause) => Effect.logWarning("Epic review progress wake failed", { cause })),
+        );
+      }),
+      Effect.forkScoped,
+    );
+  }
 
   return AgentControlEpic.of({
     changeQueue: (input: AgentControlEpicQueueChangeInput) =>
@@ -1425,6 +1922,7 @@ export const makeAgentControlEpic = Effect.gen(function* () {
     preview,
     previewHandoff: handoff.previewHandoff,
     publishHandoff: handoff.publishHandoff,
+    requestReviewRework,
     start,
     resume: (input) => control("resume", input),
     stop: (input) => control("stop", input),

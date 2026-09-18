@@ -12,10 +12,11 @@ import { vi } from "vite-plus/test";
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import { AgentControlEngine } from "../Services/AgentControlEngine.ts";
-import { loadProjectEpics } from "./authority.ts";
+import { loadProjectEpics, saveEpicRun } from "./authority.ts";
 import { makeParallelEpicQueue, prioritizePendingEpics } from "./parallelQueue.ts";
 import { loadEpicQueue, saveEpicQueue } from "./queueAuthority.ts";
 import { EpicHandoffRemote } from "./remote.ts";
+import { createEpicRun, insertEpicRun } from "./runState.ts";
 
 const at = "2026-09-18T09:00:00.000Z";
 const projectId = ProjectId.make("parallel-priority");
@@ -208,6 +209,340 @@ describe("parallel Epic admission priority", () => {
         yield* queue.process(admitted, project, preview);
         assert.deepEqual(yield* loadProjectEpics(sql, projectId), runs);
         assert.deepEqual(previewed, [1000, 1001, 1002, 1003]);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect(
+    "releases capacity after a terminal review rework failure without discarding its evidence",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations({ toMigrationInclusive: 94 });
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,created_at,updated_at,scripts_json)
+        VALUES (${projectId},'Priority test','/isolated/priority',${at},${at},'[]')`;
+        const { entries, plan } = densePlan(2);
+        const first = entries[0]!;
+        const run = yield* createEpicRun({
+          projectId,
+          commandId: first.entryId,
+          source: first.source,
+          checks: [],
+          dependencyPlan: first.dependencyPlan!,
+          projectDependencyPlan: plan,
+        });
+        yield* sql.withTransaction(insertEpicRun(sql, run));
+        const reviewedCommitSha = "a".repeat(40);
+        const candidateCommitSha = "b".repeat(40);
+        const blocker = {
+          code: "review-verification-failed",
+          issueNumber: first.source.epic.number,
+          message: "The repaired combined result failed verification.",
+        };
+        const failedVerification = {
+          status: "failed" as const,
+          commitSha: candidateCommitSha,
+          evidenceId: "failed-review-verification",
+          detail: blocker.message,
+          checks: [],
+        };
+        yield* sql.withTransaction(
+          saveEpicRun(sql, run, {
+            status: "blocked",
+            acceptedCommitSha: reviewedCommitSha,
+            blockers: [blocker],
+            activeReviewReworkId: null,
+            reviewReworks: [
+              {
+                requestId: "terminal-review-request",
+                idempotencyKey: "terminal-review-key",
+                reviewedCommitSha,
+                reviewedVerificationEvidenceId: "reviewed-proof",
+                findings: [
+                  {
+                    findingId: "review-finding",
+                    summary: "Retained finding",
+                    correctionCriteria: "Correct the retained finding.",
+                    acceptanceCriteria: "The focused check passes.",
+                  },
+                ],
+                status: "blocked",
+                previousAcceptedCommitSha: reviewedCommitSha,
+                previousVerificationEvidenceId: "reviewed-proof",
+                repairAttempts: [],
+                candidateCommitSha,
+                verification: failedVerification,
+                blocker,
+                requestedAt: at,
+                updatedAt: at,
+                completedAt: at,
+              },
+            ],
+          }),
+        );
+        const initial = yield* sql.withTransaction(
+          saveEpicQueue(sql, null, {
+            projectId,
+            maxActiveEpics: 1,
+            projectDependencyPlan: plan,
+            revision: 0,
+            entries: [{ ...first, epicRunId: run.epicRunId, status: "active" }, entries[1]!],
+            nextEntryId: entries[1]!.entryId,
+            waitReason: null,
+            nextCheckAt: null,
+          }),
+        );
+        const project: AgentControlProjectState = {
+          schemaVersion: 1,
+          projectId,
+          mode: "armed",
+          pausedFromMode: null,
+          revision: 1,
+          sequence: 1,
+          updatedAt: at,
+        };
+        const queue = yield* makeParallelEpicQueue.pipe(
+          Effect.provideService(AgentControlEngine, {
+            getProjectState: () => Effect.succeed(project),
+            dispatchHuman: () => Effect.die("Unexpected mode change"),
+            dispatchController: () => Effect.die("Unexpected mode change"),
+            dispatchSystem: () => Effect.die("Unexpected mode change"),
+            streamDomainEvents: Stream.never,
+          }),
+          Effect.provideService(EpicHandoffRemote, {
+            refreshQueueBase: () =>
+              Effect.succeed({ commitSha: "c".repeat(40), targetBranch: "main" }),
+            readPullRequest: () => Effect.die("Unexpected handoff observation"),
+            prepare: () => Effect.die("Unexpected publication"),
+            publish: () => Effect.die("Unexpected publication"),
+          }),
+        );
+        const preview = (number: number) =>
+          Effect.succeed({
+            projectId,
+            source: entries.find((entry) => entry.source.epic.number === number)!.source,
+            canStart: true,
+            blockers: [],
+          });
+
+        yield* queue.process(initial, project, preview);
+
+        const current = (yield* loadEpicQueue(sql, projectId))!;
+        assert.equal(current.entries[0]?.status, "active");
+        assert.equal(current.entries[0]?.blockers[0]?.code, "review-verification-failed");
+        assert.equal(current.entries[1]?.status, "active");
+        const retained = (yield* loadProjectEpics(sql, projectId)).find(
+          (candidate) => candidate.epicRunId === run.epicRunId,
+        )!;
+        assert.equal(retained.status, "blocked");
+        assert.equal(
+          retained.reviewReworks?.[0]?.verification?.evidenceId,
+          failedVerification.evidenceId,
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
+  it.effect(
+    "keeps update intents active and never releases mismatched published pull requests",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations({ toMigrationInclusive: 94 });
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,created_at,updated_at,scripts_json)
+        VALUES (${projectId},'Priority test','/isolated/priority',${at},${at},'[]')`;
+        const { entries, plan } = densePlan(2);
+        const first = entries[0]!;
+        const run = yield* createEpicRun({
+          projectId,
+          commandId: first.entryId,
+          source: first.source,
+          checks: [],
+          dependencyPlan: first.dependencyPlan!,
+          projectDependencyPlan: plan,
+          initialBase: { commitSha: "a".repeat(40), targetBranch: "main" },
+        });
+        yield* sql.withTransaction(insertEpicRun(sql, run));
+        const repaired = "d".repeat(40);
+        const oldHead = "b".repeat(40);
+        yield* sql.withTransaction(
+          saveEpicRun(sql, run, {
+            status: "succeeded",
+            acceptedCommitSha: repaired,
+            finalVerification: {
+              status: "passed",
+              commitSha: repaired,
+              evidenceId: "review-repair-proof",
+              detail: "Review repair passed",
+              checks: [],
+            },
+            handoff: {
+              intentId: "retained-handoff",
+              status: "update-required",
+              repository,
+              targetBranch: "main",
+              baseCommitSha: "a".repeat(40),
+              commitSha: repaired,
+              branchName: "t3auto/epic-retained",
+              verificationEvidenceId: "review-repair-proof",
+              requestedAt: at,
+              updatedAt: at,
+              pullRequest: {
+                number: 41,
+                url: "https://github.com/owner/repo/pull/41",
+                state: "open",
+                isDraft: true,
+                headSha: oldHead,
+                baseBranch: "main",
+                mergeCommitSha: null,
+              },
+              error: null,
+            },
+          }),
+        );
+        const initial = yield* sql.withTransaction(
+          saveEpicQueue(sql, null, {
+            projectId,
+            maxActiveEpics: 2,
+            projectDependencyPlan: plan,
+            revision: 0,
+            entries: [{ ...first, epicRunId: run.epicRunId, status: "active" }, entries[1]!],
+            nextEntryId: entries[1]!.entryId,
+            waitReason: null,
+            nextCheckAt: null,
+          }),
+        );
+        const project: AgentControlProjectState = {
+          schemaVersion: 1,
+          projectId,
+          mode: "armed",
+          pausedFromMode: null,
+          revision: 1,
+          sequence: 1,
+          updatedAt: at,
+        };
+        let reads = 0;
+        let observed = {
+          number: 41,
+          url: "https://github.com/owner/repo/pull/41",
+          state: "open" as "open" | "closed" | "merged",
+          isDraft: true,
+          headSha: oldHead,
+          baseBranch: "main",
+          mergeCommitSha: null as string | null,
+        };
+        const queue = yield* makeParallelEpicQueue.pipe(
+          Effect.provideService(AgentControlEngine, {
+            getProjectState: () => Effect.succeed(project),
+            dispatchHuman: () => Effect.die("Unexpected mode change"),
+            dispatchController: () => Effect.die("Unexpected mode change"),
+            dispatchSystem: () => Effect.die("Unexpected mode change"),
+            streamDomainEvents: Stream.never,
+          }),
+          Effect.provideService(EpicHandoffRemote, {
+            refreshQueueBase: () =>
+              Effect.succeed({ commitSha: "a".repeat(40), targetBranch: "main" }),
+            readPullRequest: () => {
+              reads++;
+              return Effect.succeed(observed);
+            },
+            prepare: () => Effect.die("Unexpected publication"),
+            publish: () => Effect.die("Unexpected publication"),
+          }),
+        );
+        const preview = (number: number) =>
+          Effect.succeed({
+            projectId,
+            source: entries.find((entry) => entry.source.epic.number === number)!.source,
+            canStart: true,
+            blockers: [],
+          });
+        let current = initial;
+        for (const next of [
+          { ...observed, state: "open" as const, headSha: "e".repeat(40) },
+          {
+            ...observed,
+            state: "closed" as const,
+            headSha: repaired,
+            baseBranch: "review",
+          },
+          {
+            ...observed,
+            state: "merged" as const,
+            isDraft: false,
+            mergeCommitSha: "c".repeat(40),
+          },
+        ]) {
+          observed = next;
+          yield* queue.process(current, project, preview);
+          current = (yield* loadEpicQueue(sql, projectId))!;
+          const retained = (yield* loadProjectEpics(sql, projectId)).find(
+            (candidate) => candidate.epicRunId === run.epicRunId,
+          )!;
+          assert.equal(current.entries[0]?.status, "active");
+          assert.equal(current.entries[0]?.blockers[0]?.code, "handoff-update-required");
+          assert.notInclude(
+            current.entries.map((entry) => entry.status),
+            "merged",
+          );
+          assert.equal(retained.handoff?.status, "update-required");
+          assert.equal(retained.handoff?.pullRequest?.headSha, oldHead);
+          assert.equal(retained.handoff?.pullRequest?.baseBranch, "main");
+        }
+        for (const next of [
+          {
+            ...observed,
+            state: "open" as const,
+            isDraft: true,
+            headSha: "e".repeat(40),
+            baseBranch: "main",
+            mergeCommitSha: null,
+          },
+          {
+            ...observed,
+            state: "closed" as const,
+            isDraft: true,
+            headSha: repaired,
+            baseBranch: "review",
+            mergeCommitSha: null,
+          },
+          {
+            ...observed,
+            state: "merged" as const,
+            isDraft: false,
+            headSha: oldHead,
+            baseBranch: "main",
+            mergeCommitSha: "c".repeat(40),
+          },
+        ]) {
+          const latest = (yield* loadProjectEpics(sql, projectId)).find(
+            (candidate) => candidate.epicRunId === run.epicRunId,
+          )!;
+          yield* sql.withTransaction(
+            saveEpicRun(sql, latest, {
+              handoff: {
+                ...latest.handoff!,
+                status: "published",
+                pullRequest: {
+                  ...latest.handoff!.pullRequest!,
+                  state: "open",
+                  isDraft: true,
+                  headSha: repaired,
+                  baseBranch: "main",
+                  mergeCommitSha: null,
+                },
+                error: null,
+              },
+            }),
+          );
+          observed = next;
+          yield* queue.process(current, project, preview);
+          current = (yield* loadEpicQueue(sql, projectId))!;
+          assert.equal(current.entries[0]?.status, "active");
+          assert.notInclude(
+            current.entries.map((entry) => entry.status),
+            "merged",
+          );
+        }
+        assert.equal(reads, 6);
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
 });
