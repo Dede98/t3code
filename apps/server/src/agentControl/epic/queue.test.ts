@@ -945,6 +945,73 @@ const configureParallel = Effect.fn("configureParallelQueue")(function* (
 });
 
 describe("parallel Epic queue persistence and admission", () => {
+  for (const explicitLimit of [false, true]) {
+    it.effect(
+      `retains active serial authority when saving an unchanged ${explicitLimit ? "explicit" : "default"} limit of one`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* fixture(projectId, 93);
+          yield* f.approve(10);
+          yield* f.approve(20);
+          if (explicitLimit) yield* f.change({ kind: "configure", maxActiveEpics: 1 });
+          f.setMode("armed");
+          yield* f.process();
+          const active = (yield* f.selected())!;
+          assert.equal(active.status, "running");
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            yield* f.change({ kind: "configure", maxActiveEpics: 1 });
+            assert.deepEqual(yield* loadProjectEpics(f.sql, f.id), [active]);
+            // Each call reconstructs the queue service from its persisted state.
+            yield* f.process();
+            assert.deepEqual(yield* f.selected(), active);
+            const entries = (yield* f.read())!.entries;
+            assert.equal(entries[0]!.epicRunId, active.epicRunId);
+            assert.equal(entries[0]!.status, "active");
+            assert.equal(entries[1]!.status, "pending");
+            assert.lengthOf(yield* f.runs(), 1);
+            assert.lengthOf(f.fetched, 1);
+          }
+        }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+    );
+  }
+  it.effect(
+    "retains the merged anchor on a real downgrade and preserves the next serial run on unchanged saves",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture(projectId, 93);
+        yield* approvePlanned(f, source(10));
+        yield* approvePlanned(f, source(20));
+        yield* configureParallel(f);
+        f.setMode("armed");
+        yield* f.process();
+        const runs = yield* loadProjectEpics(f.sql, f.id);
+        const first = runs.find((run) => run.source.epic.number === 10)!;
+        const second = runs.find((run) => run.source.epic.number === 20)!;
+        yield* f.sql.withTransaction(saveEpicRun(f.sql, first, { status: "succeeded", handoff }));
+        yield* f.sql.withTransaction(saveEpicRun(f.sql, second, { status: "stopped" }));
+        f.setObservation("merged");
+        yield* TestClock.adjust("1 minute");
+        yield* f.process();
+        f.setMode("observe");
+        yield* f.change({ kind: "configure", maxActiveEpics: 1 });
+        assert.deepEqual(
+          (yield* loadProjectEpics(f.sql, f.id)).map((run) => run.epicRunId),
+          [first.epicRunId],
+        );
+        assert.equal((yield* loadEpicRun(f.sql, second.epicRunId))!.status, "stopped");
+        yield* f.approve(30);
+        f.setMode("armed");
+        yield* f.process();
+        const active = (yield* f.selected())!;
+        assert.equal(active.source.epic.number, 30);
+        assert.equal(active.initialBase?.commitSha, mergedSha);
+        yield* f.change({ kind: "configure", maxActiveEpics: 1 });
+        yield* f.process();
+        assert.deepEqual(yield* loadProjectEpics(f.sql, f.id), [active]);
+        assert.lengthOf(yield* f.runs(), 3);
+        assert.lengthOf(f.fetched, 3);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
   it.effect(
     "requires opt-in, admits two distinct durable targets and preserves identities over service recovery and unchanged polls",
     () =>

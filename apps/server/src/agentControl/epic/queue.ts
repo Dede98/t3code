@@ -196,7 +196,7 @@ export const makeEpicQueue = Effect.gen(function* () {
                 "Finish or stop authorized Epics before changing their project plan or active Epic limit.",
               );
             yield* validateProjectDependencyPlan(entries, plan, action.maxActiveEpics);
-            if (action.maxActiveEpics === 1) {
+            if (action.maxActiveEpics === 1 && (previous?.maxActiveEpics ?? 1) > 1) {
               const anchor =
                 entries.findLast((entry) => entry.status === "merged")?.epicRunId ?? null;
               yield* sql`DELETE FROM main.agent_control_epic_targets WHERE project_id=${input.projectId}

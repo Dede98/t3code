@@ -2,6 +2,8 @@ import {
   AgentControlProjectPolicy,
   type AgentControlEpicPreview,
   type AgentControlEpicQueue,
+  type AgentControlEpicQueueEntry,
+  type AgentControlEpicProjectDependencyPlan,
   type AgentControlEpicRpcError,
   type AgentControlProjectState,
 } from "@t3tools/contracts";
@@ -19,6 +21,42 @@ import { EpicHandoffRemote } from "./remote.ts";
 import { createEpicRun, insertEpicRun } from "./runState.ts";
 
 const decodePolicy = Schema.decodeUnknownEffect(Schema.fromJsonString(AgentControlProjectPolicy));
+
+/** The caller validates the acyclic project plan before ordering admissions. */
+export const prioritizePendingEpics = (
+  entries: readonly AgentControlEpicQueueEntry[],
+  plan: AgentControlEpicProjectDependencyPlan,
+) => {
+  const owner = new Map(
+    entries.flatMap((entry) =>
+      entry.source.tasks.map((task) => [task.issue.issueNodeId, entry.entryId] as const),
+    ),
+  );
+  const predecessors = new Map(entries.map((entry) => [entry.entryId, new Set<string>()]));
+  for (const task of plan.tasks) {
+    const id = owner.get(task.issueNodeId)!;
+    const previous = predecessors.get(id)!;
+    for (const dependency of task.dependsOn) {
+      const prerequisite = owner.get(dependency)!;
+      if (prerequisite !== id) previous.add(prerequisite);
+    }
+  }
+  const depths = new Map<string, number>();
+  const depth = (id: string): number => {
+    const cached = depths.get(id);
+    if (cached !== undefined) return cached;
+    let result = 0;
+    for (const prerequisite of predecessors.get(id)!)
+      result = Math.max(result, 1 + depth(prerequisite));
+    depths.set(id, result);
+    return result;
+  };
+  return entries
+    .filter((entry) => entry.status === "pending")
+    .map((entry) => ({ entry, depth: depth(entry.entryId) }))
+    .toSorted((a, b) => a.depth - b.depth)
+    .map(({ entry }) => entry);
+};
 
 /** The existing project lock serializes admission; each admitted run retains its own authority. */
 export const makeParallelEpicQueue = Effect.gen(function* () {
@@ -164,21 +202,7 @@ export const makeParallelEpicQueue = Effect.gen(function* () {
       ["running", "blocked", "verifying"].includes(run.status),
     ).length;
     const plan = queue.projectDependencyPlan!;
-    const owner = new Map(
-      entries.flatMap((entry) =>
-        entry.source.tasks.map((task) => [task.issue.issueNodeId, entry.entryId] as const),
-      ),
-    );
-    const depth = (id: string): number => {
-      const prerequisites = plan.tasks
-        .filter((task) => owner.get(task.issueNodeId) === id)
-        .flatMap((task) => task.dependsOn.map((dependency) => owner.get(dependency)!))
-        .filter((dependency) => dependency !== id);
-      return prerequisites.length ? 1 + Math.max(...prerequisites.map(depth)) : 0;
-    };
-    const pending = entries
-      .filter((entry) => entry.status === "pending")
-      .toSorted((a, b) => depth(a.entryId) - depth(b.entryId));
+    const pending = prioritizePendingEpics(entries, plan);
     for (const entry of pending) {
       if (occupied >= (queue.maxActiveEpics ?? 1)) break;
       const inspected = yield* Effect.result(preview(entry.source.epic.number));
