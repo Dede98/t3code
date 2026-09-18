@@ -391,6 +391,7 @@ it.layer(NodeServices.layer)("Epic handoff remote", (it) => {
     "fetch",
     "github",
     "missing-merge",
+    "changed-head",
     "absent-merge",
     "target",
     "repository",
@@ -414,6 +415,7 @@ it.layer(NodeServices.layer)("Epic handoff remote", (it) => {
         if (error === "github") f.state.failPrRead = true;
         if (error === "missing-merge") f.state.prs[0]!.merge_commit_sha = null;
         if (error === "target") f.state.prs[0]!.base.ref = "other";
+        if (error === "changed-head") f.state.prs[0]!.head.sha = f.input.baseCommitSha;
         if (error === "repository") f.state.repositoryId = "other";
         if (error === "remote")
           yield* f.git(["remote", "set-url", "origin", "https://github.com/foreign/repo.git"]);
@@ -430,6 +432,7 @@ it.layer(NodeServices.layer)("Epic handoff remote", (it) => {
             fetch: "target-fetch-failed",
             github: "remote-unavailable",
             "missing-merge": "merge-evidence-missing",
+            "changed-head": "handoff-head-changed",
             "absent-merge": "merge-not-in-target",
             target: "target-branch-changed",
             repository: "repository-identity-changed",

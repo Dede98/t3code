@@ -6,7 +6,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { epicDigest, loadSelectedEpic } from "../epic/authority.ts";
+import { epicDigest, loadProjectEpics, loadTaskEpic } from "../epic/authority.ts";
 import { epicIssueContentFingerprint } from "../github/githubEpicSource.ts";
 import {
   deriveAgentControlAttemptId,
@@ -28,7 +28,7 @@ export const loadEpicTaskExecutionAuthority = Effect.fn("loadEpicTaskExecutionAu
     const projectId = task.source.projectId;
     const reject = (reason: AgentControlTaskConsumerGuardError["reason"]) =>
       new AgentControlTaskConsumerGuardError({ projectId, reason });
-    const epic = yield* loadSelectedEpic(sql, projectId).pipe(
+    const epic = yield* loadTaskEpic(sql, projectId, task.taskId).pipe(
       Effect.mapError(() => reject("task-projection-corrupt")),
     );
     const installed = yield* sql`SELECT 1 FROM sqlite_schema
@@ -46,7 +46,11 @@ export const loadEpicTaskExecutionAuthority = Effect.fn("loadEpicTaskExecutionAu
       plan_digest AS "planDigest",stage_run_id AS "stageRunId",base_commit_sha AS "baseCommitSha"
       FROM agent_control_epic_task_executions
       WHERE project_id=${projectId} AND task_id=${task.taskId}`;
-    if (!epic?.dependencyPlan && bindings.length === 0) return task;
+    if (!epic?.dependencyPlan && bindings.length === 0) {
+      if ((yield* loadProjectEpics(sql, projectId)).some((run) => run.dependencyPlan))
+        return yield* reject("task-status-inactive");
+      return task;
+    }
     const member = epic?.members.find((entry) => entry.taskId === task.taskId);
     const binding = bindings[0];
     const projects = yield* sql<{ mode: string; pausedFromMode: string | null }>`

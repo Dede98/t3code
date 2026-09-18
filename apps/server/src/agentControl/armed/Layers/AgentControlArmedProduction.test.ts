@@ -1,9 +1,26 @@
+import { AgentControlImplementationTurnWakeup } from "../../implementationTurn/Services/AgentControlImplementationTurnWakeup.ts";
+import { AgentControlVerificationTurnWakeup } from "../../verificationTurn/Services/AgentControlVerificationTurnWakeup.ts";
+import { ProviderAdmissionRuntimeLive } from "../../providerAdmission/Layers/ProviderAdmissionRuntime.ts";
+import { ProviderAdmissionStoreLive } from "../../providerAdmission/Layers/ProviderAdmissionStore.ts";
+import { ProviderUsage } from "../../../provider/Services/ProviderUsage.ts";
+import { makeFileHostBudgetLedger } from "../../../resourceAdmission/HostBudgetLedger.ts";
+import {
+  make as makeResourceAdmission,
+  ResourceAdmission,
+} from "../../../resourceAdmission/ResourceAdmission.ts";
+import { ResourcePressure } from "../../../resourceAdmission/ResourcePressure.ts";
+import { defaultResourceAdmissionSettings } from "../../../resourceAdmission/model.ts";
+import {
+  ProviderResourceCoordinator,
+  layer as resourceCoordinatorLayer,
+} from "../../../resourceAdmission/ProviderResourceCoordinator.ts";
+import { layerTest as resourceSettings } from "../../../serverSettings.ts";
 import { makeAgentControlEpic } from "../../epic/Layers/AgentControlEpic.ts";
 import { makeEpicResults, EpicCheckExecutor } from "../../epic/results.ts";
 import { AgentControlEpicResultHooks } from "../../epic/Services/AgentControlEpicResultHooks.ts";
 import { GithubIssueTrackerClient } from "../../github/Services/GithubIssueTrackerClient.ts";
 import { epicIssueContentFingerprint } from "../../github/githubEpicSource.ts";
-import { loadSelectedEpic, saveEpicRun } from "../../epic/authority.ts";
+import { loadSelectedEpic, loadProjectEpics, saveEpicRun } from "../../epic/authority.ts";
 import { AgentControlTaskConsumerGuard } from "../../task/Services/AgentControlTaskConsumerGuard.ts";
 import { AgentControlEpicProgress } from "../../epic/Services/AgentControlEpicProgress.ts";
 import { createEpicRun, insertEpicRun } from "../../epic/runState.ts";
@@ -336,6 +353,12 @@ const makePolicyLayer = () =>
   });
 
 it.live.each([
+  {
+    blockedMode: "armed",
+    intakeRefreshes: 0,
+    recoverMissing: false,
+    sourceChange: "epic-parallel-multi",
+  },
   ...(
     [
       "paused",
@@ -411,6 +434,7 @@ it.live.each([
     Effect.scoped(
       Effect.gen(function* () {
         const epicParallel = sourceChange.startsWith("epic-parallel");
+        const multiEpic = sourceChange === "epic-parallel-multi";
         const parallelPolling =
           sourceChange === "epic-parallel-polls" ||
           sourceChange === "epic-parallel-preparation-poll" ||
@@ -757,7 +781,59 @@ it.live.each([
               };
             }),
           );
-          yield* insertEpicRun(sql, { ...run, members, activeTaskId: members[0]!.taskId });
+          if (multiEpic) {
+            const sources = [0, 1].map((index) => ({
+              ...source,
+              epic: {
+                ...source.epic,
+                issueNodeId: `multi-epic-${index}`,
+                number: 100 + index,
+                subIssueCount: index === 0 ? 1 : 2,
+              },
+              tasks: source.tasks.filter((_, position) =>
+                index === 0 ? position === 0 : position > 0,
+              ),
+              fingerprint: `multi-source-${index}`,
+            }));
+            const projectDependencyPlan = {
+              version: 1 as const,
+              rationale:
+                "Separate Markdown files; the final task needs both results and waits for the first Epic merge.",
+              epics: sources.map((source) => ({
+                issueNodeId: source.epic.issueNodeId,
+                sourceFingerprint: source.fingerprint,
+              })),
+              tasks: run.dependencyPlan!.tasks,
+            };
+            for (const [index, source] of sources.entries()) {
+              const independent = yield* createEpicRun({
+                projectId,
+                commandId: `parallel-epic-${index}`,
+                source,
+                checks: run.checks,
+                parallelism: 2,
+                projectDependencyPlan,
+                initialBase: { commitSha: repository.baseCommitSha, targetBranch: "main" },
+                dependencyPlan: {
+                  ...run.dependencyPlan!,
+                  sourceFingerprint: source.fingerprint,
+                  tasks: run.dependencyPlan!.tasks.filter((task) =>
+                    source.tasks.some((item) => item.issue.issueNodeId === task.issueNodeId),
+                  ),
+                },
+              });
+              const owned = members.filter((member) =>
+                source.tasks.some((task) => task.issue.issueNodeId === member.issueNodeId),
+              );
+              yield* insertEpicRun(sql, {
+                ...independent,
+                members: owned,
+                activeTaskId: owned[0]!.taskId,
+              });
+            }
+          } else {
+            yield* insertEpicRun(sql, { ...run, members, activeTaskId: members[0]!.taskId });
+          }
         }
         if (sourceChange === "epic-parallel-preparation-poll") {
           beforeInitialThreadMaterialization = Effect.gen(function* () {
@@ -895,7 +971,81 @@ it.live.each([
         const projectionTurns = Layer.fresh(ProjectionTurnRepositoryLive).pipe(
           Layer.provide(sqlLayer),
         );
+        const sharedResources = multiEpic
+          ? yield* Effect.gen(function* () {
+              const usageEvents = yield* PubSub.unbounded<never>();
+              const host = yield* makeResourceAdmission({
+                ledger: makeFileHostBudgetLedger(path.join(directory, "host-budget.json")),
+                settings: {
+                  ...defaultResourceAdmissionSettings,
+                  providerMaxConcurrent: 3,
+                  interactiveReserve: 1,
+                  localCheckMaxConcurrent: 1,
+                },
+              }).pipe(
+                Effect.provideService(ResourcePressure, {
+                  sample: Effect.succeed({
+                    sampledAtMs: 1,
+                    telemetry: "available" as const,
+                    cpuUtilization: 0.1,
+                    availableMemoryBytes: 8 * 1024 ** 3,
+                    gpu: { status: "unavailable" as const },
+                  }),
+                  awaitChange: () => Effect.never,
+                }),
+              );
+              const admission = Layer.fresh(ProviderAdmissionRuntimeLive).pipe(
+                Layer.provideMerge(ProviderAdmissionStoreLive.pipe(Layer.provideMerge(sqlLayer))),
+                Layer.provide(
+                  Layer.succeed(ProviderUsage, {
+                    stream: Stream.empty,
+                    inspectForAdmission: () =>
+                      Effect.succeed({ _tag: "Unsupported" as const, observedAt: at }),
+                    getSnapshot: Effect.succeed([]),
+                    refresh: () => Effect.succeed({ refreshedAt: at, usage: [], failures: [] }),
+                    subscribeEvents: PubSub.subscribe(usageEvents),
+                  }),
+                ),
+                Layer.provide(
+                  Layer.mergeAll(
+                    Layer.succeed(AgentControlInitialPlanningWakeup, {
+                      wake: () => Effect.void,
+                      stream: Stream.never,
+                    }),
+                    Layer.succeed(AgentControlImplementationTurnWakeup, {
+                      wake: () => Effect.void,
+                      stream: Stream.never,
+                    }),
+                    Layer.succeed(AgentControlVerificationTurnWakeup, {
+                      wake: () => Effect.void,
+                      stream: Stream.never,
+                      subscribe: Effect.succeed(Stream.never),
+                    }),
+                  ),
+                ),
+                Layer.provideMerge(NodeServices.layer),
+              );
+              const resourceContext = yield* Layer.buildWithScope(
+                resourceCoordinatorLayer.pipe(
+                  Layer.provideMerge(admission),
+                  Layer.provideMerge(Layer.succeed(ResourceAdmission, host)),
+                  Layer.provide(
+                    resourceSettings({
+                      resourceAdmission: {
+                        providerMaxConcurrent: 3,
+                        interactiveReserve: 1,
+                        localCheckMaxConcurrent: 1,
+                      },
+                    }),
+                  ),
+                ),
+                scope,
+              );
+              return resourceContext;
+            })
+          : undefined;
         const executor = Layer.fresh(ProviderTurnRequestExecutorLive).pipe(
+          Layer.provideMerge(sharedResources ? Layer.succeedContext(sharedResources) : Layer.empty),
           Layer.provideMerge(coreServices),
           Layer.provideMerge(providerServiceLayer),
           Layer.provideMerge(makeProviderRegistryLayer()),
@@ -1365,6 +1515,117 @@ it.live.each([
               .length,
             2,
           );
+          if (multiEpic) {
+            const runs = yield* loadProjectEpics(sql, projectId);
+            assert.lengthOf(runs, 2);
+            const resourceCoordinator = Context.get(sharedResources!, ProviderResourceCoordinator);
+            const hostAdmission = Context.get(sharedResources!, ResourceAdmission);
+            const manualId = ThreadId.make("manual-alongside-two-epics");
+            const manualPermit = yield* resourceCoordinator.acquire({
+              idempotencyKey: "manual:parallel-acceptance",
+              providerInstanceId,
+              continuationKey: String(provider),
+              threadId: manualId,
+              requestedAt: at,
+              workloadClass: "interactive",
+              source: "manual",
+            });
+            yield* fakeProvider.service.startSession(manualId, {
+              threadId: manualId,
+              runtimeMode: "approval-required",
+              cwd: repository.cwd,
+            });
+            const manualTurn = yield* fakeProvider.service.sendTurn({
+              threadId: manualId,
+              input: "Manual fixture task",
+            });
+            yield* resourceCoordinator.enter(manualPermit, manualTurn.turnId);
+            assert.equal(fakeProvider.turnCount(), 3);
+            const capacity = yield* hostAdmission.snapshot;
+            assert.equal(
+              capacity.entries.filter(
+                (entry) => entry.kind === "providerTurn" && entry.state === "admitted",
+              ).length,
+              3,
+            );
+            const extra = yield* hostAdmission.request({
+              requestId: "third-epic-overflow",
+              accountScope: "codex",
+              kind: "providerTurn",
+              priority: "background",
+              ownerId: "third-epic",
+              ownerFenceToken: 1,
+              executionKey: "third-epic",
+            });
+            assert.equal(extra.result._tag, "Waiting");
+            const check = {
+              requestId: "epic-a-check",
+              kind: "localCheck" as const,
+              priority: "background" as const,
+              ownerId: "epic-a",
+              ownerFenceToken: 1,
+              executionKey: "epic-a-check",
+            };
+            const firstCheck = (yield* hostAdmission.request(check)).result;
+            assert.equal(firstCheck._tag, "Admitted");
+            assert.deepStrictEqual((yield* hostAdmission.request(check)).result, firstCheck);
+            const secondCheck = {
+              ...check,
+              requestId: "epic-b-check",
+              ownerId: "epic-b",
+              executionKey: "epic-b-check",
+            };
+            assert.equal((yield* hostAdmission.request(secondCheck)).result._tag, "Waiting");
+            if (firstCheck._tag !== "Admitted")
+              return yield* Effect.die("First check should hold the shared local slot");
+            assert.equal(
+              (yield* hostAdmission.release(firstCheck.authority)).newlyAdmitted[0]?.requestId,
+              secondCheck.requestId,
+            );
+
+            assert.equal((yield* loadSelectedEpic(sql, projectId))?.epicRunId, runs[0]!.epicRunId);
+            const before =
+              yield* sql`SELECT * FROM agent_control_epic_task_executions WHERE project_id=${projectId} ORDER BY task_id`;
+            assert.equal(new Set(before.map((row) => row.epic_run_id)).size, 2);
+            for (let poll = 0; poll < 3; poll++) {
+              yield* publishSources(projectId, issues, parallelPollVersion++);
+              yield* restartRecovery();
+              yield* scheduler.processProject(projectId);
+              yield* planningConsumerService.drain;
+            }
+            assert.deepStrictEqual(
+              yield* sql`SELECT * FROM agent_control_epic_task_executions WHERE project_id=${projectId} ORDER BY task_id`,
+              before,
+            );
+            assert.equal(fakeProvider.turnCount(), 3);
+            const guard = Context.get(context, AgentControlTaskConsumerGuard);
+            const providerBoundary = guard.useTaskForProviderEffectInTransaction!;
+            yield* sql.withTransaction(saveEpicRun(sql, runs[0]!, { status: "stopped" }));
+            const stoppedTask = runs[0]!.members.find(
+              (member) => member.status === "running",
+            )!.taskId!;
+            const independentTask = runs[1]!.members.find(
+              (member) => member.status === "running",
+            )!.taskId!;
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  sql.withTransaction(
+                    providerBoundary(projectId, stoppedTask, () => Effect.succeed("entered")),
+                  ),
+                ),
+              ),
+            );
+            assert.equal(
+              yield* sql.withTransaction(
+                providerBoundary(projectId, independentTask, () => Effect.succeed("independent")),
+              ),
+              "independent",
+            );
+            assert.equal((yield* engine.getProjectState({ projectId })).mode, "armed");
+            assert.deepEqual(yield* sql`PRAGMA foreign_key_check`, []);
+            return;
+          }
           if (!parallelPolling && !sourceBeforeIntegration && !revokeDuringIntegration) {
             const guard = Context.get(context, AgentControlTaskConsumerGuard);
             const taskId = AgentControlTaskId.make(

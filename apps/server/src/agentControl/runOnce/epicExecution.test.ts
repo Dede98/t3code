@@ -13,7 +13,14 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import { AgentControlControlledThreadActivation } from "../controlledThreadReservation/Services/AgentControlControlledThreadActivation.ts";
-import { epicDigest, epicError, loadSelectedEpic, saveEpicRun } from "../epic/authority.ts";
+import {
+  epicDigest,
+  epicError,
+  loadSelectedEpic,
+  loadProjectEpics,
+  loadTaskEpic,
+  saveEpicRun,
+} from "../epic/authority.ts";
 import { insertEpicRun } from "../epic/runState.ts";
 import { AgentControlStageRun } from "../stageRun/Services/AgentControlStageRun.ts";
 import { AgentControlStageRunLeaseEngine } from "../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
@@ -331,5 +338,104 @@ it.effect(
       assert.deepEqual(yield* loadSelectedEpic(f.sql, projectId), blocked);
       assert.deepEqual(yield* f.sql`SELECT * FROM agent_control_epic_task_executions`, bindings);
       assert.equal(f.calls.get(`stage:${taskId(1)}`), 1);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+);
+
+it.effect(
+  "upgrades a running serial target into an isolated Epic set and replays both owners without duplicate starts",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const firstRunner = yield* f.build;
+      yield* firstRunner(projectId);
+      const before =
+        yield* f.sql`SELECT * FROM agent_control_epic_task_executions ORDER BY execution_id`;
+      const original = (yield* loadSelectedEpic(f.sql, projectId))!;
+      yield* runMigrations({ toMigrationInclusive: 93 });
+      assert.deepEqual(yield* loadSelectedEpic(f.sql, projectId), original);
+      assert.deepEqual(
+        yield* f.sql`SELECT * FROM agent_control_epic_task_executions ORDER BY execution_id`,
+        before,
+      );
+      const second: AgentControlEpicRuntimeView = {
+        ...initial(),
+        epicRunId: "epic-second",
+        members: initial().members.map((member) => ({
+          ...member,
+          issueNodeId: `second-${member.issueNodeId}`,
+          taskId: AgentControlTaskId.make(`second-${member.taskId}`),
+        })),
+      };
+      yield* insertEpicRun(f.sql, second);
+      const restarted = yield* f.build;
+      yield* Effect.all([restarted(projectId), restarted(projectId)], { concurrency: 2 });
+      assert.equal((yield* loadProjectEpics(f.sql, projectId)).length, 2);
+      assert.deepEqual([...f.active], [taskId(1), taskId(2), "second-task-1", "second-task-2"]);
+      const owners = yield* f.sql<{ epic: string; task: string; worktree: string; thread: string }>`
+      SELECT epic_run_id AS epic,task_id AS task,worktree_reservation_id AS worktree,thread_id AS thread
+      FROM agent_control_epic_task_executions ORDER BY task_id`;
+      assert.equal(new Set(owners.map((row) => row.worktree)).size, 4);
+      assert.equal(new Set(owners.map((row) => row.thread)).size, 4);
+      assert.equal(new Set(owners.map((row) => row.epic)).size, 2);
+      for (const owner of owners) {
+        assert.equal(
+          (yield* loadTaskEpic(f.sql, projectId, AgentControlTaskId.make(owner.task)))?.epicRunId,
+          owner.epic,
+        );
+        assert.equal(f.calls.get(`stage:${owner.task}`), 1);
+        assert.equal(f.calls.get(`thread:${owner.task}`), 1);
+      }
+      yield* f.sql.withTransaction(
+        saveEpicRun(f.sql, (yield* loadTaskEpic(f.sql, projectId, taskId(1)))!, {
+          status: "stopped",
+        }),
+      );
+      yield* (yield* f.build)(projectId);
+      assert.equal(
+        (yield* loadTaskEpic(f.sql, projectId, AgentControlTaskId.make("second-task-1")))?.status,
+        "running",
+      );
+      assert.deepEqual(
+        yield* f.sql`SELECT * FROM agent_control_epic_task_executions WHERE epic_run_id=${original.epicRunId} ORDER BY execution_id`,
+        before,
+      );
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+);
+
+it.effect(
+  "interleaves new starts across Epic owners and never adopts an ambiguously assigned task",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* runMigrations({ toMigrationInclusive: 93 });
+      const second: AgentControlEpicRuntimeView = {
+        ...initial(),
+        epicRunId: "epic-second",
+        members: initial().members.map((member) => ({
+          ...member,
+          taskId: AgentControlTaskId.make(`second-${member.taskId}`),
+        })),
+      };
+      yield* insertEpicRun(f.sql, second);
+      yield* (yield* f.build)(projectId);
+      assert.deepEqual([...f.active], [taskId(1), "second-task-1", taskId(2), "second-task-2"]);
+      yield* f.sql.withTransaction(
+        saveEpicRun(
+          f.sql,
+          (yield* loadTaskEpic(f.sql, projectId, AgentControlTaskId.make("second-task-1")))!,
+          {
+            members: second.members.map((member, index) =>
+              index === 0 ? { ...member, taskId: taskId(1) } : member,
+            ),
+          },
+        ),
+      );
+      const conflicting = yield* Effect.result(loadTaskEpic(f.sql, projectId, taskId(1)));
+      assert.equal(conflicting._tag, "Failure");
+      assert.equal(
+        (yield* f.sql`SELECT execution_id FROM agent_control_epic_task_executions WHERE task_id=${taskId(1)}`)
+          .length,
+        1,
+      );
     }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
 );

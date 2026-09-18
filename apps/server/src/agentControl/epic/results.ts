@@ -625,7 +625,10 @@ export const makeEpicResults = Effect.gen(function* () {
   }>`SELECT integration_id AS "integrationId",input_json AS "inputJson",expected_commit_sha AS "expectedCommitSha",captured_commit_sha AS "capturedCommitSha",commit_sha AS "commitSha",tree_sha AS "treeSha",worktree_path AS "worktreePath",branch_ref AS "branchRef"
     FROM agent_control_epic_integration_intents WHERE epic_run_id=${epicRunId} AND child_run_id=${childRunId}`;
 
-  const integrate: NonNullable<AgentControlEpicResultHooksShape["integrate"]> = (input) => {
+  const integrateCandidate = (
+    input: Parameters<NonNullable<AgentControlEpicResultHooksShape["integrate"]>>[0],
+    prerequisite = false,
+  ) => {
     const member = input.lastAccepted;
     if (
       !member.taskId ||
@@ -656,9 +659,10 @@ export const makeEpicResults = Effect.gen(function* () {
         }>`SELECT result_json AS "resultJson",result_digest AS "resultDigest" FROM agent_control_epic_capture_results WHERE child_run_id=${member.childRunId}`;
         const retained = captureRows[0];
         if (
-          !retained ||
-          sha256Utf8(retained.resultJson) !== retained.resultDigest ||
-          canonicalJson(input.captured) !== retained.resultJson
+          !prerequisite &&
+          (!retained ||
+            sha256Utf8(retained.resultJson) !== retained.resultDigest ||
+            canonicalJson(input.captured) !== retained.resultJson)
         )
           return yield* authorityFailure(
             "Integration does not match the immutable captured task result.",
@@ -668,25 +672,35 @@ export const makeEpicResults = Effect.gen(function* () {
           return yield* authorityFailure(
             "Integration has no accepted task verification authority.",
           );
+        const captured = prerequisite
+          ? {
+              ...input.captured,
+              treeSha: yield* git(cwd, ["rev-parse", `${input.captured.commitSha}^{tree}`]),
+            }
+          : input.captured;
+        const journalChildRunId = prerequisite
+          ? `${member.childRunId}:prerequisite:${captured.commitSha}`
+          : captureInput.childRunId;
         const identity = {
           epicRunId: input.epicRunId,
           projectId: input.projectId,
           childRunId: member.childRunId,
-          captured: input.captured,
+          captured,
           expectedCommitSha: input.expectedCommitSha,
           initialBaseCommitSha: input.initialBaseCommitSha,
           checks: input.checks,
+          ...(prerequisite ? { prerequisite: true } : {}),
         };
         const inputJson = canonicalJson(identity);
         const integrationId = `epic-integration:${sha256Utf8(inputJson)}`;
-        const branchRef = `refs/heads/t3auto/epic-${sha256Utf8(input.epicRunId).slice(0, 24)}`;
+        const branchRef = `refs/heads/t3auto/epic-${sha256Utf8(input.epicRunId).slice(0, 24)}${prerequisite ? `-base-${sha256Utf8(integrationId).slice(0, 16)}` : ""}`;
         const worktreePath = NodePath.join(
           state.repositoryCommonDir,
           "t3-epic-integrations",
           sha256Utf8(input.epicRunId).slice(0, 24),
           sha256Utf8(integrationId).slice(0, 24),
         );
-        let intent = (yield* integrationRows(input.epicRunId, captureInput.childRunId)).find(
+        let intent = (yield* integrationRows(input.epicRunId, journalChildRunId)).find(
           (item) => item.integrationId === integrationId,
         );
         if (
@@ -703,9 +717,18 @@ export const makeEpicResults = Effect.gen(function* () {
           git(cwd, ["rev-parse", "--verify", branchRef]).pipe(
             Effect.catch(() => Effect.succeed(null)),
           );
+        if (prerequisite) {
+          const canonicalRef = `refs/heads/t3auto/epic-${sha256Utf8(input.epicRunId).slice(0, 24)}`;
+          if (
+            (yield* git(cwd, ["rev-parse", "--verify", canonicalRef])) !== input.expectedCommitSha
+          )
+            return yield* authorityFailure(
+              "The prerequisite base no longer matches the accepted Epic result.",
+            );
+        }
         let head = yield* branchHead();
         if (head === null) {
-          if (input.expectedCommitSha !== input.initialBaseCommitSha)
+          if (!prerequisite && input.expectedCommitSha !== input.initialBaseCommitSha)
             return yield* authorityFailure("The existing Epic integration branch is missing.");
           yield* input.authorize;
           yield* git(cwd, ["update-ref", branchRef, input.expectedCommitSha, "0".repeat(40)]);
@@ -755,7 +778,7 @@ export const makeEpicResults = Effect.gen(function* () {
           yield* input.authorize;
           // This immutable intent precedes worktree materialization, checks, and branch publication.
           yield* sql`INSERT INTO agent_control_epic_integration_intents(integration_id,epic_run_id,child_run_id,input_json,expected_commit_sha,captured_commit_sha,commit_sha,tree_sha,worktree_path,branch_ref,created_at)
-          VALUES (${integrationId},${input.epicRunId},${member.childRunId},${inputJson},${input.expectedCommitSha},${input.captured.commitSha},${commitSha},${treeSha},${worktreePath},${branchRef},${createdAt})`;
+          VALUES (${integrationId},${input.epicRunId},${journalChildRunId},${inputJson},${input.expectedCommitSha},${input.captured.commitSha},${commitSha},${treeSha},${worktreePath},${branchRef},${createdAt})`;
           intent = {
             integrationId,
             inputJson,
@@ -881,6 +904,24 @@ export const makeEpicResults = Effect.gen(function* () {
     );
   };
 
+  const integrate: NonNullable<AgentControlEpicResultHooksShape["integrate"]> = (input) =>
+    integrateCandidate(input);
+  const integratePrerequisite: NonNullable<
+    AgentControlEpicResultHooksShape["integratePrerequisite"]
+  > = (input) =>
+    integrateCandidate(
+      {
+        ...input,
+        captured: {
+          commitSha: input.mergeCommitSha,
+          treeSha: input.mergeCommitSha,
+          codeDigest: "reviewed-merge",
+          evidenceId: `reviewed-merge:${input.mergeCommitSha}`,
+        },
+      },
+      true,
+    );
+
   const verify: AgentControlEpicResultHooksShape["verify"] = (input) => {
     const member = input.lastAccepted;
     if (
@@ -977,6 +1018,11 @@ export const makeEpicResults = Effect.gen(function* () {
       Effect.mapError((cause) => resultError(cause, "Final Epic checks could not be completed.")),
     );
   };
-  return { capture, integrate, verify } satisfies AgentControlEpicResultHooksShape;
+  return {
+    capture,
+    integrate,
+    integratePrerequisite,
+    verify,
+  } satisfies AgentControlEpicResultHooksShape;
 });
 export const EpicResultsLive = Layer.effect(AgentControlEpicResultHooks, makeEpicResults);

@@ -30,12 +30,17 @@ import {
   agentControlEpicQueueChangeInput,
   agentControlEpicQueueMoveInput,
   agentControlEpicQueueView,
+  agentControlEpicRuns,
+  agentControlEpicDependencyLabel,
+  agentControlEpicProjectPlan,
+  agentControlEpicProjectPlanAdditions,
   agentControlEpicStartBlockers,
   agentControlEpicStartInput,
   agentControlEpicExecutionOptions,
   agentControlEpicMemberProgress,
   agentControlEpicControlInput,
   agentControlEpicControlAllowed,
+  agentControlEpicStopPresentation,
   agentControlEpicStatus,
   agentControlEpicHandoffPermissionBlocker,
   agentControlEpicHandoffBlockers,
@@ -1124,7 +1129,7 @@ describe("Epic execution client state", () => {
     expect(progress.threadId).toBe(run.stages.at(-1)?.threadId ?? null);
     expect(
       agentControlEpicMemberProgress({ ...member, waitReason: "dependencies" }, []).label,
-    ).toContain("predecessor integrations");
+    ).toContain("integration into the task base");
     expect(agentControlEpicMemberProgress({ ...member, waitReason: "capacity" }, []).label).toBe(
       "Waiting for capacity",
     );
@@ -1735,5 +1740,391 @@ describe("Epic queue client state", () => {
         "clear",
       ),
     ).toBe(false);
+  });
+});
+
+describe("parallel Epic client decisions", () => {
+  const entries = [0, 1].map((index) => {
+    const issue = {
+      ...epicPreview.source.tasks[0]!.issue,
+      issueNodeId: `task-${index}`,
+      number: 201 + index,
+    };
+    const source = {
+      ...epicPreview.source,
+      epic: { ...epicPreview.source.epic, issueNodeId: `epic-${index}`, number: 101 + index },
+      tasks: [{ ...epicPreview.source.tasks[0]!, issue }],
+      fingerprint: `scope-${index}`,
+    };
+    return {
+      entryId: `entry-${index}`,
+      source,
+      dependencyPlan: {
+        version: 1 as const,
+        sourceFingerprint: source.fingerprint,
+        rationale: "Reviewed separate files",
+        tasks: [{ issueNodeId: issue.issueNodeId, dependsOn: [] as string[] }],
+      },
+      approvedAt: timestamp,
+      epicRunId: `run-${index}`,
+      status: "active" as const,
+      blockers: [],
+    };
+  });
+  const parallel: AgentControlRunOnceSnapshot = {
+    ...snapshot,
+    epic: epicRun,
+    epics: entries.map((entry) => ({
+      ...epicRun,
+      epicRunId: entry.epicRunId,
+      source: entry.source,
+    })),
+    epicQueue: {
+      projectId: snapshot.projectId,
+      revision: 9,
+      entries,
+      nextEntryId: null,
+      waitReason: null,
+      nextCheckAt: null,
+    },
+  };
+
+  it("matches serial project-wide pause and parallel run-specific stop semantics", () => {
+    const serial = agentControlEpicStopPresentation(parallel, epicRun);
+    expect(serial.label).toBe("Pause Epic");
+    expect(serial.explanation).toContain("Armed off for the entire project");
+    expect(serial.explanation).toContain("preserves this Epic");
+    const projectDependencyPlan = agentControlEpicProjectPlan(
+      parallel,
+      2,
+      "Reviewed",
+      true,
+    ).projectDependencyPlan!;
+    const scoped = agentControlEpicStopPresentation(parallel, {
+      ...epicRun,
+      projectDependencyPlan,
+    });
+    expect(scoped.label).toBe("End Epic and retain results");
+    expect(scoped.explanation).toContain("only its execution authority");
+    expect(scoped.explanation).toContain("Other Epics and manual threads continue");
+    expect(agentControlEpicStopPresentation(snapshot, epicRun).label).toBe(
+      "End Epic and retain results",
+    );
+    expect(
+      agentControlEpicStopPresentation(
+        { ...parallel, epicQueue: { ...parallel.epicQueue!, enabled: false } },
+        epicRun,
+      ),
+    ).toEqual(agentControlEpicStopPresentation(snapshot, epicRun));
+    expect(
+      agentControlEpicStopPresentation(
+        { ...parallel, epicQueue: { ...parallel.epicQueue!, maxActiveEpics: 4 } },
+        epicRun,
+      ),
+    ).toEqual(serial);
+  });
+
+  it("resolves cross-Epic prerequisite labels from queue, active runs and retained history", () => {
+    const source = entries[0]!.source;
+    const prerequisite = entries[1]!.source;
+    expect(agentControlEpicDependencyLabel(parallel, source, "task-1")).toBe("#202");
+    expect(
+      agentControlEpicDependencyLabel(
+        { ...snapshot, epics: [{ ...epicRun, source: prerequisite }] },
+        source,
+        "task-1",
+      ),
+    ).toBe("#202");
+    expect(
+      agentControlEpicDependencyLabel(
+        { ...snapshot, epics: [], epicHistory: [{ ...epicRun, source: prerequisite }] },
+        source,
+        "task-1",
+      ),
+    ).toBe("#202");
+    expect(
+      agentControlEpicDependencyLabel(
+        { ...snapshot, epics: [], epicQueue: parallel.epicQueue! },
+        source,
+        "task-1",
+      ),
+    ).toBe("#202");
+    expect(agentControlEpicDependencyLabel(null, source, "task-0")).toBe("#201");
+    expect(agentControlEpicDependencyLabel(null, source, "missing")).toBe(
+      "Unresolved issue (missing)",
+    );
+  });
+
+  it("uses all authoritative runs and refuses ambiguous or foreign run controls", () => {
+    expect(agentControlEpicRuns(parallel).map((epic) => epic.epicRunId)).toEqual([
+      "run-0",
+      "run-1",
+    ]);
+    expect(agentControlEpicRuns({ ...parallel, epics: [] })).toEqual([]);
+    expect(agentControlEpicRuns({ ...snapshot, epic: epicRun })).toEqual([epicRun]);
+    const readiness = { ...start, snapshot: parallel };
+    expect(agentControlEpicControlAllowed(readiness, "stop")).toBe(false);
+    expect(agentControlEpicControlAllowed(readiness, "stop", epicRun.epicRunId)).toBe(false);
+    expect(agentControlEpicControlAllowed(readiness, "stop", "run-1")).toBe(true);
+    expect(
+      agentControlEpicControlAllowed(
+        { ...readiness, modeChangeBlocker: "Read-only environment" },
+        "stop",
+        "run-1",
+      ),
+    ).toBe(false);
+    const controls = parallel.epics!.map((epic) => agentControlEpicControlInput(epic, "stop"));
+    expect(controls[0]!.commandId).not.toBe(controls[1]!.commandId);
+    expect(controls[1]!.epicRunId).toBe("run-1");
+    expect(agentControlEpicQueueView(parallel)?.activeEntries).toHaveLength(2);
+    expect(agentControlArmedStatus({ ...parallel, armed: { enabled: true } }).label).toContain(
+      "2 Epics active",
+    );
+  });
+
+  it("preserves serial defaults and requires explicit cross-Epic review", () => {
+    expect(agentControlEpicQueueView(parallel)?.maxActiveEpics).toBe(1);
+    expect(agentControlEpicProjectPlan(parallel, 1, "", false)).toEqual({ blockers: [] });
+    expect(agentControlEpicProjectPlan(parallel, 2, "No edges", false).blockers).not.toEqual([]);
+    expect(agentControlEpicProjectPlan(parallel, 2, "", true).blockers).not.toEqual([]);
+    for (const limit of [0, 1.5, 5, NaN])
+      expect(agentControlEpicProjectPlan(parallel, limit, "Reviewed", true).blockers).not.toEqual(
+        [],
+      );
+    const plan = agentControlEpicProjectPlan(parallel, 2, "Separate components", true);
+    expect(plan.blockers).toEqual([]);
+    expect(plan.projectDependencyPlan?.epics).toEqual([
+      { issueNodeId: "epic-0", sourceFingerprint: "scope-0" },
+      { issueNodeId: "epic-1", sourceFingerprint: "scope-1" },
+    ]);
+    expect(plan.projectDependencyPlan?.tasks).toEqual([
+      { issueNodeId: "task-0", dependsOn: [] },
+      { issueNodeId: "task-1", dependsOn: [] },
+    ]);
+  });
+
+  it("adds reviewed cross-Epic edges without losing native or frozen prerequisites", () => {
+    const native = entries.map((entry, index) =>
+      index
+        ? {
+            ...entry,
+            source: {
+              ...entry.source,
+              tasks: [
+                { ...entry.source.tasks[0]!, dependencies: [entries[0]!.source.tasks[0]!.issue] },
+              ],
+            },
+          }
+        : entry,
+    );
+    const nativeSnapshot = { ...parallel, epicQueue: { ...parallel.epicQueue!, entries: native } };
+    const plan = agentControlEpicProjectPlan(nativeSnapshot, 2, "Review", true, {
+      "task-1": "#201",
+    });
+    expect(plan.blockers).toEqual([]);
+    expect(plan.projectDependencyPlan?.tasks[1]!.dependsOn).toEqual(["task-0"]);
+    const saved = {
+      ...parallel,
+      epicQueue: { ...parallel.epicQueue!, projectDependencyPlan: plan.projectDependencyPlan! },
+    };
+    expect(
+      agentControlEpicProjectPlan(
+        saved,
+        2,
+        "Review again",
+        true,
+        agentControlEpicProjectPlanAdditions(saved),
+      ).projectDependencyPlan?.tasks[1]!.dependsOn,
+    ).toEqual(["task-0"]);
+    expect(
+      agentControlEpicProjectPlan(saved, 2, "Re-reviewed without optional edge", true, {
+        "task-1": "",
+      }).projectDependencyPlan?.tasks[1]!.dependsOn,
+    ).toEqual([]);
+    const action = {
+      kind: "configure" as const,
+      maxActiveEpics: 2,
+      projectDependencyPlan: plan.projectDependencyPlan!,
+    };
+    const request = agentControlEpicQueueChangeInput(saved, action);
+    expect(agentControlEpicQueueChangeInput(saved, action)).toEqual(request);
+    expect(request.expectedRevision).toBe(9);
+    expect(
+      agentControlEpicQueueChangeInput(
+        { ...saved, epicQueue: { ...saved.epicQueue, revision: 10 } },
+        action,
+      ).commandId,
+    ).not.toBe(request.commandId);
+  });
+
+  it("shows and approves expanded native Epic dependencies for every dependent task", () => {
+    const native = entries.map((entry, index) =>
+      index
+        ? { ...entry, source: { ...entry.source, dependencies: [entries[0]!.source.epic] } }
+        : entry,
+    );
+    const nativeSnapshot = { ...parallel, epicQueue: { ...parallel.epicQueue!, entries: native } };
+    const plan = agentControlEpicProjectPlan(
+      nativeSnapshot,
+      2,
+      "Reviewed native Epic dependencies",
+      true,
+    );
+    expect(plan.blockers).toEqual([]);
+    expect(plan.projectDependencyPlan?.tasks[1]!.dependsOn).toEqual(["task-0"]);
+  });
+
+  it("expands raw Epic references in both reviewed and native task dependencies", () => {
+    const native = entries.map((entry, index) =>
+      index
+        ? {
+            ...entry,
+            source: {
+              ...entry.source,
+              tasks: [{ ...entry.source.tasks[0]!, dependencies: [entries[0]!.source.epic] }],
+            },
+            dependencyPlan: {
+              ...entry.dependencyPlan,
+              tasks: [
+                {
+                  issueNodeId: entry.source.tasks[0]!.issue.issueNodeId,
+                  dependsOn: [entries[0]!.source.epic.issueNodeId],
+                },
+              ],
+            },
+          }
+        : entry,
+    );
+    const state = { ...parallel, epicQueue: { ...parallel.epicQueue!, entries: native } };
+    const plan = agentControlEpicProjectPlan(state, 2, "Reviewed task to Epic edge", true);
+    expect(plan.blockers).toEqual([]);
+    expect(plan.projectDependencyPlan?.tasks[1]!.dependsOn).toEqual(["task-0"]);
+  });
+
+  it("rejects unknown, self and cyclic dependencies and duplicate ownership", () => {
+    for (const additions of [
+      { "task-1": "999" },
+      { "task-1": "202" },
+      { "task-1": "201", "task-0": "202" },
+    ]) {
+      expect(
+        agentControlEpicProjectPlan(parallel, 2, "Reviewed", true, additions).blockers.length,
+      ).toBeGreaterThan(0);
+    }
+    const duplicate = {
+      ...parallel,
+      epicQueue: { ...parallel.epicQueue!, entries: [entries[0]!, entries[0]!] },
+    };
+    expect(
+      agentControlEpicProjectPlan(duplicate, 2, "Reviewed", true).blockers.join(" "),
+    ).toContain("multiple Epics");
+    const legacy = {
+      ...parallel,
+      epicQueue: {
+        ...parallel.epicQueue!,
+        entries: entries.map((entry) => ({
+          entryId: entry.entryId,
+          source: entry.source,
+          approvedAt: entry.approvedAt,
+          epicRunId: entry.epicRunId,
+          status: entry.status,
+          blockers: entry.blockers,
+        })),
+      },
+    };
+    expect(agentControlEpicProjectPlan(legacy, 2, "Reviewed", true).blockers.join(" ")).toContain(
+      "own reviewed task dependency plan",
+    );
+  });
+
+  it("rejects review-boundary deadlocks even when the task graph has no cycle", () => {
+    const expanded = entries.map((entry, index) => ({
+      ...entry,
+      source: {
+        ...entry.source,
+        tasks: [
+          ...entry.source.tasks,
+          {
+            ...entry.source.tasks[0]!,
+            issue: {
+              ...entry.source.tasks[0]!.issue,
+              issueNodeId: `extra-${index}`,
+              number: 301 + index,
+            },
+          },
+        ],
+      },
+      dependencyPlan: {
+        ...entry.dependencyPlan,
+        tasks: [...entry.dependencyPlan.tasks, { issueNodeId: `extra-${index}`, dependsOn: [] }],
+      },
+    }));
+    const state = { ...parallel, epicQueue: { ...parallel.epicQueue!, entries: expanded } };
+    const plan = agentControlEpicProjectPlan(state, 2, "Review", true, {
+      "extra-0": "202",
+      "extra-1": "201",
+    });
+    expect(plan.blockers).toContain(
+      "The dependencies create a cycle across human review and merge boundaries.",
+    );
+    expect(plan.blockers).not.toContain("The reviewed task dependencies contain a cycle.");
+  });
+
+  it("allows ending a verified parallel Epic awaiting review without changing another run", () => {
+    const projectDependencyPlan = agentControlEpicProjectPlan(
+      parallel,
+      2,
+      "Reviewed",
+      true,
+    ).projectDependencyPlan!;
+    const completed = {
+      ...parallel.epics![0]!,
+      status: "succeeded" as const,
+      projectDependencyPlan,
+    };
+    const state = { ...parallel, epics: [completed, parallel.epics![1]!] };
+    const readiness = { ...start, snapshot: state };
+    expect(agentControlEpicControlAllowed(readiness, "stop", completed.epicRunId)).toBe(true);
+    expect(agentControlEpicControlAllowed(readiness, "resume", completed.epicRunId)).toBe(false);
+    expect(agentControlEpicControlInput(completed, "stop").epicRunId).toBe("run-0");
+    expect(state.epics[1]!.status).toBe("running");
+    const merged = {
+      ...completed,
+      handoff: {
+        ...publishedHandoff,
+        pullRequest: { ...publishedHandoff.pullRequest!, state: "merged" as const },
+      },
+    };
+    expect(
+      agentControlEpicControlAllowed(
+        { ...readiness, snapshot: { ...state, epics: [merged] } },
+        "stop",
+        completed.epicRunId,
+      ),
+    ).toBe(false);
+
+    expect(
+      agentControlEpicControlAllowed(
+        { ...readiness, snapshot: { ...state, epics: [{ ...completed, status: "stopped" }] } },
+        "stop",
+        completed.epicRunId,
+      ),
+    ).toBe(false);
+  });
+
+  it("retains run identities, separate evidence, and stopped queue entries on wire reload", () => {
+    const input = {
+      ...parallel,
+      epicQueue: {
+        ...parallel.epicQueue!,
+        entries: [{ ...entries[0]!, status: "stopped" }, entries[1]!],
+      },
+    };
+    const restored = decodeSnapshot(JSON.parse(JSON.stringify(input)));
+    expect(restored.epics).toEqual(parallel.epics);
+    expect(restored.epicQueue?.entries[0]!.status).toBe("stopped");
+    expect(
+      agentControlEpicQueueView(restored)?.activeEntries.map((entry) => entry.epicRunId),
+    ).toEqual(["run-1"]);
   });
 });

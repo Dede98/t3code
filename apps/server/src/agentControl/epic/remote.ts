@@ -414,6 +414,11 @@ export const makeEpicHandoffRemote = Effect.gen(function* () {
           "target-branch-changed",
           "The merged pull request does not target the approved default branch.",
         );
+      if (pr.headSha !== handoff.commitSha)
+        return yield* failure(
+          "handoff-head-changed",
+          "The merged pull request no longer contains the exact verified Epic head. Review the changed result before continuing.",
+        );
       mergeCommitSha = pr.mergeCommitSha ?? null;
       if (!mergeCommitSha || !objectId.test(mergeCommitSha))
         return yield* failure(

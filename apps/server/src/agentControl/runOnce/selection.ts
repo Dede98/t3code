@@ -4,7 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { loadSelectedEpic } from "../epic/authority.ts";
+import { loadProjectEpics } from "../epic/authority.ts";
 
 export const AGENT_CONTROL_RUN_ONCE_CANDIDATE_SQL = `SELECT candidate.task_id AS "taskId"
 FROM main.agent_control_task_states AS candidate
@@ -22,8 +22,10 @@ const decodeRows = Schema.decodeUnknownEffect(Schema.Array(CandidateRow));
 
 export const selectAgentControlRunOnceCandidate = Effect.fn("selectAgentControlRunOnceCandidate")(
   function* (sql: SqlClient.SqlClient, projectId: ProjectId, githubIntakeSequence: number) {
-    const epic = yield* loadSelectedEpic(sql, projectId);
-    if (epic !== null) {
+    const epics = yield* loadProjectEpics(sql, projectId);
+    if (epics.length > 1 || epics.some((epic) => epic.dependencyPlan)) return null;
+    const epic = epics[0];
+    if (epic !== undefined) {
       if (epic.status !== "running" || epic.activeTaskId === null) return null;
       const rows = yield* sql<
         Record<string, unknown>

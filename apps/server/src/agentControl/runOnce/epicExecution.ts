@@ -8,7 +8,13 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { AgentControlControlledThreadActivation } from "../controlledThreadReservation/Services/AgentControlControlledThreadActivation.ts";
-import { epicDigest, epicError, loadSelectedEpic, saveEpicRun } from "../epic/authority.ts";
+import {
+  epicDigest,
+  epicError,
+  loadProjectEpics,
+  loadTaskEpic,
+  saveEpicRun,
+} from "../epic/authority.ts";
 import { AgentControlStageRun } from "../stageRun/Services/AgentControlStageRun.ts";
 import { deriveAgentControlStageRunLeaseId } from "../stageRunLease/identity.ts";
 import { AgentControlStageRunLeaseEngine } from "../stageRunLease/Services/AgentControlStageRunLeaseEngine.ts";
@@ -42,7 +48,7 @@ export const makeEpicTaskExecution = Effect.fn("makeEpicTaskExecution")(function
     projectId: ProjectId,
     taskId: AgentControlTaskId,
   ) {
-    const epic = yield* loadSelectedEpic(sql, projectId);
+    const epic = yield* loadTaskEpic(sql, projectId, taskId);
     const member = epic?.members.find((item) => item.taskId === taskId);
     const rows = yield* sql<{ mode: string; revision: number; pausedFromMode: string | null }>`
       SELECT mode, revision, paused_from_mode AS "pausedFromMode"
@@ -239,11 +245,20 @@ export const makeEpicTaskExecution = Effect.fn("makeEpicTaskExecution")(function
   });
 
   return Effect.fn("EpicTaskExecution.processProject")(function* (projectId: ProjectId) {
-    const epic = yield* loadSelectedEpic(sql, projectId);
-    if (!epic?.dependencyPlan) return;
-    const members = epic.members
-      .filter((member) => member.status === "running" && member.taskId !== null)
-      .sort((a, b) => a.issueNumber - b.issueNumber || a.issueNodeId.localeCompare(b.issueNodeId));
+    const epics = (yield* loadProjectEpics(sql, projectId)).filter(
+      (epic) => epic.dependencyPlan && epic.status === "running",
+    );
+    const groups = epics.map((epic) =>
+      epic.members
+        .filter((member) => member.status === "running" && member.taskId !== null)
+        .sort(
+          (a, b) => a.issueNumber - b.issueNumber || a.issueNodeId.localeCompare(b.issueNodeId),
+        ),
+    );
+    // Interleave starts across Epics before returning to another member of a large Epic.
+    const members = Array.from({
+      length: Math.max(0, ...groups.map((group) => group.length)),
+    }).flatMap((_, index) => groups.flatMap((group) => (group[index] ? [group[index]!] : [])));
     // Starting one task only enqueues its first turn. It does not wait for a
     // provider terminal event, so later members execute concurrently under Admission.
     yield* Effect.forEach(

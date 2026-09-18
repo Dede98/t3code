@@ -1,6 +1,7 @@
 import type {
   AgentControlEpicRuntimeView,
   AgentControlEpicDependencyPlan,
+  AgentControlEpicProjectDependencyPlan,
   AgentControlEpicSource,
   AgentControlVerificationChecks,
   ProjectId,
@@ -18,9 +19,20 @@ export const createEpicRun = Effect.fn("createEpicRun")(function* (input: {
   checks: AgentControlVerificationChecks;
   parallelism?: number;
   dependencyPlan?: AgentControlEpicDependencyPlan;
+  projectDependencyPlan?: AgentControlEpicProjectDependencyPlan;
   initialBase?: { commitSha: string; targetBranch: string };
 }) {
-  yield* validateEpicDependencyPlan(input.source, input.dependencyPlan, input.parallelism);
+  yield* validateEpicDependencyPlan(
+    input.source,
+    input.dependencyPlan,
+    input.parallelism,
+    input.projectDependencyPlan
+      ? new Set([
+          ...input.projectDependencyPlan.tasks.map((task) => task.issueNodeId),
+          ...input.projectDependencyPlan.epics.map((epic) => epic.issueNodeId),
+        ])
+      : undefined,
+  );
   const now = DateTime.formatIso(yield* DateTime.now);
   return {
     epicRunId: `epic-${epicDigest({ projectId: input.projectId, commandId: input.commandId })}`,
@@ -37,6 +49,12 @@ export const createEpicRun = Effect.fn("createEpicRun")(function* (input: {
         }
       : {}),
     ...(input.initialBase ? { initialBase: input.initialBase } : {}),
+    ...(input.projectDependencyPlan
+      ? {
+          projectDependencyPlan: input.projectDependencyPlan,
+          projectDependencyPlanDigest: epicDigest(input.projectDependencyPlan),
+        }
+      : {}),
     members: input.source.tasks.map((task) => ({
       issueNodeId: task.issue.issueNodeId,
       issueNumber: task.issue.number,

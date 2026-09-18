@@ -1195,6 +1195,122 @@ describe("Epic handoff retained verification authority", () => {
 });
 
 describe("Epic task integration", () => {
+  it.effect(
+    "prepares and verifies a reviewed merge on an advanced task basis without replacing the Epic result, and replays checks once",
+    () =>
+      testWithRepo((repo) =>
+        Effect.gen(function* () {
+          yield* Migration090;
+          const sql = yield* SqlClient.SqlClient;
+          let executions = 0;
+          const executor = {
+            execute: () =>
+              Effect.sync(() => {
+                executions++;
+                return success;
+              }),
+          };
+          const build = makeEpicResults.pipe(Effect.provideService(EpicCheckExecutor, executor));
+          const hooks = yield* build;
+          const captured = yield* hooks.capture(captureInput);
+          const accepted = yield* hooks.integrate({
+            ...finalInput(captured, repo.base),
+            captured,
+            expectedCommitSha: repo.base,
+            authorize: Effect.void,
+          });
+          const prerequisitePath = NodePath.join(repo.root, "reviewed-prerequisite");
+          yield* git(repo.cwd, ["worktree", "add", "--detach", prerequisitePath, repo.base]);
+          yield* io(() =>
+            NodeFSP.writeFile(
+              NodePath.join(prerequisitePath, "prerequisite.txt"),
+              "reviewed result\n",
+            ),
+          );
+          yield* git(prerequisitePath, ["add", "prerequisite.txt"]);
+          yield* git(prerequisitePath, [
+            "-c",
+            "user.name=Reviewer",
+            "-c",
+            "user.email=review@example.invalid",
+            "commit",
+            "-qm",
+            "reviewed prerequisite",
+          ]);
+          const merged = yield* git(prerequisitePath, ["rev-parse", "HEAD"]);
+          const input = {
+            ...finalInput(accepted.accepted, repo.base),
+            expectedCommitSha: accepted.accepted.commitSha,
+            mergeCommitSha: merged,
+            authorize: Effect.void,
+          };
+          const prepared = yield* hooks.integratePrerequisite(input);
+          expect(prepared.verification.status).toBe("passed");
+          expect(yield* git(repo.cwd, ["show", `${prepared.accepted.commitSha}:source.txt`])).toBe(
+            "accepted A",
+          );
+          expect(
+            yield* git(repo.cwd, ["show", `${prepared.accepted.commitSha}:prerequisite.txt`]),
+          ).toBe("reviewed result");
+          yield* git(repo.cwd, [
+            "merge-base",
+            "--is-ancestor",
+            merged,
+            prepared.accepted.commitSha,
+          ]);
+          yield* git(repo.cwd, [
+            "merge-base",
+            "--is-ancestor",
+            accepted.accepted.commitSha,
+            prepared.accepted.commitSha,
+          ]);
+          const intents = yield* sql<{
+            branch: string;
+            commit: string;
+          }>`SELECT branch_ref AS branch,commit_sha AS "commit" FROM agent_control_epic_integration_intents ORDER BY rowid`;
+          expect(intents).toHaveLength(2);
+          expect(intents[0]!.branch).not.toBe(intents[1]!.branch);
+          expect(yield* git(repo.cwd, ["rev-parse", intents[0]!.branch])).toBe(
+            accepted.accepted.commitSha,
+          );
+          expect(yield* (yield* build).integratePrerequisite(input)).toEqual(prepared);
+          expect(executions).toBe(2);
+          expect((yield* sql`SELECT * FROM agent_control_epic_integration_results`).length).toBe(2);
+          // A later conflicting reviewed change cannot destroy the accepted result or
+          // either source worktree. The failed merge publishes no preparation receipt.
+          yield* io(() =>
+            NodeFSP.writeFile(
+              NodePath.join(prerequisitePath, "source.txt"),
+              "conflicting reviewed change\n",
+            ),
+          );
+          yield* git(prerequisitePath, ["add", "source.txt"]);
+          yield* git(prerequisitePath, [
+            "-c",
+            "user.name=Reviewer",
+            "-c",
+            "user.email=review@example.invalid",
+            "commit",
+            "-qm",
+            "conflicting prerequisite",
+          ]);
+          const conflicting = yield* git(prerequisitePath, ["rev-parse", "HEAD"]);
+          expect(
+            (yield* Effect.result(
+              hooks.integratePrerequisite({ ...input, mergeCommitSha: conflicting }),
+            ))._tag,
+          ).toBe("Failure");
+          expect(yield* git(repo.cwd, ["rev-parse", intents[0]!.branch])).toBe(
+            accepted.accepted.commitSha,
+          );
+          expect(
+            yield* io(() => NodeFSP.readFile(NodePath.join(repo.cwd, "source.txt"), "utf8")),
+          ).toBe("accepted A\n");
+          expect(executions).toBe(2);
+        }),
+      ),
+  );
+
   it.effect("merges independently captured tasks in order and checks each combined tree", () =>
     testWithRepo((repo) =>
       Effect.gen(function* () {

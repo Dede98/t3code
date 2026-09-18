@@ -18,7 +18,15 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { AgentControlEngine } from "../Services/AgentControlEngine.ts";
-import { epicDigest, epicError, loadSelectedEpic, saveEpicRun } from "./authority.ts";
+import {
+  epicDigest,
+  epicError,
+  loadProjectEpics,
+  loadSelectedEpic,
+  saveEpicRun,
+} from "./authority.ts";
+import { validateProjectDependencyPlan } from "./projectDependencyPlan.ts";
+import { makeParallelEpicQueue } from "./parallelQueue.ts";
 import { epicStructureDigest } from "./model.ts";
 import { loadEpicQueue, saveEpicQueue } from "./queueAuthority.ts";
 import { createEpicRun, insertEpicRun } from "./runState.ts";
@@ -48,6 +56,7 @@ export const makeEpicQueue = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const engine = yield* AgentControlEngine;
   const remote = yield* Effect.serviceOption(EpicHandoffRemote);
+  const parallelQueue = yield* makeParallelEpicQueue;
   const change = Effect.fn("EpicQueue.change")(function* (
     input: AgentControlEpicQueueChangeInput,
     preview: (number: number) => Effect.Effect<AgentControlEpicPreview, AgentControlEpicRpcError>,
@@ -89,7 +98,8 @@ export const makeEpicQueue = Effect.gen(function* () {
           const enabled = isAgentControlEpicQueueEnabled(previous);
           if (!enabled && input.action.kind !== "approve")
             return yield* epicError("queue-disabled", "Approve an Epic to enable the queue.");
-          const selected = yield* loadSelectedEpic(sql, input.projectId);
+          const authorized = yield* loadProjectEpics(sql, input.projectId);
+          const selected = authorized[0] ?? null;
           if (!enabled && selected?.status === "stopped")
             return yield* epicError(
               "epic-stopped",
@@ -117,10 +127,20 @@ export const makeEpicQueue = Effect.gen(function* () {
           let entries = [
             ...(enabled ? previous!.entries : selected ? [entryForRun(selected)] : []),
           ];
+          entries = entries.map((entry) =>
+            authorized.some((run) => run.epicRunId === entry.epicRunId && run.status === "stopped")
+              ? { ...entry, status: "stopped" as const }
+              : entry,
+          );
           const action = input.action;
           if (action.kind === "leave") {
-            const active = entries.find((entry) => entry.status === "active");
-            if (active && active.epicRunId !== selected?.epicRunId)
+            if (
+              entries.some(
+                (entry) =>
+                  entry.status === "active" &&
+                  !authorized.some((run) => run.epicRunId === entry.epicRunId),
+              )
+            )
               return yield* epicError(
                 "authority-conflict",
                 "The active queue entry lost its Epic selection.",
@@ -141,7 +161,7 @@ export const makeEpicQueue = Effect.gen(function* () {
                 "queue-has-pending",
                 "Remove waiting entries before leaving the queue. Their approval is not discarded automatically.",
               );
-            if (selected) {
+            for (const selected of authorized) {
               if (!entries.some((entry) => entry.epicRunId === selected.epicRunId))
                 return yield* epicError(
                   "authority-conflict",
@@ -163,6 +183,41 @@ export const makeEpicQueue = Effect.gen(function* () {
             yield* sql`INSERT INTO main.agent_control_epic_queue_commands(command_id,request_digest,project_id) VALUES (${input.commandId},${epicDigest(input)},${input.projectId})`;
             return left;
           }
+          if (action.kind === "configure") {
+            const plan = action.maxActiveEpics > 1 ? action.projectDependencyPlan : undefined;
+            const { projectDependencyPlan: previousPlan, ...queueWithoutPlan } = previous!;
+            if (
+              entries.some((entry) => entry.status === "active") &&
+              (epicDigest(previousPlan ?? null) !== epicDigest(plan ?? null) ||
+                (previous?.maxActiveEpics ?? 1) !== action.maxActiveEpics)
+            )
+              return yield* epicError(
+                "queue-busy",
+                "Finish or stop authorized Epics before changing their project plan or active Epic limit.",
+              );
+            yield* validateProjectDependencyPlan(entries, plan, action.maxActiveEpics);
+            if (action.maxActiveEpics === 1) {
+              const anchor =
+                entries.findLast((entry) => entry.status === "merged")?.epicRunId ?? null;
+              yield* sql`DELETE FROM main.agent_control_epic_targets WHERE project_id=${input.projectId}
+                AND (${anchor} IS NULL OR epic_run_id != ${anchor})`;
+            }
+            const configured = yield* saveEpicQueue(sql, previous, {
+              ...queueWithoutPlan,
+              entries,
+              maxActiveEpics: action.maxActiveEpics,
+              ...(plan ? { projectDependencyPlan: plan } : {}),
+              nextCheckAt: null,
+              waitReason: "Project dependency plan approved; waiting for Armed.",
+            });
+            yield* sql`INSERT INTO main.agent_control_epic_queue_commands(command_id,request_digest,project_id) VALUES (${input.commandId},${epicDigest(input)},${input.projectId})`;
+            return configured;
+          }
+          if ((previous?.maxActiveEpics ?? 1) > 1 && action.kind !== "reorder")
+            return yield* epicError(
+              "project-plan-frozen",
+              "Return to serial mode after stopping or completing this queue before changing its approved membership.",
+            );
           if (action.kind === "approve") {
             if (!inspected)
               return yield* epicError("authority-conflict", "Epic preview is missing.");
@@ -188,10 +243,26 @@ export const makeEpicQueue = Effect.gen(function* () {
                 "unsupported-epic",
                 "Approve an open, same-repository Epic with one level of native sub-issues.",
               );
+            const claimedTasks = new Set(
+              entries.flatMap((entry) => entry.source.tasks.map((task) => task.issue.issueNodeId)),
+            );
+            if (inspected.source.tasks.some((task) => claimedTasks.has(task.issue.issueNodeId)))
+              return yield* epicError(
+                "duplicate-issue",
+                "A task in this Epic already belongs to another approved queue entry. Assign each issue to one Epic.",
+              );
             yield* validateEpicDependencyPlan(
               inspected.source,
               action.dependencyPlan,
               action.parallelism,
+              new Set([
+                ...entries.flatMap((entry) =>
+                  entry.source.tasks.map((task) => task.issue.issueNodeId),
+                ),
+                ...inspected.source.tasks.flatMap((task) =>
+                  task.dependencies.map((dependency) => dependency.issueNodeId),
+                ),
+              ]),
             );
             entries.push({
               entryId: `queue-${epicDigest({ projectId: input.projectId, commandId: input.commandId })}`,
@@ -228,6 +299,12 @@ export const makeEpicQueue = Effect.gen(function* () {
             ];
           }
           const queue = yield* saveEpicQueue(sql, previous, {
+            ...(enabled && action.kind === "reorder" && previous?.projectDependencyPlan
+              ? {
+                  maxActiveEpics: previous.maxActiveEpics ?? 1,
+                  projectDependencyPlan: previous.projectDependencyPlan,
+                }
+              : {}),
             projectId: input.projectId,
             enabled: true,
             revision: previous?.revision ?? 0,
@@ -257,6 +334,10 @@ export const makeEpicQueue = Effect.gen(function* () {
       DateTime.toEpochMillis(DateTime.makeUnsafe(queue.nextCheckAt)) > DateTime.toEpochMillis(now)
     )
       return true;
+    if ((queue.maxActiveEpics ?? 1) > 1) {
+      yield* parallelQueue.process(queue, project, preview);
+      return true;
+    }
     const nextCheckAt = DateTime.formatIso(DateTime.add(now, { seconds: 60 }));
     const persist = (changes: Partial<AgentControlEpicQueue>) =>
       sql.withTransaction(saveEpicQueue(sql, queue, { ...queue!, ...changes }));

@@ -39,6 +39,7 @@ export const epicStructureDigest = (source: AgentControlEpicSource) =>
 export const selectEpicMember = (
   epic: AgentControlEpicRuntimeView,
   eligibleIssueIds?: ReadonlySet<string>,
+  verifiedExternalIssueIds?: ReadonlySet<string>,
 ) => {
   const satisfied = new Set(
     epic.members
@@ -57,7 +58,7 @@ export const selectEpicMember = (
               member.issueNodeId === task.issue.issueNodeId && member.status === "pending",
           ) &&
           (epic.dependencyPlan
-            ? epicDependenciesSatisfied(epic, task.issue.issueNodeId)
+            ? epicDependenciesSatisfied(epic, task.issue.issueNodeId, verifiedExternalIssueIds)
             : task.dependencies.every(
                 (dependency) =>
                   satisfied.has(dependency.issueNodeId) ||
@@ -108,7 +109,7 @@ export const epicSourceChanges = (
         issueNumber: current.epic.number,
         message: "The Epic depends on an issue in another repository.",
       });
-    else if (dependency.state === "open") {
+    else if (dependency.state === "open" && !epic.projectDependencyPlan) {
       const wasClosed = epic.source.dependencies?.some(
         (accepted) =>
           accepted.issueNodeId === dependency.issueNodeId && accepted.state === "closed",

@@ -49,7 +49,8 @@ export const requireEpicIntegrationAuthority = Effect.fn("requireEpicIntegration
     if (
       !selected ||
       selected.epicRunId !== expected.epicRunId ||
-      selected.dependencyPlanDigest !== expected.dependencyPlanDigest
+      selected.dependencyPlanDigest !== expected.dependencyPlanDigest ||
+      selected.projectDependencyPlanDigest !== expected.projectDependencyPlanDigest
     )
       return yield* epicError("authority-conflict", "Epic integration identity or plan changed.");
     if (selected.revision !== expected.revision)
@@ -62,22 +63,61 @@ export const requireEpicIntegrationAuthority = Effect.fn("requireEpicIntegration
   },
 );
 
-/** Historical migration tests predate Epic execution; absent tables mean no selection. */
-export const loadSelectedEpic = Effect.fn("loadSelectedEpic")(function* (
+/** The target set is execution authority, independent of the client's displayed Epic. */
+export const loadProjectEpics = Effect.fn("loadProjectEpics")(function* (
   sql: SqlClient.SqlClient,
   projectId: ProjectId,
 ) {
   const installed =
     yield* sql`SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='agent_control_epic_targets'`;
-  if (!installed.length) return null;
-  const rows = yield* sql<{
-    epicRunId: string;
-  }>`SELECT epic_run_id AS "epicRunId" FROM main.agent_control_epic_targets WHERE project_id=${projectId}`;
-  if (!rows[0]) return null;
-  const state = yield* loadEpicRun(sql, rows[0].epicRunId);
+  if (!installed.length) return [];
+  const rows = yield* sql<{ epicRunId: string }>`
+    SELECT target.epic_run_id AS "epicRunId" FROM main.agent_control_epic_targets target
+    LEFT JOIN main.agent_control_epic_runs run ON run.epic_run_id=target.epic_run_id
+    WHERE target.project_id=${projectId}
+    ORDER BY json_extract(run.state_json,'$.createdAt'), target.epic_run_id`;
+  return yield* Effect.forEach(rows, (row) =>
+    Effect.gen(function* () {
+      const state = yield* loadEpicRun(sql, row.epicRunId);
+      if (!state || state.projectId !== projectId)
+        return yield* epicError("authority-conflict", "Epic target authority is incomplete.");
+      return state;
+    }),
+  );
+});
+
+export const loadProjectEpic = Effect.fn("loadProjectEpic")(function* (
+  sql: SqlClient.SqlClient,
+  projectId: ProjectId,
+  epicRunId: string,
+) {
+  const targets = yield* sql`SELECT 1 FROM main.agent_control_epic_targets
+    WHERE project_id=${projectId} AND epic_run_id=${epicRunId}`;
+  if (targets.length !== 1) return null;
+  const state = yield* loadEpicRun(sql, epicRunId);
   if (!state || state.projectId !== projectId)
-    return yield* epicError("authority-conflict", "Epic selection is incomplete.");
+    return yield* epicError("authority-conflict", "Epic target belongs to another project.");
   return state;
+});
+
+/** Compatibility for the serial read model. Execution must use its run or task identity. */
+export const loadSelectedEpic = Effect.fn("loadSelectedEpic")(function* (
+  sql: SqlClient.SqlClient,
+  projectId: ProjectId,
+) {
+  return (yield* loadProjectEpics(sql, projectId))[0] ?? null;
+});
+
+export const loadTaskEpic = Effect.fn("loadTaskEpic")(function* (
+  sql: SqlClient.SqlClient,
+  projectId: ProjectId,
+  taskId: AgentControlTaskId,
+) {
+  const epics = yield* loadProjectEpics(sql, projectId);
+  const owners = epics.filter((epic) => epic.members.some((member) => member.taskId === taskId));
+  if (owners.length > 1)
+    return yield* epicError("authority-conflict", "The task has more than one Epic owner.");
+  return owners[0] ?? null;
 });
 
 /** Call inside a transaction. The revision CAS and append-only history commit together. */
@@ -87,6 +127,11 @@ export const saveEpicRun = Effect.fn("saveEpicRun")(function* (
   changes: Partial<AgentControlEpicRuntimeView>,
 ) {
   if (
+    (changes.projectDependencyPlan !== undefined &&
+      epicDigest(changes.projectDependencyPlan) !==
+        epicDigest(previous.projectDependencyPlan ?? null)) ||
+    (changes.projectDependencyPlanDigest !== undefined &&
+      changes.projectDependencyPlanDigest !== previous.projectDependencyPlanDigest) ||
     (changes.dependencyPlan !== undefined &&
       epicDigest(changes.dependencyPlan) !== epicDigest(previous.dependencyPlan ?? null)) ||
     (changes.dependencyPlanDigest !== undefined &&
@@ -125,8 +170,12 @@ export const bindEpicChildRun = Effect.fn("bindEpicChildRun")(function* (
   taskId: AgentControlTaskId,
   childRunId: AgentControlRunOnceId,
 ) {
-  const epic = yield* loadSelectedEpic(sql, projectId);
-  if (!epic) return;
+  const epic = yield* loadTaskEpic(sql, projectId, taskId);
+  if (!epic) {
+    if ((yield* loadProjectEpics(sql, projectId)).length)
+      return yield* epicError("authority-conflict", "The task has no authorized Epic owner.");
+    return;
+  }
   const member = epic.members.find((item) => item.taskId === taskId);
   if (
     epic.status !== "running" ||
@@ -152,8 +201,12 @@ export const loadEpicRunBase = Effect.fn("loadEpicRunBase")(function* (
   childRunId: AgentControlRunOnceId | null,
   targetBranch?: string,
 ) {
-  const epic = yield* loadSelectedEpic(sql, projectId);
-  if (!epic) return null;
+  const epic = yield* loadTaskEpic(sql, projectId, taskId);
+  if (!epic) {
+    if ((yield* loadProjectEpics(sql, projectId)).length)
+      return yield* epicError("authority-conflict", "The task has no authorized Epic owner.");
+    return null;
+  }
   const member = epic.members.find((item) => item.taskId === taskId);
   if (epic.dependencyPlan && childRunId === null && member?.childRunId) {
     const executions = yield* sql<{ baseCommitSha: string; planDigest: string }>`

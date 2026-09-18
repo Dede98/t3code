@@ -16,6 +16,7 @@ export const validateEpicDependencyPlan = Effect.fn("validateEpicDependencyPlan"
   source: AgentControlEpicSource,
   plan: AgentControlEpicDependencyPlan | undefined,
   parallelism = 1,
+  externalIssueIds: ReadonlySet<string> = new Set(),
 ) {
   yield* decodeParallelism(parallelism);
   if (plan === undefined) {
@@ -43,9 +44,9 @@ export const validateEpicDependencyPlan = Effect.fn("validateEpicDependencyPlan"
     if (new Set(node.dependsOn).size !== node.dependsOn.length)
       return yield* reject(`Duplicate dependency for #${task.issue.number}.`);
     for (const dependency of node.dependsOn) {
-      if (!nodes.has(dependency))
+      if (!nodes.has(dependency) && !externalIssueIds.has(dependency))
         return yield* reject(
-          `Unknown dependency ${dependency}. Only tasks within this Epic can authorize planned execution.`,
+          `Unknown dependency ${dependency}. Dependencies must belong to the reviewed Epic or project plan.`,
         );
       if (dependency === node.issueNodeId)
         return yield* reject(`Task #${task.issue.number} depends on itself.`);
@@ -56,6 +57,7 @@ export const validateEpicDependencyPlan = Effect.fn("validateEpicDependencyPlan"
   const visited = new Set<string>();
   const visiting = new Set<string>();
   const acyclic = (id: string): boolean => {
+    if (!nodes.has(id)) return true;
     if (visiting.has(id)) return false;
     if (visited.has(id)) return true;
     visiting.add(id);
@@ -71,16 +73,31 @@ export const validateEpicDependencyPlan = Effect.fn("validateEpicDependencyPlan"
 export const epicDependenciesSatisfied = (
   epic: AgentControlEpicRuntimeView,
   issueNodeId: string,
+  verifiedExternalIssueIds: ReadonlySet<string> = new Set(),
 ) => {
   const plan = epic.dependencyPlan;
   if (!plan || epic.dependencyPlanDigest !== epicDigest(plan)) return false;
   const task = plan.tasks.find((task) => task.issueNodeId === issueNodeId);
   if (!task) return false;
-  if (task.dependsOn.length === 0) return true;
+  const projectPlan = epic.projectDependencyPlan;
+  if (projectPlan && epic.projectDependencyPlanDigest !== epicDigest(projectPlan)) return false;
+  const projectTask = projectPlan?.tasks.find((node) => node.issueNodeId === issueNodeId);
+  if (projectPlan && !projectTask) return false;
+  const dependencies = projectTask?.dependsOn ?? task.dependsOn;
+  const local = dependencies.filter((id) =>
+    epic.members.some((member) => member.issueNodeId === id),
+  );
+  if (
+    dependencies.some(
+      (id) => !local.includes(id) && (!projectPlan || !verifiedExternalIssueIds.has(id)),
+    )
+  )
+    return false;
+  if (local.length === 0) return true;
   return (
     epic.integrationVerification?.status === "passed" &&
     epic.integrationVerification.commitSha === epic.acceptedCommitSha &&
-    task.dependsOn.every((dependency) =>
+    local.every((dependency) =>
       epic.members.some(
         (member) =>
           member.issueNodeId === dependency &&

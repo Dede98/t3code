@@ -38,7 +38,8 @@ export const loadEpicQueue = Effect.fn("loadEpicQueue")(function* (
     new Set(state.entries.map((entry) => entry.entryId)).size !== state.entries.length ||
     new Set(state.entries.map((entry) => entry.source.epic.issueNodeId)).size !==
       state.entries.length ||
-    state.entries.filter((entry) => entry.status === "active").length > 1 ||
+    ((state.maxActiveEpics ?? 1) === 1 &&
+      state.entries.filter((entry) => entry.status === "active").length > 1) ||
     state.entries.some((entry) => (entry.status === "pending") !== (entry.epicRunId === null))
   )
     return yield* epicError("authority-conflict", "Epic queue state or history is inconsistent.");

@@ -30,6 +30,20 @@ export interface AgentControlEpicVerifyInput {
   readonly attempt: number;
 }
 export interface AgentControlEpicResultHooksShape {
+  readonly integratePrerequisite?: (
+    input: AgentControlEpicVerifyInput & {
+      readonly mergeCommitSha: string;
+      readonly refreshSource?: Effect.Effect<void, AgentControlEpicRpcError>;
+      readonly expectedCommitSha: string;
+      readonly authorize: Effect.Effect<void, AgentControlEpicRpcError>;
+    },
+  ) => Effect.Effect<
+    {
+      readonly accepted: AgentControlEpicAcceptedResult;
+      readonly verification: AgentControlEpicFinalVerification;
+    },
+    AgentControlEpicRpcError
+  >;
   readonly integrate?: (
     input: AgentControlEpicVerifyInput & {
       readonly captured: AgentControlEpicAcceptedResult;

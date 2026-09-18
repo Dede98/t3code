@@ -34,6 +34,8 @@ import {
   saveEpicRun,
   requireEpicIntegrationAuthority,
 } from "./authority.ts";
+import { createEpicRun, insertEpicRun } from "./runState.ts";
+import { EpicHandoffRemote } from "./remote.ts";
 import { epicSourceChanges, selectEpicMember } from "./model.ts";
 import { makeAgentControlEpic } from "./Layers/AgentControlEpic.ts";
 import { AgentControlEpicResultHooks } from "./Services/AgentControlEpicResultHooks.ts";
@@ -373,6 +375,7 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
   yield* sql`INSERT INTO agent_control_task_reconcile_states(project_id,target_sequence,last_completed_sequence,revision,status,updated_at) VALUES (${projectId},7,7,1,'completed',${at})`;
   for (const number of [2, 3, 4]) yield* insertTask(sql, number);
   let currentSource = source;
+  const sources = new Map<number, AgentControlEpicSource>();
   let project: AgentControlProjectState = {
     schemaVersion: 1,
     projectId,
@@ -447,7 +450,7 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
   const client = GithubIssueTrackerClient.of({
     resolveRepository: () => Effect.succeed(repository),
     pollIssues: () => Effect.succeed({ repository, issues: [] }),
-    inspectEpic: () => Effect.sync(() => currentSource),
+    inspectEpic: (input) => Effect.sync(() => sources.get(input.epicNumber) ?? currentSource),
   });
   const attempts: number[] = [];
   let runtime: AgentControlPreflightRuntimeResult = {
@@ -497,6 +500,9 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
     },
     setSource: (next: AgentControlEpicSource) => {
       currentSource = next;
+    },
+    setSources: (values: readonly AgentControlEpicSource[]) => {
+      for (const value of values) sources.set(value.epic.number, value);
     },
     setMode: (mode: AgentControlProjectState["mode"]) => {
       project = { ...project, mode, revision: project.revision + 1 };
@@ -732,6 +738,7 @@ describe("Epic service lifecycle", () => {
         const nextSource = {
           ...source,
           epic: { ...source.epic, issueNodeId: "next-epic", number: 11 },
+          tasks: [{ issue: issue(5), position: 0, dependencies: [] }],
           fingerprint: "next-preview",
         };
         f.setSource(nextSource);
@@ -1252,4 +1259,233 @@ it.effect("waits for in-progress intake reconciliation without blocking an activ
     yield* service.processProject(projectId);
     assert.deepEqual(yield* service.get(projectId), state);
   }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+);
+
+it.effect(
+  "keeps independent work running across dependency review waits and restarts before starting on the proved merged base",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* runMigrations({ toMigrationInclusive: 93 });
+      f.setMode("armed");
+      const firstSource: AgentControlEpicSource = {
+        ...source,
+        tasks: [{ issue: issue(2), position: 0, dependencies: [] }],
+        fingerprint: "first-source",
+      };
+      const secondSource: AgentControlEpicSource = {
+        ...source,
+        epic: issue(11),
+        fingerprint: "second-source",
+        tasks: [
+          { issue: issue(3), position: 0, dependencies: [issue(2)] },
+          { issue: issue(4), position: 1, dependencies: [] },
+        ],
+      };
+      f.setSources([firstSource, secondSource]);
+      const projectDependencyPlan = {
+        version: 1 as const,
+        rationale: "Task 3 consumes reviewed task 2; task 4 is independent.",
+        epics: [firstSource, secondSource].map((value) => ({
+          issueNodeId: value.epic.issueNodeId,
+          sourceFingerprint: value.fingerprint,
+        })),
+        tasks: [
+          { issueNodeId: "issue-2", dependsOn: [] },
+          { issueNodeId: "issue-3", dependsOn: ["issue-2"] },
+          { issueNodeId: "issue-4", dependsOn: [] },
+        ],
+      };
+      const create = (value: AgentControlEpicSource) =>
+        createEpicRun({
+          projectId,
+          commandId: value.fingerprint,
+          source: value,
+          checks: [],
+          parallelism: 2,
+          initialBase: { commitSha: "a".repeat(40), targetBranch: "main" },
+          projectDependencyPlan,
+          dependencyPlan: {
+            version: 1,
+            sourceFingerprint: value.fingerprint,
+            rationale: "Reviewed task graph.",
+            tasks: projectDependencyPlan.tasks.filter((node) =>
+              value.tasks.some((task) => task.issue.issueNodeId === node.issueNodeId),
+            ),
+          },
+        });
+      const first = yield* create(firstSource);
+      const second = yield* create(secondSource);
+      yield* insertEpicRun(f.sql, first);
+      yield* insertEpicRun(f.sql, second);
+      const result = {
+        commitSha: "b".repeat(40),
+        treeSha: "c".repeat(40),
+        codeDigest: "digest",
+        evidenceId: "captured",
+      };
+      const reviewed = yield* f.sql.withTransaction(
+        saveEpicRun(f.sql, first, {
+          status: "succeeded",
+          acceptedCommitSha: result.commitSha,
+          members: first.members.map((member) => ({
+            ...member,
+            status: "accepted",
+            accepted: result,
+          })),
+          finalVerification: {
+            status: "passed",
+            commitSha: result.commitSha,
+            evidenceId: "verification",
+            detail: "Passed",
+            checks: [],
+          },
+          handoff: {
+            intentId: "handoff",
+            status: "published",
+            repository,
+            targetBranch: "main",
+            baseCommitSha: "a".repeat(40),
+            commitSha: result.commitSha,
+            branchName: "review",
+            verificationEvidenceId: "verification",
+            requestedAt: at,
+            updatedAt: at,
+            error: null,
+            pullRequest: {
+              number: 30,
+              url: "https://github.com/owner/repo/pull/30",
+              state: "open",
+              isDraft: true,
+              headSha: result.commitSha,
+              baseBranch: "main",
+              mergeCommitSha: null,
+            },
+          },
+        }),
+      );
+      let refreshes = 0;
+      const make = () =>
+        f.make().pipe(
+          Effect.provideService(EpicHandoffRemote, {
+            refreshQueueBase: (input) =>
+              Effect.sync(() => {
+                assert.equal(input.previousHandoff?.pullRequest?.state, "merged");
+                refreshes++;
+                return { commitSha: "d".repeat(40), targetBranch: "main" };
+              }),
+            readPullRequest: () => Effect.die("unused"),
+            prepare: () => Effect.die("unused"),
+            publish: () => Effect.die("unused"),
+          }),
+        );
+      yield* (yield* make()).processProject(projectId);
+      const waiting = (yield* loadEpicRun(f.sql, second.epicRunId))!;
+      assert.equal(waiting.members[0]?.status, "pending");
+      assert.equal(waiting.members[0]?.waitReason, "dependencies");
+      assert.include(waiting.members[0]?.blocker, "reviewed merge");
+      assert.equal(waiting.members[1]?.status, "running");
+      assert.equal(refreshes, 0);
+      yield* (yield* make()).processProject(projectId);
+      assert.deepEqual(yield* loadEpicRun(f.sql, second.epicRunId), waiting);
+      yield* f.sql.withTransaction(
+        saveEpicRun(f.sql, reviewed, {
+          handoff: {
+            ...reviewed.handoff!,
+            pullRequest: {
+              ...reviewed.handoff!.pullRequest!,
+              state: "merged",
+              mergeCommitSha: "e".repeat(40),
+            },
+          },
+        }),
+      );
+      yield* (yield* make()).processProject(projectId);
+      const resumed = (yield* loadEpicRun(f.sql, second.epicRunId))!;
+      assert.equal(resumed.epicRunId, waiting.epicRunId);
+      assert.equal(resumed.members[0]?.status, "running");
+      assert.equal(resumed.members[0]?.baseCommitSha, "d".repeat(40));
+      assert.equal(resumed.members[1]?.baseCommitSha, "a".repeat(40));
+      assert.equal(resumed.members[0]?.blocker, undefined);
+      yield* (yield* make()).processProject(projectId);
+      assert.deepEqual(yield* loadEpicRun(f.sql, second.epicRunId), resumed);
+      assert.equal(refreshes, 1);
+      const completed = (yield* loadEpicRun(f.sql, first.epicRunId))!;
+      const stopMerged = yield* Effect.result(
+        (yield* make()).stop({
+          projectId,
+          epicRunId: first.epicRunId,
+          expectedRevision: completed.revision,
+          commandId: CommandId.make("keep-merged-proof"),
+        }),
+      );
+      assert.equal(stopMerged._tag, "Failure");
+      if (stopMerged._tag === "Failure") assert.equal(stopMerged.failure.code, "epic-terminal");
+      assert.deepEqual(yield* loadEpicRun(f.sql, first.epicRunId), completed);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+);
+
+it.effect(
+  "retains a run-specific authority failure while independently approved Epics still select work",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* runMigrations({ toMigrationInclusive: 93 });
+      f.setMode("armed");
+      const sources = [2, 4].map((number) => ({
+        ...source,
+        epic: issue(number + 10),
+        fingerprint: `scope-${number}`,
+        tasks: [{ issue: issue(number), position: 0, dependencies: [] }],
+      }));
+      f.setSources(sources);
+      const projectDependencyPlan = {
+        version: 1 as const,
+        rationale: "Independent reviewed scopes",
+        epics: sources.map((value) => ({
+          issueNodeId: value.epic.issueNodeId,
+          sourceFingerprint: value.fingerprint,
+        })),
+        tasks: [2, 4].map((number) => ({ issueNodeId: `issue-${number}`, dependsOn: [] })),
+      };
+      const runs: AgentControlEpicRuntimeView[] = [];
+      for (const [index, value] of sources.entries()) {
+        const run = yield* createEpicRun({
+          projectId,
+          commandId: value.fingerprint,
+          source: value,
+          checks: [],
+          projectDependencyPlan,
+          initialBase: { commitSha: "a".repeat(40), targetBranch: "main" },
+          dependencyPlan: {
+            version: 1,
+            rationale: "Reviewed scope",
+            sourceFingerprint: value.fingerprint,
+            tasks: [{ issueNodeId: value.tasks[0]!.issue.issueNodeId, dependsOn: [] }],
+          },
+        });
+        const persisted =
+          index === 0 ? { ...run, dependencyPlanDigest: "divergent-authority" } : run;
+        yield* insertEpicRun(f.sql, persisted);
+        runs.push(persisted);
+      }
+      const service = yield* f.make();
+      yield* service.processProject(projectId);
+      const failed = (yield* loadEpicRun(f.sql, runs[0]!.epicRunId))!;
+      const independent = (yield* loadEpicRun(f.sql, runs[1]!.epicRunId))!;
+      assert.equal(failed.status, "blocked");
+      assert.equal(failed.blockers[0]?.code, "authority-conflict");
+      assert.equal(independent.members[0]?.status, "running");
+      assert.equal(independent.members[0]?.taskId, "task-4");
+      yield* (yield* f.make()).processProject(projectId);
+      assert.deepEqual(yield* loadEpicRun(f.sql, runs[1]!.epicRunId), independent);
+      const stopped = yield* service.stop({
+        projectId,
+        epicRunId: failed.epicRunId,
+        expectedRevision: failed.revision,
+        commandId: CommandId.make("stop-failed-owner"),
+      });
+      assert.equal(stopped.status, "stopped");
+      assert.deepEqual(yield* loadEpicRun(f.sql, runs[1]!.epicRunId), independent);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
 );

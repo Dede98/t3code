@@ -158,6 +158,8 @@ export const AgentControlRunOnceView = Schema.Struct({
 });
 export type AgentControlRunOnceView = typeof AgentControlRunOnceView.Type;
 export const AgentControlRunOnceSnapshot = Schema.Struct({
+  /** Authoritative execution targets; `epic` remains a compatibility view for older servers. */
+  epics: Schema.optionalKey(Schema.Array(AgentControlEpicRuntimeView)),
   epic: Schema.optionalKey(Schema.NullOr(AgentControlEpicRuntimeView)),
   epicQueue: Schema.optionalKey(Schema.NullOr(AgentControlEpicQueue)),
   epicHistory: Schema.optionalKey(Schema.Array(AgentControlEpicRuntimeView)),

@@ -3,7 +3,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
-import { loadSelectedEpic, saveEpicRun } from "../epic/authority.ts";
+import { loadTaskEpic, saveEpicRun } from "../epic/authority.ts";
 import type { AgentControlRunOnceError } from "./model.ts";
 import { AgentControlRunOnceReadNotifications } from "./readNotifications.ts";
 
@@ -199,7 +199,7 @@ export const persistEpicTransitionDiagnostic = Effect.fn("persistEpicTransitionD
     if (hasTransitionFailureReason(failure, transientReasons)) return;
     const changed = yield* sql.withTransaction(
       Effect.gen(function* () {
-        const epic = yield* loadSelectedEpic(sql, input.projectId);
+        const epic = yield* loadTaskEpic(sql, input.projectId, input.taskId);
         if (!epic?.dependencyPlan || (epic.status !== "running" && epic.status !== "blocked"))
           return false;
         if (failure !== null) {

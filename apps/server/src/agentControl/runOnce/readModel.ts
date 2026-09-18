@@ -3,7 +3,7 @@ import { inspectionProgress } from "../verificationTurn/inspectionPages.ts";
 import { VERIFICATION_INSPECTION_DISPLAY } from "../../provider/VerificationInspection.ts";
 import { verificationInspectionBase } from "../verificationTurn/checkEvidence.ts";
 import { loadEpicQueue } from "../epic/queueAuthority.ts";
-import { loadEpicRun, loadSelectedEpic } from "../epic/authority.ts";
+import { loadEpicRun, loadProjectEpics } from "../epic/authority.ts";
 import {
   AgentControlInternalPersistenceError,
   AgentControlRunOnceSnapshot,
@@ -143,19 +143,21 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
             (yield* isAgentControlRunOnceCandidateVacant(sql, input.projectId, candidateTaskId))
               ? candidateTaskId
               : null;
-          const epic = yield* loadSelectedEpic(sql, input.projectId);
+          const epics = yield* loadProjectEpics(sql, input.projectId);
+          const epic = epics[0] ?? null;
           const epicTables =
             yield* sql`SELECT 1 FROM sqlite_schema WHERE name='agent_control_epic_runs' AND type='table'`;
           const historicalIds = epicTables.length
             ? yield* sql<{
                 epicRunId: string;
-              }>`SELECT epic_run_id AS "epicRunId" FROM agent_control_epic_runs WHERE project_id=${input.projectId} AND (${epic?.epicRunId ?? null} IS NULL OR epic_run_id != ${epic?.epicRunId ?? null}) ORDER BY rowid DESC LIMIT 5`
+              }>`SELECT epic_run_id AS "epicRunId" FROM agent_control_epic_runs WHERE project_id=${input.projectId} AND epic_run_id NOT IN (SELECT epic_run_id FROM agent_control_epic_targets WHERE project_id=${input.projectId}) ORDER BY rowid DESC LIMIT 5`
             : [];
           const epicHistory = (yield* Effect.forEach(historicalIds, (row) =>
             loadEpicRun(sql, row.epicRunId),
           )).filter((run) => run !== null);
-          const epicRunIds =
-            epic?.members.flatMap((member) => (member.childRunId ? [member.childRunId] : [])) ?? [];
+          const epicRunIds = epics.flatMap((run) =>
+            run.members.flatMap((member) => (member.childRunId ? [member.childRunId] : [])),
+          );
 
           const rows = yield* sql`
         SELECT 1 AS "schemaVersion", run_id AS "runId", project_id AS "projectId", status,
@@ -173,7 +175,7 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
           SELECT value FROM json_each(${encodeEpicRunIds(epicRunIds)})
         ))
         ORDER BY (status='active') DESC,
-          (run_id IN (SELECT value FROM json_each(${encodeEpicRunIds(epic?.members.flatMap((member) => (member.childRunId ? [member.childRunId] : [])) ?? [])}))) DESC,
+          (run_id IN (SELECT value FROM json_each(${encodeEpicRunIds(epics.flatMap((run) => run.members.flatMap((member) => (member.childRunId ? [member.childRunId] : []))))}))) DESC,
           activation_project_revision DESC LIMIT ${input.runId !== undefined || epicRunIds.length === 0 ? 1 : 100}
       `;
           const executionTables = yield* sql`SELECT 1 FROM sqlite_schema
@@ -214,7 +216,7 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
             WHERE execution.project_id=${input.projectId}
               AND json_extract(epic.state_json,'$.dependencyPlanDigest')=execution.plan_digest
               AND ((${input.runId ?? null} IS NOT NULL AND execution.execution_id=${input.runId ?? null})
-                OR (${input.runId ?? null} IS NULL AND execution.epic_run_id=${epic?.epicRunId ?? null}))
+                OR (${input.runId ?? null} IS NULL AND execution.epic_run_id IN (SELECT epic_run_id FROM agent_control_epic_targets WHERE project_id=${input.projectId})))
             ORDER BY (status='active') DESC, execution.created_at, execution.task_id
           `;
           const unsettledExecutions = yield* unsettledEpicExecutions(sql, input.projectId);
@@ -470,6 +472,7 @@ export const makeAgentControlRunOnceReadModel = Effect.gen(function* () {
           }
           return yield* decodeSnapshot({
             epic,
+            epics,
             epicHistory,
             epicQueue: yield* loadEpicQueue(sql, input.projectId),
             armed,

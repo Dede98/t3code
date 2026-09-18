@@ -1095,6 +1095,29 @@ layer("Run-Once client read model", (it) => {
           parallelRuns[1]?.stages[0]?.admissionWait?.detail,
           "Manual thread has priority",
         );
+        yield* insertFixture("agent_control_epic_targets", {
+          project_id: id,
+          epic_run_id: selectedEpic.epicRunId,
+        });
+        const multiple = yield* read.getSnapshot({ projectId: id });
+        assert.deepStrictEqual(
+          multiple.epics?.map((epic) => epic.epicRunId).toSorted(),
+          [parallel.epicRunId, selectedEpic.epicRunId].toSorted(),
+        );
+        assert.isTrue(
+          [childA, childB, ...plannedIds].every((child) =>
+            multiple.runs.some((run) => run.state.runId === child),
+          ),
+        );
+        assert.isFalse(
+          multiple.epicHistory?.some((epic) => epic.epicRunId === selectedEpic.epicRunId),
+        );
+        assert.equal(
+          multiple.runs.find((run) => run.state.runId === plannedIds[1])?.stages[0]?.admissionWait
+            ?.detail,
+          "Manual thread has priority",
+        );
+        yield* sql`DELETE FROM agent_control_epic_targets WHERE project_id=${id} AND epic_run_id=${selectedEpic.epicRunId}`;
         assert.equal((yield* unsettledEpicExecutions(sql, id)).size, 2);
         for (const child of plannedIds) {
           yield* insertFixture("agent_control_task_verification_finalization_evidence", {

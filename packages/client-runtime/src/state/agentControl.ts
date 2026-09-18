@@ -6,6 +6,7 @@ import {
   AGENT_CONTROL_EPIC_QUEUE_RPC_METHODS,
   isAgentControlEpicQueueEnabled,
   type AgentControlEpicQueueChangeInput,
+  type AgentControlEpicProjectDependencyPlan,
   CommandId,
   AuthAccessWriteScope,
   type AuthSessionState,
@@ -17,6 +18,7 @@ import {
   type AgentControlSetProjectModeInput,
   type AgentControlTaskId,
   type AgentControlEpicPreview,
+  type AgentControlEpicSource,
   type AgentControlEpicMemberView,
   type AgentControlEpicRuntimeView,
   type AgentControlEpicStartInput,
@@ -374,12 +376,196 @@ export function agentControlEpicQueueMoveInput(
   return agentControlEpicQueueChangeInput(snapshot, { kind: "reorder", entryIds });
 }
 
+/** The list is authoritative even when empty; UI selection never grants execution authority. */
+export function agentControlEpicRuns(snapshot: AgentControlRunOnceSnapshot | null) {
+  return snapshot?.epics ?? (snapshot?.epic ? [snapshot.epic] : []);
+}
+
+/** Resolve dependency labels across current, queued and retained Epic scopes. */
+export function agentControlEpicDependencyLabel(
+  snapshot: AgentControlRunOnceSnapshot | null,
+  source: AgentControlEpicSource,
+  issueNodeId: string,
+): string {
+  const sources = [
+    source,
+    ...(snapshot?.epicQueue?.entries.map((entry) => entry.source) ?? []),
+    ...agentControlEpicRuns(snapshot).map((epic) => epic.source),
+    ...(snapshot?.epicHistory?.map((epic) => epic.source) ?? []),
+  ];
+  for (const candidate of sources) {
+    const issue = [
+      candidate.epic,
+      ...(candidate.dependencies ?? []),
+      ...candidate.tasks.flatMap((task) => [task.issue, ...task.dependencies]),
+    ].find((item) => item.issueNodeId === issueNodeId);
+    if (issue) return `#${issue.number}`;
+  }
+  return `Unresolved issue (${issueNodeId})`;
+}
+
+/** Include Epic-level GitHub edges in the graph shown for review. */
+export function agentControlEpicProjectTaskDependencies(
+  snapshot: AgentControlRunOnceSnapshot,
+  issueNodeId: string,
+): string[] {
+  const entries = snapshot.epicQueue?.entries ?? [];
+  const entry = entries.find((candidate) =>
+    candidate.source.tasks.some((task) => task.issue.issueNodeId === issueNodeId),
+  );
+  if (!entry) return [];
+  const task = entry.source.tasks.find((candidate) => candidate.issue.issueNodeId === issueNodeId)!;
+  const expand = (id: string) =>
+    entries
+      .find((candidate) => candidate.source.epic.issueNodeId === id)
+      ?.source.tasks.map((item) => item.issue.issueNodeId) ?? [id];
+  return [
+    ...new Set([
+      ...(
+        entry.dependencyPlan?.tasks.find((item) => item.issueNodeId === issueNodeId)?.dependsOn ??
+        []
+      ).flatMap(expand),
+      ...task.dependencies.flatMap((dependency) => expand(dependency.issueNodeId)),
+      ...(entry.source.dependencies ?? []).flatMap((dependency) => expand(dependency.issueNodeId)),
+    ]),
+  ];
+}
+
+/** Preserve saved optional edges as editable inputs when reviewing a replacement plan. */
+export function agentControlEpicProjectPlanAdditions(snapshot: AgentControlRunOnceSnapshot) {
+  const tasks = snapshot.epicQueue?.entries.flatMap((entry) => entry.source.tasks) ?? [];
+  return Object.fromEntries(
+    (snapshot.epicQueue?.projectDependencyPlan?.tasks ?? []).map((task) => {
+      const required = new Set(agentControlEpicProjectTaskDependencies(snapshot, task.issueNodeId));
+      return [
+        task.issueNodeId,
+        task.dependsOn
+          .filter((id) => !required.has(id))
+          .map((id) => tasks.find((source) => source.issue.issueNodeId === id)?.issue.number ?? id)
+          .join(", "),
+      ];
+    }),
+  );
+}
+
+function epicDependencyGraphHasCycle(graph: ReadonlyMap<string, readonly string[]>): boolean {
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+  const cyclic = (id: string): boolean => {
+    if (visiting.has(id)) return true;
+    if (visited.has(id)) return false;
+    visiting.add(id);
+    if ((graph.get(id) ?? []).some(cyclic)) return true;
+    visiting.delete(id);
+    visited.add(id);
+    return false;
+  };
+  return [...graph.keys()].some(cyclic);
+}
+
+/** The editable additions can only extend frozen/native edges, never remove them. */
+export function agentControlEpicProjectPlan(
+  snapshot: AgentControlRunOnceSnapshot,
+  maxActiveEpics: number,
+  rationale: string,
+  reviewed: boolean,
+  additions: Readonly<Record<string, string>> = {},
+): { blockers: string[]; projectDependencyPlan?: AgentControlEpicProjectDependencyPlan } {
+  const blockers: string[] = [];
+  if (!Number.isInteger(maxActiveEpics) || maxActiveEpics < 1 || maxActiveEpics > 4)
+    blockers.push("Choose an active Epic limit from 1 to 4.");
+  if (maxActiveEpics === 1) return { blockers };
+  if (!reviewed || !rationale.trim())
+    blockers.push("Review every Epic and task dependency and explain which work is independent.");
+  const entries = snapshot.epicQueue?.entries ?? [];
+  if (!entries.length)
+    blockers.push("Approve Epics for the queue before reviewing their shared plan.");
+  if (entries.some((entry) => !entry.dependencyPlan))
+    blockers.push(
+      "Each Epic needs its own reviewed task dependency plan before parallel Epics can be enabled.",
+    );
+  const taskSources = entries.flatMap((entry) => entry.source.tasks);
+  const byNumber = new Map(taskSources.map((task) => [task.issue.number, task.issue.issueNodeId]));
+  const ids = taskSources.map((task) => task.issue.issueNodeId);
+  if (new Set(ids).size !== ids.length)
+    blockers.push(
+      "The same task belongs to multiple Epics. Resolve the shared issue before approving parallel execution.",
+    );
+  const tasks = entries.flatMap((entry) =>
+    entry.source.tasks.map((task) => {
+      const extra = (additions[task.issue.issueNodeId] ?? "").trim();
+      const dependsOn = new Set(
+        agentControlEpicProjectTaskDependencies(snapshot, task.issue.issueNodeId),
+      );
+      for (const token of extra ? extra.split(",") : []) {
+        const number = Number(token.trim().replace(/^#/, ""));
+        const id = byNumber.get(number);
+        if (!id || !Number.isSafeInteger(number))
+          blockers.push(
+            `Task #${task.issue.number}: unknown prerequisite ${token.trim() || "(empty)"}.`,
+          );
+        else dependsOn.add(id);
+      }
+      if ([...dependsOn].some((id) => !ids.includes(id)))
+        blockers.push(
+          `Task #${task.issue.number} has a prerequisite outside the approved task graph. Approve its Epic and inspect the dependency again.`,
+        );
+      if (dependsOn.has(task.issue.issueNodeId))
+        blockers.push(`Task #${task.issue.number} cannot depend on itself.`);
+      return { issueNodeId: task.issue.issueNodeId, dependsOn: [...dependsOn] };
+    }),
+  );
+  const graph = new Map(tasks.map((task) => [task.issueNodeId, task.dependsOn]));
+  if (epicDependencyGraphHasCycle(graph))
+    blockers.push("The reviewed task dependencies contain a cycle.");
+  const owners = new Map(
+    entries.flatMap((entry) =>
+      entry.source.tasks.map(
+        (task) => [task.issue.issueNodeId, entry.source.epic.issueNodeId] as const,
+      ),
+    ),
+  );
+  const reviewGraph = new Map<string, string[]>();
+  for (const task of tasks) {
+    const owner = owners.get(task.issueNodeId)!;
+    reviewGraph.set(owner, [
+      ...new Set([
+        ...(reviewGraph.get(owner) ?? []),
+        ...task.dependsOn
+          .map((id) => owners.get(id))
+          .filter((id): id is string => id !== undefined && id !== owner),
+      ]),
+    ]);
+  }
+  if (epicDependencyGraphHasCycle(reviewGraph))
+    blockers.push("The dependencies create a cycle across human review and merge boundaries.");
+  return {
+    blockers: [...new Set(blockers)],
+    ...(blockers.length
+      ? {}
+      : {
+          projectDependencyPlan: {
+            version: 1 as const,
+            rationale: rationale.trim(),
+            epics: entries.map((entry) => ({
+              issueNodeId: entry.source.epic.issueNodeId,
+              sourceFingerprint: entry.source.fingerprint,
+            })),
+            tasks,
+          },
+        }),
+  };
+}
+
 export function agentControlEpicQueueView(snapshot: AgentControlRunOnceSnapshot | null) {
   const queue = snapshot?.epicQueue;
   if (!queue || !isAgentControlEpicQueueEnabled(queue)) return null;
   return {
     entries: queue.entries,
     active: queue.entries.find((entry) => entry.status === "active") ?? null,
+    activeEntries: queue.entries.filter((entry) => entry.status === "active"),
+    maxActiveEpics: queue.maxActiveEpics ?? 1,
+    projectDependencyPlan: queue.projectDependencyPlan,
     next: queue.entries.find((entry) => entry.entryId === queue.nextEntryId) ?? null,
     waitReason: queue.waitReason,
     nextCheckAt: queue.nextCheckAt,
@@ -404,8 +590,7 @@ export function agentControlEpicStartBlockers(
   if (isAgentControlEpicQueueEnabled(input.snapshot?.epicQueue)) {
     blockers.push("Approve this Epic for the queue and enable Armed to start it.");
   }
-  const epic = input.snapshot?.epic;
-  if (epic) {
+  if (agentControlEpicRuns(input.snapshot).length > 0) {
     blockers.push(
       "Resume the existing Epic or end it and return to ordinary tasks before selecting another Epic.",
     );
@@ -450,7 +635,8 @@ export function agentControlEpicMemberProgress(
       ? resourceAdmissionWaitMessage(stage.admissionWait)
       : member.waitReason
         ? {
-            dependencies: "Waiting for verified predecessor integrations",
+            dependencies:
+              "Waiting for required results, review/merge evidence and integration into the task base",
             capacity: "Waiting for capacity",
             integration: "Waiting for integration and checks on the combined result",
             blocker: "Blocked — inspect task evidence",
@@ -502,11 +688,41 @@ export function agentControlEpicControlInput(
   };
 }
 
+/** Match the server's serial queue pause versus run-scoped terminal stop. */
+export function agentControlEpicStopPresentation(
+  snapshot: AgentControlRunOnceSnapshot | null,
+  epic: AgentControlEpicRuntimeView,
+) {
+  if (epic.projectDependencyPlan)
+    return {
+      label: "End Epic and retain results",
+      explanation:
+        "Ending this Epic withdraws only its execution authority. Other Epics and manual threads continue. Turn off automation to pause the entire project.",
+    };
+  if (isAgentControlEpicQueueEnabled(snapshot?.epicQueue))
+    return {
+      label: "Pause Epic",
+      explanation:
+        "Pausing turns Armed off for the entire project and preserves this Epic for continuation. Manual threads remain available. Turn Armed back on to continue the saved queue.",
+    };
+  return {
+    label: "End Epic and retain results",
+    explanation:
+      "Automation off pauses new task starts. Ending retains evidence and prevents further Epic work. Turn off automation before returning to ordinary tasks.",
+  };
+}
+
 export function agentControlEpicControlAllowed(
   readiness: AgentControlReadiness,
   action: "resume" | "stop" | "clear",
+  epicRunId?: string,
 ): boolean {
-  const epic = readiness.snapshot?.epic;
+  const epics = agentControlEpicRuns(readiness.snapshot);
+  const epic = epicRunId
+    ? epics.find((run) => run.epicRunId === epicRunId)
+    : epics.length === 1
+      ? epics[0]
+      : undefined;
   if (!epic || !readiness.connected || readiness.pending || readiness.modeChangeBlocker !== null)
     return false;
   const terminal = epic.status === "succeeded" || epic.status === "stopped";
@@ -517,7 +733,16 @@ export function agentControlEpicControlAllowed(
       readiness.snapshot?.armed?.enabled === false &&
       !readiness.snapshot.runs.some((run) => run.state.status === "active")
     );
-  if (action === "stop") return !terminal;
+  if (action === "stop")
+    return (
+      epic.status !== "stopped" &&
+      (!terminal ||
+        (epic.projectDependencyPlan !== undefined &&
+          epic.handoff?.pullRequest?.state !== "merged" &&
+          readiness.snapshot?.epicQueue?.entries.some(
+            (entry) => entry.epicRunId === epic.epicRunId && entry.status === "active",
+          ) === true))
+    );
   return (
     !epic.members.some(
       (member) => member.status === "failed" && (!epic.dependencyPlan || !member.captured),
@@ -684,7 +909,7 @@ function agentControlActivationBlockers(
   } else {
     if (
       mode !== "epic" &&
-      snapshot.epic &&
+      agentControlEpicRuns(snapshot).length > 0 &&
       !(mode === "armed" && isAgentControlEpicQueueEnabled(snapshot.epicQueue))
     ) {
       blockers.push("This project has an Epic execution target. Use its resume or end controls.");
@@ -898,7 +1123,7 @@ export function agentControlRunStatus(run: AgentControlRunOnceView): AgentContro
 }
 
 export const agentControlArmedExplanation =
-  "Automatic mode (Armed) starts eligible work for this project. With an Epic queue, it follows your approved order and waits for explicit PR publication and a confirmed human merge before continuing. An empty Epic queue waits for approval of more Epics. Without a queue, eligible tasks run in server order. Armed stays enabled until you turn it off.";
+  "Automatic mode (Armed) starts eligible work for this project. A serial Epic queue waits for explicit PR publication and confirmed human merge before the next Epic starts. With reviewed parallel Epics, independent tasks can proceed while dependent tasks wait for merged results in their working base. An empty Epic queue waits for approval of more Epics. Without a queue, eligible tasks run in server order. Armed stays enabled until you turn it off.";
 export const agentControlDisarmExplanation =
   "Turning off automatic mode prevents new tasks from starting automatically. Work already admitted can continue, including later stages of the current task. This does not interrupt provider turns or guarantee that the task will finish. Saved threads, changes and check evidence remain available. Task intake stays enabled.";
 
@@ -924,10 +1149,13 @@ export function agentControlArmedStatus(
         label: `Automatic mode on · ${queue.waitReason}`,
         tone: "warning",
       };
-    if (queue.active)
+    if (queue.activeEntries.length)
       return {
         enabled: true,
-        label: `Automatic mode on · Epic #${queue.active.source.epic.number} active`,
+        label:
+          queue.activeEntries.length === 1
+            ? `Automatic mode on · Epic #${queue.activeEntries[0]!.source.epic.number} active`
+            : `Automatic mode on · ${queue.activeEntries.length} Epics active`,
         tone: "running",
       };
     return {

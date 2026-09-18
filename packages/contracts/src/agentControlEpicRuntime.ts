@@ -3,6 +3,7 @@ import {
   AgentControlEpicSource,
   AgentControlEpicDependencyPlan,
   AgentControlEpicParallelism,
+  AgentControlEpicProjectDependencyPlan,
 } from "./agentControlEpic.ts";
 import { AgentControlVerificationChecks } from "./agentControl.ts";
 import { AgentControlGithubRepositoryBinding } from "./agentControlGithub.ts";
@@ -110,6 +111,8 @@ export const AgentControlEpicRuntimeView = Schema.Struct({
   parallelism: Schema.optionalKey(AgentControlEpicParallelism),
   dependencyPlan: Schema.optionalKey(AgentControlEpicDependencyPlan),
   dependencyPlanDigest: Schema.optionalKey(Schema.String),
+  projectDependencyPlan: Schema.optionalKey(AgentControlEpicProjectDependencyPlan),
+  projectDependencyPlanDigest: Schema.optionalKey(Schema.String),
   integrationVerification: Schema.optionalKey(AgentControlEpicFinalVerification),
   checks: AgentControlVerificationChecks,
   members: Schema.Array(AgentControlEpicMemberView),

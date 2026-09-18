@@ -4,6 +4,8 @@ import {
   AgentControlEpicSource,
   AgentControlEpicDependencyPlan,
   AgentControlEpicParallelism,
+  AgentControlEpicActiveLimit,
+  AgentControlEpicProjectDependencyPlan,
 } from "./agentControlEpic.ts";
 import { AgentControlEpicBlocker } from "./agentControlEpicRuntime.ts";
 
@@ -14,13 +16,16 @@ export const AgentControlEpicQueueEntry = Schema.Struct({
   dependencyPlan: Schema.optionalKey(AgentControlEpicDependencyPlan),
   approvedAt: IsoDateTime,
   epicRunId: Schema.NullOr(Schema.String),
-  status: Schema.Literals(["pending", "active", "merged"]),
+  status: Schema.Literals(["pending", "active", "merged", "stopped"]),
   blockers: Schema.Array(AgentControlEpicBlocker),
 });
 export type AgentControlEpicQueueEntry = typeof AgentControlEpicQueueEntry.Type;
-/** Array order is execution order; active and completed entries cannot be edited. */
+/** Array order is admission priority; active and completed entries cannot be edited. */
 export const AgentControlEpicQueue = Schema.Struct({
   projectId: ProjectId,
+  /** Omitted on existing queues means serial execution. */
+  maxActiveEpics: Schema.optionalKey(AgentControlEpicActiveLimit),
+  projectDependencyPlan: Schema.optionalKey(AgentControlEpicProjectDependencyPlan),
   /** Missing on older queue states means enabled. Leaving retains its revision and history. */
   enabled: Schema.optionalKey(Schema.Boolean),
   revision: NonNegativeInt,
@@ -37,6 +42,11 @@ export const AgentControlEpicQueueChangeInput = Schema.Struct({
   commandId: CommandId,
   expectedRevision: NonNegativeInt,
   action: Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("configure"),
+      maxActiveEpics: AgentControlEpicActiveLimit,
+      projectDependencyPlan: Schema.optionalKey(AgentControlEpicProjectDependencyPlan),
+    }),
     Schema.Struct({ kind: Schema.Literal("leave") }),
     Schema.Struct({
       kind: Schema.Literal("approve"),

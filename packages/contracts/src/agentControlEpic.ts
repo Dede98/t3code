@@ -64,3 +64,24 @@ export const AgentControlEpicDependencyPlan = Schema.Struct({
 });
 export type AgentControlEpicDependencyPlan = typeof AgentControlEpicDependencyPlan.Type;
 export const AgentControlEpicParallelism = PositiveInt.check(Schema.isLessThanOrEqualTo(4));
+
+export const AgentControlEpicActiveLimit = PositiveInt.check(Schema.isLessThanOrEqualTo(4));
+/** Complete, human-reviewed task graph across the exact approved Epic scopes. */
+export const AgentControlEpicProjectDependencyPlan = Schema.Struct({
+  version: Schema.Literal(1),
+  rationale: TrimmedNonEmptyString,
+  epics: Schema.Array(
+    Schema.Struct({
+      issueNodeId: TrimmedNonEmptyString,
+      sourceFingerprint: TrimmedNonEmptyString,
+    }),
+  ),
+  tasks: Schema.Array(
+    Schema.Struct({
+      issueNodeId: TrimmedNonEmptyString,
+      dependsOn: Schema.Array(TrimmedNonEmptyString),
+    }),
+  ),
+});
+export type AgentControlEpicProjectDependencyPlan =
+  typeof AgentControlEpicProjectDependencyPlan.Type;

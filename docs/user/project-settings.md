@@ -151,13 +151,13 @@ The first approval keeps any already selected Epic at the front as active work. 
 automation is running, turn it off and finish that task before enabling the queue. Approval does not
 turn Armed on. Queue edits and Armed changes require write access to the selected environment.
 
-With Armed enabled, the server chooses the first eligible approved Epic. Each entry shows its
+With Armed enabled in serial mode, the server chooses the first eligible approved Epic. Each entry shows its
 blockers; native GitHub dependencies and trusted task approvals still apply. A merge does not close
 an issue or satisfy a GitHub dependency on an open issue. Waiting entries can be removed or moved;
 an active entry cannot be replaced. If its membership or dependencies change, remove the waiting
 entry and approve the current scope again.
 
-After verification, explicitly publish the draft PR as above. The project waits for human review
+After verification, explicitly publish the draft PR as above. In serial mode, the project waits for human review
 and merge, checking GitHub about once a minute even with no connected client. A PR closed without
 merge blocks continuation until it is reopened or its merge is confirmed. Before starting the next
 Epic, T3 Code fetches the target branch and checks that it contains GitHub's merged result. GitHub,
@@ -165,15 +165,38 @@ fetch or repository-mapping errors retain the saved work and prevent starting on
 
 Turning Armed off prevents further starts; turning it back on resumes from the saved queue.
 An exhausted queue waits for more approvals instead of starting ordinary tasks. Completed runs,
-verification evidence and PR links remain available. Pausing a queued Epic turns Armed off and preserves its execution for re-arm. A failed active Epic
-holds its place for human inspection; queue editing does not discard or retry its execution.
+verification evidence and PR links remain available. Pausing a serial queued Epic turns Armed off
+and preserves its execution for re-arm. In parallel mode, ending an Epic withdraws only its authority;
+other Epics and manual threads continue. A failed active Epic holds its place for human inspection; queue editing does not discard or retry its execution.
 
-To return to ordinary tasks, turn Armed off, wait for active work to finish, remove waiting entries,
-and choose **Leave Epic queue**. This explicitly ends the selected Epic without claiming a merge;
-its run history, checks and PR association remain available. You can later approve an Epic to begin
+To return to ordinary tasks, turn Armed off and wait for active work to finish. In parallel mode,
+merge or end the active Epics and set the active Epic limit back to 1. Remove waiting entries
+and choose **Leave Epic queue**. This explicitly ends the remaining Epics without claiming a merge;
+their run history, checks and PR associations remain available. You can later approve an Epic to begin
 a new queue. During human review only the saved PR is polled; candidate eligibility is checked again
 before starting the next Epic. If every waiting Epic is blocked, the server rechecks dependencies
 every five minutes; editing the queue requests a fresh check.
+
+### Run multiple Epics together
+
+Queues initially run one Epic at a time. To opt in, turn Armed off and merge or end any active
+Epics before editing the shared plan. Approve a dependency plan for each Epic, including Epics
+with only one task. In the approved queue, set **Maximum active Epics** to 2–4,
+review the complete task graph, add any prerequisites across Epics by issue number, and explain
+why unrelated tasks can safely proceed independently. Confirm the review, save the plan, then enable Armed.
+Missing GitHub edges do not establish independence. Existing native and approved dependencies
+remain mandatory. Scope changes require a new review before further work starts.
+
+The active Epic limit is separate from each Epic's task limit. All Epics and manual threads share
+the environment's provider and local-check limits and interactive reserve. Each active Epic shows
+its own tasks, blockers, accepted commits, verification and review handoff. Independent tasks can
+continue while another Epic waits for review. A dependency across Epics waits for the prerequisite's
+human merge and proof that its merged result is included in the dependent task's working base.
+Integration conflicts block affected work and retain the result for inspection.
+
+After all active Epics have been merged or ended, set the limit back to 1 to return to serial
+admission or revise the approved plan. Ending one Epic retains its evidence and leaves other work
+running; turning Armed off pauses autonomous starts across the whole project.
 
 ## Project icons
 

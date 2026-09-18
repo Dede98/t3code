@@ -1,5 +1,5 @@
 import { loadEnabledEpicQueue } from "../../epic/queueAuthority.ts";
-import { loadSelectedEpic } from "../../epic/authority.ts";
+import { loadProjectEpics } from "../../epic/authority.ts";
 import { AgentControlEpicProgress } from "../../epic/Services/AgentControlEpicProgress.ts";
 import {
   AgentControlEpicRpcError,
@@ -416,11 +416,11 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
 
   const processProject: AgentControlArmedSchedulerShape["processProject"] = (projectId) =>
     Effect.gen(function* () {
-      const selectedEpic = yield* loadSelectedEpic(sql, projectId);
-      if (selectedEpic !== null || (yield* loadEnabledEpicQueue(sql, projectId)) !== null)
+      const selectedEpics = yield* loadProjectEpics(sql, projectId);
+      if (selectedEpics.length > 0 || (yield* loadEnabledEpicQueue(sql, projectId)) !== null)
         yield* epicProgress.processProject(projectId);
-      const epic = yield* loadSelectedEpic(sql, projectId);
-      if (epic?.dependencyPlan) {
+      const epics = yield* loadProjectEpics(sql, projectId);
+      if (epics.some((epic) => epic.dependencyPlan)) {
         if (!runOnce.processEpicTasks) return yield* fail(projectId, "authority-conflict");
         yield* runOnce.processEpicTasks(projectId);
         return;
@@ -461,7 +461,7 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
       // completion, never a Human supersession.
       if (preflight.mode === "armed" && preflight.pausedFromMode === null) {
         yield* finishArmedDispatch(sql, dispatch, "completed", preflight.updatedAt as string);
-        if (selectedEpic !== null) yield* processProject(projectId);
+        if (selectedEpics.length > 0) yield* processProject(projectId);
         return;
       }
       if (preflight.mode !== "run-once" || preflight.pausedFromMode !== null) {
@@ -494,7 +494,7 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
       if (state.status !== "activated") return;
       if (state.mode === "armed" && state.pausedFromMode === null) {
         yield* finishArmedDispatch(sql, dispatch, "completed", state.updatedAt as string);
-        if (selectedEpic !== null) yield* processProject(projectId);
+        if (selectedEpics.length > 0) yield* processProject(projectId);
         return;
       }
       if (state.mode !== "run-once") {

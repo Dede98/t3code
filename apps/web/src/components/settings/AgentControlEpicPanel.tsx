@@ -7,7 +7,13 @@ import {
   agentControlEpicQueueChangeInput,
   agentControlEpicQueueMoveInput,
   agentControlEpicQueueView,
+  agentControlEpicRuns,
+  agentControlEpicDependencyLabel,
+  agentControlEpicProjectPlan,
+  agentControlEpicProjectTaskDependencies,
+  agentControlEpicProjectPlanAdditions,
   agentControlEpicControlAllowed,
+  agentControlEpicStopPresentation,
   agentControlEpicControlInput,
   agentControlEpicStartBlockers,
   agentControlEpicStartInput,
@@ -82,15 +88,7 @@ export function AgentControlEpicPanel({
   const leaveBlockers = agentControlEpicQueueLeaveBlockers(readiness);
   const queueBlockers = agentControlEpicQueueChangeBlockers(readiness);
   const approvalBlockers = agentControlEpicQueueApproveBlockers(readiness, preview);
-  const epic = readiness.snapshot?.epic;
-  const verifications = epic
-    ? [
-        ...epic.finalVerificationHistory.filter(
-          (verification) => verification.evidenceId !== epic.finalVerification?.evidenceId,
-        ),
-        ...(epic.finalVerification ? [epic.finalVerification] : []),
-      ]
-    : [];
+  const epics = agentControlEpicRuns(readiness.snapshot);
   const blockers = agentControlEpicStartBlockers(readiness, preview);
   const previewMessages = [
     ...new Set([
@@ -98,7 +96,6 @@ export function AgentControlEpicPanel({
       ...(preview?.source.blockers.map((blocker) => blocker.message) ?? []),
     ]),
   ];
-  const source = epic?.source ?? preview?.source;
   const limit = Number(parallelism);
   const executionBlocker =
     !Number.isInteger(limit) || limit < 1 || limit > 4
@@ -165,14 +162,17 @@ export function AgentControlEpicPanel({
     }
   }
 
-  async function execute(action: "preview" | "start" | "resume" | "stop" | "clear") {
+  async function execute(
+    action: "preview" | "start" | "resume" | "stop" | "clear",
+    epic?: AgentControlEpicRuntimeView,
+  ) {
     if (readOnly || inFlight.current || readiness.pending || !readiness.connected) return;
     if (
       action === "preview"
         ? !canInspect
         : action === "start"
           ? blockers.length > 0 || executionBlocker !== null
-          : !agentControlEpicControlAllowed(readiness, action)
+          : !agentControlEpicControlAllowed(readiness, action, epic?.epicRunId)
     )
       return;
     inFlight.current = true;
@@ -250,18 +250,6 @@ export function AgentControlEpicPanel({
               <p className="text-sm font-medium">
                 Preview: #{preview.source.epic.number} {preview.source.epic.title}
               </p>
-              {preview.source !== source ? (
-                <ol className="space-y-1 text-sm">
-                  {preview.source.tasks.map((task) => (
-                    <li key={task.issue.issueNodeId}>
-                      #{task.issue.number} {task.issue.title} · {task.issue.state}
-                      {task.dependencies.length
-                        ? ` · Requires ${task.dependencies.map((dependency) => `#${dependency.number}`).join(", ")}`
-                        : ""}
-                    </li>
-                  ))}
-                </ol>
-              ) : null}
               <label className="block text-sm">
                 Concurrent tasks (1–4)
                 <Input
@@ -345,13 +333,21 @@ export function AgentControlEpicPanel({
         <p className="text-xs text-muted-foreground">
           Approve each inspected Epic to add it to the ordered queue. The first approval includes
           the already selected Epic as active. Only waiting entries can be removed or reordered.
-          Armed waits for explicit publication and human merge before starting the next eligible
-          Epic.
+          Serial mode waits for publication and human merge. Parallel mode requires a reviewed
+          project dependency plan; dependent tasks still wait for merged results.
         </p>
       ) : null}
       {queue ? (
         <section className="space-y-2" aria-label="Approved Epic queue">
           <h3 className="text-sm font-medium">Approved Epic queue</h3>
+          {!readOnly && readiness.snapshot ? (
+            <ProjectEpicPlan
+              key={queue.maxActiveEpics + ":" + readiness.snapshot.epicQueue?.revision}
+              environmentId={environmentId}
+              readiness={readiness}
+              onRefresh={onRefresh}
+            />
+          ) : null}
           {!readOnly ? (
             <div className="space-y-1">
               <Button
@@ -363,7 +359,7 @@ export function AgentControlEpicPanel({
                 Leave Epic queue
               </Button>
               <p className="text-xs text-muted-foreground">
-                Leaving ends the selected Epic and returns to ordinary tasks. Run history,
+                Leaving ends the remaining Epics and returns to ordinary tasks. Run history,
                 verification and PR links are retained.
               </p>
               {leaveBlockers.map((message) => (
@@ -375,8 +371,10 @@ export function AgentControlEpicPanel({
           ) : null}
           <p className="text-sm">
             Active:{" "}
-            {queue.active
-              ? `#${queue.active.source.epic.number} ${queue.active.source.epic.title}`
+            {queue.activeEntries.length
+              ? queue.activeEntries
+                  .map((entry) => `#${entry.source.epic.number} ${entry.source.epic.title}`)
+                  .join(", ")
               : "None"}
           </p>
           <p className="text-sm">
@@ -415,7 +413,9 @@ export function AgentControlEpicPanel({
                     ? "Waiting"
                     : entry.status === "active"
                       ? "Active"
-                      : "Merged"}
+                      : entry.status === "stopped"
+                        ? "Stopped"
+                        : "Merged"}
                   {queue.next?.entryId === entry.entryId ? " · Next candidate" : ""}
                 </p>
                 {entry.blockers.map((blocker) => (
@@ -471,221 +471,268 @@ export function AgentControlEpicPanel({
             : null}
         </section>
       ) : null}
-      {source ? (
-        <>
-          <a href={source.epic.url} target="_blank" rel="noreferrer" className="text-sm underline">
-            #{source.epic.number} {source.epic.title}
-          </a>
-          <p className="text-xs text-muted-foreground">
-            Closed issues are external prerequisites, never reported as verified T3Auto work.
-          </p>
-          <ol className="space-y-2 text-sm" aria-label="Epic sub-task progress">
-            {source.tasks.map((task) => {
-              const member = epic?.members.find(
-                (candidate) => candidate.issueNodeId === task.issue.issueNodeId,
-              );
-              const approvedDependencies = epic?.dependencyPlan?.tasks.find(
-                (entry) => entry.issueNodeId === task.issue.issueNodeId,
-              )?.dependsOn;
-              const dependencyNumbers = approvedDependencies
-                ? approvedDependencies.map(
-                    (id) =>
-                      source.tasks.find((entry) => entry.issue.issueNodeId === id)?.issue.number ??
-                      id,
-                  )
-                : task.dependencies.map((dependency) => dependency.number);
-              const progress = member
-                ? agentControlEpicMemberProgress(member, readiness.snapshot?.runs ?? [])
-                : null;
-              return (
-                <li key={task.issue.issueNodeId} className="space-y-1 rounded border p-2">
-                  <p>
-                    #{task.issue.number} {task.issue.title} · {member?.status ?? task.issue.state}
-                    {member?.status === "running" ? " · Active task" : ""}
-                  </p>
-                  {progress ? <p role="status">{progress.label}</p> : null}
-                  {progress?.threadId ? (
-                    <div className="flex gap-2">
-                      <Button
-                        size="xs"
-                        variant="outline"
-                        onClick={() => onOpenThread(progress.threadId!)}
-                      >
-                        Open task thread
-                      </Button>
-                      <Button
-                        size="xs"
-                        variant="outline"
-                        onClick={() => onOpenThread(progress.threadId!, true)}
-                      >
-                        Open task changes
-                      </Button>
-                    </div>
-                  ) : null}
-                  {dependencyNumbers.length ? (
-                    <p className="text-muted-foreground">
-                      Requires {dependencyNumbers.map((number) => `#${number}`).join(", ")}
-                    </p>
-                  ) : (
-                    <p className="text-xs text-muted-foreground">
-                      {approvedDependencies
-                        ? "No dependencies (reviewed)"
-                        : "No declared dependencies · independence not reviewed"}
-                    </p>
-                  )}
-                  {member?.baseCommitSha ? (
-                    <p className="break-all text-xs">Starting commit: {member.baseCommitSha}</p>
-                  ) : null}
-                  {member?.accepted ? (
-                    <p className="break-all text-xs">
-                      Accepted commit: {member.accepted.commitSha} · Evidence:{" "}
-                      {member.accepted.evidenceId}
-                    </p>
-                  ) : null}
-                  {member?.childRunId ? (
-                    <Button
-                      size="xs"
-                      variant="outline"
-                      onClick={() => onOpenRun(member.childRunId!)}
-                    >
-                      Open task run and evidence
-                    </Button>
-                  ) : null}
-                </li>
-              );
-            })}
-          </ol>
-        </>
-      ) : null}
-      {epic ? (
-        <div className="space-y-2">
-          <p role="status" className="text-sm font-medium">
-            {agentControlEpicStatus(epic).label}
-          </p>
-          <p className="break-all text-xs">Epic run: {epic.epicRunId}</p>
-          <p className="text-xs">Concurrent task limit: {epic.parallelism ?? 1}</p>
-          {epic.dependencyPlan ? (
-            <p className="text-xs">Approved independence: {epic.dependencyPlan.rationale}</p>
-          ) : null}
-          <p className="text-sm">
-            {epic.members.filter((member) => member.status === "accepted").length} accepted ·{" "}
-            {epic.members.filter((member) => member.status === "external-closed").length} externally
-            closed · {epic.members.length} total
-          </p>
-          {epic.externalPrerequisites?.length ? (
-            <p className="text-xs text-muted-foreground">
-              External prerequisites observed closed:{" "}
-              {epic.externalPrerequisites
-                .map((item) => `#${item.issueNumber} (${item.observedAt})`)
-                .join(", ")}
-              . These are not T3-verified results.
-            </p>
-          ) : null}
-          {epic.acceptedCommitSha ? (
-            <p className="break-all text-xs">Common commit: {epic.acceptedCommitSha}</p>
-          ) : null}
-          {epic.blockers.map((blocker) => (
-            <p key={`${blocker.code}:${blocker.issueNumber}`} className="text-sm text-amber-600">
-              {blocker.message}
-            </p>
-          ))}
-          {!readOnly && readiness.modeChangeBlocker ? (
-            <p className="text-sm text-muted-foreground">{readiness.modeChangeBlocker}</p>
-          ) : null}
-          {!readOnly ? (
-            <>
-              <div className="flex flex-wrap gap-2">
-                {epic.status !== "stopped" && epic.status !== "succeeded" ? (
-                  <>
-                    <Button
-                      size="sm"
-                      disabled={!agentControlEpicControlAllowed(readiness, "resume")}
-                      onClick={() => void execute("resume")}
-                    >
-                      Resume Epic
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={!agentControlEpicControlAllowed(readiness, "stop")}
-                      onClick={() => void execute("stop")}
-                    >
-                      {queue ? "Pause Epic" : "End Epic"}
-                    </Button>
-                  </>
-                ) : (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={!agentControlEpicControlAllowed(readiness, "clear")}
-                    onClick={() => void execute("clear")}
-                  >
-                    Return to ordinary tasks
-                  </Button>
-                )}
-              </div>
-              <p className="text-xs text-muted-foreground">
-                {queue
-                  ? "Pausing turns Armed off and preserves this Epic. Turn Armed back on to continue; resolve any blockers before resuming."
-                  : "Automation off pauses new task starts. Ending retains evidence and prevents further Epic work. Turn off automation before returning to ordinary tasks."}
-              </p>
-            </>
-          ) : null}
-          {epic.blockerHistory.length ? (
-            <details className="text-sm">
-              <summary>Previous blockers</summary>
-              {epic.blockerHistory.map((entry) => (
-                <p key={JSON.stringify(entry)}>
-                  {entry.recordedAt}: {entry.blockers.map((blocker) => blocker.message).join("; ")}
+      {[
+        ...epics.map((epic) => ({ epic, source: epic.source })),
+        ...(preview ? [{ epic: null, source: preview.source }] : []),
+      ].map(({ epic, source }) => {
+        const verifications = epic
+          ? [
+              ...epic.finalVerificationHistory.filter(
+                (verification) => verification.evidenceId !== epic.finalVerification?.evidenceId,
+              ),
+              ...(epic.finalVerification ? [epic.finalVerification] : []),
+            ]
+          : [];
+        return (
+          <section
+            key={epic?.epicRunId ?? `preview:${source.fingerprint}`}
+            className="space-y-3 rounded border p-3"
+          >
+            {source ? (
+              <>
+                <a
+                  href={source.epic.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-sm underline"
+                >
+                  #{source.epic.number} {source.epic.title}
+                </a>
+                <p className="text-xs text-muted-foreground">
+                  Closed issues are external prerequisites, never reported as verified T3Auto work.
                 </p>
-              ))}
-            </details>
-          ) : null}
-          {verifications.map((verification) => (
-            <details
-              key={verification.evidenceId}
-              open={verification === epic.finalVerification}
-              className="space-y-2 text-sm"
-            >
-              <summary>
-                {verification === epic.finalVerification
-                  ? "Common result verification"
-                  : "Previous common result verification"}{" "}
-                · {verification.status}
-              </summary>
-              <p>{verification.detail}</p>
-              <p className="break-all text-xs">
-                Checked commit: {verification.commitSha} · Evidence: {verification.evidenceId}
-              </p>
-              {verification.checks.map((check) => (
-                <details key={check.id} className="rounded border p-2">
-                  <summary>
-                    {check.id} · {check.required ? "Required" : "Optional"} · {check.status}
-                  </summary>
-                  <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all text-xs">
-                    {[check.command, ...check.args].join(" ")}
-                    {`\nDirectory: ${check.cwd}\nExit code: ${check.exitCode ?? "unavailable"}\nCompleted: ${check.completedAt ?? "unavailable"}\n${check.output ?? "No captured output"}`}
-                  </pre>
-                </details>
-              ))}
-            </details>
-          ))}
-          <EpicHandoff
-            key={JSON.stringify([environmentId, projectId, epic.epicRunId, readiness.connected])}
-            environmentId={environmentId}
-            epic={epic}
-            connected={readiness.connected}
-            pending={readiness.pending}
-            permissionBlocker={handoffPermissionBlocker}
-            onRefresh={onRefresh}
-          />
-          {!epic.finalVerification ? (
-            <p className="text-sm text-muted-foreground">
-              Common result verification has not completed.
-            </p>
-          ) : null}
-        </div>
-      ) : null}
+                <ol className="space-y-2 text-sm" aria-label="Epic sub-task progress">
+                  {source.tasks.map((task) => {
+                    const member = epic?.members.find(
+                      (candidate) => candidate.issueNodeId === task.issue.issueNodeId,
+                    );
+                    const approvedDependencies =
+                      epic?.projectDependencyPlan?.tasks.find(
+                        (entry) => entry.issueNodeId === task.issue.issueNodeId,
+                      )?.dependsOn ??
+                      epic?.dependencyPlan?.tasks.find(
+                        (entry) => entry.issueNodeId === task.issue.issueNodeId,
+                      )?.dependsOn;
+                    const dependencyLabels = approvedDependencies
+                      ? approvedDependencies.map((id) =>
+                          agentControlEpicDependencyLabel(readiness.snapshot, source, id),
+                        )
+                      : task.dependencies.map((dependency) => `#${dependency.number}`);
+                    const progress = member
+                      ? agentControlEpicMemberProgress(member, readiness.snapshot?.runs ?? [])
+                      : null;
+                    return (
+                      <li key={task.issue.issueNodeId} className="space-y-1 rounded border p-2">
+                        <p>
+                          #{task.issue.number} {task.issue.title} ·{" "}
+                          {member?.status ?? task.issue.state}
+                          {member?.status === "running" ? " · Active task" : ""}
+                        </p>
+                        {progress ? <p role="status">{progress.label}</p> : null}
+                        {progress?.threadId ? (
+                          <div className="flex gap-2">
+                            <Button
+                              size="xs"
+                              variant="outline"
+                              onClick={() => onOpenThread(progress.threadId!)}
+                            >
+                              Open task thread
+                            </Button>
+                            <Button
+                              size="xs"
+                              variant="outline"
+                              onClick={() => onOpenThread(progress.threadId!, true)}
+                            >
+                              Open task changes
+                            </Button>
+                          </div>
+                        ) : null}
+                        {dependencyLabels.length ? (
+                          <p className="text-muted-foreground">
+                            Requires {dependencyLabels.join(", ")}
+                          </p>
+                        ) : (
+                          <p className="text-xs text-muted-foreground">
+                            {approvedDependencies
+                              ? "No dependencies (reviewed)"
+                              : "No declared dependencies · independence not reviewed"}
+                          </p>
+                        )}
+                        {member?.baseCommitSha ? (
+                          <p className="break-all text-xs">
+                            Starting commit: {member.baseCommitSha}
+                          </p>
+                        ) : null}
+                        {member?.accepted ? (
+                          <p className="break-all text-xs">
+                            Accepted commit: {member.accepted.commitSha} · Evidence:{" "}
+                            {member.accepted.evidenceId}
+                          </p>
+                        ) : null}
+                        {member?.childRunId ? (
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            onClick={() => onOpenRun(member.childRunId!)}
+                          >
+                            Open task run and evidence
+                          </Button>
+                        ) : null}
+                      </li>
+                    );
+                  })}
+                </ol>
+              </>
+            ) : null}
+            {epic ? (
+              <div className="space-y-2">
+                <p role="status" className="text-sm font-medium">
+                  {agentControlEpicStatus(epic).label}
+                </p>
+                <p className="break-all text-xs">Epic run: {epic.epicRunId}</p>
+                <p className="text-xs">Concurrent task limit: {epic.parallelism ?? 1}</p>
+                {epic.dependencyPlan ? (
+                  <p className="text-xs">Approved independence: {epic.dependencyPlan.rationale}</p>
+                ) : null}
+                <p className="text-sm">
+                  {epic.members.filter((member) => member.status === "accepted").length} accepted ·{" "}
+                  {epic.members.filter((member) => member.status === "external-closed").length}{" "}
+                  externally closed · {epic.members.length} total
+                </p>
+                {epic.externalPrerequisites?.length ? (
+                  <p className="text-xs text-muted-foreground">
+                    External prerequisites observed closed:{" "}
+                    {epic.externalPrerequisites
+                      .map((item) => `#${item.issueNumber} (${item.observedAt})`)
+                      .join(", ")}
+                    . These are not T3-verified results.
+                  </p>
+                ) : null}
+                {epic.acceptedCommitSha ? (
+                  <p className="break-all text-xs">Common commit: {epic.acceptedCommitSha}</p>
+                ) : null}
+                {epic.blockers.map((blocker) => (
+                  <p
+                    key={`${blocker.code}:${blocker.issueNumber}`}
+                    className="text-sm text-amber-600"
+                  >
+                    {blocker.message}
+                  </p>
+                ))}
+                {!readOnly && readiness.modeChangeBlocker ? (
+                  <p className="text-sm text-muted-foreground">{readiness.modeChangeBlocker}</p>
+                ) : null}
+                {!readOnly ? (
+                  <>
+                    <div className="flex flex-wrap gap-2">
+                      {epic.status !== "stopped" &&
+                      (epic.status !== "succeeded" ||
+                        agentControlEpicControlAllowed(readiness, "stop", epic.epicRunId)) ? (
+                        <>
+                          {epic.status !== "succeeded" ? (
+                            <Button
+                              size="sm"
+                              disabled={
+                                !agentControlEpicControlAllowed(readiness, "resume", epic.epicRunId)
+                              }
+                              onClick={() => void execute("resume", epic)}
+                            >
+                              Resume Epic
+                            </Button>
+                          ) : null}
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={
+                              !agentControlEpicControlAllowed(readiness, "stop", epic.epicRunId)
+                            }
+                            onClick={() => void execute("stop", epic)}
+                          >
+                            {agentControlEpicStopPresentation(readiness.snapshot, epic).label}
+                          </Button>
+                        </>
+                      ) : (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={
+                            !agentControlEpicControlAllowed(readiness, "clear", epic.epicRunId)
+                          }
+                          onClick={() => void execute("clear", epic)}
+                        >
+                          Return to ordinary tasks
+                        </Button>
+                      )}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {agentControlEpicStopPresentation(readiness.snapshot, epic).explanation}
+                    </p>
+                  </>
+                ) : null}
+                {epic.blockerHistory.length ? (
+                  <details className="text-sm">
+                    <summary>Previous blockers</summary>
+                    {epic.blockerHistory.map((entry) => (
+                      <p key={JSON.stringify(entry)}>
+                        {entry.recordedAt}:{" "}
+                        {entry.blockers.map((blocker) => blocker.message).join("; ")}
+                      </p>
+                    ))}
+                  </details>
+                ) : null}
+                {verifications.map((verification) => (
+                  <details
+                    key={verification.evidenceId}
+                    open={verification === epic.finalVerification}
+                    className="space-y-2 text-sm"
+                  >
+                    <summary>
+                      {verification === epic.finalVerification
+                        ? "Common result verification"
+                        : "Previous common result verification"}{" "}
+                      · {verification.status}
+                    </summary>
+                    <p>{verification.detail}</p>
+                    <p className="break-all text-xs">
+                      Checked commit: {verification.commitSha} · Evidence: {verification.evidenceId}
+                    </p>
+                    {verification.checks.map((check) => (
+                      <details key={check.id} className="rounded border p-2">
+                        <summary>
+                          {check.id} · {check.required ? "Required" : "Optional"} · {check.status}
+                        </summary>
+                        <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all text-xs">
+                          {[check.command, ...check.args].join(" ")}
+                          {`\nDirectory: ${check.cwd}\nExit code: ${check.exitCode ?? "unavailable"}\nCompleted: ${check.completedAt ?? "unavailable"}\n${check.output ?? "No captured output"}`}
+                        </pre>
+                      </details>
+                    ))}
+                  </details>
+                ))}
+                <EpicHandoff
+                  key={JSON.stringify([
+                    environmentId,
+                    projectId,
+                    epic.epicRunId,
+                    readiness.connected,
+                  ])}
+                  environmentId={environmentId}
+                  epic={epic}
+                  connected={readiness.connected}
+                  pending={readiness.pending}
+                  permissionBlocker={handoffPermissionBlocker}
+                  onRefresh={onRefresh}
+                />
+                {!epic.finalVerification ? (
+                  <p className="text-sm text-muted-foreground">
+                    Common result verification has not completed.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+          </section>
+        );
+      })}
       {!readOnly && readiness.snapshot?.epicHistory?.length ? (
         <div className="space-y-2">
           <h3 className="text-sm font-medium">Previous Epics</h3>
@@ -702,7 +749,12 @@ export function AgentControlEpicPanel({
                 handoffPermissionBlocker={handoffPermissionBlocker}
                 readiness={{
                   ...readiness,
-                  snapshot: { ...readiness.snapshot!, epic: saved, epicHistory: [] },
+                  snapshot: {
+                    ...readiness.snapshot!,
+                    epic: saved,
+                    epics: [saved],
+                    epicHistory: [],
+                  },
                 }}
                 onRefresh={onRefresh}
                 onOpenRun={onOpenRun}
@@ -718,6 +770,138 @@ export function AgentControlEpicPanel({
         </p>
       ) : null}
     </section>
+  );
+}
+
+function ProjectEpicPlan({
+  environmentId,
+  readiness,
+  onRefresh,
+}: Pick<Props, "environmentId" | "readiness" | "onRefresh">) {
+  const snapshot = readiness.snapshot!;
+  const queue = snapshot.epicQueue!;
+  const [limit, setLimit] = useState(String(queue.maxActiveEpics ?? 1));
+  const [rationale, setRationale] = useState(queue.projectDependencyPlan?.rationale ?? "");
+  const [reviewed, setReviewed] = useState(false);
+  const [additions, setAdditions] = useState<Record<string, string>>(() =>
+    agentControlEpicProjectPlanAdditions(snapshot),
+  );
+  const [error, setError] = useState<string | null>(null);
+  const inFlight = useRef(false);
+  const changeQueue = useAtomCommand(agentControlEnvironment.epicQueueChange);
+  const plan = agentControlEpicProjectPlan(snapshot, Number(limit), rationale, reviewed, additions);
+  const blockers = [
+    ...agentControlEpicQueueChangeBlockers(readiness),
+    ...plan.blockers,
+    ...(queue.entries.some((entry) => entry.status === "active")
+      ? ["Finish or end all active Epics before changing the project plan or active Epic limit."]
+      : []),
+  ];
+  const tasks = queue.entries.flatMap((entry) => entry.source.tasks);
+  async function save() {
+    if (inFlight.current || blockers.length) return;
+    inFlight.current = true;
+    try {
+      const result = await changeQueue({
+        environmentId,
+        input: agentControlEpicQueueChangeInput(snapshot, {
+          kind: "configure",
+          maxActiveEpics: Number(limit),
+          ...(plan.projectDependencyPlan
+            ? { projectDependencyPlan: plan.projectDependencyPlan }
+            : {}),
+        }),
+      });
+      if (result._tag === "Failure")
+        setError(agentControlCommandErrorMessage(squashAtomCommandFailure(result)));
+      else onRefresh();
+    } finally {
+      inFlight.current = false;
+    }
+  }
+  return (
+    <div className="space-y-2">
+      <p>
+        Active Epic limit: {queue.maxActiveEpics ?? 1}. Task limits apply separately per Epic; all
+        work shares host and provider capacity.
+      </p>
+      <Input
+        aria-label="Maximum active Epics"
+        value={limit}
+        onChange={(event) => setLimit(event.target.value)}
+      />
+      {Number(limit) > 1 ? (
+        <div className="space-y-2">
+          <p>
+            Review the complete graph before enabling parallel Epics. Existing dependencies cannot
+            be removed here. Prerequisites across Epics require human merge and verified integration
+            into the dependent task base.
+          </p>
+          {queue.entries.map((entry) => (
+            <div key={entry.entryId} className="space-y-2">
+              <p>
+                Epic #{entry.source.epic.number}: {entry.source.epic.title}
+              </p>
+              {entry.source.tasks.map((task) => {
+                const edges = agentControlEpicProjectTaskDependencies(
+                  snapshot,
+                  task.issue.issueNodeId,
+                );
+                return (
+                  <div key={task.issue.issueNodeId} className="space-y-2">
+                    <p>
+                      Task #{task.issue.number}: {task.issue.title}. Requires:{" "}
+                      {edges.length
+                        ? edges
+                            .map(
+                              (id) =>
+                                `#${tasks.find((item) => item.issue.issueNodeId === id)?.issue.number ?? id}`,
+                            )
+                            .join(", ")
+                        : "none declared (review required)"}
+                    </p>
+                    <Input
+                      aria-label={`Additional prerequisites for task #${task.issue.number}`}
+                      placeholder="Additional issue numbers, comma separated"
+                      value={additions[task.issue.issueNodeId] ?? ""}
+                      onChange={(event) => {
+                        setReviewed(false);
+                        setAdditions((current) => ({
+                          ...current,
+                          [task.issue.issueNodeId]: event.target.value,
+                        }));
+                      }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+          <Input
+            aria-label="Cross-Epic independence rationale"
+            placeholder="Why can unrelated work proceed independently?"
+            value={rationale}
+            onChange={(event) => setRationale(event.target.value)}
+          />
+          <label className="flex gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={reviewed}
+              onChange={(event) => setReviewed(event.target.checked)}
+            />
+            I reviewed every Epic and all task dependencies; unrelated tasks can safely run
+            independently.
+          </label>
+        </div>
+      ) : null}
+      <Button disabled={blockers.length > 0} onClick={() => void save()}>
+        Save Epic parallelism and reviewed plan
+      </Button>
+      {blockers.map((blocker) => (
+        <p key={blocker}>{blocker}</p>
+      ))}
+      {error ? <p>{error}</p> : null}
+    </div>
   );
 }
 

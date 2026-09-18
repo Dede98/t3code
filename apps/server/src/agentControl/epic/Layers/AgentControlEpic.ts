@@ -1,3 +1,4 @@
+import { projectTaskPrerequisites } from "../projectDependencyPlan.ts";
 import { unsettledEpicExecutions } from "../executionState.ts";
 import { withAgentControlRunOnceProjectFence } from "../../runOnce/context.ts";
 import { epicDependenciesSatisfied, validateEpicDependencyPlan } from "../dependencyPlan.ts";
@@ -41,6 +42,8 @@ import {
   epicDigest,
   epicError,
   loadEpicRun,
+  loadProjectEpic,
+  loadProjectEpics,
   loadSelectedEpic,
   saveEpicRun,
   requireEpicIntegrationAuthority,
@@ -425,13 +428,25 @@ export const makeAgentControlEpic = Effect.gen(function* () {
             yield* recoverModeIntent(replay);
             return replay;
           }
-          const current = yield* get(input.projectId);
+          const current = yield* loadProjectEpic(sql, input.projectId, input.epicRunId);
           if (!current || current.epicRunId !== input.epicRunId)
-            return yield* epicError("epic-missing", "This Epic run is no longer selected.");
+            return yield* epicError(
+              "epic-missing",
+              "This Epic run no longer has execution authority.",
+            );
           if (current.revision !== input.expectedRevision)
             return yield* epicError(
               "revision-conflict",
               "Epic progress changed. Reload before continuing.",
+            );
+          if (
+            kind === "stop" &&
+            current.status === "succeeded" &&
+            current.handoff?.pullRequest?.state === "merged"
+          )
+            return yield* epicError(
+              "epic-terminal",
+              "A merged Epic is complete. Its accepted dependency evidence must be retained.",
             );
           if (kind === "resume" && (current.status === "stopped" || current.status === "succeeded"))
             return yield* epicError(
@@ -447,7 +462,7 @@ export const makeAgentControlEpic = Effect.gen(function* () {
             yield* sql
               .withTransaction(
                 Effect.gen(function* () {
-                  const selected = yield* loadSelectedEpic(sql, input.projectId);
+                  const selected = yield* loadProjectEpic(sql, input.projectId, input.epicRunId);
                   const project = yield* engine.getProjectState({ projectId: input.projectId });
                   const activeRuns =
                     yield* sql`SELECT 1 FROM main.agent_control_run_once_states WHERE project_id=${input.projectId} AND status='active'`;
@@ -488,7 +503,7 @@ export const makeAgentControlEpic = Effect.gen(function* () {
                 sql,
                 current,
                 kind === "stop"
-                  ? queued
+                  ? queued && !current.projectDependencyPlan
                     ? {}
                     : { status: "stopped" }
                   : {
@@ -528,7 +543,9 @@ export const makeAgentControlEpic = Effect.gen(function* () {
                 (kind === "resume" &&
                   modeState.mode !== "armed" &&
                   modeState.mode !== "run-once") ||
-                (kind === "stop" && (modeState.mode === "armed" || modeState.mode === "run-once"))
+                (kind === "stop" &&
+                  !current.projectDependencyPlan &&
+                  (modeState.mode === "armed" || modeState.mode === "run-once"))
               )
                 yield* modeIntent(
                   updated,
@@ -546,103 +563,85 @@ export const makeAgentControlEpic = Effect.gen(function* () {
       )
       .pipe(Effect.mapError(mapError));
 
-  const processProject = (projectId: ProjectId) =>
-    locks
-      .withPermit(
+  const processEpic = (projectId: ProjectId, epicRunId: string) =>
+    Effect.gen(function* () {
+      let state = yield* loadProjectEpic(sql, projectId, epicRunId);
+      if (state) yield* recoverModeIntent(state);
+      if (
+        !state ||
+        state.status === "succeeded" ||
+        state.status === "stopped" ||
+        state.status === "blocked"
+      )
+        return;
+      if (state.dependencyPlan && state.dependencyPlanDigest !== epicDigest(state.dependencyPlan))
+        return yield* epicError(
+          "authority-conflict",
+          "The approved dependency plan changed during execution.",
+        );
+      const project = yield* engine.getProjectState({ projectId });
+      if (project.mode !== "armed" || project.pausedFromMode !== null) return;
+      const inspected = yield* inspect({
         projectId,
-        Effect.gen(function* () {
-          const beforeQueue = yield* loadEnabledEpicQueue(sql, projectId);
-          yield* queue.process(projectId, (epicNumber) => preview({ projectId, epicNumber }));
-          const afterQueue = yield* loadEnabledEpicQueue(sql, projectId);
-          if (beforeQueue?.revision !== afterQueue?.revision) yield* publish(projectId);
-          let state: AgentControlEpicRuntimeView | null = yield* get(projectId);
-          if (state) yield* recoverModeIntent(state);
-          if (
-            !state ||
-            state.status === "succeeded" ||
-            state.status === "stopped" ||
-            state.status === "blocked"
-          )
-            return;
-          if (
-            state.dependencyPlan &&
-            state.dependencyPlanDigest !== epicDigest(state.dependencyPlan)
-          )
-            return yield* epicError(
-              "authority-conflict",
-              "The approved dependency plan changed during execution.",
-            );
-          const project = yield* engine.getProjectState({ projectId });
-          if (project.mode !== "armed" || project.pausedFromMode !== null) return;
-          const inspected = yield* inspect({
-            projectId,
-            epicNumber: state.source.epic.number,
-          }).pipe(
-            Effect.catch((cause) =>
-              Effect.gen(function* () {
-                const error = mapError(cause);
-                if (
-                  ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
-                    error.code,
-                  )
-                )
-                  return yield* error;
-                yield* block(state!, [
-                  { code: error.code, issueNumber: null, message: error.message },
-                ]);
-                return null;
-              }),
-            ),
-          );
-          if (!inspected) return;
-          const changes = epicSourceChanges(state, inspected);
-          if (changes.length) {
-            yield* block(state, changes);
-            return;
-          }
-          const availableTasks = yield* sourceTasks(projectId).pipe(
-            Effect.catch((cause) =>
-              Effect.gen(function* () {
-                const error = mapError(cause);
-                if (error.code === "intake-incomplete") return null;
-                if (
-                  ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
-                    error.code,
-                  )
-                )
-                  return yield* error;
-                yield* block(state!, [
-                  { code: error.code, issueNumber: null, message: error.message },
-                ]);
-                return null;
-              }),
-            ),
-          );
-          if (!availableTasks) return;
-          const activeMembers = state.members.filter((member) => member.status === "running");
-          for (const active of activeMembers) {
-            if (!active.childRunId) continue;
-            const currentTask = availableTasks.find((task) => task.taskId === active.taskId);
-            if (!currentTask || currentTask.sourceGate !== "eligible") {
-              yield* block(state, [
-                {
-                  code: "task-not-approved",
-                  issueNumber: active.issueNumber,
-                  message:
-                    "The active task lost its current source approval. Restore approval and resume, or stop this Epic. Its result and worktree are retained.",
-                },
-              ]);
-              return;
-            }
-            const terminal: ReadonlyArray<{
-              status: string;
-              evidenceId: string;
-              reservationId: string | null;
-            }> = yield* sql<{
-              status: string;
-              evidenceId: string;
-              reservationId: string | null;
-            }>`
+        epicNumber: state.source.epic.number,
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.gen(function* () {
+            const error = mapError(cause);
+            if (
+              ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(error.code)
+            )
+              return yield* error;
+            yield* block(state!, [{ code: error.code, issueNumber: null, message: error.message }]);
+            return null;
+          }),
+        ),
+      );
+      if (!inspected) return;
+      const changes = epicSourceChanges(state, inspected);
+      if (changes.length) {
+        yield* block(state, changes);
+        return;
+      }
+      const availableTasks = yield* sourceTasks(projectId).pipe(
+        Effect.catch((cause) =>
+          Effect.gen(function* () {
+            const error = mapError(cause);
+            if (error.code === "intake-incomplete") return null;
+            if (
+              ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(error.code)
+            )
+              return yield* error;
+            yield* block(state!, [{ code: error.code, issueNumber: null, message: error.message }]);
+            return null;
+          }),
+        ),
+      );
+      if (!availableTasks) return;
+      const activeMembers = state.members.filter((member) => member.status === "running");
+      for (const active of activeMembers) {
+        if (!active.childRunId) continue;
+        const currentTask = availableTasks.find((task) => task.taskId === active.taskId);
+        if (!currentTask || currentTask.sourceGate !== "eligible") {
+          yield* block(state, [
+            {
+              code: "task-not-approved",
+              issueNumber: active.issueNumber,
+              message:
+                "The active task lost its current source approval. Restore approval and resume, or stop this Epic. Its result and worktree are retained.",
+            },
+          ]);
+          return;
+        }
+        const terminal: ReadonlyArray<{
+          status: string;
+          evidenceId: string;
+          reservationId: string | null;
+        }> = yield* sql<{
+          status: string;
+          evidenceId: string;
+          reservationId: string | null;
+        }>`
         SELECT json_extract(event.payload_json,'$.status') AS status,evidence.task_finalization_evidence_id AS "evidenceId",COALESCE(run.worktree_reservation_id,execution.worktree_reservation_id) AS "reservationId"
         FROM agent_control_task_verification_finalization_evidence evidence
         JOIN agent_control_task_verification_finalization_receipts receipt ON receipt.task_finalization_evidence_id=evidence.task_finalization_evidence_id AND receipt.status='accepted'
@@ -652,160 +651,465 @@ export const makeAgentControlEpic = Effect.gen(function* () {
         LEFT JOIN ${state.dependencyPlan ? sql`agent_control_epic_task_executions` : sql`(SELECT run_id AS execution_id,task_id,project_id,worktree_reservation_id FROM agent_control_run_once_states)`} execution ON execution.execution_id=${active.childRunId} AND execution.task_id=evidence.task_id AND execution.project_id=evidence.project_id
         WHERE evidence.project_id=${projectId} AND evidence.task_id=${active.taskId}
         AND (run.run_id IS NOT NULL OR execution.execution_id IS NOT NULL)`;
-            if (!terminal.length) {
-              const attention = yield* sql<{
-                status: string;
-              }>`SELECT status FROM main.agent_control_task_states WHERE task_id=${active.taskId} AND project_id=${projectId}`;
-              if (attention[0]?.status === "needs-attention" && state.dependencyPlan) {
-                state = yield* persist(state, {
-                  members: state.members.map((member) =>
-                    member.issueNodeId === active.issueNodeId
-                      ? {
-                          ...member,
-                          status: "failed",
-                          waitReason: "blocker",
-                          blocker: "Task requires attention; its dependents cannot start.",
-                        }
-                      : member,
-                  ),
-                });
-                continue;
-              }
-              if (attention[0]?.status === "needs-attention")
-                yield* block(state, [
-                  {
-                    code: "child-needs-attention",
-                    issueNumber: active.issueNumber,
-                    message:
-                      "The active child requires human attention. Inspect its thread and evidence, then resume this Epic or stop it.",
-                  },
-                ]);
-              if (state.dependencyPlan) continue;
-              return;
-            }
-            if (terminal.length !== 1)
-              return yield* epicError(
-                "authority-conflict",
-                "Epic child finalization is ambiguous.",
-              );
-            const result = terminal[0]!;
-            if (result.status !== "succeeded" || !result.reservationId) {
-              state = yield* persist(state, {
-                members: state.members.map((member) =>
-                  member.issueNodeId === active.issueNodeId
-                    ? { ...member, status: "failed", taskFinalizationEvidenceId: result.evidenceId }
-                    : member,
-                ),
-              });
-              if (state.dependencyPlan) continue;
-              yield* block(state, [
-                {
-                  code: "child-failed",
-                  issueNumber: active.issueNumber,
-                  message:
-                    "The child task failed or exhausted its bounded repair. Its changes were not accepted. Inspect its thread and evidence. For a queued run, disarm, remove waiting entries and leave the queue to return to ordinary tasks.",
-                },
-              ]);
-              return;
-            }
-            if (state.dependencyPlan && active.waitReason !== "integration")
-              state = yield* persist(state, {
-                members: state.members.map((member) =>
-                  member.issueNodeId === active.issueNodeId
-                    ? { ...member, waitReason: "integration" }
-                    : member,
-                ),
-              });
-            const captured: AgentControlEpicAcceptedResult | null = yield* results
-              .capture({
-                epicRunId: state.epicRunId,
-                projectId,
-                taskId: active.taskId!,
-                childRunId: active.childRunId,
-                reservationId: result.reservationId,
-                previousCommitSha: state.dependencyPlan
-                  ? active.baseCommitSha
-                  : (state.acceptedCommitSha ?? state.initialBase?.commitSha ?? null),
-                taskFinalizationEvidenceId: result.evidenceId,
-              })
-              .pipe(
-                Effect.catch((error) =>
-                  Effect.gen(function* () {
-                    if (
-                      ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
-                        error.code,
-                      )
-                    )
-                      return yield* error;
-                    if (state!.dependencyPlan) {
-                      state = yield* persist(state!, {
-                        members: state!.members.map((member) =>
-                          member.issueNodeId === active.issueNodeId
-                            ? {
-                                ...member,
-                                status: "failed",
-                                waitReason: "blocker",
-                                blocker: error.message,
-                              }
-                            : member,
-                        ),
-                        blockers: [
-                          ...state!.blockers,
-                          {
-                            code: error.code,
-                            issueNumber: active.issueNumber,
-                            message: error.message,
-                          },
-                        ],
-                      });
-                    } else
-                      yield* block(state!, [
-                        {
-                          code: error.code,
-                          issueNumber: active.issueNumber,
-                          message: error.message,
-                        },
-                      ]);
-                    return null;
-                  }),
-                ),
-              );
-            if (!captured) {
-              if (state.dependencyPlan) continue;
-              return;
-            }
-            let accepted: AgentControlEpicAcceptedResult = captured;
-            let integrationVerification: AgentControlEpicFinalVerification | undefined =
-              state.integrationVerification;
-            if (state.dependencyPlan) {
-              if (!results.integrate || !state.initialBase)
-                return yield* epicError(
-                  "integration-unavailable",
-                  "Planned execution requires integrated result verification.",
-                );
-              const expectedState: AgentControlEpicRuntimeView = state;
-              const member: AgentControlEpicMemberView = {
-                ...active,
-                captured,
-                accepted: captured,
-                reservationId: result.reservationId,
-                taskFinalizationEvidenceId: result.evidenceId,
-              };
-              const integrated: {
-                accepted: AgentControlEpicAcceptedResult;
-                verification: AgentControlEpicFinalVerification;
-              } | null = yield* results
-                .integrate({
-                  epicRunId: state.epicRunId,
+        if (!terminal.length) {
+          const attention = yield* sql<{
+            status: string;
+          }>`SELECT status FROM main.agent_control_task_states WHERE task_id=${active.taskId} AND project_id=${projectId}`;
+          if (attention[0]?.status === "needs-attention" && state.dependencyPlan) {
+            state = yield* persist(state, {
+              members: state.members.map((member) =>
+                member.issueNodeId === active.issueNodeId
+                  ? {
+                      ...member,
+                      status: "failed",
+                      waitReason: "blocker",
+                      blocker: "Task requires attention; its dependents cannot start.",
+                    }
+                  : member,
+              ),
+            });
+            continue;
+          }
+          if (attention[0]?.status === "needs-attention")
+            yield* block(state, [
+              {
+                code: "child-needs-attention",
+                issueNumber: active.issueNumber,
+                message:
+                  "The active child requires human attention. Inspect its thread and evidence, then resume this Epic or stop it.",
+              },
+            ]);
+          if (state.dependencyPlan) continue;
+          return;
+        }
+        if (terminal.length !== 1)
+          return yield* epicError("authority-conflict", "Epic child finalization is ambiguous.");
+        const result = terminal[0]!;
+        if (result.status !== "succeeded" || !result.reservationId) {
+          state = yield* persist(state, {
+            members: state.members.map((member) =>
+              member.issueNodeId === active.issueNodeId
+                ? { ...member, status: "failed", taskFinalizationEvidenceId: result.evidenceId }
+                : member,
+            ),
+          });
+          if (state.dependencyPlan) continue;
+          yield* block(state, [
+            {
+              code: "child-failed",
+              issueNumber: active.issueNumber,
+              message:
+                "The child task failed or exhausted its bounded repair. Its changes were not accepted. Inspect its thread and evidence. For a queued run, disarm, remove waiting entries and leave the queue to return to ordinary tasks.",
+            },
+          ]);
+          return;
+        }
+        if (state.dependencyPlan && active.waitReason !== "integration")
+          state = yield* persist(state, {
+            members: state.members.map((member) =>
+              member.issueNodeId === active.issueNodeId
+                ? { ...member, waitReason: "integration" }
+                : member,
+            ),
+          });
+        const captured: AgentControlEpicAcceptedResult | null = yield* results
+          .capture({
+            epicRunId: state.epicRunId,
+            projectId,
+            taskId: active.taskId!,
+            childRunId: active.childRunId,
+            reservationId: result.reservationId,
+            previousCommitSha: state.dependencyPlan
+              ? active.baseCommitSha
+              : (state.acceptedCommitSha ?? state.initialBase?.commitSha ?? null),
+            taskFinalizationEvidenceId: result.evidenceId,
+          })
+          .pipe(
+            Effect.catch((error) =>
+              Effect.gen(function* () {
+                if (
+                  ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
+                    error.code,
+                  )
+                )
+                  return yield* error;
+                if (state!.dependencyPlan) {
+                  state = yield* persist(state!, {
+                    members: state!.members.map((member) =>
+                      member.issueNodeId === active.issueNodeId
+                        ? {
+                            ...member,
+                            status: "failed",
+                            waitReason: "blocker",
+                            blocker: error.message,
+                          }
+                        : member,
+                    ),
+                    blockers: [
+                      ...state!.blockers,
+                      {
+                        code: error.code,
+                        issueNumber: active.issueNumber,
+                        message: error.message,
+                      },
+                    ],
+                  });
+                } else
+                  yield* block(state!, [
+                    {
+                      code: error.code,
+                      issueNumber: active.issueNumber,
+                      message: error.message,
+                    },
+                  ]);
+                return null;
+              }),
+            ),
+          );
+        if (!captured) {
+          if (state.dependencyPlan) continue;
+          return;
+        }
+        let accepted: AgentControlEpicAcceptedResult = captured;
+        let integrationVerification: AgentControlEpicFinalVerification | undefined =
+          state.integrationVerification;
+        if (state.dependencyPlan) {
+          if (!results.integrate || !state.initialBase)
+            return yield* epicError(
+              "integration-unavailable",
+              "Planned execution requires integrated result verification.",
+            );
+          const expectedState: AgentControlEpicRuntimeView = state;
+          const member: AgentControlEpicMemberView = {
+            ...active,
+            captured,
+            accepted: captured,
+            reservationId: result.reservationId,
+            taskFinalizationEvidenceId: result.evidenceId,
+          };
+          const integrated: {
+            accepted: AgentControlEpicAcceptedResult;
+            verification: AgentControlEpicFinalVerification;
+          } | null = yield* results
+            .integrate({
+              epicRunId: state.epicRunId,
+              projectId,
+              commitSha: captured.commitSha,
+              captured,
+              expectedCommitSha: state.acceptedCommitSha ?? state.initialBase.commitSha,
+              initialBaseCommitSha: state.initialBase.commitSha,
+              firstAccepted: state.members.find((item) => item.accepted) ?? member,
+              lastAccepted: member,
+              checks: state.checks,
+              attempt: state.verificationAttempt,
+              refreshSource: Effect.gen(function* () {
+                const observed = yield* inspect({
                   projectId,
-                  commitSha: captured.commitSha,
-                  captured,
-                  expectedCommitSha: state.acceptedCommitSha ?? state.initialBase.commitSha,
-                  initialBaseCommitSha: state.initialBase.commitSha,
-                  firstAccepted: state.members.find((item) => item.accepted) ?? member,
-                  lastAccepted: member,
-                  checks: state.checks,
-                  attempt: state.verificationAttempt,
+                  epicNumber: expectedState.source.epic.number,
+                });
+                const changes = epicSourceChanges(expectedState, observed);
+                if (changes.length)
+                  return yield* epicError(
+                    "scope-changed",
+                    changes.map((change) => change.message).join(" "),
+                  );
+              }).pipe(Effect.mapError(mapError)),
+              authorize: Effect.gen(function* () {
+                const selected = yield* loadProjectEpic(sql, projectId, expectedState.epicRunId);
+                yield* requireEpicIntegrationAuthority(expectedState, selected);
+              }).pipe(Effect.mapError(mapError)),
+              authorizePublication: Effect.gen(function* () {
+                const project = yield* engine.getProjectState({ projectId });
+                const current = (yield* sourceTasks(projectId)).find(
+                  (task) => task.taskId === active.taskId,
+                );
+                const snapshot = yield* github.getCompletedSnapshot(projectId);
+                if (
+                  Option.isNone(snapshot) ||
+                  (current &&
+                    current.sequence !== snapshot.value.sourcePrecondition.githubIntakeSequence)
+                )
+                  return yield* epicError(
+                    "intake-incomplete",
+                    "Wait for current GitHub reconciliation before accepting integration.",
+                  );
+                const issue = snapshot.value.issues.find(
+                  (issue) => issue.issueNodeId === active.issueNodeId,
+                );
+                const frozen = expectedState.source.tasks.find(
+                  (task) => task.issue.issueNodeId === active.issueNodeId,
+                )?.issue;
+                if (
+                  project.mode !== "armed" ||
+                  project.pausedFromMode !== null ||
+                  !current ||
+                  current.sourceGate !== "eligible" ||
+                  !issue ||
+                  issue.state !== "open" ||
+                  !issue.ready ||
+                  issue.paused ||
+                  !issue.eligible ||
+                  !issue.timelineComplete ||
+                  issue.eligibilityReason !== "eligible" ||
+                  !frozen ||
+                  issue.repositoryNodeId !== frozen.repositoryNodeId ||
+                  (frozen.contentFingerprint !== undefined &&
+                    epicIssueContentFingerprint(issue) !== frozen.contentFingerprint)
+                )
+                  return yield* epicError(
+                    "task-not-approved",
+                    "Task source approval or content changed during integration. Restore the approved source and resume, or stop this Epic. The captured result is retained.",
+                  );
+              }).pipe(Effect.mapError(mapError)),
+            })
+            .pipe(
+              Effect.catch((error) =>
+                Effect.gen(function* () {
+                  if (error.code === "intake-incomplete") return null;
+                  if (
+                    ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
+                      error.code,
+                    )
+                  )
+                    return yield* error;
+                  state = yield* persist(state!, {
+                    members: state!.members.map((item) =>
+                      item.issueNodeId === active.issueNodeId
+                        ? {
+                            ...item,
+                            captured,
+                            reservationId: result.reservationId,
+                            taskFinalizationEvidenceId: result.evidenceId,
+                            waitReason: "blocker",
+                            blocker: error.message,
+                            status: "failed",
+                          }
+                        : item,
+                    ),
+                    blockers: [
+                      ...state!.blockers,
+                      {
+                        code: error.code,
+                        issueNumber: active.issueNumber,
+                        message: error.message,
+                      },
+                    ],
+                  });
+                  return null;
+                }),
+              ),
+            );
+          if (!integrated) continue;
+          if (integrated.verification.status !== "passed") {
+            state = yield* persist(state, {
+              members: state.members.map((item) =>
+                item.issueNodeId === active.issueNodeId
+                  ? {
+                      ...item,
+                      captured,
+                      reservationId: result.reservationId,
+                      taskFinalizationEvidenceId: result.evidenceId,
+                      integrationVerification: integrated.verification,
+                      status: "failed",
+                      waitReason: "blocker",
+                      blocker: integrated.verification.detail,
+                    }
+                  : item,
+              ),
+              blockers: [
+                ...state.blockers,
+                {
+                  code: "integration-check-failed",
+                  issueNumber: active.issueNumber,
+                  message: integrated.verification.detail,
+                },
+              ],
+            });
+            continue;
+          }
+          if (integrated.verification.commitSha !== integrated.accepted.commitSha)
+            return yield* epicError(
+              "authority-conflict",
+              "Integration proof belongs to another head.",
+            );
+          accepted = integrated.accepted;
+          integrationVerification = integrated.verification;
+        }
+        state = yield* persist(state, {
+          activeTaskId: null,
+          finalVerification: null,
+          ...(integrationVerification ? { integrationVerification } : {}),
+          acceptedCommitSha: accepted.commitSha,
+          members: state.members.map((member) => {
+            if (member.issueNodeId !== active.issueNodeId) return member;
+            const { blocker: _blocker, waitReason: _waitReason, ...retained } = member;
+            return {
+              ...retained,
+              status: "accepted",
+              accepted,
+              ...(state!.dependencyPlan
+                ? { captured, ...(integrationVerification ? { integrationVerification } : {}) }
+                : {}),
+              reservationId: result.reservationId,
+              taskFinalizationEvidenceId: result.evidenceId,
+            };
+          }),
+        });
+      }
+      const externalPrerequisites = [...(state.externalPrerequisites ?? [])];
+      for (const task of inspected.tasks) {
+        for (const dependency of task.dependencies) {
+          if (
+            !state.projectDependencyPlan &&
+            dependency.state === "closed" &&
+            !state.members.some((member) => member.issueNodeId === dependency.issueNodeId) &&
+            !externalPrerequisites.some((item) => item.issueNodeId === dependency.issueNodeId)
+          ) {
+            externalPrerequisites.push({
+              issueNodeId: dependency.issueNodeId,
+              issueNumber: dependency.number,
+              observedAt: inspected.inspectedAt,
+            });
+          }
+        }
+      }
+      if (externalPrerequisites.length !== (state.externalPrerequisites?.length ?? 0))
+        state = yield* persist(state, { externalPrerequisites });
+      if (!state.dependencyPlan && state.members.some((member) => member.status === "failed")) {
+        yield* block(state, [
+          {
+            code: "child-failed",
+            issueNumber: null,
+            message:
+              "A failed child requires inspection. For a queued run, disarm, remove waiting entries and leave the queue before starting a new scope.",
+          },
+        ]);
+        return;
+      }
+      if (!state.dependencyPlan && state.activeTaskId !== null) {
+        const selected = availableTasks.find((task) => task.taskId === state!.activeTaskId);
+        if (
+          !selected ||
+          selected.status !== "candidate" ||
+          selected.sourceGate !== "eligible" ||
+          selected.stage !== "intake"
+        )
+          yield* block(state, [
+            {
+              code: selected ? "task-not-approved" : "missing-issue",
+              issueNumber:
+                state.members.find((member) => member.taskId === state!.activeTaskId)
+                  ?.issueNumber ?? null,
+              message:
+                "The selected child lost its complete, trusted intake authority before starting. Restore its approval and resume, or stop this Epic.",
+            },
+          ]);
+        return;
+      }
+      const eligibleIssueIds = new Set(
+        availableTasks
+          .filter(
+            (task) =>
+              task.status === "candidate" &&
+              task.sourceGate === "eligible" &&
+              task.stage === "intake",
+          )
+          .map((task) => task.issueNodeId),
+      );
+      if (state.dependencyPlan) {
+        const projectRuns = yield* loadProjectEpics(sql, projectId);
+        const verifiedExternalIssueIds = new Set<string>();
+        const dependencyWaits = new Map<string, string>();
+        const dependencyFailures = new Map<string, AgentControlEpicBlocker>();
+        for (const member of state.members.filter((item) => item.status === "pending")) {
+          const prerequisites = projectTaskPrerequisites(state, member.issueNodeId, projectRuns);
+          if (prerequisites.blockers.length) {
+            eligibleIssueIds.delete(member.issueNodeId);
+            dependencyWaits.set(
+              member.issueNodeId,
+              prerequisites.blockers.map((item) => item.message).join(" "),
+            );
+          } else
+            for (const prerequisite of prerequisites.prerequisites)
+              verifiedExternalIssueIds.add(prerequisite.issueNodeId);
+        }
+        let members = state.members;
+        const selectedState = { ...state };
+        while (
+          members.filter((member) => member.status === "running").length < (state.parallelism ?? 1)
+        ) {
+          const next = selectEpicMember(selectedState, eligibleIssueIds, verifiedExternalIssueIds);
+          if (!next) break;
+          const prerequisites = projectTaskPrerequisites(
+            state,
+            next.issue.issueNodeId,
+            projectRuns,
+          );
+          let taskBase: string = state.acceptedCommitSha ?? state.initialBase!.commitSha;
+          if (prerequisites.prerequisites.length) {
+            const expectedState = state;
+            const prepared = yield* Effect.result(
+              Effect.gen(function* () {
+                if (Option.isNone(handoffRemote) || !handoffRemote.value.refreshQueueBase)
+                  return yield* epicError(
+                    "base-unavailable",
+                    "Reviewed dependency base loading is unavailable.",
+                  );
+                const roots = yield* sql<{
+                  cwd: string;
+                }>`SELECT workspace_root AS cwd FROM projection_projects
+                    WHERE project_id=${projectId} AND deleted_at IS NULL`;
+                if (!roots[0])
+                  return yield* epicError("base-unavailable", "Project directory is unavailable.");
+                let freshBase: string | undefined;
+                const visited = new Set<string>();
+                for (const prerequisite of prerequisites.prerequisites) {
+                  if (visited.has(prerequisite.run.epicRunId)) continue;
+                  visited.add(prerequisite.run.epicRunId);
+                  const fresh = yield* handoffRemote.value.refreshQueueBase({
+                    cwd: roots[0].cwd,
+                    repository: expectedState.source.repository,
+                    previousHandoff: prerequisite.run.handoff!,
+                  });
+                  if (fresh.targetBranch !== expectedState.initialBase!.targetBranch)
+                    return yield* epicError(
+                      "target-branch-changed",
+                      "The prerequisite merge targets another branch.",
+                    );
+                  if (freshBase !== undefined && freshBase !== fresh.commitSha)
+                    return yield* epicError(
+                      "target-changed",
+                      "The target changed while proving prerequisites. Retry on a stable reviewed basis.",
+                    );
+                  freshBase = fresh.commitSha;
+                }
+                if (freshBase === undefined) return taskBase;
+                // All required merges were proven in this same fetched target.
+                if (expectedState.acceptedCommitSha === null) return freshBase;
+                if (!results.integratePrerequisite)
+                  return yield* epicError(
+                    "integration-unavailable",
+                    "Dependency integration is unavailable.",
+                  );
+                const acceptedMember = expectedState.members.find(
+                  (item) => item.accepted?.commitSha === expectedState.acceptedCommitSha,
+                );
+                if (!acceptedMember)
+                  return yield* epicError(
+                    "authority-conflict",
+                    "The accepted Epic basis has no owning task.",
+                  );
+                const integrated = yield* results.integratePrerequisite({
+                  epicRunId: expectedState.epicRunId,
+                  projectId,
+                  commitSha: taskBase,
+                  expectedCommitSha: taskBase,
+                  mergeCommitSha: freshBase,
+                  initialBaseCommitSha: expectedState.initialBase!.commitSha,
+                  firstAccepted: expectedState.members.find((item) => item.accepted)!,
+                  lastAccepted: acceptedMember,
+                  checks: expectedState.checks,
+                  attempt: expectedState.verificationAttempt,
                   refreshSource: Effect.gen(function* () {
                     const observed = yield* inspect({
                       projectId,
@@ -815,368 +1119,268 @@ export const makeAgentControlEpic = Effect.gen(function* () {
                     if (changes.length)
                       return yield* epicError(
                         "scope-changed",
-                        changes.map((change) => change.message).join(" "),
+                        changes.map((item) => item.message).join(" "),
                       );
                   }).pipe(Effect.mapError(mapError)),
                   authorize: Effect.gen(function* () {
-                    const selected = yield* get(projectId);
-                    yield* requireEpicIntegrationAuthority(expectedState, selected);
-                  }).pipe(Effect.mapError(mapError)),
-                  authorizePublication: Effect.gen(function* () {
+                    yield* requireEpicIntegrationAuthority(
+                      expectedState,
+                      yield* loadProjectEpic(sql, projectId, expectedState.epicRunId),
+                    );
                     const project = yield* engine.getProjectState({ projectId });
-                    const current = (yield* sourceTasks(projectId)).find(
-                      (task) => task.taskId === active.taskId,
-                    );
-                    const snapshot = yield* github.getCompletedSnapshot(projectId);
-                    if (
-                      Option.isNone(snapshot) ||
-                      (current &&
-                        current.sequence !== snapshot.value.sourcePrecondition.githubIntakeSequence)
-                    )
+                    if (project.mode !== "armed" || project.pausedFromMode !== null)
                       return yield* epicError(
-                        "intake-incomplete",
-                        "Wait for current GitHub reconciliation before accepting integration.",
+                        "authority-conflict",
+                        "Project automation is paused.",
                       );
-                    const issue = snapshot.value.issues.find(
-                      (issue) => issue.issueNodeId === active.issueNodeId,
+                    const current = projectTaskPrerequisites(
+                      expectedState,
+                      next.issue.issueNodeId,
+                      yield* loadProjectEpics(sql, projectId),
                     );
-                    const frozen = expectedState.source.tasks.find(
-                      (task) => task.issue.issueNodeId === active.issueNodeId,
-                    )?.issue;
-                    if (
-                      project.mode !== "armed" ||
-                      project.pausedFromMode !== null ||
-                      !current ||
-                      current.sourceGate !== "eligible" ||
-                      !issue ||
-                      issue.state !== "open" ||
-                      !issue.ready ||
-                      issue.paused ||
-                      !issue.eligible ||
-                      !issue.timelineComplete ||
-                      issue.eligibilityReason !== "eligible" ||
-                      !frozen ||
-                      issue.repositoryNodeId !== frozen.repositoryNodeId ||
-                      (frozen.contentFingerprint !== undefined &&
-                        epicIssueContentFingerprint(issue) !== frozen.contentFingerprint)
-                    )
+                    if (current.blockers.length)
                       return yield* epicError(
-                        "task-not-approved",
-                        "Task source approval or content changed during integration. Restore the approved source and resume, or stop this Epic. The captured result is retained.",
+                        "dependency-changed",
+                        "The reviewed prerequisite changed during integration.",
                       );
                   }).pipe(Effect.mapError(mapError)),
-                })
-                .pipe(
-                  Effect.catch((error) =>
-                    Effect.gen(function* () {
-                      if (error.code === "intake-incomplete") return null;
-                      if (
-                        ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
-                          error.code,
-                        )
-                      )
-                        return yield* error;
-                      state = yield* persist(state!, {
-                        members: state!.members.map((item) =>
-                          item.issueNodeId === active.issueNodeId
-                            ? {
-                                ...item,
-                                captured,
-                                reservationId: result.reservationId,
-                                taskFinalizationEvidenceId: result.evidenceId,
-                                waitReason: "blocker",
-                                blocker: error.message,
-                                status: "failed",
-                              }
-                            : item,
-                        ),
-                        blockers: [
-                          ...state!.blockers,
-                          {
-                            code: error.code,
-                            issueNumber: active.issueNumber,
-                            message: error.message,
-                          },
-                        ],
-                      });
-                      return null;
-                    }),
-                  ),
-                );
-              if (!integrated) continue;
-              if (integrated.verification.status !== "passed") {
-                state = yield* persist(state, {
-                  members: state.members.map((item) =>
-                    item.issueNodeId === active.issueNodeId
-                      ? {
-                          ...item,
-                          captured,
-                          reservationId: result.reservationId,
-                          taskFinalizationEvidenceId: result.evidenceId,
-                          integrationVerification: integrated.verification,
-                          status: "failed",
-                          waitReason: "blocker",
-                          blocker: integrated.verification.detail,
-                        }
-                      : item,
-                  ),
-                  blockers: [
-                    ...state.blockers,
-                    {
-                      code: "integration-check-failed",
-                      issueNumber: active.issueNumber,
-                      message: integrated.verification.detail,
-                    },
-                  ],
                 });
-                continue;
-              }
-              if (integrated.verification.commitSha !== integrated.accepted.commitSha)
-                return yield* epicError(
-                  "authority-conflict",
-                  "Integration proof belongs to another head.",
-                );
-              accepted = integrated.accepted;
-              integrationVerification = integrated.verification;
-            }
-            state = yield* persist(state, {
-              activeTaskId: null,
-              finalVerification: null,
-              ...(integrationVerification ? { integrationVerification } : {}),
-              acceptedCommitSha: accepted.commitSha,
-              members: state.members.map((member) => {
-                if (member.issueNodeId !== active.issueNodeId) return member;
-                const { blocker: _blocker, waitReason: _waitReason, ...retained } = member;
-                return {
-                  ...retained,
-                  status: "accepted",
-                  accepted,
-                  ...(state!.dependencyPlan
-                    ? { captured, ...(integrationVerification ? { integrationVerification } : {}) }
-                    : {}),
-                  reservationId: result.reservationId,
-                  taskFinalizationEvidenceId: result.evidenceId,
-                };
+                if (integrated.verification.status !== "passed")
+                  return yield* epicError(
+                    "dependency-integration-failed",
+                    "The combined dependency basis failed verification. Inspect the retained integration checks and resume after resolving the cause.",
+                  );
+                return integrated.accepted.commitSha;
               }),
-            });
-          }
-          const externalPrerequisites = [...(state.externalPrerequisites ?? [])];
-          for (const task of inspected.tasks) {
-            for (const dependency of task.dependencies) {
+            );
+            if (prepared._tag === "Failure") {
+              eligibleIssueIds.delete(next.issue.issueNodeId);
+              const error = mapError(prepared.failure);
+              dependencyWaits.set(next.issue.issueNodeId, error.message);
               if (
-                dependency.state === "closed" &&
-                !state.members.some((member) => member.issueNodeId === dependency.issueNodeId) &&
-                !externalPrerequisites.some((item) => item.issueNodeId === dependency.issueNodeId)
-              ) {
-                externalPrerequisites.push({
-                  issueNodeId: dependency.issueNodeId,
-                  issueNumber: dependency.number,
-                  observedAt: inspected.inspectedAt,
-                });
-              }
-            }
-          }
-          if (externalPrerequisites.length !== (state.externalPrerequisites?.length ?? 0))
-            state = yield* persist(state, { externalPrerequisites });
-          if (!state.dependencyPlan && state.members.some((member) => member.status === "failed")) {
-            yield* block(state, [
-              {
-                code: "child-failed",
-                issueNumber: null,
-                message:
-                  "A failed child requires inspection. For a queued run, disarm, remove waiting entries and leave the queue before starting a new scope.",
-              },
-            ]);
-            return;
-          }
-          if (!state.dependencyPlan && state.activeTaskId !== null) {
-            const selected = availableTasks.find((task) => task.taskId === state!.activeTaskId);
-            if (
-              !selected ||
-              selected.status !== "candidate" ||
-              selected.sourceGate !== "eligible" ||
-              selected.stage !== "intake"
-            )
-              yield* block(state, [
-                {
-                  code: selected ? "task-not-approved" : "missing-issue",
-                  issueNumber:
-                    state.members.find((member) => member.taskId === state!.activeTaskId)
-                      ?.issueNumber ?? null,
-                  message:
-                    "The selected child lost its complete, trusted intake authority before starting. Restore its approval and resume, or stop this Epic.",
-                },
-              ]);
-            return;
-          }
-          const eligibleIssueIds = new Set(
-            availableTasks
-              .filter(
-                (task) =>
-                  task.status === "candidate" &&
-                  task.sourceGate === "eligible" &&
-                  task.stage === "intake",
+                [
+                  "epic-result-unavailable",
+                  "authority-conflict",
+                  "dependency-integration-failed",
+                  "scope-changed",
+                  "integration-unavailable",
+                ].includes(error.code)
               )
-              .map((task) => task.issueNodeId),
-          );
-          if (state.dependencyPlan) {
-            let members = state.members;
-            const selectedState = { ...state };
-            while (
-              members.filter((member) => member.status === "running").length <
-              (state.parallelism ?? 1)
-            ) {
-              const next = selectEpicMember(selectedState, eligibleIssueIds);
-              if (!next) break;
-              const task = availableTasks.find(
-                (item) => item.issueNodeId === next.issue.issueNodeId,
-              )!;
-              members = members.map((member) =>
-                member.issueNodeId === next.issue.issueNodeId
-                  ? {
-                      ...member,
-                      taskId: AgentControlTaskId.make(task.taskId),
-                      status: "running" as const,
-                      waitReason: "capacity" as const,
-                      baseCommitSha: state!.acceptedCommitSha ?? state!.initialBase!.commitSha,
-                    }
-                  : member,
-              );
-              selectedState.members = members;
+                dependencyFailures.set(next.issue.issueNodeId, {
+                  code: error.code,
+                  issueNumber: next.issue.number,
+                  message: error.message,
+                });
+              continue;
             }
-            members = members.map((member) =>
-              member.status === "pending"
-                ? {
-                    ...member,
-                    waitReason: epicDependenciesSatisfied(selectedState, member.issueNodeId)
-                      ? ("capacity" as const)
-                      : ("dependencies" as const),
-                  }
-                : member,
-            );
-            if (epicDigest(members) !== epicDigest(state.members))
-              state = yield* persist(state, {
-                members,
-                activeTaskId:
-                  members.find(
-                    (member) => member.status === "running" && member.childRunId === null,
-                  )?.taskId ?? null,
-              });
-            if (members.some((member) => member.status === "running")) return;
-            if (members.some((member) => member.status === "failed")) {
-              yield* block(
-                state,
-                state.blockers.length
-                  ? state.blockers
-                  : [
-                      {
-                        code: "child-failed",
-                        issueNumber: null,
-                        message:
-                          "Failed tasks block their dependents. Independent work has drained; inspect each task blocker.",
-                      },
-                    ],
-              );
-              return;
-            }
-          }
-          const next = selectEpicMember(state, eligibleIssueIds);
-          if (!next) {
-            if (state.members.some((member) => member.status === "pending")) {
-              yield* block(state, [
-                {
-                  code: "dependencies-blocked",
-                  issueNumber: null,
-                  message:
-                    "No remaining task has current trusted approval and all explicit prerequisites satisfied. Check missing issues, approvals, prerequisites, and dependency cycles.",
-                },
-              ]);
-              return;
-            }
-            const lastAccepted = state.members
-              .toReversed()
-              .find((member) => member.accepted?.commitSha === state!.acceptedCommitSha);
-            const firstAccepted = state.members.find(
-              (member) =>
-                member.accepted && member.baseCommitSha === (state!.initialBase?.commitSha ?? null),
-            );
-            if (!firstAccepted || !lastAccepted || !state.acceptedCommitSha) {
-              yield* block(state, [
-                {
-                  code: "no-accepted-result",
-                  issueNumber: null,
-                  message:
-                    "The original accepted member or final result is unavailable; T3 cannot verify the complete Epic.",
-                },
-              ]);
-              return;
-            }
-            if (state.status !== "verifying")
-              state = yield* persist(state, { status: "verifying" });
-            const finalVerification = yield* results
-              .verify({
-                epicRunId: state.epicRunId,
-                projectId,
-                commitSha: state.acceptedCommitSha!,
-                initialBaseCommitSha: state.initialBase?.commitSha ?? null,
-                firstAccepted,
-                checks: state.checks,
-                lastAccepted,
-                attempt: state.verificationAttempt,
-              })
-              .pipe(
-                Effect.catch((error) =>
-                  Effect.gen(function* () {
-                    if (
-                      ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
-                        error.code,
-                      )
-                    )
-                      return yield* error;
-                    yield* block(state!, [
-                      { code: error.code, issueNumber: null, message: error.message },
-                    ]);
-                    return null;
-                  }),
-                ),
-              );
-            if (!finalVerification) return;
-            if (finalVerification.commitSha !== state.acceptedCommitSha)
-              return yield* epicError(
-                "authority-conflict",
-                "Epic verification checked a different result commit.",
-              );
-            state = yield* persist(state, {
-              finalVerification,
-              finalVerificationHistory: [...state.finalVerificationHistory, finalVerification],
-              status: finalVerification.status === "passed" ? "succeeded" : "verifying",
-            });
-            if (finalVerification.status !== "passed")
-              yield* block(state, [
-                {
-                  code: "final-verification-failed",
-                  issueNumber: null,
-                  message: finalVerification.detail,
-                },
-              ]);
-            return;
+            taskBase = prepared.success;
           }
           const task = availableTasks.find((item) => item.issueNodeId === next.issue.issueNodeId)!;
-          const taskId = AgentControlTaskId.make(task.taskId);
-          yield* persist(state, {
-            activeTaskId: taskId,
-            members: state.members.map((member) =>
-              member.issueNodeId === next.issue.issueNodeId
-                ? {
-                    ...member,
-                    taskId,
-                    status: "running",
-                    baseCommitSha:
-                      state!.acceptedCommitSha ?? state!.initialBase?.commitSha ?? null,
-                  }
-                : member,
-            ),
+          members = members.map((member) => {
+            if (member.issueNodeId !== next.issue.issueNodeId) return member;
+            const { blocker: _blocker, ...ready } = member;
+            return {
+              ...ready,
+              taskId: AgentControlTaskId.make(task.taskId),
+              status: "running" as const,
+              waitReason: "capacity" as const,
+              baseCommitSha: taskBase,
+            };
           });
+          selectedState.members = members;
+        }
+        members = members.map((member) =>
+          member.status === "pending"
+            ? {
+                ...member,
+                waitReason: dependencyFailures.has(member.issueNodeId)
+                  ? ("blocker" as const)
+                  : !dependencyWaits.has(member.issueNodeId) &&
+                      epicDependenciesSatisfied(
+                        selectedState,
+                        member.issueNodeId,
+                        verifiedExternalIssueIds,
+                      )
+                    ? ("capacity" as const)
+                    : ("dependencies" as const),
+                ...(dependencyWaits.has(member.issueNodeId)
+                  ? { blocker: dependencyWaits.get(member.issueNodeId)! }
+                  : {}),
+              }
+            : member,
+        );
+        if (epicDigest(members) !== epicDigest(state.members))
+          state = yield* persist(state, {
+            members,
+            activeTaskId:
+              members.find((member) => member.status === "running" && member.childRunId === null)
+                ?.taskId ?? null,
+          });
+        if (members.some((member) => member.status === "running")) return;
+        // Dependency waits wake on the normal project/queue receipt flow.
+        // They retain running authority so a reviewed merge can resume them.
+        if (dependencyFailures.size > 0) {
+          yield* block(state, [...dependencyFailures.values()]);
+          return;
+        }
+        if (state.projectDependencyPlan && dependencyWaits.size > 0) return;
+        if (members.some((member) => member.status === "failed")) {
+          yield* block(
+            state,
+            state.blockers.length
+              ? state.blockers
+              : [
+                  {
+                    code: "child-failed",
+                    issueNumber: null,
+                    message:
+                      "Failed tasks block their dependents. Independent work has drained; inspect each task blocker.",
+                  },
+                ],
+          );
+          return;
+        }
+      }
+      const next = selectEpicMember(state, eligibleIssueIds);
+      if (!next) {
+        if (state.members.some((member) => member.status === "pending")) {
+          yield* block(state, [
+            {
+              code: "dependencies-blocked",
+              issueNumber: null,
+              message:
+                "No remaining task has current trusted approval and all explicit prerequisites satisfied. Check missing issues, approvals, prerequisites, and dependency cycles.",
+            },
+          ]);
+          return;
+        }
+        const lastAccepted = state.members
+          .toReversed()
+          .find((member) => member.accepted?.commitSha === state!.acceptedCommitSha);
+        const firstAccepted = state.members.find(
+          (member) =>
+            member.accepted &&
+            (state!.dependencyPlan !== undefined ||
+              member.baseCommitSha === (state!.initialBase?.commitSha ?? null)),
+        );
+        if (!firstAccepted || !lastAccepted || !state.acceptedCommitSha) {
+          yield* block(state, [
+            {
+              code: "no-accepted-result",
+              issueNumber: null,
+              message:
+                "The original accepted member or final result is unavailable; T3 cannot verify the complete Epic.",
+            },
+          ]);
+          return;
+        }
+        if (state.status !== "verifying") state = yield* persist(state, { status: "verifying" });
+        const finalVerification = yield* results
+          .verify({
+            epicRunId: state.epicRunId,
+            projectId,
+            commitSha: state.acceptedCommitSha!,
+            initialBaseCommitSha: state.initialBase?.commitSha ?? null,
+            firstAccepted,
+            checks: state.checks,
+            lastAccepted,
+            attempt: state.verificationAttempt,
+          })
+          .pipe(
+            Effect.catch((error) =>
+              Effect.gen(function* () {
+                if (
+                  ["epic-unavailable", "authority-conflict", "revision-conflict"].includes(
+                    error.code,
+                  )
+                )
+                  return yield* error;
+                yield* block(state!, [
+                  { code: error.code, issueNumber: null, message: error.message },
+                ]);
+                return null;
+              }),
+            ),
+          );
+        if (!finalVerification) return;
+        if (finalVerification.commitSha !== state.acceptedCommitSha)
+          return yield* epicError(
+            "authority-conflict",
+            "Epic verification checked a different result commit.",
+          );
+        state = yield* persist(state, {
+          finalVerification,
+          finalVerificationHistory: [...state.finalVerificationHistory, finalVerification],
+          status: finalVerification.status === "passed" ? "succeeded" : "verifying",
+        });
+        if (finalVerification.status !== "passed")
+          yield* block(state, [
+            {
+              code: "final-verification-failed",
+              issueNumber: null,
+              message: finalVerification.detail,
+            },
+          ]);
+        return;
+      }
+      const task = availableTasks.find((item) => item.issueNodeId === next.issue.issueNodeId)!;
+      const taskId = AgentControlTaskId.make(task.taskId);
+      yield* persist(state, {
+        activeTaskId: taskId,
+        members: state.members.map((member) =>
+          member.issueNodeId === next.issue.issueNodeId
+            ? {
+                ...member,
+                taskId,
+                status: "running",
+                baseCommitSha: state!.acceptedCommitSha ?? state!.initialBase?.commitSha ?? null,
+              }
+            : member,
+        ),
+      });
+    }).pipe(Effect.mapError(mapError));
+
+  const processProject = (projectId: ProjectId) =>
+    locks
+      .withPermit(
+        projectId,
+        Effect.gen(function* () {
+          const beforeQueue = yield* loadEnabledEpicQueue(sql, projectId);
+          yield* queue.process(projectId, (epicNumber) => preview({ projectId, epicNumber }));
+          const afterQueue = yield* loadEnabledEpicQueue(sql, projectId);
+          if (beforeQueue?.revision !== afterQueue?.revision) yield* publish(projectId);
+          const runs = yield* loadProjectEpics(sql, projectId);
+          // A run-scoped failure must not abort the scheduler before other Epics
+          // dispatch their tasks. Retain it as an actionable blocker on that run.
+          let failure: AgentControlEpicRpcError | undefined;
+          for (const run of runs) {
+            yield* processEpic(projectId, run.epicRunId).pipe(
+              Effect.catch((cause) =>
+                Effect.gen(function* () {
+                  if (!run.projectDependencyPlan) {
+                    failure ??= cause;
+                    return;
+                  }
+                  if (cause.code === "revision-conflict") return;
+                  yield* Effect.gen(function* () {
+                    const current = yield* loadProjectEpic(sql, projectId, run.epicRunId);
+                    if (current && current.status !== "stopped" && current.status !== "succeeded")
+                      yield* block(current, [
+                        { code: cause.code, issueNumber: null, message: cause.message },
+                      ]);
+                  }).pipe(
+                    Effect.catch((error) =>
+                      Effect.logWarning("Could not retain Epic blocker", {
+                        epicRunId: run.epicRunId,
+                        error,
+                      }),
+                    ),
+                  );
+                }),
+              ),
+            );
+          }
+          if (failure) return yield* failure;
         }),
       )
       .pipe(Effect.mapError(mapError));
