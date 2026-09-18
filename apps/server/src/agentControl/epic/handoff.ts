@@ -419,27 +419,24 @@ export const makeEpicHandoff = Effect.fn("makeEpicHandoff")(function* (options: 
         // Preserve the local successful result even if push/PR response or persistence was lost.
         const current = yield* load(input);
         if (
+          expectedPreviousCommitSha === undefined &&
           current.handoff?.pullRequest &&
           current.handoff.pullRequest.headSha === current.handoff.commitSha
         )
           return current;
         return yield* persist(current, {
           ...handoff,
-          status:
-            expectedPreviousCommitSha &&
-            ["remote-unavailable", "remote-response-invalid", "handoff-unavailable"].includes(
-              failure.code,
-            )
-              ? "update-required"
-              : [
-                    "remote-unavailable",
-                    "remote-branch-rejected",
-                    "remote-response-invalid",
-                    "handoff-unavailable",
-                    "handoff-persistence-failed",
-                  ].includes(failure.code)
-                ? "failed"
-                : "blocked",
+          status: expectedPreviousCommitSha
+            ? "update-required"
+            : [
+                  "remote-unavailable",
+                  "remote-branch-rejected",
+                  "remote-response-invalid",
+                  "handoff-unavailable",
+                  "handoff-persistence-failed",
+                ].includes(failure.code)
+              ? "failed"
+              : "blocked",
           // A known rejection cannot authorize adopting a branch that appears later.
           branchCreationAttempted:
             failure.code === "remote-branch-rejected" ||

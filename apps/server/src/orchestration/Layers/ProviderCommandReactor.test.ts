@@ -1689,11 +1689,9 @@ describe("ProviderCommandReactor", () => {
         assert.equal(acquired[0]!.handoffId, "review-request");
         const evidence = yield* Effect.promise(() =>
           harness.runEffect(
-            Effect.gen(function* () {
-              return yield* harness.database<{ claims: number; receipts: number }>`SELECT
-                (SELECT count(*) FROM agent_control_epic_review_repair_delivery_claims) AS claims,
-                (SELECT count(*) FROM agent_control_epic_review_repair_delivery_receipts) AS receipts`;
-            }),
+            harness.database<{ claims: number; receipts: number }>`SELECT
+              (SELECT count(*) FROM agent_control_epic_review_repair_delivery_claims) AS claims,
+              (SELECT count(*) FROM agent_control_epic_review_repair_delivery_receipts) AS receipts`,
           ),
         );
         assert.deepEqual(evidence, [{ claims: 1, receipts: 1 }]);
@@ -1716,6 +1714,216 @@ describe("ProviderCommandReactor", () => {
         assert.equal(harness.sendTurnWithInvocationBoundary.mock.calls.length, 1);
       }),
   );
+
+  it("replays an accepted unclaimed Epic review repair turn when the reactor starts", async () => {
+    const receiptBound = await Effect.runPromise(Deferred.make<void>());
+    const coordinator: ProviderResourceCoordinatorShape = {
+      acquire: () => Effect.succeed(manualPermit),
+      enter: (_permit, providerTurnId) =>
+        providerTurnId === undefined
+          ? Effect.void
+          : Deferred.succeed(receiptBound, undefined).pipe(Effect.asVoid),
+      release: () => Effect.void,
+      observeRuntimeEvent: () => Effect.void,
+      reconcile: () => Effect.void,
+    };
+    const harness = await createHarness({
+      providerResourceCoordinator: coordinator,
+      startReactor: false,
+      sendTurnWithInvocationBoundaryEffect: (boundary) =>
+        (boundary.beforeInvocation?.() ?? Effect.void).pipe(
+          Effect.andThen(Effect.sync(() => boundary.onInvocationStarted())),
+          Effect.andThen(
+            Effect.succeed({
+              threadId: ThreadId.make("thread-1"),
+              turnId: asTurnId("recovered-review-turn"),
+            }),
+          ),
+        ),
+    });
+    const now = "2026-01-01T00:00:00.000Z";
+    const commandId = CommandId.make("epic-review-turn:accepted-review-request:1");
+    const messageId = asMessageId("epic-review-message:accepted-review-request:1");
+    await harness.runEffect(
+      Effect.gen(function* () {
+        const state = canonicalJson({
+          epicRunId: "accepted-review-run",
+          projectId: "project-1",
+          revision: 2,
+          status: "verifying",
+          activeReviewReworkId: "accepted-review-request",
+          reviewReworks: [{ requestId: "accepted-review-request", status: "repairing" }],
+          updatedAt: now,
+        });
+        yield* harness.database`INSERT INTO agent_control_project_states(
+          project_id,mode,paused_from_mode,revision,last_event_sequence,updated_at)
+          VALUES ('project-1','armed',NULL,1,1,${now})`;
+        yield* harness.database`INSERT INTO agent_control_epic_runs(
+          epic_run_id,project_id,revision,state_json,state_digest)
+          VALUES ('accepted-review-run','project-1',2,${state},'fixture')`;
+        yield* harness.database`INSERT INTO agent_control_epic_review_requests(
+          request_id,project_id,epic_run_id,idempotency_key,command_id,request_digest,
+          request_json,reviewed_commit_sha,reviewed_verification_evidence_id,
+          accepted_revision,accepted_at)
+          VALUES ('accepted-review-request','project-1','accepted-review-run','accepted-review-key',
+            'accepted-review-command','digest','{}',${"a".repeat(40)},'proof',2,${now})`;
+        yield* harness.database`INSERT INTO agent_control_epic_review_repair_intents(
+          request_id,attempt,intent_json,intent_digest,provider_instance_id,model,runtime_mode,
+          thread_id,turn_request_command_id,message_id,worktree_path,branch_name,created_at)
+          VALUES ('accepted-review-request',1,'{}','intent','codex','gpt-5-codex',
+            'approval-required','thread-1',${commandId},${messageId},'/tmp/provider-project',
+            't3auto/review',${now})`;
+      }),
+    );
+    const turnStart = {
+      type: "thread.turn.start" as const,
+      commandId,
+      threadId: ThreadId.make("thread-1"),
+      message: {
+        messageId,
+        role: "user" as const,
+        text: "repair only the retained findings",
+        attachments: [],
+      },
+      modelSelection: { instanceId: CODEX_INSTANCE_ID, model: "gpt-5-codex" },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required" as const,
+      createdAt: now,
+    };
+    await harness.runEffect(harness.engine.dispatch(turnStart));
+    await harness.runEffect(harness.engine.dispatch(turnStart));
+
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await Effect.runPromise(harness.reactor.start().pipe(Scope.provide(scope)));
+    await Effect.runPromise(Deferred.await(receiptBound));
+
+    expect(harness.sendTurnWithInvocationBoundary).toHaveBeenCalledTimes(1);
+    const evidence = await harness.runEffect(
+      harness.database<{ claims: number; receipts: number; events: number }>`SELECT
+        (SELECT count(*) FROM agent_control_epic_review_repair_delivery_claims
+          WHERE request_id='accepted-review-request' AND attempt=1) AS claims,
+        (SELECT count(*) FROM agent_control_epic_review_repair_delivery_receipts
+          WHERE request_id='accepted-review-request' AND attempt=1) AS receipts,
+        (SELECT count(*) FROM orchestration_events
+          WHERE command_id=${commandId} AND event_type='thread.turn-start-requested') AS events`,
+    );
+    expect(evidence).toEqual([{ claims: 1, receipts: 1, events: 1 }]);
+  });
+
+  it("does not recover a fresh startup delivery claim as an orphan", async () => {
+    const claimReached = await Effect.runPromise(Deferred.make<void>());
+    const allowInvocation = await Effect.runPromise(Deferred.make<void>());
+    const receiptBound = await Effect.runPromise(Deferred.make<void>());
+    let dispatchAfterSubscription: Effect.Effect<void> = Effect.void;
+    const coordinator: ProviderResourceCoordinatorShape = {
+      acquire: () => Effect.succeed(manualPermit),
+      enter: (_permit, providerTurnId) =>
+        providerTurnId === undefined
+          ? Effect.void
+          : Deferred.succeed(receiptBound, undefined).pipe(Effect.asVoid),
+      release: () => Effect.void,
+      observeRuntimeEvent: () => Effect.void,
+      reconcile: () => Effect.void,
+    };
+    const harness = await createHarness({
+      providerResourceCoordinator: coordinator,
+      startReactor: false,
+      reactorHooks: {
+        afterDomainEventSubscription: () => dispatchAfterSubscription,
+        beforeInitialPlanningOwnershipRead: () => Effect.void,
+        afterInitialPlanningOwnershipRead: () => Effect.void,
+      },
+      sendTurnWithInvocationBoundaryEffect: (boundary) =>
+        Effect.gen(function* () {
+          yield* boundary.beforeInvocation?.() ?? Effect.void;
+          yield* Deferred.succeed(claimReached, undefined);
+          yield* Deferred.await(allowInvocation);
+          boundary.onInvocationStarted();
+          return {
+            threadId: ThreadId.make("thread-1"),
+            turnId: asTurnId("startup-race-review-turn"),
+          };
+        }),
+    });
+    const now = "2026-01-01T00:00:00.000Z";
+    const commandId = CommandId.make("epic-review-turn:startup-race-request:1");
+    const messageId = asMessageId("epic-review-message:startup-race-request:1");
+    await harness.runEffect(
+      Effect.gen(function* () {
+        const state = canonicalJson({
+          epicRunId: "startup-race-run",
+          projectId: "project-1",
+          revision: 2,
+          status: "verifying",
+          activeReviewReworkId: "startup-race-request",
+          reviewReworks: [{ requestId: "startup-race-request", status: "repairing" }],
+          updatedAt: now,
+        });
+        yield* harness.database`INSERT INTO agent_control_project_states(
+          project_id,mode,paused_from_mode,revision,last_event_sequence,updated_at)
+          VALUES ('project-1','armed',NULL,1,1,${now})`;
+        yield* harness.database`INSERT INTO agent_control_epic_runs(
+          epic_run_id,project_id,revision,state_json,state_digest)
+          VALUES ('startup-race-run','project-1',2,${state},'fixture')`;
+        yield* harness.database`INSERT INTO agent_control_epic_review_requests(
+          request_id,project_id,epic_run_id,idempotency_key,command_id,request_digest,
+          request_json,reviewed_commit_sha,reviewed_verification_evidence_id,
+          accepted_revision,accepted_at)
+          VALUES ('startup-race-request','project-1','startup-race-run','startup-race-key',
+            'startup-race-command','digest','{}',${"a".repeat(40)},'proof',2,${now})`;
+        yield* harness.database`INSERT INTO agent_control_epic_review_repair_intents(
+          request_id,attempt,intent_json,intent_digest,provider_instance_id,model,runtime_mode,
+          thread_id,turn_request_command_id,message_id,worktree_path,branch_name,created_at)
+          VALUES ('startup-race-request',1,'{}','intent','codex','gpt-5-codex',
+            'approval-required','thread-1',${commandId},${messageId},'/tmp/provider-project',
+            't3auto/review',${now})`;
+      }),
+    );
+    const turnStart = {
+      type: "thread.turn.start" as const,
+      commandId,
+      threadId: ThreadId.make("thread-1"),
+      message: {
+        messageId,
+        role: "user" as const,
+        text: "repair only the retained findings",
+        attachments: [],
+      },
+      modelSelection: { instanceId: CODEX_INSTANCE_ID, model: "gpt-5-codex" },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required" as const,
+      createdAt: now,
+    };
+    dispatchAfterSubscription = harness.engine
+      .dispatch(turnStart)
+      .pipe(Effect.orDie, Effect.asVoid);
+
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await Effect.runPromise(harness.reactor.start().pipe(Scope.provide(scope)));
+    await Effect.runPromise(Deferred.await(claimReached));
+    expect(
+      await harness.runEffect(
+        harness.database<{ count: number }>`SELECT count(*) AS count
+          FROM agent_control_epic_review_repair_results
+          WHERE request_id='startup-race-request' AND attempt=1`,
+      ),
+    ).toEqual([{ count: 0 }]);
+
+    await Effect.runPromise(Deferred.succeed(allowInvocation, undefined));
+    await Effect.runPromise(Deferred.await(receiptBound));
+    expect(harness.sendTurnWithInvocationBoundary).toHaveBeenCalledTimes(1);
+    expect(
+      await harness.runEffect(
+        harness.database<{ claims: number; receipts: number; results: number }>`SELECT
+          (SELECT count(*) FROM agent_control_epic_review_repair_delivery_claims
+            WHERE request_id='startup-race-request' AND attempt=1) AS claims,
+          (SELECT count(*) FROM agent_control_epic_review_repair_delivery_receipts
+            WHERE request_id='startup-race-request' AND attempt=1) AS receipts,
+          (SELECT count(*) FROM agent_control_epic_review_repair_results
+            WHERE request_id='startup-race-request' AND attempt=1) AS results`,
+      ),
+    ).toEqual([{ claims: 1, receipts: 1, results: 0 }]);
+  });
 
   it("recovers cancelled and pre-invoke-crashed Epic review deliveries on startup", async () => {
     const retired: Array<string> = [];

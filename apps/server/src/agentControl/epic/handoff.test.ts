@@ -283,6 +283,67 @@ describe("Epic handoff persistence and recovery", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
 
+  it.effect("retries a verified PR update after it returns to draft", () =>
+    Effect.gen(function* () {
+      const retained = updateRequired("update-draft-race");
+      const candidatePr = { ...pr, headSha: updatedCommitSha };
+      const state = {
+        ...retained,
+        handoff: { ...retained.handoff!, pullRequest: candidatePr },
+      };
+      yield* seed(state);
+      let publishAttempts = 0;
+      let observed: AgentControlEpicHandoffPullRequest = candidatePr;
+      const service = yield* build(
+        {
+          prepare: () => Effect.die("An existing pull request update must not prepare a new PR"),
+          readPullRequest: () => Effect.succeed(observed),
+          publish: () => {
+            publishAttempts++;
+            if (publishAttempts === 1) {
+              observed = { ...candidatePr, isDraft: false };
+              return Effect.fail(
+                new EpicHandoffRemoteError({
+                  code: "handoff-pr-not-draft",
+                  message: "Return the pull request to draft before updating it.",
+                }),
+              );
+            }
+            observed = candidatePr;
+            return Effect.succeed(observed);
+          },
+        },
+        () => Effect.succeed(updateProof),
+      );
+
+      const ready = yield* service.previewHandoff(updateRequest(state));
+      assert.equal(ready.handoff?.status, "update-required");
+      assert.isTrue(ready.canPublish);
+      const rejected = yield* service.publishHandoff(updateRequest(state));
+      assert.equal(rejected.handoff?.status, "update-required");
+      assert.equal(rejected.handoff?.pullRequest?.headSha, updatedCommitSha);
+      assert.equal(rejected.handoff?.error?.code, "handoff-pr-not-draft");
+
+      observed = { ...pr, headSha: "d".repeat(40) };
+      const changed = yield* service.previewHandoff(updateRequest(state));
+      assert.equal(changed.handoff?.status, "update-required");
+      assert.isFalse(changed.canPublish);
+      assert.equal(changed.handoff?.error?.code, "handoff-head-changed");
+
+      observed = candidatePr;
+      const reopened = yield* service.previewHandoff(updateRequest(state));
+      assert.equal(reopened.handoff?.status, "update-required");
+      assert.isTrue(reopened.canPublish);
+      assert.isNull(reopened.handoff?.error);
+
+      const published = yield* service.publishHandoff(updateRequest(state));
+      assert.equal(published.handoff?.status, "published");
+      assert.equal(published.handoff?.pullRequest?.headSha, updatedCommitSha);
+      assert.equal(published.handoffHistory?.[0]?.handoff.commitSha, commitSha);
+      assert.equal(publishAttempts, 2);
+    }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
   for (const condition of ["closed", "merged", "not-draft"] as const)
     it.effect(`retains the update intent through ${condition} and a later draft reopen`, () =>
       Effect.gen(function* () {

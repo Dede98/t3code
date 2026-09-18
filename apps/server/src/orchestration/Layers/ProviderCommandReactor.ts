@@ -2323,19 +2323,23 @@ const make = Effect.gen(function* () {
       attempt: number;
       threadId: string;
       messageId: string;
+      turnRequestCommandId: string;
       providerInstanceId: string;
       claimedAt: string | null;
       cancellationAt: string | null;
       resultStatus: string | null;
+      turnRequestEventSequence: number | null;
       receiptTurnId: string | null;
       projectedTurnId: string | null;
       turnState: string | null;
     }>`SELECT intent.request_id AS "requestId",intent.attempt,
       intent.thread_id AS "threadId",intent.message_id AS "messageId",
+      intent.turn_request_command_id AS "turnRequestCommandId",
       intent.provider_instance_id AS "providerInstanceId",
       claim.claimed_at AS "claimedAt",
       cancellation.cancelled_at AS "cancellationAt",
       json_extract(result.result_json,'$.status') AS "resultStatus",
+      command_receipt.result_sequence AS "turnRequestEventSequence",
       receipt.provider_turn_id AS "receiptTurnId",turn.turn_id AS "projectedTurnId",
       turn.state AS "turnState"
       FROM main.agent_control_epic_review_repair_intents intent
@@ -2347,16 +2351,38 @@ const make = Effect.gen(function* () {
         ON cancellation.request_id=intent.request_id AND cancellation.attempt=intent.attempt
       LEFT JOIN main.agent_control_epic_review_repair_results result
         ON result.request_id=intent.request_id AND result.attempt=intent.attempt
+      LEFT JOIN main.orchestration_command_receipts command_receipt
+        ON command_receipt.command_id=intent.turn_request_command_id
+        AND command_receipt.status='accepted'
       LEFT JOIN main.projection_turns turn
         ON turn.thread_id=intent.thread_id AND turn.pending_message_id=intent.message_id
       WHERE (result.request_id IS NULL OR json_extract(result.result_json,'$.status')='blocked')
-        AND (claim.request_id IS NOT NULL OR cancellation.request_id IS NOT NULL)
       ORDER BY intent.request_id,intent.attempt`;
     const sessions = yield* providerService.listSessions();
     yield* Effect.forEach(
       rows,
       (row) =>
         Effect.gen(function* () {
+          if (row.claimedAt === null && row.cancellationAt === null) {
+            if (row.resultStatus !== null || row.turnRequestEventSequence === null) return;
+            const retainedEvent = yield* Stream.runHead(
+              orchestrationEngine.readEvents(row.turnRequestEventSequence - 1, 1),
+            );
+            if (
+              Option.isSome(retainedEvent) &&
+              retainedEvent.value.sequence === row.turnRequestEventSequence &&
+              retainedEvent.value.type === "thread.turn-start-requested" &&
+              retainedEvent.value.commandId === row.turnRequestCommandId &&
+              retainedEvent.value.payload.threadId === row.threadId &&
+              retainedEvent.value.payload.messageId === row.messageId
+            ) {
+              // Accepted command receipts are idempotent and do not republish
+              // their hot event. Re-enter the normal worker so its durable
+              // claim remains the sole provider-invocation boundary.
+              yield* worker.enqueue(retainedEvent.value);
+            }
+            return;
+          }
           const activeSession = sessions.find(
             (session) =>
               String(session.threadId) === row.threadId && session.activeTurnId !== undefined,
@@ -2537,12 +2563,12 @@ const make = Effect.gen(function* () {
       }
     });
 
-    // Subscribe before returning, even while event handling waits for server activation.
+    // Acquire the hot subscription before recovery so events arriving during
+    // the scan are retained. Consume it only after the snapshot is classified;
+    // otherwise a fresh claim can look like a pre-restart orphan.
     const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;
     yield* Effect.addFinalizer(() => hooks.onDomainEventSubscriptionRelease?.() ?? Effect.void);
     yield* hooks.afterDomainEventSubscription?.() ?? Effect.void;
-    yield* forkParked(Stream.runForEach(domainEvents, processEvent));
-
     yield* recoverEpicReviewRepairDeliveries().pipe(
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)
@@ -2552,6 +2578,7 @@ const make = Effect.gen(function* () {
             }),
       ),
     );
+    yield* forkParked(Stream.runForEach(domainEvents, processEvent));
 
     // The domain event stream is hot, so work pending before this reactor
     // starts cannot be resumed. Correlated completions only clear the request
