@@ -226,6 +226,7 @@ const make = Effect.gen(function* () {
     ownerId: hostOwnerId,
     ownerFenceToken: hostOwnerFenceToken,
     executionKey: `provider:${request.threadId}`,
+    ...(request.idempotencyKey.startsWith("automatic-claim:") ? { replayable: false } : {}),
   });
 
   const acquire: ProviderResourceCoordinatorShape["acquire"] = Effect.fn(
@@ -672,6 +673,46 @@ const make = Effect.gen(function* () {
                   : Effect.void,
               ),
             );
+          const durableDeliveryClaim =
+            row.idempotencyKey.startsWith("automatic-claim:") ||
+            (row.source === "automatic" &&
+              row.stage !== null &&
+              row.handoffId !== null &&
+              row.idempotencyKey.startsWith("automatic:") &&
+              !row.idempotencyKey.startsWith("automatic:epic-review:"));
+          if (row.status !== "entered" && durableDeliveryClaim) {
+            // A replacement consumer claims a new durable delivery generation. Nothing
+            // can have invoked the provider before this row enters, so retire both
+            // provisional reservations instead of leaving an abandoned queue entry.
+            // This also retires delivery-only keys created before claim-scoped admission.
+            return Effect.gen(function* () {
+              const host = (yield* hostAdmission.snapshot).entries.find(
+                (entry) => entry.requestId === `host:${row.requestId}`,
+              );
+              if (host !== undefined && (host.state === "waiting" || host.state === "admitted")) {
+                const authority = {
+                  reservationId: host.requestId,
+                  ownerId: host.ownerId,
+                  ownerFenceToken: host.ownerFenceToken,
+                };
+                const retired =
+                  host.state === "waiting"
+                    ? yield* hostAdmission.cancelWaiting(authority)
+                    : host.reservationFenceToken !== null
+                      ? yield* hostAdmission.release({
+                          ...authority,
+                          reservationFenceToken: host.reservationFenceToken,
+                        })
+                      : undefined;
+                if (retired?.result !== true)
+                  return yield* new ProviderResourceCoordinatorError({
+                    operation: "reconcile-uninvoked-claim",
+                    message: "The abandoned delivery claim lost its host retirement fence.",
+                  });
+              }
+              yield* reconcileResource(row.requestId, "inactive");
+            });
+          }
           if (row.status === "waiting") {
             // Automatic deliveries are durable and can re-enter with their
             // stable delivery id. Manual request fibers are not replayable, so

@@ -20,7 +20,7 @@ import {
   layer as coordinatorLayer,
 } from "./ProviderResourceCoordinator.ts";
 import { ResourceAdmission } from "./ResourceAdmission.ts";
-import type { ResourceReservationAuthority } from "./model.ts";
+import type { ResourceAdmissionSnapshotEntry, ResourceReservationAuthority } from "./model.ts";
 
 it.effect("coordinates both authorities and ignores unfenced session exits", () =>
   Effect.gen(function* () {
@@ -393,3 +393,207 @@ it.effect("coordinates both authorities and ignores unfenced session exits", () 
     assert.deepStrictEqual(calls, ["host-active", "provider-release", "host-release"]);
   }),
 );
+
+for (const scenario of [
+  { name: "waiting claim", status: "waiting", hostState: "waiting", activity: "possible" },
+  { name: "admitted claim", status: "admitted", hostState: "admitted", activity: "possible" },
+  { name: "half-entered claim", status: "admitted", hostState: "admitted", activity: "active" },
+  { name: "unknown entered claim", status: "entered", hostState: "admitted", activity: "unknown" },
+  {
+    name: "legacy waiting delivery",
+    status: "waiting",
+    hostState: "waiting",
+    activity: "possible",
+    legacy: true,
+  },
+  {
+    name: "legacy durable verification delivery",
+    status: "waiting",
+    hostState: "waiting",
+    activity: "possible",
+    legacy: true,
+    stage: "verification",
+    handoffId: "verification-handoff",
+  },
+  {
+    name: "legacy epic review delivery",
+    status: "waiting",
+    hostState: "waiting",
+    activity: "possible",
+    legacy: true,
+    epicReview: true,
+    stage: "implementation",
+    handoffId: "epic-review-handoff",
+  },
+  {
+    name: "failed waiting retirement",
+    status: "waiting",
+    hostState: "waiting",
+    activity: "possible",
+    retirementFails: true,
+  },
+  {
+    name: "failed admitted retirement",
+    status: "admitted",
+    hostState: "admitted",
+    activity: "active",
+    retirementFails: true,
+  },
+] as const) {
+  it.effect(`reconciles ${scenario.name} without freeing uncertain provider work`, () =>
+    Effect.gen(function* () {
+      const legacy = "legacy" in scenario;
+      const epicReview = "epicReview" in scenario;
+      const preserveLegacy = legacy && (!("stage" in scenario) || epicReview);
+      const retirementFails = "retirementFails" in scenario;
+      const permit: ProviderResourceAdmissionPermit = {
+        requestId: "provider-claim",
+        idempotencyKey: epicReview
+          ? "automatic:epic-review:request:3"
+          : legacy
+            ? "automatic:delivery"
+            : "automatic-claim:delivery:3",
+        providerInstanceId: ProviderInstanceId.make("codex-claim"),
+        threadId: "claim-thread",
+        accountScope: "codex",
+        workloadClass: "background",
+        source: "automatic",
+        requestedAt: "2026-09-19T10:00:00.000Z",
+        stage: "stage" in scenario ? scenario.stage : null,
+        handoffId: "handoffId" in scenario ? scenario.handoffId : null,
+        ownerId: "previous-provider-owner",
+        leaseExpiresAt: "2026-09-19T10:02:00.000Z",
+        fenceToken: 7,
+      };
+      const row: ProviderResourceAdmissionActive = {
+        ...permit,
+        status: scenario.status,
+        providerTurnId: null,
+        waitReason: scenario.status === "waiting" ? "provider-limit" : null,
+        lastObservedActivity: "unknown",
+        lastObservedAt: permit.requestedAt,
+        permit: scenario.status === "waiting" ? null : permit,
+      };
+      // Startup may already have adopted the host reservation with different
+      // authority. Retirement must use its snapshot, never the old provider fence.
+      const hostRow: ResourceAdmissionSnapshotEntry = {
+        requestId: `host:${permit.requestId}`,
+        kind: "providerTurn",
+        priority: "background",
+        accountScope: "codex",
+        state: scenario.hostState,
+        waitReason: scenario.hostState === "waiting" ? "cpu-pressure" : null,
+        accounted: true,
+        gpuRequired: false,
+        ownerId: "recovery-host-owner",
+        ownerFenceToken: 19,
+        executionKey: "claim-thread",
+        reservationFenceToken: scenario.hostState === "waiting" ? null : 23,
+        requestedAtMs: 1,
+        admittedAtMs: scenario.hostState === "waiting" ? null : 2,
+        activity: scenario.activity,
+        activityObservedAtMs: 3,
+        parentReservationId: null,
+      };
+      const calls: string[] = [];
+      const provider = ProviderAdmissionRuntime.of({
+        awaitFailure: Effect.never,
+        request: () => Effect.die("unused"),
+        usageChanged: () => Effect.die("unused"),
+        capacityReleased: () => Effect.void,
+        requestResource: () => Effect.die("unused"),
+        enterResource: () => Effect.die("unused"),
+        listResourceActive: Effect.succeed([row]),
+        reconcileResource: (_requestId, activity) =>
+          Effect.sync(() => {
+            calls.push(`provider:${activity}`);
+            return null;
+          }),
+      });
+      const retired = {
+        result: !retirementFails,
+        newlyAdmitted: [],
+        ledgerRevision: 2,
+        pressureSampledAtMs: 3,
+      };
+      const host = ResourceAdmission.of({
+        request: () => Effect.die("unused"),
+        acquire: () => Effect.die("unused"),
+        defer: () => Effect.die("unused"),
+        observeActivity: () => Effect.die("unused"),
+        refresh: Effect.die("unused"),
+        adoptActive: (request) =>
+          Effect.sync(() => {
+            assert.equal(request.replayable, false);
+            calls.push("host:retain");
+            return {
+              reservationId: hostRow.requestId,
+              ownerId: hostRow.ownerId,
+              ownerFenceToken: hostRow.ownerFenceToken,
+              reservationFenceToken: 23,
+            };
+          }),
+        cancelWaiting: (authority) =>
+          Effect.sync(() => {
+            assert.deepStrictEqual(authority, {
+              reservationId: hostRow.requestId,
+              ownerId: hostRow.ownerId,
+              ownerFenceToken: hostRow.ownerFenceToken,
+            });
+            calls.push("host:cancel");
+            return retired;
+          }),
+        release: (authority) =>
+          Effect.sync(() => {
+            assert.deepStrictEqual(authority, {
+              reservationId: hostRow.requestId,
+              ownerId: hostRow.ownerId,
+              ownerFenceToken: hostRow.ownerFenceToken,
+              reservationFenceToken: hostRow.reservationFenceToken,
+            });
+            calls.push("host:release");
+            return retired;
+          }),
+        snapshot: Effect.succeed({
+          entries: [hostRow],
+          pressure: {
+            telemetryAvailable: true,
+            cpuPaused: false,
+            memoryPaused: false,
+            sampledAtMs: 3,
+          },
+          enforcement: {
+            slotAccounting: "host-process-atomic",
+            cpu: "observed-soft-threshold",
+            memory: "observed-soft-threshold",
+            gpu: "unavailable",
+            osHardLimits: "unsupported",
+          },
+          effectiveSettings: null,
+        }),
+      });
+      const coordinator = yield* ProviderResourceCoordinator.pipe(
+        Effect.provide(
+          coordinatorLayer.pipe(
+            Layer.provide(Layer.succeed(ProviderAdmissionRuntime, provider)),
+            Layer.provide(Layer.succeed(ResourceAdmission, host)),
+            Layer.provide(serverSettingsTest()),
+          ),
+        ),
+      );
+      const exit = yield* coordinator.reconcile([]).pipe(Effect.exit);
+      assert.equal(exit._tag, retirementFails ? "Failure" : "Success");
+      assert.deepStrictEqual(
+        calls,
+        preserveLegacy
+          ? ["provider:unknown"]
+          : scenario.status === "entered"
+            ? ["provider:unknown", "host:retain"]
+            : [
+                scenario.hostState === "waiting" ? "host:cancel" : "host:release",
+                ...(retirementFails ? [] : ["provider:inactive"]),
+              ],
+      );
+    }),
+  );
+}

@@ -1054,7 +1054,10 @@ const make = Effect.gen(function* () {
                     restore(
                       resourceCoordinator
                         .acquire({
-                          idempotencyKey: `automatic:${providerAdmissionPermit.providerDeliveryId}`,
+                          // A not-invoked attempt retires its resources permanently. Only a new
+                          // durable delivery claim may acquire another reservation; replaying the
+                          // same claim must keep its identity, including after a restart.
+                          idempotencyKey: `automatic-claim:${providerAdmissionPermit.providerDeliveryId}:${boundary.claimGeneration}`,
                           providerInstanceId: attestation.providerInstanceId,
                           continuationKey: String(instanceInfo.driverKind),
                           threadId: String(prepared.input.threadId),

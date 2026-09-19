@@ -438,6 +438,7 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const exit = yield* restore(
           turnRequestExecutor.sendPreparedTurnAtPreInvokeBoundary(prepareExit.value, {
+            claimGeneration: owned.delivery.claimGeneration,
             beforeDeliveryCas: () =>
               hooks.beforeDeliveryCas?.(owned.evidence.handoffId) ?? Effect.void,
             persistDeliveryAttempted: (attestation) => {

@@ -750,6 +750,110 @@ it.effect("startup keeps dead active and unknown checks fail-closed and visible"
   }),
 );
 
+it.effect(
+  "retires dead nonreplayable provider waits and grants before scheduling a new claim",
+  () =>
+    Effect.gen(function* () {
+      for (const beforeRestart of ["waiting", "possible"] as const) {
+        let cpuUtilization = beforeRestart === "waiting" ? 0.95 : 0.1;
+        const settings = {
+          ...defaultResourceAdmissionSettings,
+          providerMaxConcurrent: 1,
+          interactiveReserve: 0,
+        };
+        const { ledger, pressure, service } = yield* makeHarness({
+          settings,
+          sample: () => ({ ...healthySample(), cpuUtilization }),
+        });
+        const oldClaim = request(`old-claim-${beforeRestart}`, {
+          replayable: false,
+          ownerId: "provider-coordinator:2147483647:dead",
+        });
+        assert.equal(
+          (yield* service.request(oldClaim)).result._tag,
+          beforeRestart === "waiting" ? "Waiting" : "Admitted",
+        );
+        // A crash here can happen before a provider-capacity row even exists.
+        cpuUtilization = 0.1;
+        const restarted = yield* make({ ledger, settings }).pipe(
+          Effect.provideService(ResourcePressure, pressure),
+        );
+        const retired = (yield* restarted.snapshot).entries.find(
+          (entry) => entry.requestId === oldClaim.requestId,
+        );
+        assert.equal(retired?.state, "canceled");
+        assert.equal(retired?.activity, "inactive");
+        assert.equal((yield* restarted.request(oldClaim)).result._tag, "Rejected");
+        yield* admitted(
+          restarted,
+          request(`new-claim-${beforeRestart}`, {
+            replayable: false,
+            ownerId: `provider-coordinator:${process.pid}:new`,
+          }),
+        );
+      }
+    }),
+);
+
+it.effect("retains nonreplayable provider claims when the dead owner may have invoked work", () =>
+  Effect.gen(function* () {
+    for (const activity of ["active", "unknown"] as const) {
+      const settings = {
+        ...defaultResourceAdmissionSettings,
+        providerMaxConcurrent: 1,
+        interactiveReserve: 0,
+      };
+      const { ledger, pressure, service } = yield* makeHarness({ settings });
+      const oldClaim = yield* admitted(
+        service,
+        request(`entered-claim-${activity}`, {
+          replayable: false,
+          ownerId: "provider-coordinator:2147483647:dead",
+        }),
+      );
+      yield* service.observeActivity(oldClaim.authority, activity);
+      const restarted = yield* make({ ledger, settings }).pipe(
+        Effect.provideService(ResourcePressure, pressure),
+      );
+      const retained = (yield* restarted.snapshot).entries.find(
+        (entry) => entry.requestId === oldClaim.authority.reservationId,
+      );
+      assert.equal(retained?.state, "admitted");
+      assert.equal(
+        retained?.activity,
+        activity === "active" ? "orphaned-active" : "orphaned-unknown",
+      );
+      assert.equal(
+        (yield* restarted.request(request(`replacement-${activity}`, { replayable: false }))).result
+          ._tag,
+        "Waiting",
+      );
+    }
+  }),
+);
+
+it.effect("preserves a live claim and rejects changes to its replay policy", () =>
+  Effect.gen(function* () {
+    const { ledger, pressure, service } = yield* makeHarness();
+    const current = request("live-nonreplayable", {
+      replayable: false,
+      ownerId: `provider-coordinator:${process.pid}:live`,
+    });
+    const original = yield* admitted(service, current);
+    const secondEnvironment = yield* make({ ledger }).pipe(
+      Effect.provideService(ResourcePressure, pressure),
+    );
+    assert.deepStrictEqual(
+      (yield* admitted(secondEnvironment, current)).authority,
+      original.authority,
+    );
+    assert.equal(
+      (yield* secondEnvironment.request({ ...current, replayable: true })).result._tag,
+      "Rejected",
+    );
+  }),
+);
+
 it.effect("keeps only bounded recent terminal tombstones", () =>
   Effect.gen(function* () {
     const { service } = yield* makeHarness({

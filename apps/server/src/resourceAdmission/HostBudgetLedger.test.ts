@@ -57,6 +57,33 @@ const request = (id: string): ResourceAdmissionRequest => ({
   executionKey: `session-${id}`,
 });
 
+it.effect("persists per-claim recovery policy when a host ledger is reopened", () =>
+  withTemporaryDirectory((directory) =>
+    Effect.gen(function* () {
+      const path = NodePath.join(directory, "host-budget.json");
+      const first = yield* makeService(path);
+      const oldClaim = {
+        ...request("claim-before-crash"),
+        replayable: false,
+        ownerId: "provider-coordinator:2147483647:dead",
+      };
+      assert.equal((yield* first.request(oldClaim)).result._tag, "Admitted");
+      assert.equal(
+        (yield* makeFileHostBudgetLedger(path).read).reservations[oldClaim.requestId]?.replayable,
+        false,
+      );
+
+      const reopened = yield* makeService(path);
+      assert.equal(
+        (yield* reopened.snapshot).entries.find((entry) => entry.requestId === oldClaim.requestId)
+          ?.state,
+        "canceled",
+      );
+      assert.equal((yield* reopened.request(request("claim-after-crash"))).result._tag, "Admitted");
+    }),
+  ),
+);
+
 it.effect("serializes transactions from independent environment ledgers without lost updates", () =>
   withTemporaryDirectory((directory) =>
     Effect.gen(function* () {

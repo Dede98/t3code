@@ -660,6 +660,7 @@ const make = Effect.gen(function* () {
     const deliveryExit = yield* Effect.uninterruptibleMask((restore) =>
       restore(
         executor.sendPreparedTurnAtPreInvokeBoundary(prepared.value, {
+          claimGeneration: owned.delivery.claimGeneration,
           beforeDeliveryCas: () =>
             hooks.beforeDeliveryCas?.(owned.evidence.handoffId) ?? Effect.void,
           persistDeliveryAttempted: (attestation) => {

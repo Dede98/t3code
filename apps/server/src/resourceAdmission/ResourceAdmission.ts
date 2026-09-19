@@ -462,6 +462,7 @@ function sameRequest(existing: PersistedReservation, request: ResourceAdmissionR
     existing.priority === request.priority &&
     existing.accountScope === (request.accountScope ?? null) &&
     existing.executionKey === (request.executionKey ?? null) &&
+    (existing.replayable ?? true) === (request.replayable ?? true) &&
     existing.gpuRequired === (request.gpuRequired ?? false) &&
     existing.parentReservationId === (request.parent?.reservationId ?? null)
   );
@@ -755,6 +756,7 @@ export const make = Effect.fn("resourceAdmission.make")(function* (options: {
         ownerId: request.ownerId,
         ownerFenceToken: request.ownerFenceToken,
         executionKey: request.executionKey ?? null,
+        replayable: request.replayable ?? true,
         reservationFenceToken: null,
         requestedAtMs: nowMs,
         sequence: state.nextSequence,
@@ -835,6 +837,7 @@ export const make = Effect.fn("resourceAdmission.make")(function* (options: {
               ownerId: request.ownerId,
               ownerFenceToken: request.ownerFenceToken,
               executionKey: request.executionKey ?? null,
+              replayable: request.replayable ?? true,
               reservationFenceToken,
               requestedAtMs: nowMs,
               sequence: state.nextSequence,
@@ -1189,9 +1192,9 @@ export const make = Effect.fn("resourceAdmission.make")(function* (options: {
   });
 
   // A dead server cannot later start work which was only waiting or had not
-  // crossed an external boundary. Provider requests remain replayable under a
-  // newer fenced owner; local check requests are terminal because their
-  // durable verification stage will retry with a new attempt only when safe.
+  // crossed an external boundary. Replayable provider requests can pass to a
+  // newer fenced owner. Local checks and per-claim provider requests are
+  // terminal because their durable owner retries under a new identity.
   // Active work stays accounted because its provider/child tree may survive.
   yield* Effect.gen(function* () {
     const settings = yield* currentSettings;
@@ -1207,12 +1210,13 @@ export const make = Effect.fn("resourceAdmission.make")(function* (options: {
           continue;
         }
         if (reservation.state === "waiting" || reservation.activity === "possible") {
+          const terminal = reservation.kind === "localCheck" || reservation.replayable === false;
           reservations[reservation.requestId] = {
             ...reservation,
-            state: reservation.kind === "localCheck" ? "canceled" : "waiting",
+            state: terminal ? "canceled" : "waiting",
             admittedAtMs: null,
             reservationFenceToken: null,
-            activity: reservation.kind === "localCheck" ? "inactive" : "unknown",
+            activity: terminal ? "inactive" : "unknown",
             activityObservedAtMs: nowMs,
           };
         } else if (

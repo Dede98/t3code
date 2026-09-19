@@ -57,6 +57,8 @@ export interface ResourceAdmissionRequest {
   readonly ownerFenceToken: number;
   /** Stable provider-session or local-check identity used during startup reconciliation. */
   readonly executionKey?: string;
+  /** False when a dead owner's unstarted work must retry under a new request id. */
+  readonly replayable?: boolean;
   readonly gpuRequired?: boolean;
   readonly parent?: ResourceAdmissionParentAuthority;
 }
@@ -164,6 +166,7 @@ export const PersistedReservation = Schema.Struct({
   ownerId: Schema.String,
   ownerFenceToken: Schema.Int,
   executionKey: Schema.NullOr(Schema.String),
+  replayable: Schema.optional(Schema.Boolean),
   reservationFenceToken: Schema.NullOr(Schema.Int),
   requestedAtMs: Schema.Int,
   sequence: Schema.Int,

@@ -87,6 +87,8 @@ export interface ProviderTurnRequestExecutorShape {
   readonly sendPreparedTurnAtPreInvokeBoundary: (
     prepared: PreparedProviderTurnRequest,
     boundary: {
+      /** Durable delivery claim; stable within an attempt and incremented before a safe retry. */
+      readonly claimGeneration: number;
       readonly beforeDeliveryCas: () => Effect.Effect<void>;
       readonly persistDeliveryAttempted: (
         attestation: ProviderTurnAttestation,

@@ -3,12 +3,18 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
+  EventId,
   type ProviderSession,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { assert, describe, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -18,7 +24,26 @@ import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
-import type { ProviderAdmissionPermit } from "../../agentControl/providerAdmission/model.ts";
+import {
+  DEFAULT_PROVIDER_RESOURCE_ADMISSION_LIMITS,
+  providerAdmissionUsageEvidence,
+  type ProviderAdmissionPermit,
+  type ProviderAdmissionStage,
+} from "../../agentControl/providerAdmission/model.ts";
+import { ProviderAdmissionStoreLive } from "../../agentControl/providerAdmission/Layers/ProviderAdmissionStore.ts";
+import { ProviderAdmissionStore } from "../../agentControl/providerAdmission/Services/ProviderAdmissionStore.ts";
+import { ProviderAdmissionRuntime } from "../../agentControl/providerAdmission/Services/ProviderAdmissionRuntime.ts";
+import {
+  ProviderResourceCoordinator,
+  layer as coordinatorLayer,
+} from "../../resourceAdmission/ProviderResourceCoordinator.ts";
+import { makeMemoryHostBudgetLedger } from "../../resourceAdmission/HostBudgetLedger.ts";
+import {
+  ResourceAdmission,
+  make as makeHostAdmission,
+} from "../../resourceAdmission/ResourceAdmission.ts";
+import { ResourcePressure } from "../../resourceAdmission/ResourcePressure.ts";
+import { layerTest as settingsTest } from "../../serverSettings.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
 import {
@@ -32,6 +57,7 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import {
   ProviderTurnDeliveryError,
   ProviderTurnRequestExecutor,
+  type PreparedProviderTurnRequest,
 } from "../Services/ProviderTurnRequestExecutor.ts";
 import {
   buildInitialPlanningSessionEvidence,
@@ -117,11 +143,15 @@ const buildExecutor = (
   sql: SqlClient.SqlClient,
   providerService: ProviderService["Service"],
   dispatch: OrchestrationEngineService["Service"]["dispatch"],
+  resourceCoordinator?: ProviderResourceCoordinator["Service"],
 ) =>
   Layer.buildWithScope(
     Layer.fresh(ProviderTurnRequestExecutorLive).pipe(
       Layer.provide(
         Layer.mergeAll(
+          resourceCoordinator === undefined
+            ? Layer.empty
+            : Layer.succeed(ProviderResourceCoordinator, resourceCoordinator),
           Layer.succeed(SqlClient.SqlClient, sql),
           Layer.succeed(ProviderService, providerService),
           Layer.succeed(ProviderRegistry, providerRegistry),
@@ -353,6 +383,7 @@ it.effect("does not invoke a turn when atomic session evidence persistence fails
       });
       const result = yield* Effect.exit(
         executor.sendPreparedTurnAtPreInvokeBoundary(prepared, {
+          claimGeneration: 1,
           beforeDeliveryCas: () => Effect.void,
           persistDeliveryAttempted: () =>
             Effect.die("Missing evidence storage must prevent delivery CAS"),
@@ -448,6 +479,7 @@ it.effect(
         const prepared = yield* executor.prepareTurnDelivery(input);
         const rejected = yield* Effect.exit(
           executor.sendPreparedTurnAtPreInvokeBoundary(prepared, {
+            claimGeneration: 1,
             beforeDeliveryCas: () => Effect.void,
             persistDeliveryAttempted: () =>
               Effect.gen(function* () {
@@ -478,6 +510,7 @@ it.effect(
           [],
         );
         yield* executor.sendPreparedTurnAtPreInvokeBoundary(prepared, {
+          claimGeneration: 1,
           beforeDeliveryCas: () => Effect.void,
           persistDeliveryAttempted: () => Effect.void,
           afterDeliveryCas: () => Effect.void,
@@ -690,3 +723,336 @@ describe("Initial Planning delivery Cause mapping", () => {
     }
   });
 });
+
+const makeAdmissionRetryHarness = Effect.fn("makeAdmissionRetryHarness")(function* (
+  stage: ProviderAdmissionStage,
+) {
+  const scope = yield* Scope.make("sequential");
+  yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+  const sqlContext = yield* Layer.buildWithScope(
+    SqlitePersistenceMemory.pipe(Layer.provideMerge(NodeServices.layer)),
+    scope,
+  );
+  const sql = Context.get(sqlContext, SqlClient.SqlClient);
+  // The executor owns evidence atomicity. Delivery authority is represented by
+  // the provider boundary below; resource reservations use the actual stores.
+  yield* sql`PRAGMA foreign_keys = OFF`;
+  const tableStage = stage.replaceAll("-", "_");
+  yield* sql.unsafe(`DROP TRIGGER agent_control_${tableStage}_session_evidence_validate`);
+  const storeContext = yield* Layer.buildWithScope(
+    ProviderAdmissionStoreLive.pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
+    scope,
+  );
+  const store = Context.get(storeContext, ProviderAdmissionStore);
+  const now = DateTime.now.pipe(Effect.map(DateTime.formatIso));
+  const resources = ProviderAdmissionRuntime.of({
+    awaitFailure: Effect.never,
+    request: () => Effect.die("Only resource admission is used by this fixture"),
+    usageChanged: () => Effect.void,
+    capacityReleased: () => Effect.void,
+    requestResource: (request, limits = DEFAULT_PROVIDER_RESOURCE_ADMISSION_LIMITS) =>
+      Effect.gen(function* () {
+        const observed = yield* now;
+        return (yield* store.requestResource!({
+          request,
+          limits,
+          usage: providerAdmissionUsageEvidence({
+            providerInstanceId: request.providerInstanceId,
+            status: "allowed",
+            observedAt: observed,
+            source: "capability",
+            nextRelevantAt: null,
+          }),
+          ownerId: "executor-resource-owner",
+          now: observed,
+          leaseExpiresAt: DateTime.formatIso(
+            DateTime.addDuration(yield* DateTime.now, "2 minutes"),
+          ),
+        })).decision;
+      }),
+    acquireResource: () => Effect.die("Provider scope should have free capacity"),
+    enterResource: (resourcePermit, providerTurnId) =>
+      now.pipe(
+        Effect.flatMap((enteredAt) =>
+          store.enterResource!({
+            permit: resourcePermit,
+            enteredAt,
+            ...(providerTurnId === undefined ? {} : { providerTurnId }),
+          }),
+        ),
+      ),
+    releaseResource: (resourcePermit) =>
+      now.pipe(
+        Effect.flatMap((releasedAt) =>
+          store.releaseResource!({ permit: resourcePermit, releasedAt }),
+        ),
+        Effect.asVoid,
+      ),
+    deferResource: (resourcePermit) =>
+      now.pipe(
+        Effect.flatMap((deferredAt) =>
+          store.deferResource!({ permit: resourcePermit, deferredAt }),
+        ),
+        Effect.asVoid,
+      ),
+    cancelResource: (request) =>
+      now.pipe(
+        Effect.flatMap((cancelledAt) => store.cancelResource!({ request, cancelledAt })),
+        Effect.asVoid,
+      ),
+    listResourceActive: store.listResourceActive!,
+    reconcileResource: (requestId, observedActivity) =>
+      Effect.gen(function* () {
+        return yield* store.reconcileResource!({
+          requestId,
+          observedActivity,
+          ownerId: "replacement-resource-owner",
+          observedAt: yield* now,
+          leaseExpiresAt: DateTime.formatIso(
+            DateTime.addDuration(yield* DateTime.now, "2 minutes"),
+          ),
+        });
+      }),
+  });
+  const waitStarted = yield* Deferred.make<void>();
+  const pressureReleased = yield* Deferred.make<void>();
+  let cpuPressure = true;
+  const host = yield* makeHostAdmission({ ledger: yield* makeMemoryHostBudgetLedger() }).pipe(
+    Effect.provideService(ResourcePressure, {
+      sample: DateTime.now.pipe(
+        Effect.map((date) => ({
+          sampledAtMs: DateTime.toEpochMillis(date),
+          telemetry: "available" as const,
+          cpuUtilization: cpuPressure ? 0.95 : 0.1,
+          availableMemoryBytes: 8 * 1024 ** 3,
+          gpu: { status: "unavailable" as const },
+        })),
+      ),
+      awaitChange: () =>
+        Deferred.succeed(waitStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(pressureReleased)),
+        ),
+    }),
+  );
+  const newCoordinator = () =>
+    Layer.buildWithScope(
+      Layer.fresh(coordinatorLayer).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(ResourceAdmission, host),
+            Layer.succeed(ProviderAdmissionRuntime, resources),
+            settingsTest(),
+          ),
+        ),
+      ),
+      scope,
+    ).pipe(Effect.map((context) => Context.get(context, ProviderResourceCoordinator)));
+  const coordinator = yield* newCoordinator();
+  let nativeInvocations = 0;
+  let uncertain = false;
+  const service = ProviderService.of({
+    ...makeProvider({
+      startSession: () => Effect.succeed(session),
+      listSessions: () => Effect.succeed([session]),
+      quarantineAdmissionIfEntered: () => Effect.void,
+    }),
+    sendTurnAtPreInvokeBoundary: (_input, boundary) =>
+      Effect.gen(function* () {
+        // Model the existing exact entry deadline guard; production guard tests
+        // independently exercise its owner, fence, lease, and stage authority.
+        if (boundary.providerAdmissionPermit.admissionLeaseExpiresAt <= (yield* now))
+          return yield* new ProviderAdapterRequestError({
+            provider,
+            method: "thread.turn.start",
+            detail: "Expired entry authority",
+          });
+        yield* boundary.beforeDeliveryCas();
+        yield* boundary.persistDeliveryAttempted({
+          ...modelEvidence,
+          providerInstanceId,
+          effectiveModelSelection: modelSelection,
+        });
+        yield* boundary.afterDeliveryCas();
+        boundary.onNativeInvocationStarted?.();
+        nativeInvocations += 1;
+        if (uncertain)
+          return yield* new ProviderAdapterRequestError({
+            provider,
+            method: "thread.turn.start",
+            detail: "Native acceptance unknown",
+          });
+        return { threadId, turnId: TurnId.make("retry-native-turn") };
+      }),
+  });
+  const newExecutor = (resourceCoordinator = coordinator) =>
+    buildExecutor(
+      scope,
+      sql,
+      service,
+      () => Effect.succeed({ sequence: 1 }),
+      resourceCoordinator,
+    ).pipe(Effect.map((context) => Context.get(context, ProviderTurnRequestExecutor)));
+  const executor = yield* newExecutor();
+  const sessionAttestation = session.initialPlanningAttestation;
+  if (sessionAttestation === undefined) return yield* Effect.die("Missing fixture attestation");
+  const prepare = Effect.gen(function* (): Effect.gen.Return<PreparedProviderTurnRequest> {
+    const observed = yield* now;
+    return {
+      input: { threadId, input: "verify admission retry", modelSelection },
+      providerDeliveryId: permit.providerDeliveryId,
+      durableDeliveryKind: stage,
+      providerAdmissionPermit: {
+        ...permit,
+        stage,
+        admissionLeaseExpiresAt: DateTime.formatIso(
+          DateTime.addDuration(yield* DateTime.now, "2 minutes"),
+        ),
+      },
+      sessionAttestation,
+      sessionResumeCursorJson: "null",
+      sessionEvidenceRecordedAt: observed,
+    };
+  });
+  const boundary = (claimGeneration: number) => ({
+    claimGeneration,
+    beforeDeliveryCas: () => Effect.void,
+    persistDeliveryAttempted: () => Effect.void,
+    afterDeliveryCas: () => Effect.void,
+  });
+  const unblock = Effect.sync(() => {
+    cpuPressure = false;
+  }).pipe(Effect.andThen(Deferred.succeed(pressureReleased, undefined)), Effect.asVoid);
+  return {
+    sql,
+    host,
+    coordinator,
+    executor,
+    newExecutor,
+    newCoordinator,
+    prepare,
+    boundary,
+    waitStarted,
+    unblock,
+    nativeInvocations: () => nativeInvocations,
+    makeUncertain: () => {
+      uncertain = true;
+    },
+  };
+});
+
+for (const stage of ["initial-planning", "implementation", "verification"] as const) {
+  it.effect(
+    `retries ${stage} once under a new claim after resource waiting expires entry authority`,
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeAdmissionRetryHarness(stage);
+          const prepared = yield* h.prepare;
+          const first = yield* h.executor
+            .sendPreparedTurnAtPreInvokeBoundary(prepared, h.boundary(1))
+            .pipe(Effect.exit, Effect.forkChild);
+          yield* Deferred.await(h.waitStarted);
+          yield* TestClock.adjust("121 seconds");
+          yield* h.unblock;
+          const failed = yield* Fiber.join(first);
+          assert.isTrue(Exit.isFailure(failed));
+          if (Exit.isFailure(failed))
+            assert.equal(
+              failed.cause.reasons.find(Cause.isFailReason)?.error.certainty,
+              "not-attempted",
+            );
+          assert.equal(h.nativeInvocations(), 0);
+          assert.deepStrictEqual(
+            yield* h.sql`SELECT status FROM resource_admission_provider_requests`,
+            [{ status: "released" }],
+          );
+          // A replay of the failed claim cannot revive its terminal reservations.
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                h.executor.sendPreparedTurnAtPreInvokeBoundary(yield* h.prepare, h.boundary(1)),
+              ),
+            ),
+          );
+          assert.equal(h.nativeInvocations(), 0);
+          // Reconstruct runtime layers over the same stores, as after process recovery.
+          const replacement = yield* h.newCoordinator();
+          yield* replacement.reconcile([]);
+          const executor = yield* h.newExecutor(replacement);
+          const result = yield* executor.sendPreparedTurnAtPreInvokeBoundary(
+            yield* h.prepare,
+            h.boundary(2),
+          );
+          assert.equal(result.certainty, "accepted");
+          assert.equal(h.nativeInvocations(), 1);
+          assert.deepStrictEqual(
+            yield* h.sql`SELECT status FROM resource_admission_provider_requests ORDER BY requested_at`,
+            [{ status: "released" }, { status: "entered" }],
+          );
+          yield* replacement.observeRuntimeEvent({
+            type: "turn.completed",
+            eventId: EventId.make("retry-completed"),
+            provider,
+            providerInstanceId,
+            threadId,
+            turnId: result.result.turnId,
+            createdAt,
+            payload: { state: "completed" },
+          });
+          assert.equal(
+            (yield* h.host.snapshot).entries.filter((entry) => entry.state === "admitted").length,
+            0,
+          );
+        }),
+      ),
+  );
+}
+
+it.effect("cancels a resource wait without invocation and lets a new durable claim retry", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const h = yield* makeAdmissionRetryHarness("verification");
+      const running = yield* h.executor
+        .sendPreparedTurnAtPreInvokeBoundary(yield* h.prepare, h.boundary(1))
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(h.waitStarted);
+      yield* Fiber.interrupt(running);
+      assert.equal(h.nativeInvocations(), 0);
+      assert.equal((yield* h.host.snapshot).entries[0]?.state, "canceled");
+      yield* h.unblock;
+      yield* h.executor.sendPreparedTurnAtPreInvokeBoundary(yield* h.prepare, h.boundary(2));
+      assert.equal(h.nativeInvocations(), 1);
+    }),
+  ),
+);
+
+it.effect("retains ambiguous native invocation capacity across coordinator recovery", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const h = yield* makeAdmissionRetryHarness("verification");
+      yield* h.unblock;
+      h.makeUncertain();
+      const result = yield* Effect.exit(
+        h.executor.sendPreparedTurnAtPreInvokeBoundary(yield* h.prepare, h.boundary(1)),
+      );
+      assert.isTrue(Exit.isFailure(result));
+      if (Exit.isFailure(result))
+        assert.equal(
+          result.cause.reasons.find(Cause.isFailReason)?.error.certainty,
+          "acceptance-unknown",
+        );
+      assert.equal(h.nativeInvocations(), 1);
+      const replacement = yield* h.newCoordinator();
+      yield* replacement.reconcile([]);
+      assert.deepStrictEqual(
+        yield* h.sql`SELECT status,last_observed_activity FROM resource_admission_provider_requests`,
+        [{ status: "entered", last_observed_activity: "unknown" }],
+      );
+      assert.equal(
+        (yield* h.host.snapshot).entries.filter((entry) => entry.state === "admitted").length,
+        1,
+      );
+      assert.equal(h.nativeInvocations(), 1);
+    }),
+  ),
+);
