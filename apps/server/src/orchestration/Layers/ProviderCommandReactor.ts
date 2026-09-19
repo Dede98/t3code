@@ -2569,7 +2569,7 @@ const make = Effect.gen(function* () {
     const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;
     yield* Effect.addFinalizer(() => hooks.onDomainEventSubscriptionRelease?.() ?? Effect.void);
     yield* hooks.afterDomainEventSubscription?.() ?? Effect.void;
-    yield* recoverEpicReviewRepairDeliveries().pipe(
+    const recoverReviewRepairs = recoverEpicReviewRepairDeliveries().pipe(
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.interrupt
@@ -2578,7 +2578,17 @@ const make = Effect.gen(function* () {
             }),
       ),
     );
-    yield* forkParked(Stream.runForEach(domainEvents, processEvent));
+    const consumeDomainEvents = Stream.runForEach(domainEvents, processEvent);
+    const activation = yield* ServerActivation;
+    if (activation === undefined) {
+      yield* recoverReviewRepairs;
+      yield* forkParked(consumeDomainEvents);
+    } else {
+      // Recovery can enqueue provider work, so it belongs behind the same
+      // activation boundary as live events. Keeping both in one parked root
+      // also preserves recovery-before-consumption ordering after activation.
+      yield* forkParked(recoverReviewRepairs.pipe(Effect.andThen(consumeDomainEvents)));
+    }
 
     // The domain event stream is hot, so work pending before this reactor
     // starts cannot be resumed. Correlated completions only clear the request
@@ -2598,7 +2608,6 @@ const make = Effect.gen(function* () {
         );
       }),
     );
-    const activation = yield* ServerActivation;
     if (activation === undefined) {
       yield* clearInterrupted;
     } else {

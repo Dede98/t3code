@@ -1715,7 +1715,8 @@ describe("ProviderCommandReactor", () => {
       }),
   );
 
-  it("replays an accepted unclaimed Epic review repair turn when the reactor starts", async () => {
+  it("waits for activation before replaying an accepted unclaimed Epic review repair turn", async () => {
+    const activation = await Effect.runPromise(Deferred.make<void>());
     const receiptBound = await Effect.runPromise(Deferred.make<void>());
     const coordinator: ProviderResourceCoordinatorShape = {
       acquire: () => Effect.succeed(manualPermit),
@@ -1794,7 +1795,26 @@ describe("ProviderCommandReactor", () => {
     await harness.runEffect(harness.engine.dispatch(turnStart));
 
     scope = await Effect.runPromise(Scope.make("sequential"));
-    await Effect.runPromise(harness.reactor.start().pipe(Scope.provide(scope)));
+    await Effect.runPromise(
+      harness.reactor
+        .start()
+        .pipe(
+          Scope.provide(scope),
+          Effect.provideService(ServerActivation, Deferred.await(activation)),
+        ),
+    );
+    expect(harness.sendTurnWithInvocationBoundary).not.toHaveBeenCalled();
+    expect(
+      await harness.runEffect(
+        harness.database<{ claims: number; receipts: number }>`SELECT
+          (SELECT count(*) FROM agent_control_epic_review_repair_delivery_claims
+            WHERE request_id='accepted-review-request' AND attempt=1) AS claims,
+          (SELECT count(*) FROM agent_control_epic_review_repair_delivery_receipts
+            WHERE request_id='accepted-review-request' AND attempt=1) AS receipts`,
+      ),
+    ).toEqual([{ claims: 0, receipts: 0 }]);
+
+    await Effect.runPromise(Deferred.succeed(activation, undefined));
     await Effect.runPromise(Deferred.await(receiptBound));
 
     expect(harness.sendTurnWithInvocationBoundary).toHaveBeenCalledTimes(1);
