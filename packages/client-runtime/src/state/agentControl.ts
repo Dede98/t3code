@@ -770,7 +770,13 @@ export function agentControlEpicControlAllowed(
             (entry) => entry.epicRunId === epic.epicRunId && entry.status === "active",
           ) === true))
     );
-  if (epic.reviewReworks?.at(-1)?.status === "blocked") return false;
+  const review = epic.reviewReworks?.at(-1);
+  if (
+    review?.status === "blocked" &&
+    (review.blocker?.code !== "review-repair-budget-exhausted" ||
+      review.repairAttempts.at(-1)?.error?.code !== "review-repair-turn-failed")
+  )
+    return false;
   return (
     !epic.members.some(
       (member) => member.status === "failed" && (!epic.dependencyPlan || !member.captured),

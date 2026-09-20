@@ -35,6 +35,10 @@ export class AgentControlEpicReviewRepair extends Context.Reference<{
   readonly progress: (
     input: AgentControlEpicReviewRepairInput,
   ) => Effect.Effect<AgentControlEpicReviewRepairProgress, AgentControlEpicRpcError>;
+  /** Explicit resume only: accept a finished checkpoint without another provider turn. */
+  readonly recover?: (
+    input: AgentControlEpicReviewRepairInput,
+  ) => Effect.Effect<AgentControlEpicReviewRepairProgress, AgentControlEpicRpcError>;
   readonly cancel: (input: {
     readonly state: AgentControlEpicRuntimeView;
     readonly rework: AgentControlEpicReviewRework;

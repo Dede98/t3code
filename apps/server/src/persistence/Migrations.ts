@@ -1,3 +1,4 @@
+import AgentMigration0095 from "./Migrations/095_AgentControlEpicReviewCheckpointRecovery.ts";
 import AgentMigration0093 from "./Migrations/093_AgentControlParallelEpics.ts";
 import AgentMigration0094 from "./Migrations/094_AgentControlEpicReviewRework.ts";
 import AgentMigration0092 from "./Migrations/092_AgentControlEpicFrozenTaskMaterialization.ts";
@@ -205,6 +206,7 @@ const agentMigrationEntries = [
   [92, "AgentControlEpicFrozenTaskMaterialization", AgentMigration0092],
   [93, "AgentControlParallelEpics", AgentMigration0093],
   [94, "AgentControlEpicReviewRework", AgentMigration0094],
+  [95, "AgentControlEpicReviewCheckpointRecovery", AgentMigration0095],
 ] as const;
 
 const migrationEntries = [

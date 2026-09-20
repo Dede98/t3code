@@ -535,7 +535,8 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
       receipt.provider_turn_id AS "receiptTurnId",turn.turn_id AS "projectedTurnId",
       turn.pending_message_id AS "pendingMessageId",turn.state AS "turnState",
       turn.checkpoint_ref AS "checkpointRef",turn.checkpoint_status AS "checkpointStatus",
-      result.result_json AS "resultJson",result.result_digest AS "resultDigest"
+      COALESCE(recovery.result_json,result.result_json) AS "resultJson",
+      COALESCE(recovery.result_digest,result.result_digest) AS "resultDigest"
       FROM main.agent_control_epic_review_repair_results result
       JOIN main.agent_control_epic_review_repair_intents intent
         ON intent.request_id=result.request_id AND intent.attempt=result.attempt
@@ -545,6 +546,9 @@ export const makeEpicHandoffEvidence = Effect.gen(function* () {
         ON receipt.request_id=intent.request_id AND receipt.attempt=intent.attempt
       LEFT JOIN main.projection_turns turn
         ON turn.thread_id=intent.thread_id AND turn.pending_message_id=intent.message_id
+      LEFT JOIN main.agent_control_epic_review_repair_recoveries recovery
+        ON recovery.request_id=result.request_id AND recovery.attempt=result.attempt
+          AND recovery.original_result_digest=result.result_digest
       WHERE result.request_id=${rework.requestId}
       ORDER BY result.attempt DESC LIMIT 1`;
       if (

@@ -17,6 +17,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { checkpointRefForThreadTurn } from "../../checkpointing/Utils.ts";
 import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
 import { AgentControlPolicyService } from "../AgentControlPolicyService.ts";
 import { canonicalJson, sha256Utf8 } from "../initialPlanning/eventEvidence.ts";
@@ -62,7 +63,7 @@ const make = Effect.gen(function* () {
   const orchestration = yield* OrchestrationEngineService;
 
   const progress = Effect.fn("AgentControlEpicReviewRepair.progress")(
-    function* (input: AgentControlEpicReviewRepairInput) {
+    function* (input: AgentControlEpicReviewRepairInput, recovering = false) {
       yield* input.authorize;
       const projects = yield* sql<{ cwd: string }>`SELECT workspace_root AS cwd
       FROM main.projection_projects WHERE project_id=${input.state.projectId} AND deleted_at IS NULL`;
@@ -98,17 +99,51 @@ const make = Effect.gen(function* () {
         worktreePath: string;
         branchName: string;
         createdAt: string;
+        originalResultJson: string | null;
+        originalResultDigest: string | null;
         resultJson: string | null;
         completedAt: string | null;
       }>`SELECT intent.attempt,intent.provider_instance_id AS "providerInstanceId",
       intent.model,intent.runtime_mode AS "runtimeMode",intent.thread_id AS "threadId",intent.worktree_path AS "worktreePath",
       intent.turn_request_command_id AS "turnRequestCommandId",intent.message_id AS "messageId",
       intent.branch_name AS "branchName",intent.created_at AS "createdAt",
-      result.result_json AS "resultJson",result.completed_at AS "completedAt"
+      result.result_json AS "originalResultJson",result.result_digest AS "originalResultDigest",
+      COALESCE(recovery.result_json,result.result_json) AS "resultJson",
+      COALESCE(recovery.completed_at,result.completed_at) AS "completedAt"
       FROM main.agent_control_epic_review_repair_intents intent
       LEFT JOIN main.agent_control_epic_review_repair_results result
         ON result.request_id=intent.request_id AND result.attempt=intent.attempt
+      LEFT JOIN main.agent_control_epic_review_repair_recoveries recovery
+        ON recovery.request_id=result.request_id AND recovery.attempt=result.attempt
+          AND recovery.original_result_digest=result.result_digest
       WHERE intent.request_id=${input.rework.requestId} ORDER BY intent.attempt`;
+      const recoverable = rows.at(-1);
+      if (recovering) {
+        const original = recoverable?.originalResultJson
+          ? yield* decodeResult(recoverable.originalResultJson)
+          : null;
+        const requests = yield* sql`SELECT 1 FROM main.agent_control_epic_review_requests
+          WHERE request_id=${input.rework.requestId} AND project_id=${input.state.projectId}
+            AND epic_run_id=${input.state.epicRunId}
+            AND reviewed_commit_sha=${input.rework.reviewedCommitSha}
+            AND reviewed_verification_evidence_id=${input.rework.previousVerificationEvidenceId}`;
+        const cancelled =
+          yield* sql`SELECT 1 FROM main.agent_control_epic_review_repair_cancellations
+          WHERE request_id=${input.rework.requestId}`;
+        if (
+          !recoverable ||
+          requests.length !== 1 ||
+          cancelled.length !== 0 ||
+          original?.status !== "failed" ||
+          original.code !== "review-repair-turn-failed" ||
+          original.message !== "The repair provider turn did not complete successfully." ||
+          recoverable.originalResultDigest !== sha256Utf8(recoverable.originalResultJson!)
+        )
+          return yield* epicError(
+            "review-rework-terminal",
+            "This review failure has no recoverable checkpoint evidence.",
+          );
+      }
       const ensureDispatched = Effect.fn("AgentControlEpicReviewRepair.ensureDispatched")(
         function* (intent: {
           readonly attempt: number;
@@ -287,7 +322,7 @@ const make = Effect.gen(function* () {
           };
       }
 
-      const active = rows.findLast((row) => row.resultJson === null);
+      const active = recovering ? recoverable : rows.findLast((row) => row.resultJson === null);
       if (active) {
         const activeLocation = repairLocation(active.attempt);
         const observed = yield* sql<{
@@ -297,11 +332,12 @@ const make = Effect.gen(function* () {
           turnId: string | null;
           checkpointRef: string | null;
           checkpointStatus: string | null;
+          checkpointTurnCount: number | null;
           receiptTurnId: string | null;
           claimedAt: string | null;
         }>`SELECT session.status AS "sessionStatus",session.last_error AS "lastError",
         turn.state AS "turnState",turn.turn_id AS "turnId",turn.checkpoint_ref AS "checkpointRef",
-        turn.checkpoint_status AS "checkpointStatus",receipt.provider_turn_id AS "receiptTurnId",
+        turn.checkpoint_status AS "checkpointStatus",turn.checkpoint_turn_count AS "checkpointTurnCount",receipt.provider_turn_id AS "receiptTurnId",
         claim.claimed_at AS "claimedAt" FROM main.projection_threads thread
         LEFT JOIN main.projection_thread_sessions session ON session.thread_id=thread.thread_id
         LEFT JOIN main.projection_turns turn ON turn.thread_id=thread.thread_id
@@ -313,6 +349,54 @@ const make = Effect.gen(function* () {
         WHERE thread.thread_id=${active.threadId} AND thread.project_id=${input.state.projectId}
           AND thread.worktree_path=${activeLocation.worktreePath}`;
         const terminal = observed[0];
+        if (recovering) {
+          // A provider diff is provisional. Recovery requires the later, owned final
+          // checkpoint and rejects any durable terminal checkpoint error in between.
+          const evidence = yield* sql`SELECT 1 FROM main.orchestration_events placeholder
+            JOIN main.orchestration_events final ON final.stream_id=placeholder.stream_id
+              AND final.sequence>placeholder.sequence
+            WHERE placeholder.stream_id=${active.threadId}
+              AND placeholder.event_type='thread.turn-diff-completed'
+              AND json_extract(placeholder.payload_json,'$.turnId')=${terminal?.turnId ?? ""}
+              AND json_extract(placeholder.payload_json,'$.status')='missing'
+              AND json_extract(placeholder.payload_json,'$.checkpointRef') LIKE 'provider-diff:%'
+              AND final.event_type='thread.turn-diff-completed'
+              AND json_extract(final.payload_json,'$.turnId')=${terminal?.turnId ?? ""}
+              AND json_extract(final.payload_json,'$.status')='ready'
+              AND json_extract(final.payload_json,'$.checkpointRef')=${terminal?.checkpointRef ?? ""}
+              AND NOT EXISTS (SELECT 1 FROM main.orchestration_events failed
+                WHERE failed.stream_id=placeholder.stream_id
+                  AND failed.event_type='thread.turn-diff-completed'
+                  AND json_extract(failed.payload_json,'$.turnId')=${terminal?.turnId ?? ""}
+                  AND (json_extract(failed.payload_json,'$.status')='error'
+                    OR (json_extract(failed.payload_json,'$.status')='missing'
+                      AND json_extract(failed.payload_json,'$.checkpointRef') NOT LIKE 'provider-diff:%')))
+              AND NOT EXISTS (SELECT 1 FROM main.orchestration_events failedSession
+                WHERE failedSession.stream_id=placeholder.stream_id
+                  AND failedSession.event_type='thread.session-set'
+                  AND json_extract(failedSession.payload_json,'$.session.status') IN ('error','stopped','interrupted'))
+            LIMIT 1`;
+          if (
+            !terminal ||
+            terminal.turnState !== "completed" ||
+            terminal.sessionStatus !== "ready" ||
+            terminal.lastError !== null ||
+            terminal.checkpointStatus !== "ready" ||
+            !terminal.turnId ||
+            terminal.receiptTurnId !== terminal.turnId ||
+            !terminal.checkpointTurnCount ||
+            terminal.checkpointRef !==
+              checkpointRefForThreadTurn(
+                ThreadId.make(active.threadId),
+                terminal.checkpointTurnCount,
+              ) ||
+            evidence.length !== 1
+          )
+            return yield* epicError(
+              "review-rework-terminal",
+              "The failed review does not have a later authorized final checkpoint.",
+            );
+        }
         if (
           !terminal ||
           terminal.turnState === null ||
@@ -361,7 +445,10 @@ const make = Effect.gen(function* () {
         if (
           terminal.turnState === "completed" &&
           terminal.sessionStatus === "ready" &&
-          terminal.checkpointStatus === null
+          terminal.lastError === null &&
+          (terminal.checkpointStatus === null ||
+            (terminal.checkpointStatus === "missing" &&
+              terminal.checkpointRef?.startsWith("provider-diff:")))
         )
           return { kind: "repairing" as const, attempts };
         if (
@@ -375,27 +462,64 @@ const make = Effect.gen(function* () {
           const { branchRef, worktreePath } = activeLocation;
           yield* input.authorize;
           const head = yield* git(worktreePath, ["rev-parse", "HEAD"]);
-          const candidate = yield* git(worktreePath, [
-            "rev-parse",
-            "--verify",
-            `${terminal.checkpointRef}^{commit}`,
+          if (
+            terminal.checkpointTurnCount !== 1 ||
+            terminal.checkpointRef !== checkpointRefForThreadTurn(ThreadId.make(active.threadId), 1)
+          )
+            return yield* epicError(
+              "authority-conflict",
+              "Repair checkpoint belongs to a different turn.",
+            );
+          const [candidateTree, reviewedTree, baselineTree] = yield* Effect.all([
+            git(worktreePath, ["rev-parse", "--verify", `${terminal.checkpointRef}^{tree}`]),
+            git(worktreePath, ["rev-parse", `${input.rework.reviewedCommitSha}^{tree}`]),
+            git(worktreePath, [
+              "rev-parse",
+              "--verify",
+              `${checkpointRefForThreadTurn(ThreadId.make(active.threadId), 0)}^{tree}`,
+            ]),
           ]);
-          if (!objectId.test(candidate))
-            return yield* epicError("authority-conflict", "Repair produced an invalid Git commit.");
+          if (!objectId.test(candidateTree) || baselineTree !== reviewedTree)
+            return yield* epicError(
+              "authority-conflict",
+              "Repair checkpoint baseline differs from the reviewed commit.",
+            );
+          // Checkpoints are parentless snapshots. Bind their exact tree to the
+          // reviewed commit, with stable metadata so a crash recreates the same candidate.
+          const candidate = yield* git(
+            worktreePath,
+            [
+              "commit-tree",
+              candidateTree,
+              "-p",
+              input.rework.reviewedCommitSha,
+              "-m",
+              `T3Auto review repair ${input.rework.requestId} attempt ${active.attempt}`,
+            ],
+            {
+              GIT_AUTHOR_NAME: "T3Auto",
+              GIT_AUTHOR_EMAIL: "t3auto@localhost",
+              GIT_COMMITTER_NAME: "T3Auto",
+              GIT_COMMITTER_EMAIL: "t3auto@localhost",
+              GIT_AUTHOR_DATE: active.createdAt,
+              GIT_COMMITTER_DATE: active.createdAt,
+            },
+          );
           yield* git(projectCwd, [
             "merge-base",
             "--is-ancestor",
             input.rework.reviewedCommitSha,
-            candidate,
+            head,
           ]);
           yield* input.authorize;
           yield* git(projectCwd, ["update-ref", branchRef, candidate, head]);
           yield* git(worktreePath, ["reset", "--hard", candidate]);
-          const [candidateTree, reviewedTree] = yield* Effect.all([
-            git(worktreePath, ["rev-parse", `${candidate}^{tree}`]),
-            git(worktreePath, ["rev-parse", `${input.rework.reviewedCommitSha}^{tree}`]),
-          ]);
           if (candidateTree === reviewedTree) {
+            if (recovering)
+              return yield* epicError(
+                "review-rework-terminal",
+                "The retained checkpoint contains no repair changes.",
+              );
             const completedAt = DateTime.formatIso(yield* DateTime.now);
             const result = {
               status: "failed" as const,
@@ -433,13 +557,21 @@ const make = Effect.gen(function* () {
             };
             const json = canonicalJson(result);
             yield* input.authorize;
-            yield* sql`INSERT INTO main.agent_control_epic_review_repair_results(
-            request_id,attempt,result_json,result_digest,completed_at)
-            VALUES (${input.rework.requestId},${active.attempt},${json},${sha256Utf8(json)},${completedAt})
-            ON CONFLICT(request_id,attempt) DO NOTHING`;
+            if (recovering) {
+              yield* sql`INSERT INTO main.agent_control_epic_review_repair_recoveries(
+                request_id,attempt,original_result_digest,result_json,result_digest,completed_at)
+                VALUES (${input.rework.requestId},${active.attempt},${active.originalResultDigest},
+                  ${json},${sha256Utf8(json)},${completedAt})
+                ON CONFLICT(request_id,attempt) DO NOTHING`;
+            } else {
+              yield* sql`INSERT INTO main.agent_control_epic_review_repair_results(
+              request_id,attempt,result_json,result_digest,completed_at)
+              VALUES (${input.rework.requestId},${active.attempt},${json},${sha256Utf8(json)},${completedAt})
+              ON CONFLICT(request_id,attempt) DO NOTHING`;
+            }
             const nextAttempts = attempts.map((attempt) =>
               attempt.attempt === active.attempt
-                ? { ...attempt, status: "succeeded" as const, completedAt }
+                ? { ...attempt, status: "succeeded" as const, completedAt, error: null }
                 : attempt,
             );
             return { kind: "candidate" as const, attempts: nextAttempts, commitSha: candidate };
@@ -620,7 +752,11 @@ const make = Effect.gen(function* () {
     ),
   );
 
-  return AgentControlEpicReviewRepair.of({ progress, cancel });
+  return AgentControlEpicReviewRepair.of({
+    progress,
+    recover: (input) => progress(input, true),
+    cancel,
+  });
 });
 
 export const EpicReviewRepairLive = Layer.effect(AgentControlEpicReviewRepair, make);

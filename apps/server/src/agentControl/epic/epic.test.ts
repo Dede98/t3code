@@ -512,6 +512,7 @@ const fixture = Effect.fn("epicServiceFixture")(function* () {
           reviewRepairCalls.push(input);
           return reviewProgress(input);
         },
+        recover: (input) => reviewProgress(input),
         cancel: () => Effect.void,
       }),
       Effect.provideService(AgentControlEpicResultHooks, {
@@ -1078,6 +1079,87 @@ const reviewRequest = (
 });
 
 describe("Epic review rework", () => {
+  it.effect(
+    "resumes a recovered checkpoint into verification and retains the blocked history",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* runMigrations({ toMigrationInclusive: 95 });
+        const original = succeededReviewState();
+        f.setMode("armed");
+        yield* seedRun(f.sql, original);
+        f.setReviewProgress((input) =>
+          input.authorize.pipe(
+            Effect.as({
+              kind: "blocked" as const,
+              attempts: [
+                {
+                  ...reviewAttempt(),
+                  status: "failed" as const,
+                  error: { code: "review-repair-turn-failed", message: "Checkpoint pending" },
+                },
+              ],
+              code: "review-repair-budget-exhausted",
+              message: "Repair budget exhausted",
+            }),
+          ),
+        );
+        const service = yield* f.make();
+        yield* service.requestReviewRework(reviewRequest(original));
+        yield* service.processProject(projectId);
+        const blocked = (yield* service.get(projectId))!;
+        assert.equal(blocked.status, "blocked");
+        f.setMode("observe");
+        let recovered = 0;
+        f.setReviewProgress((input) =>
+          Effect.gen(function* () {
+            yield* input.authorize;
+            recovered++;
+            return {
+              kind: "candidate" as const,
+              attempts: [reviewAttempt("succeeded")],
+              commitSha: repairedCommitSha,
+            };
+          }),
+        );
+        f.setReviewVerification((input) =>
+          input.authorize.pipe(
+            Effect.as({
+              status: "passed" as const,
+              commitSha: input.commitSha,
+              evidenceId: "recovered-checkpoint-proof",
+              detail: "Fresh required checks passed",
+              checks: [],
+            }),
+          ),
+        );
+        const command = {
+          projectId,
+          epicRunId: blocked.epicRunId,
+          expectedRevision: blocked.revision,
+          commandId: CommandId.make("resume-checkpoint"),
+        };
+        const resumed = yield* service.resume(command);
+        assert.equal(resumed.status, "verifying");
+        assert.equal(resumed.activeReviewReworkId, blocked.reviewReworks?.[0]?.requestId);
+        assert.equal(resumed.acceptedCommitSha, reviewedCommitSha);
+        assert.deepEqual(resumed.blockerHistory, blocked.blockerHistory);
+        assert.deepEqual(yield* service.resume(command), resumed);
+        assert.equal(recovered, 1);
+        const restarted = yield* f.make();
+        yield* restarted.processProject(projectId);
+        const completed = (yield* restarted.get(projectId))!;
+        assert.equal(completed.status, "succeeded");
+        assert.equal(completed.acceptedCommitSha, repairedCommitSha);
+        assert.equal(completed.handoff?.status, "update-required");
+        assert.lengthOf(f.reviewVerificationCalls, 1);
+        assert.lengthOf(f.reviewRepairCalls, 1);
+        const history = yield* f.sql<{ stateJson: string }>`SELECT state_json AS "stateJson"
+        FROM agent_control_epic_history WHERE epic_run_id=${blocked.epicRunId} AND revision=${blocked.revision}`;
+        assert.deepEqual(decodeEpicState(history[0]!.stateJson), blocked);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+  );
+
   for (const status of ["failed", "blocked", "publishing"] as const)
     it.effect(`rejects feedback for an unconfirmed ${status} handoff without a saved PR`, () =>
       Effect.gen(function* () {

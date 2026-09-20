@@ -473,11 +473,50 @@ export const makeAgentControlEpic = Effect.gen(function* () {
               "epic-terminal",
               "A completed or stopped Epic run cannot be resumed.",
             );
-          if (kind === "resume" && current.reviewReworks?.at(-1)?.status === "blocked")
-            return yield* epicError(
-              "review-rework-terminal",
-              "A failed review repair remains blocked with its evidence retained; end this Epic instead of resuming its completed tasks.",
-            );
+          const blockedReview = kind === "resume" ? current.reviewReworks?.at(-1) : undefined;
+          const recoveredReview = yield* Effect.gen(function* () {
+            if (blockedReview?.status !== "blocked") return null;
+            if (
+              current.status !== "blocked" ||
+              current.activeReviewReworkId ||
+              blockedReview.blocker?.code !== "review-repair-budget-exhausted" ||
+              current.acceptedCommitSha !== blockedReview.previousAcceptedCommitSha ||
+              current.finalVerification?.evidenceId !==
+                blockedReview.previousVerificationEvidenceId ||
+              !reviewRepair.recover
+            )
+              return yield* epicError(
+                "review-rework-terminal",
+                "This review failure cannot be resumed from checkpoint evidence.",
+              );
+            const mode = yield* engine.getProjectState({ projectId: input.projectId });
+            const authorize = Effect.gen(function* () {
+              const selected = yield* loadProjectEpic(sql, input.projectId, input.epicRunId);
+              const project = yield* engine.getProjectState({ projectId: input.projectId });
+              if (
+                !selected ||
+                selected.revision !== current.revision ||
+                selected.status !== "blocked" ||
+                project.revision !== mode.revision ||
+                project.pausedFromMode !== null
+              )
+                return yield* epicError(
+                  "authority-conflict",
+                  "Review checkpoint recovery lost its revision or project authority.",
+                );
+            }).pipe(Effect.mapError(mapError));
+            const progress = yield* reviewRepair.recover({
+              state: current,
+              rework: blockedReview,
+              authorize,
+            });
+            if (progress.kind !== "candidate")
+              return yield* epicError(
+                "review-rework-terminal",
+                "No completed review checkpoint is available for recovery.",
+              );
+            return { rework: blockedReview, progress, authorize };
+          });
           if (kind === "clear" && (yield* loadEnabledEpicQueue(sql, input.projectId)))
             return yield* epicError(
               "queue-entry-retained",
@@ -525,64 +564,84 @@ export const makeAgentControlEpic = Effect.gen(function* () {
           const controlAt = DateTime.formatIso(yield* DateTime.now);
           const updated = yield* sql.withTransaction(
             Effect.gen(function* () {
+              if (recoveredReview) yield* recoveredReview.authorize;
               const updated = yield* saveEpicRun(
                 sql,
                 current,
-                kind === "stop"
-                  ? queued && !current.projectDependencyPlan && !current.activeReviewReworkId
-                    ? {}
-                    : {
-                        status: "stopped",
-                        activeReviewReworkId: null,
-                        ...(current.reviewReworks
+                recoveredReview
+                  ? {
+                      status: "verifying",
+                      blockers: [],
+                      activeReviewReworkId: recoveredReview.rework.requestId,
+                      reviewReworks: (current.reviewReworks ?? []).map((rework) =>
+                        rework.requestId === recoveredReview.rework.requestId
                           ? {
-                              reviewReworks: current.reviewReworks.map((rework) =>
-                                rework.requestId === current.activeReviewReworkId &&
-                                (rework.status === "accepted" ||
-                                  rework.status === "repairing" ||
-                                  rework.status === "verifying")
-                                  ? {
-                                      ...rework,
-                                      status: "stopped" as const,
-                                      completedAt: controlAt,
-                                      updatedAt: controlAt,
-                                    }
-                                  : rework,
-                              ),
+                              ...rework,
+                              status: "verifying" as const,
+                              repairAttempts: recoveredReview.progress.attempts,
+                              candidateCommitSha: recoveredReview.progress.commitSha,
+                              blocker: null,
+                              completedAt: null,
+                              updatedAt: controlAt,
+                            }
+                          : rework,
+                      ),
+                    }
+                  : kind === "stop"
+                    ? queued && !current.projectDependencyPlan && !current.activeReviewReworkId
+                      ? {}
+                      : {
+                          status: "stopped",
+                          activeReviewReworkId: null,
+                          ...(current.reviewReworks
+                            ? {
+                                reviewReworks: current.reviewReworks.map((rework) =>
+                                  rework.requestId === current.activeReviewReworkId &&
+                                  (rework.status === "accepted" ||
+                                    rework.status === "repairing" ||
+                                    rework.status === "verifying")
+                                    ? {
+                                        ...rework,
+                                        status: "stopped" as const,
+                                        completedAt: controlAt,
+                                        updatedAt: controlAt,
+                                      }
+                                    : rework,
+                                ),
+                              }
+                            : {}),
+                        }
+                    : {
+                        status: "running",
+                        blockers: [],
+                        ...(current.dependencyPlan
+                          ? {
+                              members: current.members.map((member) => {
+                                if (member.status !== "failed" || !member.captured) return member;
+                                const {
+                                  blocker: _blocker,
+                                  waitReason: _waitReason,
+                                  ...retained
+                                } = member;
+                                return {
+                                  ...retained,
+                                  status: "running" as const,
+                                  waitReason: "integration" as const,
+                                };
+                              }),
                             }
                           : {}),
-                      }
-                  : {
-                      status: "running",
-                      blockers: [],
-                      ...(current.dependencyPlan
-                        ? {
-                            members: current.members.map((member) => {
-                              if (member.status !== "failed" || !member.captured) return member;
-                              const {
-                                blocker: _blocker,
-                                waitReason: _waitReason,
-                                ...retained
-                              } = member;
-                              return {
-                                ...retained,
-                                status: "running" as const,
-                                waitReason: "integration" as const,
-                              };
-                            }),
-                          }
-                        : {}),
-                      verificationAttempt:
-                        current.dependencyPlan !== undefined ||
-                        current.finalVerification !== null ||
-                        (current.acceptedCommitSha !== null &&
-                          current.members.every(
-                            (member) =>
-                              member.status === "accepted" || member.status === "external-closed",
-                          ))
-                          ? current.verificationAttempt + 1
-                          : current.verificationAttempt,
-                    },
+                        verificationAttempt:
+                          current.dependencyPlan !== undefined ||
+                          current.finalVerification !== null ||
+                          (current.acceptedCommitSha !== null &&
+                            current.members.every(
+                              (member) =>
+                                member.status === "accepted" || member.status === "external-closed",
+                            ))
+                            ? current.verificationAttempt + 1
+                            : current.verificationAttempt,
+                      },
               );
               yield* recordCommand(kind, input, current.epicRunId);
               if (

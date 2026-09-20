@@ -1603,6 +1603,45 @@ describe("Epic review repair requests", () => {
     ).toBeNull();
   });
 
+  it("allows an explicit checkpoint recovery attempt but keeps other failed reviews terminal", () => {
+    const failedReview = {
+      ...activeRework,
+      status: "blocked" as const,
+      blocker: { code: "review-repair-budget-exhausted", issueNumber: null, message: "Blocked" },
+      repairAttempts: activeRework.repairAttempts.map((attempt) => ({
+        ...attempt,
+        status: "failed" as const,
+        error: { code: "review-repair-turn-failed", message: "Checkpoint pending" },
+      })),
+    };
+    const readiness = {
+      ...start,
+      snapshot: {
+        ...snapshot,
+        epic: {
+          ...verifiedEpic,
+          status: "blocked" as const,
+          reviewReworks: [failedReview],
+        },
+        armed: { enabled: false },
+      },
+    };
+    expect(agentControlEpicControlAllowed(readiness, "resume")).toBe(true);
+    for (const code of ["review-verification-failed", "review-repair-delivery-ambiguous"]) {
+      const blocked = {
+        ...readiness,
+        snapshot: {
+          ...readiness.snapshot,
+          epic: {
+            ...readiness.snapshot.epic,
+            reviewReworks: [{ ...failedReview, blocker: { ...failedReview.blocker, code } }],
+          },
+        },
+      };
+      expect(agentControlEpicControlAllowed(blocked, "resume")).toBe(false);
+    }
+  });
+
   it("binds a normalized request to exact reviewed evidence with stable semantic idempotency", () => {
     const input = agentControlEpicReviewReworkInput(verifiedEpic, [
       {
