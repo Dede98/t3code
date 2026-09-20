@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  AgentControlTaskId,
   AgentControlWorktreeRpcError,
   AgentControlEpicRpcError,
   CommandId,
@@ -35,6 +36,8 @@ import { AgentControlTaskIntakeReactor } from "../../task/Services/AgentControlT
 import { makeEpicQueue, mapEpicQueueError } from "../../epic/queue.ts";
 import { AgentControlEpicProgress } from "../../epic/Services/AgentControlEpicProgress.ts";
 import { loadEpicQueue, saveEpicQueue } from "../../epic/queueAuthority.ts";
+import { bindEpicChildRun, loadSelectedEpic, saveEpicRun } from "../../epic/authority.ts";
+import { createEpicRun, insertEpicRun } from "../../epic/runState.ts";
 import { canonicalJson } from "../../initialPlanning/eventEvidence.ts";
 import { makeReactorStartupActivation } from "../../../reactorStartupActivation.ts";
 import { AgentControlRunOnceError } from "../../runOnce/model.ts";
@@ -264,11 +267,7 @@ const seedSourceAndCandidate = Effect.fn("seedArmedSchedulerSource")(function* (
   return githubSequence;
 });
 
-const makeNoEligibleRunOnceHandler = (
-  sql: SqlClient.SqlClient,
-  engine: AgentControlEngine["Service"],
-  id: ProjectId,
-) =>
+const seedArmedRunOnce = (sql: SqlClient.SqlClient, id: ProjectId) =>
   Effect.gen(function* () {
     const rows = yield* sql<ActivatedDispatchRow>`
       SELECT event.event_id AS "eventId", event.sequence,
@@ -385,6 +384,16 @@ const makeNoEligibleRunOnceHandler = (
         recordedAt: activationEvent.occurredAt,
       });
     yield* commit(1, "activation-admitted", {}, state("active", {}));
+    return { runId, activationEvent, taskId, state, commit };
+  });
+
+const makeNoEligibleRunOnceHandler = (
+  sql: SqlClient.SqlClient,
+  engine: AgentControlEngine["Service"],
+  id: ProjectId,
+) =>
+  Effect.gen(function* () {
+    const { runId, activationEvent, taskId, state, commit } = yield* seedArmedRunOnce(sql, id);
     // This scheduler-level test intentionally delegates Run-Once internals.
     // Make the dispatch-selected task non-candidate before the Run-Once
     // selection point, then complete the real no-eligible E/R/M reset path
@@ -605,6 +614,190 @@ it.effect("interrupts active workers when the scheduler scope closes", () =>
   }),
 );
 
+it.effect(
+  "re-arms an owned Epic child without dispatching it again, then advances after settlement",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const engine = yield* AgentControlEngine;
+      const id = ProjectId.make("armed-epic-outstanding-child");
+      yield* resetRunOnce(id);
+      yield* addProject(sql, id);
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make(`${id}-observe`),
+        projectId: id,
+        expectedRevision: 0,
+        mode: "observe",
+      });
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make(`${id}-arm`),
+        projectId: id,
+        expectedRevision: 1,
+        mode: "armed",
+      });
+      yield* seedSourceAndCandidate(sql, id, true, 2);
+      const issue = (number: number) => ({
+        repositoryNodeId: "armed-scheduler-repo",
+        nameWithOwner: "owner/repo",
+        issueNodeId: `${id}-issue${number === 1 ? "" : `-${number}`}`,
+        number,
+        url: `https://github.com/owner/repo/issues/${number}`,
+        title: `Issue ${number}`,
+        state: "open" as const,
+        subIssueCount: 0,
+      });
+      const created = yield* createEpicRun({
+        projectId: id,
+        commandId: `${id}-epic`,
+        checks: [],
+        source: {
+          format: "github-native-sub-issues-v1",
+          repository: { repositoryNodeId: "armed-scheduler-repo", nameWithOwner: "owner/repo" },
+          epic: { ...issue(33), subIssueCount: 2 },
+          tasks: [1, 2].map((number, position) => ({
+            issue: issue(number),
+            position,
+            dependencies: [],
+          })),
+          blockers: [],
+          fingerprint: "source",
+          inspectedAt: at,
+        },
+      });
+      yield* insertEpicRun(sql, created);
+      yield* saveEpicRun(sql, created, {
+        activeTaskId: AgentControlTaskId.make(`${id}-task`),
+        members: created.members.map((member, index) => ({
+          ...member,
+          taskId: AgentControlTaskId.make(`${id}-task${index === 0 ? "" : "-2"}`),
+          status: index === 0 ? "running" : "pending",
+        })),
+      });
+      const scheduler = yield* make();
+      yield* scheduler.processProject(id);
+      const run = yield* seedArmedRunOnce(sql, id);
+      yield* run.commit(
+        2,
+        "task-selected",
+        { taskId: run.taskId },
+        run.state("active", { taskId: run.taskId }),
+      );
+      yield* bindEpicChildRun(sql, id, AgentControlTaskId.make(run.taskId), run.runId);
+      const active = yield* engine.getProjectState({ projectId: id });
+      const stopCommand = CommandId.make(`${id}-stop`);
+      yield* engine.dispatchHuman({
+        commandId: stopCommand,
+        projectId: id,
+        expectedRevision: active.revision,
+        mode: "observe",
+      });
+      const stop = (yield* sql<{
+        eventId: string;
+        sequence: number;
+        streamVersion: number;
+        occurredAt: string;
+      }>`SELECT event_id AS "eventId", sequence, stream_version AS "streamVersion", occurred_at AS "occurredAt" FROM agent_control_events WHERE command_id=${stopCommand}`)[0]!;
+      const stopEvent = {
+        ...run.activationEvent,
+        eventId: EventId.make(stop.eventId),
+        sequence: stop.sequence,
+        streamVersion: stop.streamVersion,
+        occurredAt: stop.occurredAt,
+        commandId: stopCommand,
+        correlationId: stopCommand,
+        authority: "human" as const,
+        payload: {
+          projectId: id,
+          previousMode: "run-once" as const,
+          mode: "observe" as const,
+          previousPausedFromMode: null,
+          pausedFromMode: null,
+          changedAt: stop.occurredAt,
+        },
+      };
+      const authority = yield* loadRunOnceModeAuthority(sql, id, stopEvent);
+      yield* run.commit(
+        3,
+        "mode-reset-superseded",
+        {
+          taskId: run.taskId,
+          modeEventId: stopEvent.eventId,
+          modeEventSequence: stop.sequence,
+          modeEventStreamVersion: stop.streamVersion,
+          modeExpectedRevision: authority.expectedRevision,
+          modeCommandFingerprint: authority.commandFingerprint,
+          modeEventPayloadBytes: authority.eventPayloadBytes,
+          modeEventMetadataBytes: authority.eventMetadataBytes,
+        },
+        run.state("active", { taskId: run.taskId, resetProjectRevision: stop.streamVersion }),
+      );
+      yield* run.commit(
+        4,
+        "completed",
+        { taskId: run.taskId },
+        run.state("completed", { taskId: run.taskId, resetProjectRevision: stop.streamVersion }),
+      );
+      yield* scheduler.processProject(id);
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make(`${id}-rearm`),
+        projectId: id,
+        expectedRevision: stop.streamVersion,
+        mode: "armed",
+      });
+      for (let restart = 0; restart < 2; restart++) {
+        const recovered = yield* make();
+        yield* recovered.processProject(id);
+        assert.equal((yield* engine.getProjectState({ projectId: id })).mode, "armed");
+      }
+      assert.equal(yield* getRunOnceCalls(id), 1);
+      assert.deepEqual(
+        yield* sql`SELECT count(*) AS count FROM agent_control_armed_dispatch_evidence WHERE project_id=${id}`,
+        [{ count: 1 }],
+      );
+      const retained = (yield* loadSelectedEpic(sql, id))!;
+      assert.equal(retained.members[0]!.childRunId, run.runId);
+      // Epic progress owns result acceptance; simulate its persisted transition
+      // to the next member after the outstanding child has settled.
+      const advanced = yield* saveEpicRun(sql, retained, {
+        activeTaskId: AgentControlTaskId.make(`${id}-task-2`),
+        members: retained.members.map((member, index) => ({
+          ...member,
+          status: index === 0 ? "accepted" : "running",
+        })),
+      });
+      yield* scheduler.processProject(id);
+      assert.equal(yield* getRunOnceCalls(id), 2);
+      assert.deepEqual(
+        yield* sql`SELECT selected_task_id AS task FROM agent_control_armed_dispatch_evidence WHERE project_id=${id} ORDER BY rowid`,
+        [{ task: `${id}-task` }, { task: `${id}-task-2` }],
+      );
+      // A forged/mismatched child binding must fail instead of hiding corruption.
+      yield* saveEpicRun(sql, advanced, {
+        members: advanced.members.map((member, index) =>
+          index === 1 ? { ...member, childRunId: run.runId } : member,
+        ),
+      });
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make(`${id}-stop-second`),
+        projectId: id,
+        expectedRevision: (yield* engine.getProjectState({ projectId: id })).revision,
+        mode: "observe",
+      });
+      yield* scheduler.processProject(id);
+      yield* engine.dispatchHuman({
+        commandId: CommandId.make(`${id}-rearm-second`),
+        projectId: id,
+        expectedRevision: (yield* engine.getProjectState({ projectId: id })).revision,
+        mode: "armed",
+      });
+      const invalid = yield* Effect.exit(scheduler.processProject(id));
+      assert.isTrue(Exit.isFailure(invalid));
+      assert.equal(yield* getRunOnceCalls(id), 2);
+    }).pipe(
+      Effect.provideService(AgentControlEpicProgress, { processProject: () => Effect.void }),
+      Effect.provide(dependencies),
+    ),
+);
 layer("AgentControlArmedScheduler", (it) => {
   it.effect("releases the shared fence after activation and honors immediate Human takeover", () =>
     Effect.gen(function* () {

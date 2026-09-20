@@ -23,8 +23,10 @@ import {
 } from "../initialPlanning/eventEvidence.ts";
 import {
   isAgentControlRunOnceCandidateVacant,
+  isEpicChildRunOnceOwned,
   selectAgentControlRunOnceCandidate,
 } from "../runOnce/selection.ts";
+import { loadProjectEpics } from "../epic/authority.ts";
 import { fingerprintAgentControlRunOnceSource } from "../runOnce/source.ts";
 import {
   deriveArmedClaimId,
@@ -60,6 +62,7 @@ interface AuthoritySnapshot {
 
 export type ArmedClaimOutcome =
   | { readonly _tag: "inactive" }
+  | { readonly _tag: "settling" }
   | { readonly _tag: "busy"; readonly retryAt: string }
   | { readonly _tag: "no-candidate"; readonly replayed: boolean }
   | {
@@ -770,6 +773,10 @@ export const claimArmedDispatch = Effect.fn("claimArmedDispatch")(function* (
         }
         const snapshot = yield* readSnapshot(sql, input.projectId);
         if (snapshot === null) return { _tag: "inactive" as const };
+        const epics = yield* loadProjectEpics(sql, input.projectId);
+        if (epics.length === 1 && (yield* isEpicChildRunOnceOwned(sql, epics[0]!))) {
+          return { _tag: "settling" as const };
+        }
         const selectedTaskId = yield* selectAgentControlRunOnceCandidate(
           sql,
           input.projectId,

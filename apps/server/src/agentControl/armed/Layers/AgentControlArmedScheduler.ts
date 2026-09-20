@@ -439,7 +439,12 @@ export const make = Effect.fn("AgentControlArmedScheduler.make")(function* (
             claimedAt,
             expiresAt,
           });
-          if (claimed._tag === "inactive" || claimed._tag === "no-candidate") return null;
+          if (
+            claimed._tag === "inactive" ||
+            claimed._tag === "no-candidate" ||
+            claimed._tag === "settling"
+          )
+            return null;
           if (claimed._tag === "busy") {
             return yield* fail(projectId, "persistence", undefined, claimed.retryAt);
           }

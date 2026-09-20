@@ -1,10 +1,14 @@
 import { loadEnabledEpicQueue } from "../epic/queueAuthority.ts";
-import { AgentControlTaskId, type ProjectId } from "@t3tools/contracts";
+import {
+  AgentControlTaskId,
+  type AgentControlEpicRuntimeView,
+  type ProjectId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { loadProjectEpics } from "../epic/authority.ts";
+import { epicError, loadProjectEpics } from "../epic/authority.ts";
 
 export const AGENT_CONTROL_RUN_ONCE_CANDIDATE_SQL = `SELECT candidate.task_id AS "taskId"
 FROM main.agent_control_task_states AS candidate
@@ -20,6 +24,63 @@ LIMIT 1`;
 const CandidateRow = Schema.Struct({ taskId: AgentControlTaskId });
 const decodeRows = Schema.decodeUnknownEffect(Schema.Array(CandidateRow));
 
+export const isEpicChildRunOnceOwned = Effect.fn("isEpicChildRunOnceOwned")(function* (
+  sql: SqlClient.SqlClient,
+  epic: AgentControlEpicRuntimeView,
+) {
+  if (epic.dependencyPlan || epic.status !== "running" || epic.activeTaskId === null) return false;
+  const members = epic.members.filter((member) => member.taskId === epic.activeTaskId);
+  const member = members[0];
+  if (members.length !== 1 || member?.status !== "running")
+    return yield* epicError("authority-conflict", "The active Epic child is ambiguous.");
+  if (member.childRunId !== null) {
+    // Observe can finish the Run Once controller while its admitted turn
+    // still settles. Re-arming must wait for Epic progress to accept that
+    // child's result, rather than admit its unchanged intake task again.
+    const owned = yield* sql`
+    SELECT run.run_id
+    FROM main.agent_control_run_once_states run
+    JOIN main.agent_control_run_once_activations activation
+      ON activation.run_id=run.run_id AND activation.project_id=run.project_id
+    JOIN main.agent_control_run_once_step_evidence selected
+      ON selected.run_id=run.run_id AND selected.project_id=run.project_id
+        AND selected.step='task-selected' AND selected.task_id=run.task_id
+    JOIN main.agent_control_run_once_step_receipts selected_receipt
+      ON selected_receipt.evidence_id=selected.evidence_id
+        AND selected_receipt.receipt_id=selected.receipt_id
+        AND selected_receipt.status='accepted'
+    JOIN main.agent_control_run_once_step_markers selected_marker
+      ON selected_marker.evidence_id=selected.evidence_id
+        AND selected_marker.receipt_id=selected_receipt.receipt_id
+        AND selected_marker.marker_id=selected.marker_id
+    JOIN main.agent_control_run_once_step_evidence latest
+      ON latest.run_id=run.run_id AND latest.project_id=run.project_id
+        AND latest.ordinal=run.next_ordinal-1 AND latest.step=run.last_step
+        AND latest.task_id=run.task_id
+        AND latest.stage_run_id IS run.stage_run_id
+        AND latest.lease_id IS run.lease_id
+        AND latest.worktree_reservation_id IS run.worktree_reservation_id
+        AND latest.controlled_thread_reservation_id IS run.controlled_thread_reservation_id
+        AND latest.terminal_task_event_id IS run.terminal_task_event_id
+    JOIN main.agent_control_run_once_step_receipts receipt
+      ON receipt.evidence_id=latest.evidence_id AND receipt.receipt_id=latest.receipt_id
+        AND receipt.status='accepted'
+    JOIN main.agent_control_run_once_step_markers marker
+      ON marker.evidence_id=latest.evidence_id AND marker.receipt_id=receipt.receipt_id
+        AND marker.marker_id=latest.marker_id
+    WHERE run.run_id=${member.childRunId} AND run.project_id=${epic.projectId}
+      AND run.task_id=${epic.activeTaskId} AND run.status IN ('active','completed')
+    `;
+    if (owned.length !== 1)
+      return yield* epicError(
+        "authority-conflict",
+        "The active Epic child has no matching Run Once authority.",
+      );
+    return true;
+  }
+  return false;
+});
+
 export const selectAgentControlRunOnceCandidate = Effect.fn("selectAgentControlRunOnceCandidate")(
   function* (sql: SqlClient.SqlClient, projectId: ProjectId, githubIntakeSequence: number) {
     const epics = yield* loadProjectEpics(sql, projectId);
@@ -27,6 +88,7 @@ export const selectAgentControlRunOnceCandidate = Effect.fn("selectAgentControlR
     const epic = epics[0];
     if (epic !== undefined) {
       if (epic.status !== "running" || epic.activeTaskId === null) return null;
+      if (yield* isEpicChildRunOnceOwned(sql, epic)) return null;
       const rows = yield* sql<
         Record<string, unknown>
       >`SELECT task_id AS "taskId" FROM main.agent_control_task_states
