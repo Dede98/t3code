@@ -82,6 +82,46 @@ const run = Effect.fn("makeProjectPlanRun")(function* (entry: AgentControlEpicQu
 });
 
 describe("reviewed project dependency plan", () => {
+  it.effect("retains a merged serial Epic when approving subsequent parallel work", () =>
+    Effect.gen(function* () {
+      const { dependencyPlan: _previousPlan, ...serial } = entries[0]!;
+      const merged = { ...serial, status: "merged" as const, epicRunId: "merged-serial-run" };
+      yield* validateProjectDependencyPlan([merged, entries[1]!], plan, 2);
+      for (const status of ["pending", "active", "stopped"] as const) {
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              validateProjectDependencyPlan([{ ...merged, status }, entries[1]!], plan, 2),
+            ),
+          ),
+        );
+      }
+      const native = {
+        ...merged,
+        source: {
+          ...merged.source,
+          tasks: merged.source.tasks.map((task) =>
+            task.issue.number === 2 ? { ...task, dependencies: [issue(1)] } : task,
+          ),
+        },
+      };
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(validateProjectDependencyPlan([native, entries[1]!], plan, 2)),
+        ),
+      );
+      yield* validateProjectDependencyPlan(
+        [native, entries[1]!],
+        {
+          ...plan,
+          tasks: plan.tasks.map((task) =>
+            task.issueNodeId === "2" ? { ...task, dependsOn: ["1"] } : task,
+          ),
+        },
+        2,
+      );
+    }),
+  );
   it.effect(
     "preserves serial opt-in and requires complete reviewed scopes for parallel Epics",
     () =>

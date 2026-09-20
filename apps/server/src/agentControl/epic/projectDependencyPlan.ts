@@ -87,23 +87,26 @@ export const validateProjectDependencyPlan = Effect.fn("validateProjectDependenc
   const expand = (id: string) =>
     epics.get(id)?.source.tasks.map((task) => task.issue.issueNodeId) ?? [id];
   for (const entry of entries) {
-    if (!entry.dependencyPlan)
+    // A merged serial Epic is retained prerequisite evidence, not new work to
+    // parallelize. The complete project plan still covers its scope and native edges.
+    if (!entry.dependencyPlan && entry.status !== "merged")
       return yield* reject(
         "Each Epic needs a reviewed task plan before project parallelism is approved.",
       );
-    yield* validateEpicDependencyPlan(
-      entry.source,
-      entry.dependencyPlan,
-      entry.parallelism,
-      allIds,
-    );
+    if (entry.dependencyPlan)
+      yield* validateEpicDependencyPlan(
+        entry.source,
+        entry.dependencyPlan,
+        entry.parallelism,
+        allIds,
+      );
     for (const task of entry.source.tasks) {
       const dependencies = nodes.get(task.issue.issueNodeId)!;
-      const local = entry.dependencyPlan.tasks.find(
+      const local = entry.dependencyPlan?.tasks.find(
         (node) => node.issueNodeId === task.issue.issueNodeId,
-      )!;
+      );
       if (
-        local.dependsOn.flatMap(expand).some((id) => !dependencies.includes(id)) ||
+        (local?.dependsOn ?? []).flatMap(expand).some((id) => !dependencies.includes(id)) ||
         task.dependencies
           .flatMap((dependency) => expand(dependency.issueNodeId))
           .some((id) => !dependencies.includes(id))
