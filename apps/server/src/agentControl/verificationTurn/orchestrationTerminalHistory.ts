@@ -21,6 +21,7 @@ import {
   type OrchestrationEventRawHistoryError,
 } from "../../orchestration/orchestrationEventRaw.ts";
 import type { AgentControlVerificationClaim } from "./model.ts";
+import { ORPHANED_PROVIDER_SESSION_ERROR } from "../../orchestration/providerSessionRecovery.ts";
 import type { AgentControlVerificationTurnAcceptance } from "./Services/AgentControlVerificationHandoffStore.ts";
 import { isStructuredAgentControlVerificationPromptVersion } from "./prompt.ts";
 import {
@@ -144,6 +145,68 @@ const terminalSessionStatus = (source: VerificationTerminalSource): "ready" | "e
     : "ready";
 
 const uuidV4Pattern = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+const legacyStartupCommandPattern = new RegExp(`^${uuidV4Pattern}$`, "u");
+
+const isLegacyStartupSessionReset = Effect.fn("isLegacyStartupSessionReset")(function* (
+  sql: SqlClient.SqlClient,
+  entry: StoredSessionEvent,
+  previous: StoredSessionEvent | undefined,
+  started: StoredSessionEvent,
+) {
+  const { event } = entry;
+  const commandId = event.commandId;
+  if (
+    entry.actorKind !== "client" ||
+    commandId === null ||
+    !legacyStartupCommandPattern.test(commandId) ||
+    event.causationEventId !== null ||
+    event.correlationId !== commandId ||
+    canonicalJson(event.metadata as JsonValue) !== "{}" ||
+    entry.streamVersion >= started.streamVersion ||
+    previous === undefined ||
+    previous.event.payload.session.status !== "starting" ||
+    previous.event.payload.session.activeTurnId !== null
+  )
+    return false;
+
+  const { admissionWait: _admissionWait, ...previousSession } = previous.event.payload.session;
+  if (
+    canonicalJson(event.payload as JsonValue) !==
+    canonicalJson({
+      threadId: previous.event.payload.threadId,
+      session: {
+        ...previousSession,
+        status: "error",
+        activeTurnId: null,
+        lastError: ORPHANED_PROVIDER_SESSION_ERROR,
+        updatedAt: event.occurredAt,
+      },
+    } as JsonValue)
+  )
+    return false;
+
+  // Older startup code used a UUID without the server namespace. The independent
+  // command receipt proves this exact pre-invocation reset came from system dispatch;
+  // a matching message or client-looking event alone is never recovery authority.
+  const receipts = yield* sql<Record<string, unknown>>`
+    SELECT command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence,
+      authority, status, error
+    FROM orchestration_command_receipts WHERE command_id = ${commandId}
+  `;
+  const receipt = receipts[0];
+  return (
+    receipts.length === 1 &&
+    receipt !== undefined &&
+    receipt.command_id === commandId &&
+    receipt.aggregate_kind === "thread" &&
+    receipt.aggregate_id === event.aggregateId &&
+    receipt.accepted_at === event.occurredAt &&
+    receipt.result_sequence === event.sequence &&
+    receipt.authority === "system" &&
+    receipt.status === "accepted" &&
+    receipt.error === null
+  );
+});
 const providerRuntimeSessionCommandPattern = new RegExp(
   `^provider:.+:thread-session-set:${uuidV4Pattern}$`,
   "iu",
@@ -704,7 +767,7 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
 
   // Phase 3: session history and projection authority include every valid session event,
   // while the technical terminal remains anchored to provider lifecycle evidence.
-  for (const entry of allSessions) {
+  for (const [index, entry] of allSessions.entries()) {
     if (entry.streamVersion <= turnEntry.streamVersion) continue;
     const session = entry.event.payload.session;
     const commandId = entry.event.commandId;
@@ -729,7 +792,9 @@ const loadVerificationTerminalFromOrchestrationHistoryInTransaction = Effect.fn(
       entry.event.causationEventId !== null ||
       entry.event.correlationId !== commandId
     ) {
-      return yield* error("runtime-session-envelope-lineage", "corrupt-history");
+      if (!(yield* isLegacyStartupSessionReset(sql, entry, allSessions[index - 1], started))) {
+        return yield* error("runtime-session-envelope-lineage", "corrupt-history");
+      }
     }
     if (entry.streamVersion <= started.streamVersion) continue;
     if (

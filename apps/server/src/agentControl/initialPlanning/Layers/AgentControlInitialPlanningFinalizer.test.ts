@@ -98,6 +98,8 @@ import {
 } from "../../../persistence/Migrations/060_AgentControlVerificationEvaluation.ts";
 import { makeMigration061 } from "../../../persistence/Migrations/061_AgentControlVerificationStageFinalization.ts";
 import { makeReactorStartupAttempt } from "../../../reactorStartupActivation.ts";
+import { reconcileProviderSessions } from "../../../serverRuntimeStartup.ts";
+import { ORPHANED_PROVIDER_SESSION_ERROR } from "../../../orchestration/providerSessionRecovery.ts";
 import { ServerConfig } from "../../../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../../../persistence/Layers/OrchestrationEventStore.ts";
@@ -20342,6 +20344,251 @@ it.effect(
           assert.equal(restored._tag, "Ready");
           if (ready._tag === "Ready" && restored._tag === "Ready") {
             assert.deepStrictEqual(restored.observation, ready.observation);
+          }
+        }),
+      ),
+    ),
+);
+
+it.effect.each(["current", "legacy"] as const)(
+  "Verification accepts a $0 startup reset before native invocation with system authority",
+  (version) =>
+    withNode(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* prepareVerificationTurnDelivery(
+            `verification-startup-reset-${version}`,
+          );
+          const executorCalls = yield* Ref.make(0);
+          const consumer = yield* buildVerificationTurnConsumer({
+            sql: prepared.database.sqlA,
+            scope: prepared.database.scopeA,
+            coordinator: prepared.coordinator,
+            executorCalls,
+          });
+          yield* consumer.processHandoff(prepared.handoffId);
+          const claim = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadAcceptedByHandoffId(prepared.handoffId),
+          );
+          const acceptance = Option.getOrThrow(
+            yield* prepared.coordinator.handoffStore.loadTurnAcceptance(prepared.handoffId),
+          );
+          const threadId = claim.evidence.threadId;
+          const baseSession = {
+            threadId,
+            providerName: "codex" as const,
+            providerInstanceId: claim.evidence.providerInstanceId,
+            runtimeMode: claim.evidence.runtimeMode,
+            lastError: null,
+          };
+          const beforeRestart = claim.delivery.providerAcceptedAt!;
+          yield* prepared.coordinator.orchestration.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("server:before-startup-reset"),
+            threadId,
+            session: {
+              ...baseSession,
+              status: "starting",
+              activeTurnId: null,
+              admissionWait: { reason: "cpu-pressure" },
+              updatedAt: beforeRestart,
+            },
+            createdAt: beforeRestart,
+          });
+          let resetCommandId: CommandId | undefined;
+          yield* reconcileProviderSessions.pipe(
+            Effect.provideService(ProjectionSnapshotQuery, prepared.coordinator.snapshots),
+            Effect.provideService(OrchestrationEngineService, {
+              ...prepared.coordinator.orchestration,
+              dispatch: (command) => {
+                if (command.type === "thread.session.set" && command.threadId === threadId) {
+                  assert.match(command.commandId, /^server:startup-session-reconcile:/);
+                  resetCommandId =
+                    version === "legacy"
+                      ? CommandId.make("11111111-1111-4111-8111-111111111111")
+                      : command.commandId;
+                  return prepared.coordinator.orchestration.dispatch({
+                    ...command,
+                    commandId: resetCommandId,
+                  });
+                }
+                return prepared.coordinator.orchestration.dispatch(command);
+              },
+            }),
+            Effect.provideService(ProviderSessionDirectory, {
+              getBinding: () => Effect.succeed(Option.none()),
+              listBindings: () => Effect.succeed([]),
+              upsert: () => Effect.die("unexpected binding mutation"),
+              recordImportedTranscript: () => Effect.die("unused"),
+              getProvider: () => Effect.die("unused"),
+              listThreadIds: () => Effect.die("unused"),
+            }),
+            Effect.provideService(ProviderService, {
+              listSessions: () => Effect.succeed([]),
+              startSession: () => Effect.die("unexpected provider invocation"),
+              sendTurn: () => Effect.die("unexpected provider invocation"),
+              compactThread: () => Effect.die("unused"),
+              interruptTurn: () => Effect.die("unused"),
+              respondToRequest: () => Effect.die("unused"),
+              respondToUserInput: () => Effect.die("unused"),
+              stopSession: () => Effect.die("unused"),
+              getCapabilities: () => Effect.die("unused"),
+              assertConversationRollbackSupported: () => Effect.die("unused"),
+              getInstanceInfo: () => Effect.die("unused"),
+              rollbackConversation: () => Effect.die("unused"),
+              uploadFeedback: () => Effect.die("unused"),
+              streamEvents: Stream.empty,
+            }),
+            Effect.provide(ServerSettingsService.layerTest()),
+          );
+          assert.isDefined(resetCommandId);
+          const [reset] = yield* prepared.database.sqlA<{ actorKind: string; payloadJson: string }>`
+      SELECT actor_kind AS "actorKind", payload_json AS "payloadJson"
+      FROM orchestration_events WHERE command_id=${resetCommandId!}
+    `;
+          assert.equal(reset!.actorKind, version === "legacy" ? "client" : "server");
+          const providerTurnId = TurnId.make(claim.delivery.providerTurnId!);
+          for (const phase of ["start", "terminal"] as const) {
+            const at = shiftIso(beforeRestart, phase === "start" ? 1 : 2);
+            yield* prepared.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make(`provider:startup-reset:${phase}`),
+              threadId,
+              session: {
+                ...baseSession,
+                status: phase === "start" ? "running" : "ready",
+                activeTurnId: phase === "start" ? providerTurnId : null,
+                updatedAt: at,
+              },
+              providerRuntimeLifecycle:
+                phase === "start"
+                  ? {
+                      runtimeEventId: EventId.make("runtime:startup-reset:start"),
+                      runtimeEventType: "turn.started",
+                      providerInstanceId: claim.evidence.providerInstanceId,
+                      providerTurnId,
+                    }
+                  : {
+                      runtimeEventId: EventId.make("runtime:startup-reset:terminal"),
+                      runtimeEventType: "turn.completed",
+                      providerInstanceId: claim.evidence.providerInstanceId,
+                      providerTurnId,
+                      providerState: "completed",
+                    },
+              createdAt: at,
+            });
+          }
+          const readHistory = () =>
+            loadVerificationTerminalFromOrchestrationHistory(
+              prepared.database.sqlB,
+              claim,
+              acceptance,
+            );
+          const ready = yield* readHistory();
+          assert.equal(ready._tag, "Ready");
+          assert.equal(yield* Ref.get(executorCalls), 1);
+          if (version === "legacy") {
+            const mutate = (statement: string) =>
+              Effect.sync(() => {
+                const native = openNativeDatabase(prepared.database.filename);
+                try {
+                  native.prepare(statement).run(resetCommandId!);
+                } finally {
+                  native.close();
+                }
+              });
+            for (const [column, badValue] of [
+              ["authority", "'client'"],
+              ["result_sequence", "result_sequence + 1"],
+              ["aggregate_id", "'foreign-thread'"],
+              ["aggregate_kind", "'project'"],
+              ["accepted_at", "'2000-01-01T00:00:00.000Z'"],
+              ["status", "'rejected'"],
+              ["error", "'failure'"],
+            ] as const) {
+              const [original] = yield* prepared.database.sqlA<Record<string, unknown>>`
+          SELECT * FROM orchestration_command_receipts WHERE command_id=${resetCommandId!}
+        `;
+              yield* mutate(
+                `UPDATE orchestration_command_receipts SET ${column}=${badValue} WHERE command_id=?`,
+              );
+              const rejected = yield* Effect.flip(readHistory());
+              assert.equal(rejected.operation, "runtime-session-envelope-lineage", column);
+              yield* Effect.sync(() => {
+                const native = openNativeDatabase(prepared.database.filename);
+                try {
+                  native
+                    .prepare(
+                      `UPDATE orchestration_command_receipts SET ${column}=? WHERE command_id=?`,
+                    )
+                    .run(original![column] as string | number | null, resetCommandId!);
+                } finally {
+                  native.close();
+                }
+              });
+            }
+            yield* mutate(
+              "UPDATE orchestration_command_receipts SET command_id='missing-startup-receipt' WHERE command_id=?",
+            );
+            assert.equal(
+              (yield* Effect.flip(readHistory())).operation,
+              "runtime-session-envelope-lineage",
+            );
+            yield* Effect.sync(() => {
+              const native = openNativeDatabase(prepared.database.filename);
+              try {
+                native
+                  .prepare(
+                    "UPDATE orchestration_command_receipts SET command_id=? WHERE command_id='missing-startup-receipt'",
+                  )
+                  .run(resetCommandId!);
+              } finally {
+                native.close();
+              }
+            });
+            yield* mutate(
+              "UPDATE orchestration_events SET payload_json=json_set(payload_json, '$.session.lastError', 'Unrelated client failure') WHERE command_id=?",
+            );
+            assert.equal(
+              (yield* Effect.flip(readHistory())).operation,
+              "runtime-session-envelope-lineage",
+            );
+            yield* Effect.sync(() => {
+              const native = openNativeDatabase(prepared.database.filename);
+              try {
+                native
+                  .prepare("UPDATE orchestration_events SET payload_json=? WHERE command_id=?")
+                  .run(reset!.payloadJson, resetCommandId!);
+              } finally {
+                native.close();
+              }
+            });
+            const restored = yield* readHistory();
+            assert.deepStrictEqual(restored, ready);
+            const [unchanged] = yield* prepared.database.sqlA<{ payloadJson: string }>`
+        SELECT payload_json AS "payloadJson" FROM orchestration_events WHERE command_id=${resetCommandId!}
+      `;
+            assert.equal(unchanged!.payloadJson, reset!.payloadJson);
+            // A system receipt must not promote a legacy reset after native start
+            // into terminal authority, even when its payload has the same error.
+            const lateAt = shiftIso(beforeRestart, 3);
+            yield* prepared.coordinator.orchestration.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make("22222222-2222-4222-8222-222222222222"),
+              threadId,
+              session: {
+                ...baseSession,
+                status: "error",
+                activeTurnId: null,
+                lastError: ORPHANED_PROVIDER_SESSION_ERROR,
+                updatedAt: lateAt,
+              },
+              createdAt: lateAt,
+            });
+            assert.equal(
+              (yield* Effect.flip(readHistory())).operation,
+              "runtime-session-envelope-lineage",
+            );
           }
         }),
       ),

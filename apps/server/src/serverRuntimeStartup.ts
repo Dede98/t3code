@@ -31,6 +31,7 @@ import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
+import { ORPHANED_PROVIDER_SESSION_ERROR } from "./orchestration/providerSessionRecovery.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as OrchestrationReactor from "./orchestration/Services/OrchestrationReactor.ts";
 import * as AgentControlReactor from "./agentControl/Services/AgentControlReactor.ts";
@@ -407,8 +408,6 @@ export const startReactorsAtomically = Effect.fn("startReactorsAtomically")(func
   );
 });
 
-const ORPHANED_PROVIDER_SESSION_ERROR =
-  "Provider session did not survive a server restart. Send a new message to continue.";
 const SERVER_UPDATE_CONTINUATION_KEY = "continueAfterServerUpdate";
 const SERVER_UPDATE_CONTINUATION_PROMPT = "Continue where you left off.";
 
@@ -690,7 +689,9 @@ export const reconcileProviderSessions = Effect.gen(function* () {
           const { admissionWait: _admissionWait, ...sessionWithoutAdmissionWait } = session;
           yield* orchestrationEngine.dispatch({
             type: "thread.session.set",
-            commandId: CommandId.make(yield* crypto.randomUUIDv4),
+            commandId: CommandId.make(
+              `server:startup-session-reconcile:${yield* crypto.randomUUIDv4}`,
+            ),
             threadId: thread.id,
             session: {
               ...sessionWithoutAdmissionWait,
@@ -738,7 +739,9 @@ export const reconcileProviderSessions = Effect.gen(function* () {
         const { admissionWait: _admissionWait, ...sessionWithoutAdmissionWait } = session;
         yield* orchestrationEngine.dispatch({
           type: "thread.session.set",
-          commandId: CommandId.make(yield* crypto.randomUUIDv4),
+          commandId: CommandId.make(
+            `server:startup-session-continue:${yield* crypto.randomUUIDv4}`,
+          ),
           threadId: thread.id,
           session: {
             ...sessionWithoutAdmissionWait,
@@ -791,7 +794,9 @@ export const reconcileProviderSessions = Effect.gen(function* () {
                 const { admissionWait: _admissionWait, ...sessionWithoutAdmissionWait } = session;
                 yield* orchestrationEngine.dispatch({
                   type: "thread.session.set",
-                  commandId: CommandId.make(yield* crypto.randomUUIDv4),
+                  commandId: CommandId.make(
+                    `server:startup-session-admission:${yield* crypto.randomUUIDv4}`,
+                  ),
                   threadId: thread.id,
                   session: {
                     ...sessionWithoutAdmissionWait,
