@@ -8353,7 +8353,7 @@ describe("ClaudeAdapterLive", () => {
           dialogKind: "resume_return",
           payload: { sessionAgeMinutes: 145, estimatedTokens: 275123 },
         },
-        { signal: new AbortController().signal },
+        { signal: new AbortController().signal, requestId: "resume-return-1" },
       );
 
       const requested = yield* Stream.runHead(adapter.streamEvents);

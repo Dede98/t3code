@@ -570,9 +570,10 @@ export const importClaudeNativeSessionToStore = Effect.fn(
 
 /**
  * Build a query-local SDK SessionStore that preserves the real target
- * CLAUDE_CONFIG_DIR. Anthropic SDK 0.3.207 treats a null first main load as
- * native resume, so we materialize only projects/<session> before returning
- * null. Target credentials, settings, skills, hooks, and plugins are untouched.
+ * CLAUDE_CONFIG_DIR. The SDK's store-backed resume treats a null first main
+ * load as native resume (verified through 0.3.276), so we materialize only
+ * projects/<session> before returning null. Target credentials, settings,
+ * skills, hooks, and plugins are untouched.
  */
 export function makeClaudeNativeResumeStore(
   sharedStore: ClaudeSessionStoreShape,

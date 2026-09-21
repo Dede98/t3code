@@ -12,8 +12,10 @@ against the live tree and history because they can move over time.
 - Claude cross-account continuation and manual synchronization.
 - A provider registry scoped per instance.
 - Provider hydration that terminates only sessions affected by the changed provider state.
-- The exact Claude Agent SDK pin `0.3.207`, unless a deliberate compatibility comparison proves a
-  version change is safe and the resulting version remains intentionally pinned.
+- Claude Agent SDK compatibility with the native resume store: a null first main `load()` from a
+  custom session store must still mean native resume. The fork follows upstream's SDK version
+  (`0.3.276` as of 2026-09-21); before accepting a further bump, re-run the real-SDK server suites
+  and the opt-in native memory test against the new version.
 - Desktop notifications.
 - The local macOS signing workflow.
 - Worktree settings, naming, and hydration.
