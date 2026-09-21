@@ -508,9 +508,10 @@ export const make = Effect.fn("resourceTelemetry.nativeTelemetryClient.make")(fu
           Effect.flatMap(
             Option.match({
               onNone: () => Effect.void,
-              onSome: (deferred) => Deferred.succeed(deferred, event.processes).pipe(Effect.asVoid),
+              onSome: (deferred) => Deferred.succeed(deferred, event.processes),
             }),
           ),
+          Effect.asVoid,
         );
       case "historyChunk":
         return Effect.gen(function* () {

@@ -666,21 +666,6 @@ export function buildSessionErrorDismissalKey(
   return session?.lastError ? `${session.updatedAt}\u0000${session.lastError}` : null;
 }
 
-export function resolveVisibleThreadError(input: {
-  readonly localError: string | null;
-  readonly sessionError: string | null;
-  readonly sessionErrorKey: string | null;
-  readonly dismissedSessionErrorKey: string | null;
-}): string | null {
-  if (input.localError !== null) {
-    return input.localError;
-  }
-  if (input.sessionErrorKey !== null && input.sessionErrorKey === input.dismissedSessionErrorKey) {
-    return null;
-  }
-  return input.sessionError;
-}
-
 export function buildThreadTurnInterruptInput(thread: Pick<Thread, "id" | "session">): {
   threadId: ThreadId;
   turnId?: TurnId;
