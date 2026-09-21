@@ -10,20 +10,32 @@ import { CLAUDE_SESSION_STORE_CONTINUATION_KEY } from "../Services/ClaudeSession
 
 const quotePath = Schema.encodeSync(Schema.fromJsonString(Schema.String));
 
+const resolveProcessHomePath = (baseEnv?: NodeJS.ProcessEnv): string => {
+  const inheritedHome = baseEnv?.HOME?.trim();
+  return inheritedHome ? expandHomePath(inheritedHome) : NodeOS.homedir();
+};
+
+/**
+ * Resolve the Claude config directory the legacy `homePath` field points at:
+ * the instance's `homePath`, then an inherited `CLAUDE_CONFIG_DIR`, then
+ * Claude's default `~/.claude`. Empty must not fall back to bare `$HOME`;
+ * that leftover from the old HOME override produced a different continuation
+ * group than an explicit `~/.claude`.
+ */
 export const resolveClaudeHomePath = Effect.fn("resolveClaudeHomePath")(function* (
   config: Pick<ClaudeSettings, "homePath">,
   baseEnv?: NodeJS.ProcessEnv,
 ): Effect.fn.Return<string, never, Path.Path> {
   const path = yield* Path.Path;
   const homePath = config.homePath.trim();
-  const inheritedHome = baseEnv?.HOME?.trim();
-  return path.resolve(
-    homePath.length > 0
-      ? expandHomePath(homePath)
-      : inheritedHome
-        ? expandHomePath(inheritedHome)
-        : NodeOS.homedir(),
-  );
+  if (homePath.length > 0) {
+    return path.resolve(expandHomePath(homePath));
+  }
+  const inheritedConfigDirPath = baseEnv?.CLAUDE_CONFIG_DIR?.trim();
+  if (inheritedConfigDirPath) {
+    return path.resolve(expandHomePath(inheritedConfigDirPath));
+  }
+  return path.resolve(resolveProcessHomePath(baseEnv), ".claude");
 });
 
 export const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath")(function* (
@@ -39,12 +51,7 @@ export const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath"
   // `homePath` is the legacy field used by existing profiles. Treat its
   // value as CLAUDE_CONFIG_DIR rather than overriding process HOME, which
   // would also relocate the macOS login keychain lookup.
-  if (config.homePath.trim().length > 0) {
-    return yield* resolveClaudeHomePath(config, baseEnv);
-  }
-
-  const homePath = yield* resolveClaudeHomePath(config, baseEnv);
-  return path.join(homePath, ".claude");
+  return yield* resolveClaudeHomePath(config, baseEnv);
 });
 
 export const resolveClaudeTranscriptDirPath = Effect.fn("resolveClaudeTranscriptDirPath")(
@@ -91,19 +98,19 @@ export const makeClaudeEnvironment = Effect.fn("makeClaudeEnvironment")(function
   };
 });
 
+/**
+ * Continuation identity is the config directory the CLI actually reads, so an
+ * empty profile, a legacy `homePath`, an explicit `configDirPath`, and an
+ * inherited `CLAUDE_CONFIG_DIR` that all land on the same directory share one
+ * group and can resume each other's sessions.
+ */
 export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationGroupKey")(
   function* (
     config: Pick<ClaudeSettings, "configDirPath" | "homePath">,
     baseEnv?: NodeJS.ProcessEnv,
   ): Effect.fn.Return<string, never, Path.Path> {
-    const hasConfigDir = Boolean(config.configDirPath.trim() || baseEnv?.CLAUDE_CONFIG_DIR?.trim());
-    if (hasConfigDir) {
-      const resolvedConfigDirPath = yield* resolveClaudeConfigDirPath(config, baseEnv);
-      return `claude:config:${resolvedConfigDirPath}`;
-    }
-
-    const resolvedHomePath = yield* resolveClaudeHomePath(config, baseEnv);
-    return `claude:home:${resolvedHomePath}`;
+    const resolvedConfigDirPath = yield* resolveClaudeConfigDirPath(config, baseEnv);
+    return `claude:home:${resolvedConfigDirPath}`;
   },
 );
 

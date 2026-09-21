@@ -5,7 +5,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { runMigrations } from "../Migrations.ts";
 
-it.layer(NodeSqliteClient.layerMemory())("054_PullRequestFilesViewed", (it) => {
+it.layer(NodeSqliteClient.layer({ filename: ":memory:" }))("054_PullRequestFilesViewed", (it) => {
   it.effect("adds viewed-file storage without changing the existing fork migration history", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

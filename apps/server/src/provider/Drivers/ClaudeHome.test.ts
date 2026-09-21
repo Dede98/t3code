@@ -78,16 +78,34 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
       }),
     );
 
-    it.effect("uses the process home when no Claude home override is configured", () =>
+    it.effect("treats empty, ~/.claude, and the expanded default as the same Claude home", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
-        const resolved = path.resolve(NodeOS.homedir());
+        const resolved = path.resolve(path.join(NodeOS.homedir(), ".claude"));
 
         expect(yield* resolveClaudeHomePath({ homePath: "" })).toBe(resolved);
+        expect(yield* resolveClaudeHomePath({ homePath: "~/.claude" })).toBe(resolved);
+        expect(yield* resolveClaudeHomePath({ homePath: resolved })).toBe(resolved);
         expect(yield* resolveClaudeTranscriptDirPath({ configDirPath: "", homePath: "" })).toBe(
-          path.join(resolved, ".claude", "projects"),
+          path.join(resolved, "projects"),
         );
         expect(yield* makeClaudeEnvironment({ configDirPath: "", homePath: "" })).toBe(process.env);
+
+        const key = `claude:home:${resolved}`;
+        for (const config of [
+          { configDirPath: "", homePath: "" },
+          { configDirPath: "", homePath: "~/.claude" },
+          { configDirPath: "", homePath: resolved },
+          { configDirPath: "~/.claude", homePath: "" },
+        ]) {
+          expect(yield* makeClaudeContinuationGroupKey(config)).toBe(key);
+        }
+        expect(
+          yield* makeClaudeContinuationGroupKey(
+            { configDirPath: "", homePath: "" },
+            { CLAUDE_CONFIG_DIR: "~/.claude" },
+          ),
+        ).toBe(key);
       }),
     );
 
@@ -118,9 +136,9 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
         expect(yield* resolveClaudeConfigDirPath(config)).toBe(resolved);
         expect(yield* resolveClaudeTranscriptDirPath(config)).toBe(path.join(resolved, "projects"));
         expect((yield* makeClaudeEnvironment(config)).CLAUDE_CONFIG_DIR).toBe(resolved);
-        expect(yield* makeClaudeContinuationGroupKey(config)).toBe(`claude:config:${resolved}`);
+        expect(yield* makeClaudeContinuationGroupKey(config)).toBe(`claude:home:${resolved}`);
         expect(yield* makeClaudeCapabilitiesCacheKey({ binaryPath: "claude", ...config })).toBe(
-          `claude\0claude:config:${resolved}\0`,
+          `claude\0claude:home:${resolved}\0`,
         );
       }),
     );
@@ -132,12 +150,16 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
         const config = { configDirPath: "", homePath: "" };
         const baseEnv = { CLAUDE_CONFIG_DIR: "~/.claude-work" };
 
+        expect(yield* resolveClaudeHomePath(config, baseEnv)).toBe(resolved);
         expect((yield* makeClaudeEnvironment(config, baseEnv)).CLAUDE_CONFIG_DIR).toBe(resolved);
         expect(yield* resolveClaudeTranscriptDirPath(config, baseEnv)).toBe(
           path.join(resolved, "projects"),
         );
         expect(yield* makeClaudeContinuationGroupKey(config, baseEnv)).toBe(
-          `claude:config:${resolved}`,
+          `claude:home:${resolved}`,
+        );
+        expect(yield* resolveClaudeHomePath({ homePath: "~/.claude-explicit" }, baseEnv)).toBe(
+          path.resolve(NodeOS.homedir(), ".claude-explicit"),
         );
       }),
     );
@@ -159,17 +181,6 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
         const first = yield* makeClaudeCapabilitiesCacheKey(config, undefined, "/repo-a");
         const second = yield* makeClaudeCapabilitiesCacheKey(config, undefined, "/repo-b");
         expect(first).not.toBe(second);
-      }),
-    );
-
-    it.effect("keeps continuation compatible across instances with the same Claude HOME", () =>
-      Effect.gen(function* () {
-        const path = yield* Path.Path;
-        const resolved = path.resolve(NodeOS.homedir());
-
-        expect(yield* makeClaudeContinuationGroupKey({ configDirPath: "", homePath: "" })).toBe(
-          `claude:home:${resolved}`,
-        );
       }),
     );
 
