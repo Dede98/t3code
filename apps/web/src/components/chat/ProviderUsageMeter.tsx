@@ -86,11 +86,7 @@ export function ProviderUsageMeter(props: {
           </button>
         }
       />
-      <PopoverPopup
-        side="top"
-        align="end"
-        className="w-[min(26rem,calc(100vw-2rem))] max-w-none p-3"
-      >
+      <PopoverPopup side="top" align="end" className="w-[min(26rem,calc(100vw-2rem))] max-w-none">
         <div className="flex flex-col gap-3">
           <div className="flex items-center justify-between gap-3">
             <div>

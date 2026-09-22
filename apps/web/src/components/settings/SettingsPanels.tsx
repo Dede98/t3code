@@ -855,7 +855,7 @@ function TokenStreamingWarningDialog({
 }) {
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogPopup className="max-w-lg">
+      <AlertDialogPopup>
         <AlertDialogHeader>
           <AlertDialogTitle>Token by token is a worse experience</AlertDialogTitle>
           <AlertDialogDescription>
@@ -2954,8 +2954,7 @@ export function GeneralSettingsPanel() {
           }
           control={
             <ToggleGroup
-              variant="outline"
-              size="sm"
+              variant="segmented"
               value={[settings.worktreeBranchNameMode]}
               onValueChange={(value) => {
                 const next = value[0];
@@ -2965,12 +2964,8 @@ export function GeneralSettingsPanel() {
               }}
               aria-label="Worktree branch name mode"
             >
-              <Toggle className="px-3" value="prefixed">
-                Prefix
-              </Toggle>
-              <Toggle className="px-3" value="full">
-                Fully generated
-              </Toggle>
+              <Toggle value="prefixed">Prefix</Toggle>
+              <Toggle value="full">Fully generated</Toggle>
             </ToggleGroup>
           }
         />
@@ -3447,7 +3442,7 @@ export function ArchivedThreadsPanel() {
             title={
               <span className="inline-flex items-center gap-2">
                 {isLoadingArchive ? (
-                  <Spinner className="size-3.5 text-muted-foreground" />
+                  <Spinner size="sm" tone="muted" />
                 ) : (
                   <ArchiveIcon className="size-3.5 text-muted-foreground" />
                 )}
