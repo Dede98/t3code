@@ -296,6 +296,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
             Effect.andThen(snapshot.refresh),
           ),
         },
+        invalidateCaches: Cache.invalidateAll(capabilitiesProbeCache),
         snapshotForCwd,
         adapter,
         textGeneration,
