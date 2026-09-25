@@ -66,12 +66,6 @@ it.effect("parses keybinding rules", () =>
     });
     assert.strictEqual(parsedCommandPalette.command, "commandPalette.toggle");
 
-    const parsedUsageOpen = yield* decode(KeybindingRule, {
-      key: "mod+u",
-      command: "usage.open",
-    });
-    assert.strictEqual(parsedUsageOpen.command, "usage.open");
-
     const parsedFilePicker = yield* decode(KeybindingRule, {
       key: "mod+p",
       command: "filePicker.toggle",
@@ -83,6 +77,12 @@ it.effect("parses keybinding rules", () =>
       command: "projectSearch.toggle",
     });
     assert.strictEqual(parsedProjectSearch.command, "projectSearch.toggle");
+
+    const parsedUsageOpen = yield* decode(KeybindingRule, {
+      key: "mod+u",
+      command: "usage.open",
+    });
+    assert.strictEqual(parsedUsageOpen.command, "usage.open");
 
     const parsedThemeEditor = yield* decode(KeybindingRule, {
       key: "mod+alt+shift+t",

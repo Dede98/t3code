@@ -9,7 +9,6 @@ import {
 } from "react";
 import { useLocation, useNavigate, useParams } from "@tanstack/react-router";
 
-import { isCommandPaletteOpen } from "../commandPaletteBus";
 import { isElectron } from "../env";
 import { getLocalStorageItem, removeLocalStorageItem } from "../hooks/useLocalStorage";
 import {
@@ -36,10 +35,8 @@ import LegacyThreadSidebar from "./LegacySidebar";
 import ThreadSidebar from "./Sidebar";
 import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
 import { SidebarChromeHeader } from "./sidebar/SidebarChrome";
-import {
-  resolveSidebarStageFocusRingOffsetClass,
-  useSidebarStageBackdropVariant,
-} from "./SidebarStageBackdrop";
+import { MainAppLocationTracker } from "./sidebar/mainAppLocation";
+import { useSidebarStageBackdropVariant } from "./SidebarStageBackdrop";
 import { useProjects } from "../state/entities";
 import {
   resolveInitialThreadSidebarWidth,
@@ -139,9 +136,6 @@ function SidebarControl() {
               className={cn(
                 "pointer-events-auto",
                 isSidebarVisible && stageBackdropVariant && "relative top-auto translate-y-0",
-                isSidebarVisible &&
-                  stageBackdropVariant &&
-                  resolveSidebarStageFocusRingOffsetClass(stageBackdropVariant),
               )}
               aria-label="Toggle main sidebar"
             />
@@ -214,7 +208,6 @@ function ProjectProjectionRetention() {
 }
 
 export function AppSidebarLayout({ children }: { children: ReactNode }) {
-  const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const navigate = useNavigate();
   const legacySidebarEnabled = useLegacySidebarEnabled();
   const { active: panelAnimationsActive, durationMs: panelAnimationDurationMs } =
@@ -253,28 +246,6 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
       ? { "--workspace-controls-left": MACOS_TRAFFIC_LIGHTS_LEFT_INSET }
       : {}),
   } as CSSProperties;
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || isCommandPaletteOpen()) return;
-      if (
-        resolveShortcutCommand(event, keybindings, {
-          context: { terminalFocus: isTerminalFocused() },
-        }) !== "usage.open"
-      ) {
-        return;
-      }
-
-      event.preventDefault();
-      event.stopPropagation();
-      if (pathname !== "/usage") {
-        void navigate({ to: "/usage" });
-      }
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [keybindings, navigate, pathname]);
 
   useEffect(() => {
     if (!isMacosDesktop) return;
@@ -351,6 +322,7 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
         {children}
         <SidebarControl />
         <NavigationHistoryShortcuts />
+        <MainAppLocationTracker />
       </SidebarProvider>
     </PanelAnimationSuppressionProvider>
   );
