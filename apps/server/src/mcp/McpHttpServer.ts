@@ -24,6 +24,7 @@ import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
 import { PreviewControlsHandlersLive } from "./toolkits/previewControls/handlers.ts";
 import { EnvironmentToolkit } from "./toolkits/environment/tools.ts";
 import { EnvironmentHandlersLive } from "./toolkits/environment/handlers.ts";
+import * as EnvironmentCapacity from "../resourceTelemetry/EnvironmentCapacity.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import { ProjectHandlersLive } from "./toolkits/project/handlers.ts";
 import { AttachmentToolkit } from "./toolkits/attachment/tools.ts";
@@ -679,8 +680,9 @@ const PreviewControlsRegistrationLive = McpServer.toolkit(PreviewControlsToolkit
   Layer.provide(PreviewControlsHandlersLive),
 );
 
-const EnvironmentRegistrationLive = McpServer.toolkit(EnvironmentToolkit).pipe(
+export const EnvironmentRegistrationLive = McpServer.toolkit(EnvironmentToolkit).pipe(
   Layer.provide(EnvironmentHandlersLive),
+  Layer.provide(EnvironmentCapacity.layer),
 );
 
 const ProjectRegistrationLive = McpServer.toolkit(ProjectToolkit).pipe(

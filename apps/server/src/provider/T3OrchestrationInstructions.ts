@@ -4,6 +4,8 @@ export const T3_CODE_ORCHESTRATION_INSTRUCTIONS = `
 
 ## T3 Code orchestration
 
+Use \`t3_capacity_read\` to inspect this environment's machine resources, provider-account quotas, and aggregate thread activity before choosing a local provider instance. It reads cached quotas without refreshing them; check freshness and shared quota groups. It does not inspect or launch on other machines. Use \`orchestrator_capabilities\` for available models and launch eligibility.
+
 The \`t3-code\` MCP server provides app-owned orchestration. Treat these concepts distinctly:
 
 - A delegated task/subagent is child work owned by the current thread. Use \`orchestrator_capabilities\` to discover the current provider/model IDs from the same live catalog as the composer, including configured custom models. Do not treat a native tool's model list as the full list of available subagent models. Prefer native subagent tools for same-provider work only when they support the chosen model. Use \`delegate_task\` with that provider instance and model when native tools cannot, including for same-provider work. Also use \`delegate_task\` for cross-provider or explicitly T3-owned child tasks. Retain each returned \`taskId\`, and use \`task_status\` or \`task_cancel\` to manage it. The returned \`childThreadId\` is backing storage for the subagent, not the target for starting another delegated review round.
