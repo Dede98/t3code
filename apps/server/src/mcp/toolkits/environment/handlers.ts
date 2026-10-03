@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Environment from "../../../environment/ServerEnvironment.ts";
 import * as ThreadCommandExecutor from "../../../orchestration-v2/ThreadCommandExecutor.ts";
 import * as Settings from "../../../serverSettings.ts";
+import * as EnvironmentCapacity from "../../../resourceTelemetry/EnvironmentCapacity.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { readCaller, readMutationCaller, unavailable } from "../../threadAccess.ts";
 import { EnvironmentToolkit } from "./tools.ts";
@@ -41,6 +42,12 @@ const access = (writable = false) =>
     return { ...context, descriptor, settings: yield* Settings.ServerSettingsService };
   });
 export const EnvironmentHandlersLive = EnvironmentToolkit.toLayer({
+  t3_capacity_read: () =>
+    Effect.gen(function* () {
+      yield* access();
+      const capacity = yield* EnvironmentCapacity.EnvironmentCapacity;
+      return yield* capacity.read.pipe(Effect.mapError(unavailable));
+    }),
   t3_environment_read: () =>
     Effect.gen(function* () {
       const { descriptor, settings } = yield* access();

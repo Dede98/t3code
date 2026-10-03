@@ -114,6 +114,15 @@ or endpoint configurations do not report subscription limits.
 API-key accounts may not report subscription limits. This also applies to Claude connections
 using a proxy through `ANTHROPIC_AUTH_TOKEN`.
 
+Agents can inspect the current environment with the built-in `t3_capacity_read` tool before
+choosing a provider account for new work. It reports machine CPU and memory, cached account
+quotas with reset times and freshness, and thread counts across the environment's projects.
+Provider-native subagents are counted separately. Counts describe thread activity, not queued
+message totals or active provider processes. Other projects' conversations are not exposed.
+Matching quota groups share an allowance; missing limits mean unknown capacity. The tool does
+not refresh provider quotas, reserve capacity, or select another machine. Refresh **Usage → Limits**
+when a quota snapshot is stale, and use the existing launch tools to select a local account.
+
 ## Connect a CLIProxyAPI hub
 
 To see pooled accounts, open **Settings → Providers → Usage providers → Add hub**. Choose the

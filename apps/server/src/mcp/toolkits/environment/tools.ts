@@ -2,6 +2,7 @@ import {
   BackgroundActivityProfile,
   BackgroundActivityProfileSelection,
   ExecutionEnvironmentDescriptor,
+  EnvironmentCapacityReport,
   OrchestratorMcpFailure,
   ServerSettings,
   ServerSettingsPatch,
@@ -12,6 +13,7 @@ import * as ServerEnvironment from "../../../environment/ServerEnvironment.ts";
 import * as ThreadCommandExecutor from "../../../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as Settings from "../../../serverSettings.ts";
+import * as EnvironmentCapacity from "../../../resourceTelemetry/EnvironmentCapacity.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const PreferenceFields = {
@@ -64,4 +66,18 @@ const EnvironmentPreferencesTool = Tool.make("t3_environment_preferences_update"
   }),
   success: Schema.Struct(PreferenceFields),
 }).annotate(Tool.Destructive, true);
-export const EnvironmentToolkit = Toolkit.make(EnvironmentReadTool, EnvironmentPreferencesTool);
+const CapacityReadTool = Tool.make("t3_capacity_read", {
+  ...shared,
+  dependencies: [...shared.dependencies, EnvironmentCapacity.EnvironmentCapacity],
+  description:
+    "Read this environment's CPU/memory, cached provider-instance quotas and aggregate thread counts across its projects. No remote environments, account credentials, or conversation content. threads includes delegated children; nativeSubagents is separate. Counts use each non-archived thread's activity status, not provider processes or queued-message backlog; waitingForBackgroundThreads is an overlapping subset. Quota snapshots are not refreshed: inspect checkedAt, ageMs, stale (over 5 minutes or a future timestamp), and resetPassed. Sparse events may leave individual windows older. Matching non-null quotaGroupId values share one allowance; null identity or usageLimits means unknown, not unlimited. Host readings older than 15 seconds are stale. Use orchestrator_capabilities for models and launch eligibility; this report does not reserve capacity or route launches.",
+  success: EnvironmentCapacityReport,
+})
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false);
+
+export const EnvironmentToolkit = Toolkit.make(
+  EnvironmentReadTool,
+  EnvironmentPreferencesTool,
+  CapacityReadTool,
+);
