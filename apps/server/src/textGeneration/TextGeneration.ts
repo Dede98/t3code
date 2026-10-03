@@ -2,10 +2,10 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import type {
+  BranchNamingOptions,
   ChatAttachment,
   ModelSelection,
   ProviderInstanceId,
-  WorktreeBranchNameMode,
 } from "@t3tools/contracts";
 import { TextGenerationError } from "@t3tools/contracts";
 
@@ -54,11 +54,10 @@ export interface PrContentGenerationResult {
 }
 
 export interface BranchNameGenerationInput {
+  naming?: BranchNamingOptions | undefined;
   cwd: string;
   message: string;
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
-  /** Whether generation should produce only the suffix or the complete branch name. */
-  branchNameMode?: WorktreeBranchNameMode | undefined;
   /** What model and provider to use for generation. */
   modelSelection: ModelSelection;
 }

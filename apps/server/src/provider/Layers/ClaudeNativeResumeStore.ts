@@ -491,6 +491,55 @@ const readNativeSession = Effect.fn("ClaudeNativeResumeStore.readNativeSession")
   } satisfies ClaudeSessionSnapshot;
 });
 
+/** The SDK's filesystem fork uses the process-wide home. Bind its store API to
+ * this account instead; a fork never needs to mutate the server's environment. */
+export function makeClaudeNativeForkStore(
+  configDirPath: string,
+  sourceSessionId: string,
+  dependencies: ClaudeNativeResumeStoreDependencies,
+): SessionStore {
+  const { fileSystem, path } = dependencies;
+  let sourcePath: string | null = null;
+  return {
+    load: (key) =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          if (key.sessionId !== sourceSessionId || key.subpath !== undefined) {
+            return yield* storeError("nativeFork:load", "Unexpected native fork source.");
+          }
+          validateProjectKey(key.projectKey);
+          sourcePath = yield* findNativeMainTranscript(
+            configDirPath,
+            key.projectKey,
+            sourceSessionId,
+            dependencies,
+          );
+          return sourcePath === null ? null : yield* parseTranscriptFile(sourcePath, fileSystem);
+        }),
+      ),
+    append: (key, entries) =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          if (
+            sourcePath === null ||
+            key.sessionId === sourceSessionId ||
+            !/^[a-f0-9-]{36}$/i.test(key.sessionId) ||
+            key.subpath !== undefined
+          ) {
+            return yield* storeError("nativeFork:append", "Unexpected native fork destination.");
+          }
+          // The SDK rewrites message UUIDs and lineage. Only create its new file;
+          // never overwrite an existing conversation, including on retries.
+          yield* fileSystem.writeFileString(
+            path.join(path.dirname(sourcePath), `${key.sessionId}${MAIN_TRANSCRIPT_SUFFIX}`),
+            encodeJsonLines(entries),
+            { flag: "wx", mode: 0o600 },
+          );
+        }),
+      ),
+  };
+}
+
 /**
  * Import an existing native Claude transcript into the shared store without
  * spawning Claude or consuming provider usage.

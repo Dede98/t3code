@@ -9,7 +9,7 @@
 import * as Schema from "effect/Schema";
 import * as Effect from "effect/Effect";
 import { limitTitleMessage } from "./ThreadTitleContext.ts";
-import type { ChatAttachment, WorktreeBranchNameMode } from "@t3tools/contracts";
+import type { BranchNamingOptions, ChatAttachment } from "@t3tools/contracts";
 
 import { limitSection } from "./TextGenerationUtils.ts";
 import type { TextGenerationPolicy } from "./TextGenerationPolicy.ts";
@@ -144,9 +144,9 @@ export function buildPrContentPrompt(input: PrContentPromptInput) {
 // ---------------------------------------------------------------------------
 
 export interface BranchNamePromptInput {
+  naming?: BranchNamingOptions | undefined;
   message: string;
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
-  branchNameMode?: WorktreeBranchNameMode | undefined;
   policy?: TextGenerationPolicy | undefined;
 }
 
@@ -186,29 +186,34 @@ function buildPromptFromMessage(input: PromptFromMessageInput): string {
 }
 
 export function buildBranchNamePrompt(input: BranchNamePromptInput) {
-  const namingRules =
-    input.branchNameMode === "full"
-      ? [
-          "Return the complete Git branch name, including a useful slash-separated type or namespace.",
-          "Use lowercase ASCII letters, numbers, hyphens, and forward slashes only (for example fix/login-timeout).",
-          "Do not use protected branch names such as main, master, or develop.",
-        ]
-      : [
-          "Return only the descriptive suffix; do not add a namespace such as feature/ or fix/.",
-          "Use plain words only, with no issue prefixes or punctuation-heavy text.",
-        ];
   const prompt = buildPromptFromMessage({
     instruction: "You generate concise git branch names.",
     responseShape: "Return a JSON object with key: branch.",
     rules: [
       "Branch should describe the requested work from the user message.",
-      "Keep it short and specific (2-6 words).",
-      ...namingRules,
+      "Return a valid Git branch name without spaces.",
+      ...(input.naming?.mode === "custom"
+        ? [
+            "Return the complete branch name, following the user's naming instructions. No prefix or suffix will be added.",
+          ]
+        : [
+            "Keep it short and specific (2-6 words), in lowercase with hyphen-separated words.",
+            ...(input.naming?.mode === "semantic"
+              ? [
+                  "Include a semantic prefix and a slash in the branch name, for example feat/add-search, fix/login-error, refactor/auth, docs/setup, or chore/update-deps. Choose the prefix that best describes the work.",
+                ]
+              : [
+                  "Return only the descriptive branch fragment, without a prefix or namespace. The application adds the configured prefix.",
+                ]),
+          ]),
       "If images are attached, use them as primary context for visual/UI issues.",
     ],
     message: input.message,
     attachments: input.attachments,
-    additionalInstructions: input.policy?.branchInstructions,
+    additionalInstructions:
+      input.naming?.mode === "custom"
+        ? input.naming.instructions
+        : input.policy?.branchInstructions,
   });
   const outputSchema = Schema.Struct({
     branch: Schema.String,

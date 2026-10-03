@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeCrypto from "node:crypto";
+import { resolveExternalMcpServers } from "../ExternalMcpServers.ts";
+import { ProviderRegistrySessionLifecycle } from "../Services/ProviderRegistrySessionLifecycle.ts";
 /**
  * ProviderInstanceRegistryHydration — derive a `ProviderInstanceConfigMap`
  * from `ServerSettings` and keep `ProviderInstanceRegistry` in sync with it.
@@ -46,22 +50,18 @@ import {
   ProviderInstanceId,
   type ProviderInstanceConfig,
   type ProviderInstanceConfigMap,
-  type ProviderSession,
   ServerSettings,
 } from "@t3tools/contracts";
 import * as Equal from "effect/Equal";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS, type BuiltInDriversEnv } from "../builtInDrivers.ts";
-import type { ProviderInstance } from "../ProviderDriver.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
-import type { ProviderInstanceRegistryShape } from "../Services/ProviderInstanceRegistry.ts";
 import {
   ProviderInstanceRegistryMutator,
   type ProviderInstanceRegistryMutatorShape,
@@ -71,109 +71,18 @@ import {
   type ProviderRegistryRebuildBarrierShape,
 } from "../Services/ProviderRegistryRebuildBarrier.ts";
 import { ProviderInstanceRegistryMutableLayer } from "./ProviderInstanceRegistryLive.ts";
+import {
+  type ProviderOrchestrationAdapterInfrastructure,
+  ProviderOrchestrationAdapterInfrastructureLive,
+} from "./ProviderOrchestrationAdapterInfrastructure.ts";
+import { AcpRegistryCatalog } from "../acp/AcpRegistrySupport.ts";
+import { AcpRegistryCatalogLive } from "./AcpRegistryCatalog.ts";
 
-export function isProviderSessionBusyForRegistryRebuild(
-  status: ProviderSession["status"],
-): boolean {
-  return status === "connecting" || status === "running";
-}
-
-export interface ProviderSessionSettleWaitOptions {
-  readonly pollIntervalMs?: number;
-  readonly timeoutMs?: number;
-  readonly instanceIds?: ReadonlySet<ProviderInstanceId>;
-}
-
-function selectProviderInstancesForSettleCheck(
-  instances: ReadonlyArray<ProviderInstance>,
-  instanceIds: ReadonlySet<ProviderInstanceId> | undefined,
-): ReadonlyArray<ProviderInstance> {
-  if (instanceIds === undefined) return instances;
-  return instances.filter((instance) => instanceIds.has(instance.instanceId));
-}
-
-const areProviderSessionsSettled = Effect.fn(
-  "ProviderInstanceRegistryHydration.areProviderSessionsSettled",
-)(function* (
-  registry: Pick<ProviderInstanceRegistryShape, "listInstances">,
-  options: Pick<ProviderSessionSettleWaitOptions, "instanceIds"> & {
-    readonly timeoutMs?: number;
-  } = {},
-) {
-  if (options.instanceIds?.size === 0) return true;
-  const result = yield* Effect.gen(function* () {
-    const instances = selectProviderInstancesForSettleCheck(
-      yield* registry.listInstances,
-      options.instanceIds,
-    );
-    const sessionGroups = yield* Effect.forEach(
-      instances,
-      (instance) => instance.adapter.listSessions().pipe(Effect.exit),
-      { concurrency: "unbounded" },
-    );
-    return sessionGroups.every(
-      (sessions) =>
-        Exit.isSuccess(sessions) &&
-        sessions.value.every(
-          (session) =>
-            !isProviderSessionBusyForRegistryRebuild(session.status) &&
-            session.activeTurnId === undefined,
-        ),
-    );
-  }).pipe(Effect.exit, Effect.timeoutOption(options.timeoutMs ?? 100));
-
-  return Option.isSome(result) && Exit.isSuccess(result.value) && result.value.value;
-});
-
-/**
- * Check whether the selected provider sessions are safe to tear down without
- * allowing a hung or failing adapter status read to block its caller forever.
- */
-export const waitForProviderSessionsToSettle = Effect.fn(
-  "ProviderInstanceRegistryHydration.waitForProviderSessionsToSettle",
-)(function* (
-  registry: Pick<ProviderInstanceRegistryShape, "listInstances">,
-  options: ProviderSessionSettleWaitOptions = {},
-) {
-  if (options.instanceIds?.size === 0) return true;
-  const pollIntervalMs = options.pollIntervalMs ?? 100;
-  const timeoutMs = options.timeoutMs ?? 1_000;
-  const result = yield* Effect.gen(function* () {
-    while (true) {
-      const sessionGroupsExit = yield* registry.listInstances.pipe(
-        Effect.map((instances) =>
-          selectProviderInstancesForSettleCheck(instances, options.instanceIds),
-        ),
-        Effect.flatMap((instances) =>
-          Effect.forEach(
-            instances,
-            (instance) => instance.adapter.listSessions().pipe(Effect.exit),
-            { concurrency: "unbounded" },
-          ),
-        ),
-        Effect.exit,
-      );
-      if (Exit.isFailure(sessionGroupsExit)) {
-        yield* Effect.sleep(pollIntervalMs);
-        continue;
-      }
-      const sessionGroups = sessionGroupsExit.value;
-      const hasBusyOrUnknownSession = sessionGroups.some(
-        (sessions) =>
-          Exit.isFailure(sessions) ||
-          sessions.value.some(
-            (session) =>
-              isProviderSessionBusyForRegistryRebuild(session.status) ||
-              session.activeTurnId !== undefined,
-          ),
-      );
-      if (!hasBusyOrUnknownSession) return;
-      yield* Effect.sleep(pollIntervalMs);
-    }
-  }).pipe(Effect.timeoutOption(timeoutMs));
-
-  return Option.isSome(result);
-});
+type ProviderInstanceRegistryHydrationEnv =
+  | Exclude<BuiltInDriversEnv, ProviderOrchestrationAdapterInfrastructure | AcpRegistryCatalog>
+  | ServerSettingsService
+  | ProviderRegistryRebuildBarrier
+  | ProviderRegistrySessionLifecycle;
 
 /**
  * Synthesize a `ProviderInstanceConfigMap` from a `ServerSettings` snapshot.
@@ -243,6 +152,21 @@ export const deriveProviderInstanceConfigMap = (
     };
   }
 
+  for (const [id, entry] of Object.entries(merged)) {
+    if (entry.config !== null && typeof entry.config === "object" && !Array.isArray(entry.config)) {
+      merged[id] = {
+        ...entry,
+        config: {
+          ...entry.config,
+          externalMcpConfiguration: NodeCrypto.createHash("sha256")
+            .update(
+              JSON.stringify(resolveExternalMcpServers(settings, ProviderInstanceId.make(id))),
+            )
+            .digest("hex"),
+        },
+      };
+    }
+  }
   return merged as ProviderInstanceConfigMap;
 };
 
@@ -270,12 +194,10 @@ export interface ProviderRegistryReconcileWorkerOptions {
   readonly desired: Ref.Ref<DesiredProviderRegistrySettings>;
   readonly initialAppliedVersion: number;
   readonly initialAppliedConfigMap: ProviderInstanceConfigMap;
-  readonly registry: Pick<ProviderInstanceRegistryShape, "listInstances">;
+  readonly lifecycle: ProviderRegistrySessionLifecycle["Service"];
   readonly mutator: Pick<ProviderInstanceRegistryMutatorShape, "reconcile">;
   readonly rebuildBarrier: Pick<ProviderRegistryRebuildBarrierShape, "withRebuild">;
   readonly pollIntervalMs?: number;
-  readonly settleTimeoutMs?: number;
-  readonly exclusiveCheckTimeoutMs?: number;
 }
 
 /**
@@ -287,8 +209,6 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
   "ProviderInstanceRegistryHydration.runProviderRegistryReconcileWorker",
 )(function* (options: ProviderRegistryReconcileWorkerOptions) {
   const pollIntervalMs = options.pollIntervalMs ?? 100;
-  const settleTimeoutMs = options.settleTimeoutMs ?? 1_000;
-  const exclusiveCheckTimeoutMs = options.exclusiveCheckTimeoutMs ?? 100;
   let appliedVersion = options.initialAppliedVersion;
   let appliedConfigMap = options.initialAppliedConfigMap;
 
@@ -304,11 +224,13 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
       appliedConfigMap,
       desiredConfigMap,
     );
-    const settled = yield* waitForProviderSessionsToSettle(options.registry, {
-      pollIntervalMs,
-      timeoutMs: settleTimeoutMs,
-      instanceIds: affectedInstanceIds,
-    });
+    const settled = yield* options.lifecycle
+      .canRebuild(affectedInstanceIds)
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Provider settlement check failed", cause).pipe(Effect.as(false)),
+        ),
+      );
     if (!settled) {
       yield* Effect.logWarning(
         "Provider registry reconcile remains deferred because sessions did not settle",
@@ -333,14 +255,10 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
             appliedConfigMap,
             latestConfigMap,
           );
-          if (
-            !(yield* areProviderSessionsSettled(options.registry, {
-              timeoutMs: exclusiveCheckTimeoutMs,
-              instanceIds: latestAffectedInstanceIds,
-            }))
-          ) {
+          if (!(yield* options.lifecycle.canRebuild(latestAffectedInstanceIds))) {
             return undefined;
           }
+          yield* options.lifecycle.closeInstances(latestAffectedInstanceIds);
           yield* options.mutator.reconcile(latestConfigMap);
           return {
             version: latest.version,
@@ -378,7 +296,7 @@ const SettingsWatcherLive = (initialSettings: ServerSettings | undefined) =>
   Layer.effectDiscard(
     Effect.gen(function* () {
       const mutator = yield* ProviderInstanceRegistryMutator;
-      const registry = yield* ProviderInstanceRegistry;
+      const lifecycle = yield* ProviderRegistrySessionLifecycle;
       const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
       const serverSettings = yield* ServerSettingsService;
       const settingsChanges = yield* serverSettings.subscribeChanges;
@@ -394,17 +312,28 @@ const SettingsWatcherLive = (initialSettings: ServerSettings | undefined) =>
           initialSettings === undefined
             ? ({} as ProviderInstanceConfigMap)
             : deriveProviderInstanceConfigMap(initialSettings),
-        registry,
+        lifecycle,
         mutator,
         rebuildBarrier,
       }).pipe(Effect.forkScoped);
 
       yield* settingsChanges.pipe(
+        Stream.mapEffect(() =>
+          serverSettings.getSettings.pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Provider settings could not be materialized", cause).pipe(
+                Effect.as(undefined),
+              ),
+            ),
+          ),
+        ),
         Stream.runForEach((next) =>
-          Ref.update(desired, (current) => ({
-            settings: next,
-            version: current.version + 1,
-          })),
+          next === undefined
+            ? Effect.void
+            : Ref.update(desired, (current) => ({
+                settings: next,
+                version: current.version + 1,
+              })),
         ),
         Effect.forkScoped,
       );
@@ -430,7 +359,7 @@ const SettingsWatcherLive = (initialSettings: ServerSettings | undefined) =>
 export const ProviderInstanceRegistryHydrationLive: Layer.Layer<
   ProviderInstanceRegistry,
   never,
-  BuiltInDriversEnv | ServerSettingsService | ProviderRegistryRebuildBarrier
+  ProviderInstanceRegistryHydrationEnv
 > = Layer.unwrap(
   Effect.gen(function* () {
     const serverSettings = yield* ServerSettingsService;
@@ -445,12 +374,11 @@ export const ProviderInstanceRegistryHydrationLive: Layer.Layer<
     const mutableLayer = ProviderInstanceRegistryMutableLayer({
       drivers: BUILT_IN_DRIVERS,
       configMap: initialConfigMap,
-    });
+    }).pipe(
+      Layer.provide(ProviderOrchestrationAdapterInfrastructureLive),
+      Layer.provide(AcpRegistryCatalogLive),
+    );
 
     return SettingsWatcherLive(initialSettings).pipe(Layer.provideMerge(mutableLayer));
   }),
-) as Layer.Layer<
-  ProviderInstanceRegistry,
-  never,
-  BuiltInDriversEnv | ServerSettingsService | ProviderRegistryRebuildBarrier
->;
+) as Layer.Layer<ProviderInstanceRegistry, never, ProviderInstanceRegistryHydrationEnv>;

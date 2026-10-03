@@ -1,6 +1,7 @@
-import { CodexInstallation } from "../CodexInstallation.ts";
-import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
-import { ServerEnvironmentIdentity } from "../../environment/ServerEnvironment.ts";
+import { ProviderRegistrySessionLifecycle } from "../Services/ProviderRegistrySessionLifecycle.ts";
+import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
+import * as CodexInstallation from "../CodexInstallation.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, it, assert } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -41,12 +42,13 @@ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
 import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
-import { AntigravityInstallation } from "../AntigravityInstallation.ts";
+import * as AntigravityInstallation from "../AntigravityInstallation.ts";
 import * as ModelManifest from "../ModelManifest.ts";
 import { applyProviderCompatibility } from "../providerCompatibility.ts";
 import * as ResetCreditCoordinator from "./resetCreditCoordinator.ts";
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import { ClaudeSessionStoreLive } from "./ClaudeSessionStore.ts";
+import * as OpenCodeServerLedger from "../OpenCodeServerLedger.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
 import {
@@ -56,6 +58,8 @@ import {
 import {
   mergeProviderSnapshot,
   ProviderRegistryLive as ProviderRegistryLiveUnprovided,
+  mergeProviderSnapshots,
+  selectProvidersByKind,
   upsertProviderWorkspaceSnapshot,
 } from "./ProviderRegistry.ts";
 import * as ServerConfig from "../../config.ts";
@@ -107,6 +111,7 @@ const ClaudeSessionStoreTestLive = ClaudeSessionStoreLive.pipe(
   Layer.provide(SqlitePersistenceMemory),
 );
 const ProviderInstanceRegistryHydrationTestLive = ProviderInstanceRegistryHydrationLive.pipe(
+  Layer.provideMerge(ProviderRegistrySessionLifecycle.layer),
   Layer.provide(ProviderRegistryRebuildBarrierLive),
 );
 const ProviderRegistryLive = ProviderRegistryLiveUnprovided.pipe(
@@ -193,7 +198,7 @@ function makeSnapshotTestInstance(input: {
       streamChanges: input.streamChanges ?? Stream.empty,
       applyUsageLimits: () => Effect.void,
     },
-    adapter: {} as ProviderInstance["adapter"],
+    orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
     textGeneration: {} as ProviderInstance["textGeneration"],
   };
 }
@@ -395,6 +400,19 @@ function makeMutableServerSettingsService(
           yield* PubSub.publish(changes, next);
           return next;
         }),
+      updateProviderInstance: (mutation, patch = {}) =>
+        Effect.gen(function* () {
+          const current = yield* Ref.get(settingsRef);
+          const next = ServerSettingsModule.applyProviderInstanceMutation(
+            applyServerSettingsPatch(current, patch),
+            mutation,
+          );
+          encodeServerSettings(next);
+          yield* Ref.set(settingsRef, next);
+          yield* PubSub.publish(changes, next);
+          return next;
+        }),
+      withSettingsSnapshot: (use) => Ref.get(settingsRef).pipe(Effect.flatMap(use)),
       get streamChanges() {
         return Stream.fromPubSub(changes);
       },
@@ -424,9 +442,11 @@ const awaitPersistedProvider = (
 
 const TestNodeServices = Layer.mergeAll(
   NodeServices.layer,
-  Layer.mock(CodexInstallation)({ managedDirectory: "unused-managed-installation" }),
-  Layer.mock(ServerSecretStore)({}),
-  Layer.succeed(ServerEnvironmentIdentity, {
+  Layer.mock(CodexInstallation.CodexInstallation)({
+    managedDirectory: "unused-managed-installation",
+  }),
+  Layer.mock(ServerSecretStore.ServerSecretStore)({}),
+  Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
     getEnvironmentId: Effect.succeed(EnvironmentId.make("00000000-0000-4000-8000-000000000001")),
   }),
 );
@@ -769,6 +789,82 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
         ]);
       });
 
+      it("drops stale ACP Registry models missing from a completed discovery probe", () => {
+        const previousProvider = {
+          instanceId: ProviderInstanceId.make("acpRegistry_codex"),
+          driver: ProviderDriverKind.make("acpRegistry"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-08-13T00:00:00.000Z",
+          version: "1.2.0",
+          models: [
+            { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
+            {
+              slug: "gpt-5.6-sol[low]",
+              name: "GPT-5.6-Sol (low)",
+              isCustom: false,
+              capabilities: null,
+            },
+            { slug: "default", name: "Default", isCustom: false, capabilities: null },
+          ],
+          slashCommands: [],
+          skills: [],
+        } as const satisfies ServerProvider;
+        const refreshedProvider = {
+          ...previousProvider,
+          checkedAt: "2026-08-13T00:01:00.000Z",
+          models: [
+            { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
+          ],
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, refreshedProvider).models, [
+          ...refreshedProvider.models,
+        ]);
+      });
+
+      it("retains ACP Registry models while discovery has not completed", () => {
+        const previousProvider = {
+          instanceId: ProviderInstanceId.make("acpRegistry_codex"),
+          driver: ProviderDriverKind.make("acpRegistry"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-08-13T00:00:00.000Z",
+          version: "1.2.0",
+          models: [
+            { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
+          ],
+          slashCommands: [],
+          skills: [],
+        } as const satisfies ServerProvider;
+        const checkingProvider = {
+          ...previousProvider,
+          checkedAt: "2026-08-13T00:01:00.000Z",
+          auth: { status: "unknown" },
+          models: [{ slug: "default", name: "Default", isCustom: false, capabilities: null }],
+        } satisfies ServerProvider;
+        const failedProbeProvider = {
+          ...checkingProvider,
+          status: "warning",
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, checkingProvider).models, [
+          { slug: "default", name: "Default", isCustom: false, capabilities: null },
+          { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
+        ]);
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousProvider, failedProbeProvider).models,
+          [
+            { slug: "default", name: "Default", isCustom: false, capabilities: null },
+            { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
+          ],
+        );
+      });
+
       it("drops stale OpenCode models missing from a successful refresh", () => {
         const previousProvider = {
           instanceId: ProviderInstanceId.make("opencode"),
@@ -1096,7 +1192,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 streamChanges: Stream.empty,
                 applyUsageLimits: () => Effect.void,
               },
-              adapter: {} as ProviderInstance["adapter"],
+              orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
               textGeneration: {} as ProviderInstance["textGeneration"],
             } satisfies ProviderInstance;
             const instanceRegistryLayer = Layer.succeed(
@@ -1463,7 +1559,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            adapter: {} as ProviderInstance["adapter"],
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           } satisfies ProviderInstance;
           const instanceRegistryLayer = Layer.succeed(
@@ -1548,7 +1644,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            adapter: {} as ProviderInstance["adapter"],
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           } satisfies ProviderInstance;
           const instanceRegistryLayer = Layer.succeed(
@@ -1814,7 +1910,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
             },
             snapshotForCwd,
             invalidateCaches: Ref.update(cacheInvalidations, (count) => count + 1),
-            adapter: {} as ProviderInstance["adapter"],
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           });
           const firstInstance = makeInstance(machineProvider, () =>
@@ -2056,7 +2152,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 streamChanges: Stream.empty,
                 applyUsageLimits: () => Effect.void,
               },
-              adapter: {} as ProviderInstance["adapter"],
+              orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
               textGeneration: {} as ProviderInstance["textGeneration"],
             },
             {
@@ -2083,7 +2179,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 streamChanges: Stream.empty,
                 applyUsageLimits: () => Effect.void,
               },
-              adapter: {} as ProviderInstance["adapter"],
+              orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
               textGeneration: {} as ProviderInstance["textGeneration"],
             },
           ] satisfies ReadonlyArray<ProviderInstance>;
@@ -2149,6 +2245,71 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
           assert.strictEqual(yield* Ref.get(openCodeRefreshCalls), 2);
         }),
       );
+
+      it("persists merged provider snapshots for the providers that were refreshed", () => {
+        const previousProviders = [
+          {
+            instanceId: ProviderInstanceId.make("cursor"),
+            driver: ProviderDriverKind.make("cursor"),
+            status: "ready",
+            enabled: true,
+            installed: true,
+            auth: { status: "authenticated" },
+            checkedAt: "2026-04-14T00:00:00.000Z",
+            version: "2026.04.09-f2b0fcd",
+            models: [
+              {
+                slug: "claude-opus-4-6",
+                name: "Opus 4.6",
+                isCustom: false,
+                capabilities: createModelCapabilities({
+                  optionDescriptors: [
+                    selectDescriptor("reasoning", "Reasoning", [
+                      { id: "high", label: "High", isDefault: true },
+                    ]),
+                    booleanDescriptor("fastMode", "Fast Mode"),
+                    booleanDescriptor("thinking", "Thinking"),
+                  ],
+                }),
+              },
+            ],
+            slashCommands: [],
+            skills: [],
+          },
+          {
+            instanceId: ProviderInstanceId.make("codex"),
+            driver: ProviderDriverKind.make("codex"),
+            status: "ready",
+            enabled: true,
+            installed: true,
+            auth: { status: "authenticated" },
+            checkedAt: "2026-04-14T00:00:00.000Z",
+            version: "1.0.0",
+            models: [],
+            slashCommands: [],
+            skills: [],
+          },
+        ] as const satisfies ReadonlyArray<ServerProvider>;
+        const refreshedCursor = {
+          ...previousProviders[0],
+          checkedAt: "2026-04-14T00:01:00.000Z",
+          models: [],
+        } satisfies ServerProvider;
+
+        const mergedProviders = mergeProviderSnapshots(previousProviders, [refreshedCursor]);
+        const persistedProviders = selectProvidersByKind(
+          mergedProviders,
+          new Set([ProviderDriverKind.make("cursor")]),
+        );
+
+        assert.deepStrictEqual(persistedProviders, [
+          {
+            ...refreshedCursor,
+            models: [...previousProviders[0].models],
+          },
+        ]);
+      });
+
       it.effect("persists the merged snapshot when a live update has empty models", () =>
         Effect.gen(function* () {
           const cursorDriver = ProviderDriverKind.make("cursor");
@@ -2207,7 +2368,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               streamChanges: Stream.fromPubSub(changes),
               applyUsageLimits: () => Effect.void,
             },
-            adapter: {} as ProviderInstance["adapter"],
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           } satisfies ProviderInstance;
           const instanceRegistryLayer = Layer.succeed(
@@ -2335,7 +2496,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 streamChanges: Stream.fromPubSub(changes),
                 applyUsageLimits: () => Effect.void,
               },
-              adapter: {} as ProviderInstance["adapter"],
+              orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
               textGeneration: {} as ProviderInstance["textGeneration"],
             } satisfies ProviderInstance;
             const instanceRegistryLayer = Layer.succeed(
@@ -2438,7 +2599,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            adapter: {} as ProviderInstance["adapter"],
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           } satisfies ProviderInstance;
           const instanceRegistryLayer = Layer.succeed(
@@ -2539,7 +2700,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            adapter: {} as ProviderInstance["adapter"],
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           });
           const codexInstance = makeInstance(codexProvider);
@@ -2675,10 +2836,11 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 Layer.provide(ClaudeSessionStoreTestLive),
               ),
             ),
-            Layer.provideMerge(AntigravityInstallation.layer),
+            Layer.provideMerge(AntigravityInstallation.AntigravityInstallation.layer),
             Layer.provideMerge(
               Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
             ),
+            Layer.provideMerge(ServerSecretStore.layer),
             Layer.provideMerge(
               ServerConfig.layerTest(process.cwd(), {
                 prefix: "t3-provider-registry-",
@@ -2693,7 +2855,11 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
             ),
             Layer.provideMerge(ModelManifest.layerTest),
             Layer.provideMerge(ResetCreditCoordinator.layerTest),
-            Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+            Layer.provideMerge(
+              OpenCodeRuntime.OpenCodeRuntimeLive.pipe(
+                Layer.provide(OpenCodeServerLedger.layerTest),
+              ),
+            ),
             Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
             // NO spawner mock — `ChildProcessSpawner` is supplied by the
             // outer `NodeServices.layer` on `it.layer(...)` and will
@@ -2769,10 +2935,11 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 Layer.provide(ClaudeSessionStoreTestLive),
               ),
             ),
-            Layer.provideMerge(AntigravityInstallation.layer),
+            Layer.provideMerge(AntigravityInstallation.AntigravityInstallation.layer),
             Layer.provideMerge(
               Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
             ),
+            Layer.provideMerge(ServerSecretStore.layer),
             Layer.provideMerge(
               ServerConfig.layerTest(process.cwd(), {
                 prefix: "t3-provider-registry-",
@@ -2787,7 +2954,11 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
             ),
             Layer.provideMerge(ModelManifest.layerTest),
             Layer.provideMerge(ResetCreditCoordinator.layerTest),
-            Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+            Layer.provideMerge(
+              OpenCodeRuntime.OpenCodeRuntimeLive.pipe(
+                Layer.provide(OpenCodeServerLedger.layerTest),
+              ),
+            ),
             Layer.updateService(ChildProcessSpawner.ChildProcessSpawner, (spawner) =>
               ChildProcessSpawner.make((command) => {
                 if (command._tag !== "StandardCommand") return spawner.spawn(command);
@@ -2883,7 +3054,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
             yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
             const hydrationLayer = ProviderInstanceRegistryHydrationTestLive.pipe(
               Layer.provide(ClaudeSessionStoreTestLive),
-              Layer.provideMerge(AntigravityInstallation.layer),
+              Layer.provideMerge(AntigravityInstallation.AntigravityInstallation.layer),
               Layer.provideMerge(
                 Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
               ),
@@ -2901,7 +3072,11 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               ),
               Layer.provideMerge(ModelManifest.layerTest),
               Layer.provideMerge(ResetCreditCoordinator.layerTest),
-              Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+              Layer.provideMerge(
+                OpenCodeRuntime.OpenCodeRuntimeLive.pipe(
+                  Layer.provide(OpenCodeServerLedger.layerTest),
+                ),
+              ),
               Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
               Layer.provideMerge(NodeServices.layer),
             );
@@ -2912,25 +3087,22 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
               const before = yield* registry.getInstance(claudeInstanceId);
               assert.notStrictEqual(before, undefined);
-              assert.strictEqual(before?.adapter.syncContinuation, undefined);
+              const disabledSync = yield* before!.orchestrationAdapter.syncContinuation!({
+                nativeThreadId: "disabled-sync",
+                cwd: "/workspace",
+              }).pipe(Effect.flip);
+              assert.equal(disabledSync.code, "feature-disabled");
+              const changes = yield* registry.subscribeChanges;
 
               yield* Effect.yieldNow;
               yield* serverSettings.updateSettings({
                 claudeCrossAccountContinuationEnabled: true,
               });
               yield* TestClock.adjust("100 millis");
-
-              let after = yield* registry.getInstance(claudeInstanceId);
-              for (
-                let attempts = 0;
-                attempts < 100 && after?.adapter.syncContinuation === undefined;
-                attempts += 1
-              ) {
-                yield* Effect.yieldNow;
-                after = yield* registry.getInstance(claudeInstanceId);
-              }
-
-              assert.strictEqual(typeof after?.adapter.syncContinuation, "function");
+              yield* PubSub.take(changes);
+              const after = yield* registry.getInstance(claudeInstanceId);
+              assert.notStrictEqual(after, before);
+              assert.strictEqual(typeof after?.orchestrationAdapter.syncContinuation, "function");
               assert.strictEqual(
                 (yield* registry.listUnavailable).some(
                   (provider) => provider.instanceId === claudeInstanceId,
@@ -2939,202 +3111,6 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               );
             }).pipe(Effect.provide(runtimeServices));
           }),
-      );
-
-      it.effect("defers provider registry settings while a session status read is hung", () =>
-        Effect.gen(function* () {
-          const codexInstanceId = ProviderInstanceId.make("codex_hardening");
-          const serverSettings = yield* makeMutableServerSettingsService(
-            decodeServerSettings(
-              deepMerge(encodedDefaultServerSettings, {
-                claudeCrossAccountContinuationEnabled: false,
-                providers: {
-                  codex: { enabled: false },
-                  claudeAgent: { enabled: false },
-                  cursor: { enabled: false },
-                  grok: { enabled: false },
-                  opencode: { enabled: false },
-                },
-                providerInstances: {
-                  codex_hardening: {
-                    driver: "codex",
-                    displayName: "Before",
-                    enabled: false,
-                    config: { enabled: false },
-                  },
-                } as unknown as ContractServerSettings["providerInstances"],
-              }),
-            ),
-          );
-          const scope = yield* Scope.make();
-          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
-          const hydrationLayer = ProviderInstanceRegistryHydrationTestLive.pipe(
-            Layer.provide(ClaudeSessionStoreTestLive),
-            Layer.provideMerge(AntigravityInstallation.layer),
-            Layer.provideMerge(
-              Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
-            ),
-            Layer.provideMerge(
-              ServerConfig.layerTest(process.cwd(), {
-                prefix: "t3-provider-registry-gate-hardening-",
-              }),
-            ),
-            Layer.provideMerge(TestHttpClientLive),
-            Layer.provideMerge(
-              Layer.succeed(
-                ProviderEventLoggers.ProviderEventLoggers,
-                ProviderEventLoggers.NoOpProviderEventLoggers,
-              ),
-            ),
-            Layer.provideMerge(ModelManifest.layerTest),
-            Layer.provideMerge(ResetCreditCoordinator.layerTest),
-            Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
-            Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
-            Layer.provideMerge(NodeServices.layer),
-          );
-          const runtimeServices = yield* Layer.build(hydrationLayer).pipe(Scope.provide(scope));
-
-          yield* Effect.gen(function* () {
-            const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
-            const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
-            const claudeBefore = yield* registry.getInstance(claudeInstanceId);
-            assert.notStrictEqual(claudeBefore, undefined);
-            if (claudeBefore === undefined) return;
-
-            const mutableClaudeAdapter = claudeBefore.adapter as unknown as {
-              listSessions: ProviderInstance["adapter"]["listSessions"];
-            };
-            mutableClaudeAdapter.listSessions = () => Effect.never;
-
-            yield* Effect.yieldNow;
-            yield* serverSettings.updateSettings({
-              claudeCrossAccountContinuationEnabled: true,
-              providerInstances: {
-                codex_hardening: {
-                  driver: "codex",
-                  displayName: "After",
-                  enabled: false,
-                  config: { enabled: false },
-                },
-              } as unknown as ContractServerSettings["providerInstances"],
-            });
-
-            const codexAfter = yield* registry.getInstance(codexInstanceId);
-            assert.strictEqual(codexAfter?.displayName, "Before");
-            const claudeAfter = yield* registry.getInstance(claudeInstanceId);
-            assert.strictEqual(claudeAfter, claudeBefore);
-            assert.strictEqual(claudeAfter?.adapter.syncContinuation, undefined);
-          }).pipe(Effect.provide(runtimeServices));
-        }),
-      );
-
-      it.effect("rechecks Claude sessions after acquiring the exclusive rebuild barrier", () =>
-        Effect.gen(function* () {
-          const serverSettings = yield* makeMutableServerSettingsService(
-            decodeServerSettings(
-              deepMerge(encodedDefaultServerSettings, {
-                claudeCrossAccountContinuationEnabled: false,
-                providers: {
-                  codex: { enabled: false },
-                  claudeAgent: { enabled: false },
-                  cursor: { enabled: false },
-                  grok: { enabled: false },
-                  opencode: { enabled: false },
-                },
-              }),
-            ),
-          );
-          let rebuildEntries = 0;
-          let turnStartedBeforeExclusiveCheck = false;
-          const barrier = ProviderRegistryRebuildBarrier.of({
-            withOperation: (effect) => effect,
-            withRebuild: (effect) =>
-              Effect.sync(() => {
-                rebuildEntries += 1;
-                // The worker enters only after its optimistic settled read.
-                if (rebuildEntries === 1) turnStartedBeforeExclusiveCheck = true;
-              }).pipe(Effect.andThen(effect)),
-          });
-          const scope = yield* Scope.make();
-          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
-          const hydrationLayer = ProviderInstanceRegistryHydrationLive.pipe(
-            Layer.provide(Layer.succeed(ProviderRegistryRebuildBarrier, barrier)),
-            Layer.provide(ClaudeSessionStoreTestLive),
-            Layer.provideMerge(AntigravityInstallation.layer),
-            Layer.provideMerge(
-              Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
-            ),
-            Layer.provideMerge(
-              ServerConfig.layerTest(process.cwd(), {
-                prefix: "t3-provider-registry-gate-toctou-",
-              }),
-            ),
-            Layer.provideMerge(TestHttpClientLive),
-            Layer.provideMerge(
-              Layer.succeed(
-                ProviderEventLoggers.ProviderEventLoggers,
-                ProviderEventLoggers.NoOpProviderEventLoggers,
-              ),
-            ),
-            Layer.provideMerge(ModelManifest.layerTest),
-            Layer.provideMerge(ResetCreditCoordinator.layerTest),
-            Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
-            Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
-            Layer.provideMerge(NodeServices.layer),
-          );
-          const runtimeServices = yield* Layer.build(hydrationLayer).pipe(Scope.provide(scope));
-
-          yield* Effect.gen(function* () {
-            const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
-            const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
-            const before = yield* registry.getInstance(claudeInstanceId);
-            assert.notStrictEqual(before, undefined);
-            if (before === undefined) return;
-
-            const mutableClaudeAdapter = before.adapter as unknown as {
-              listSessions: ProviderInstance["adapter"]["listSessions"];
-            };
-            mutableClaudeAdapter.listSessions = () =>
-              turnStartedBeforeExclusiveCheck
-                ? Effect.succeed([
-                    {
-                      provider: ProviderDriverKind.make("claudeAgent"),
-                      providerInstanceId: claudeInstanceId,
-                      status: "running" as const,
-                      runtimeMode: "full-access" as const,
-                      threadId: "thread-gate-toctou" as never,
-                      createdAt: "2026-07-17T00:00:00.000Z",
-                      updatedAt: "2026-07-17T00:00:00.000Z",
-                    },
-                  ])
-                : Effect.succeed([]);
-
-            yield* Effect.yieldNow;
-            yield* serverSettings.updateSettings({
-              claudeCrossAccountContinuationEnabled: true,
-            });
-            yield* TestClock.adjust("100 millis");
-            yield* Effect.yieldNow;
-
-            const deferred = yield* registry.getInstance(claudeInstanceId);
-            assert.strictEqual(deferred, before);
-            assert.strictEqual(deferred?.adapter.syncContinuation, undefined);
-            assert.isAtLeast(rebuildEntries, 1);
-
-            turnStartedBeforeExclusiveCheck = false;
-            yield* TestClock.adjust("200 millis");
-            let after = yield* registry.getInstance(claudeInstanceId);
-            for (
-              let attempts = 0;
-              attempts < 100 && after?.adapter.syncContinuation === undefined;
-              attempts += 1
-            ) {
-              yield* Effect.yieldNow;
-              after = yield* registry.getInstance(claudeInstanceId);
-            }
-            assert.strictEqual(typeof after?.adapter.syncContinuation, "function");
-          }).pipe(Effect.provide(runtimeServices));
-        }),
       );
 
       it.effect("includes unavailable instance snapshots in getProviders", () =>
@@ -3168,10 +3144,11 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 Layer.provide(ClaudeSessionStoreTestLive),
               ),
             ),
-            Layer.provideMerge(AntigravityInstallation.layer),
+            Layer.provideMerge(AntigravityInstallation.AntigravityInstallation.layer),
             Layer.provideMerge(
               Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
             ),
+            Layer.provideMerge(ServerSecretStore.layer),
             Layer.provideMerge(
               ServerConfig.layerTest(process.cwd(), {
                 prefix: "t3-provider-registry-",
@@ -3186,7 +3163,11 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
             ),
             Layer.provideMerge(ModelManifest.layerTest),
             Layer.provideMerge(ResetCreditCoordinator.layerTest),
-            Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+            Layer.provideMerge(
+              OpenCodeRuntime.OpenCodeRuntimeLive.pipe(
+                Layer.provide(OpenCodeServerLedger.layerTest),
+              ),
+            ),
             Layer.provideMerge(NodeServices.layer),
             Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
           );
@@ -3234,10 +3215,11 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                   Layer.provide(ClaudeSessionStoreTestLive),
                 ),
               ),
-              Layer.provideMerge(AntigravityInstallation.layer),
+              Layer.provideMerge(AntigravityInstallation.AntigravityInstallation.layer),
               Layer.provideMerge(
                 Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
               ),
+              Layer.provideMerge(ServerSecretStore.layer),
               Layer.provideMerge(
                 ServerConfig.layerTest(process.cwd(), {
                   prefix: "t3-provider-registry-",
@@ -3252,7 +3234,11 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               ),
               Layer.provideMerge(ModelManifest.layerTest),
               Layer.provideMerge(ResetCreditCoordinator.layerTest),
-              Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+              Layer.provideMerge(
+                OpenCodeRuntime.OpenCodeRuntimeLive.pipe(
+                  Layer.provide(OpenCodeServerLedger.layerTest),
+                ),
+              ),
               Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
               Layer.provideMerge(
                 mockCommandSpawnerLayer((command, args) => {
@@ -3299,6 +3285,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 "cursor",
                 "grok",
                 "opencode",
+                "pi",
               ]);
               assert.strictEqual(cursorProvider?.enabled, false);
               assert.strictEqual(cursorProvider?.status, "disabled");

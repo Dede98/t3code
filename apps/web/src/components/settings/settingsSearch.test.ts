@@ -284,6 +284,10 @@ describe("searchSettings", () => {
       id: "word-wrap",
       to: "/settings/appearance",
     });
+    expect(searchSettings("composer context")[0]).toMatchObject({
+      id: "composer-context",
+      to: "/settings/appearance",
+    });
     expect(searchSettings("environment identification")[0]).toMatchObject({
       id: "environment-identification",
       to: "/settings/appearance",
@@ -294,14 +298,13 @@ describe("searchSettings", () => {
   it("indexes fork settings through the upstream search catalog", () => {
     expect(searchSettings("worktree")).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: "worktree-branch-names", to: "/settings/general" }),
+        expect.objectContaining({ id: "worktree-branch-naming", to: "/settings/source-control" }),
         expect.objectContaining({ id: "storage-worktrees", to: "/settings/storage" }),
       ]),
     );
     expect(searchSettings("branch prefix")[0]).toMatchObject({
-      id: "worktree-branch-prefix",
-      to: "/settings/general",
-      targetId: "worktree-branch-names",
+      id: "worktree-branch-naming",
+      to: "/settings/source-control",
     });
     expect(searchSettings("claude")[0]).toMatchObject({
       id: "claude-cross-account-continuation",

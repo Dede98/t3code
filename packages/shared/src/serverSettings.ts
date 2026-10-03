@@ -2,6 +2,7 @@ import {
   isProviderDriverKind,
   isProviderAvailable,
   resolveProviderInstanceEnabled,
+  isProviderTextGenerationCapable,
   type ModelSelection,
   type ProjectId,
   type ProjectScopedServerSettingKey,
@@ -94,7 +95,9 @@ export function resolveSourceControlWriterModelSelection(
   }
 
   const provider = providers.find((candidate) => candidate.instanceId === selection.instanceId);
-  return provider?.enabled === true && isProviderAvailable(provider)
+  return provider?.enabled === true &&
+    isProviderAvailable(provider) &&
+    isProviderTextGenerationCapable(provider)
     ? selection
     : settings.textGenerationModelSelection;
 }
@@ -324,6 +327,23 @@ export function applyServerSettingsPatch(
   const next = deepMerge(current, patchForMerge);
   const nextWithReplacementsBase = {
     ...next,
+    // Older fork clients still send these fields. Translate at the boundary,
+    // then clear them so there is one source of truth for branch generation.
+    ...(patch.worktreeBranchNameMode === undefined
+      ? {}
+      : {
+          branchNamingMode:
+            patch.branchNamingMode ??
+            (patch.worktreeBranchNameMode === "full" ? ("semantic" as const) : ("static" as const)),
+          worktreeBranchNameMode: "prefixed" as const,
+        }),
+    ...(patch.worktreeBranchPrefix === undefined
+      ? {}
+      : {
+          branchNamePrefix: patch.branchNamePrefix ?? patch.worktreeBranchPrefix,
+          worktreeBranchPrefix: "t3code",
+        }),
+
     ...(worktreeCleanupPatch === undefined
       ? {}
       : {

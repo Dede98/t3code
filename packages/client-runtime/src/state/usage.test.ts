@@ -252,6 +252,7 @@ describe("needsCursorKeychainAccess", () => {
     ...summary,
     sources: [
       {
+        sourceId: "cursor-test-source",
         fingerprint: {
           hostId: "host",
           provider: "cursor",
@@ -297,6 +298,7 @@ describe("needsCursorKeychainAccess", () => {
       ...summary,
       sources: [
         {
+          sourceId: "cursor-test-source",
           fingerprint: {
             hostId: "cursor.com",
             provider: "cursor",

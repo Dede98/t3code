@@ -1,5 +1,5 @@
 import type {
-  WorktreeBranchNameMode,
+  BranchNamingOptions,
   VcsRef,
   SourceControlProviderInfo,
   VcsStatusLocalResult,
@@ -42,37 +42,22 @@ export function sanitizeBranchFragment(raw: string): string {
   return branchFragment.length > 0 ? branchFragment : "update";
 }
 
-export function normalizeWorktreeBranchPrefix(raw: string): string {
-  const compact = raw
+/** Custom naming preserves the model's complete ref; Git validates it on rename. */
+export function formatGeneratedBranchName(raw: string, naming?: BranchNamingOptions): string {
+  if (naming?.mode === "custom") return raw.trim();
+  const branch = sanitizeBranchFragment(raw);
+  if (naming?.mode !== "static") return branch;
+  const prefix = naming.prefix
     .split("/")
-    .map((segment) => segment.trim())
-    .filter((segment) => segment.length > 0)
+    .map((part) =>
+      part
+        .replace(/[^a-zA-Z0-9_-]+/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-+|-+$/g, ""),
+    )
+    .filter(Boolean)
     .join("/");
-  return compact.length > 0 ? sanitizeBranchFragment(compact) : WORKTREE_BRANCH_PREFIX;
-}
-
-export function buildGeneratedWorktreeBranchName(
-  raw: string,
-  mode: WorktreeBranchNameMode,
-  configuredPrefix: string,
-): string {
-  const normalized = raw
-    .trim()
-    .toLowerCase()
-    .replace(/^refs\/heads\//, "")
-    .replace(/['"`]/g, "");
-
-  const sanitized = sanitizeBranchFragment(normalized);
-  if (mode === "full") {
-    return sanitized;
-  }
-
-  const prefix = normalizeWorktreeBranchPrefix(configuredPrefix);
-  const withoutPrefix = sanitized.startsWith(`${prefix}/`)
-    ? sanitized.slice(`${prefix}/`.length)
-    : sanitized;
-  const safeFragment = sanitizeBranchFragment(withoutPrefix);
-  return `${prefix}/${safeFragment}`;
+  return prefix ? `${prefix}/${branch}` : branch;
 }
 
 /**
@@ -388,6 +373,7 @@ function toLocalStatusPart(status: VcsStatusResult): VcsStatusLocalResult {
     refName: status.refName,
     hasWorkingTreeChanges: status.hasWorkingTreeChanges,
     workingTree: status.workingTree,
+    ...(status.branchChanges ? { branchChanges: status.branchChanges } : {}),
   };
 }
 
