@@ -407,9 +407,13 @@ it.effect(
 
 const scope: McpInvocationContext.McpInvocationScope = {
   environmentId,
-  threadId: callerId,
-  providerInstanceId: instanceId,
-  providerSessionId: "test-session",
+  thread: {
+    threadId: callerId,
+    providerInstanceId: instanceId,
+    providerSessionId: "test-session",
+  },
+  client: undefined,
+  requestNamespace: "capacity-test",
   issuedAt: 0,
   capabilities: new Set(["orchestration"]),
 };

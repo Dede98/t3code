@@ -1,6 +1,7 @@
 import { resolveExternalMcpServers } from "../provider/ExternalMcpServers.ts";
 import { ProviderRegistrySessionLifecycle } from "../provider/Services/ProviderRegistrySessionLifecycle.ts";
 import { ProviderRegistryRebuildBarrier } from "../provider/Services/ProviderRegistryRebuildBarrier.ts";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   ModelSelection,
@@ -39,7 +40,6 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "./IdAllocator.ts";
-import { makeKeyedSerialExecutor } from "./KeyedSerialExecutor.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import {
   ProviderAdapterEventStreamError,
@@ -366,6 +366,25 @@ export const layerWithOptions = (
         },
       );
       const layerScope = yield* Effect.scope;
+      // Ctrl+C, or a stop that signals the whole process group, reaches the
+      // provider CLIs with the server. They report their own background work
+      // stopped before shutdown captures restart continuations, so provider
+      // events after the signal are dropped; restart recovery owns that state.
+      const shutdownSignal = { received: false };
+      const onShutdownSignal = () => {
+        shutdownSignal.received = true;
+      };
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          process.on("SIGINT", onShutdownSignal);
+          process.on("SIGTERM", onShutdownSignal);
+        }),
+        () =>
+          Effect.sync(() => {
+            process.off("SIGINT", onShutdownSignal);
+            process.off("SIGTERM", onShutdownSignal);
+          }),
+      );
       const sessions = yield* Ref.make(new Map<string, LiveSessionEntry>());
       const registryLifecycle = yield* Effect.serviceOption(ProviderRegistrySessionLifecycle);
       const registryBarrier = yield* Effect.serviceOption(ProviderRegistryRebuildBarrier);
@@ -375,9 +394,9 @@ export const layerWithOptions = (
       // cannot drop cleanup for threads only the earlier session served.
       const releaseRecordRetries = yield* FiberSet.make();
       const nextSubscriberId = yield* Ref.make(0);
-      const sessionOpen = yield* makeKeyedSerialExecutor<ProviderSessionId>();
+      const sessionOpen = yield* KeyedLock.make<ProviderSessionId>();
       // Orders a thread's attach against a detach unloading it on the same session.
-      const threadAttachment = yield* makeKeyedSerialExecutor<string>();
+      const threadAttachment = yield* KeyedLock.make<string>();
       const threadAttachmentKey = (input: {
         readonly providerSessionId: ProviderSessionId;
         readonly threadId: ThreadId;
@@ -416,7 +435,7 @@ export const layerWithOptions = (
       };
       const isMcpCredentialReserved = (threadId: ThreadId, mcpCredentialId: string) =>
         (mcpCredentialReservations.get(mcpReservationKey(threadId, mcpCredentialId)) ?? 0) > 0;
-      const mcpPrepareLock = yield* makeKeyedSerialExecutor<ThreadId>();
+      const mcpPrepareLock = yield* KeyedLock.make<ThreadId>();
       /**
        * Resolves (or mints) the thread's MCP credential and returns it with a
        * reservation held; the caller must drop the reservation exactly once.
@@ -463,8 +482,8 @@ export const layerWithOptions = (
                   const resolved = yield* mcpSessionRegistry.resolve(rawToken);
                   if (
                     resolved !== undefined &&
-                    resolved.threadId === threadId &&
-                    resolved.providerInstanceId === providerInstanceId &&
+                    resolved.thread.threadId === threadId &&
+                    resolved.thread.providerInstanceId === providerInstanceId &&
                     // A flipped browser-access setting must not survive through
                     // credential reuse: rotate so the new scope reflects it.
                     resolved.capabilities.has("preview") === browserToolsAvailable &&
@@ -1623,6 +1642,7 @@ export const layerWithOptions = (
         let stoppedByProvider = false;
         return entry.runtime.events.pipe(
           Stream.runForEach((event) => {
+            if (shutdownSignal.received) return Effect.void;
             if (
               event.type === "provider_session.updated" &&
               event.providerSession.status === "stopped"
@@ -1681,6 +1701,8 @@ export const layerWithOptions = (
           Effect.exit,
           Effect.flatMap((exit) =>
             Effect.gen(function* () {
+              // A provider that exits on the shutdown signal is released by shutdown.
+              if (shutdownSignal.received) return;
               const current = (yield* Ref.get(sessions)).get(
                 sessionKey(entry.runtime.providerSessionId),
               );

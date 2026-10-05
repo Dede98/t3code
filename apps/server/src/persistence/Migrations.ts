@@ -269,6 +269,29 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
   const executedMigrations = yield* run({
     loader: makeMigrationLoader(entries, toMigrationInclusive),
   });
+  // Effect's migrator treats every ledger constraint failure as a concurrent
+  // runner and returns []. Verify progress so a rejected insert cannot let the
+  // server start against an unupgraded schema. A successful competing runner
+  // has already committed these rows and satisfies the same check.
+  const previousId = recorded.at(-1)?.migration_id ?? 0;
+  const pending = entries.filter(
+    ([id]) => id > previousId && (toMigrationInclusive === undefined || id <= toMigrationInclusive),
+  );
+  if (pending.length > 0 && executedMigrations.length === 0) {
+    const completed = yield* sql<{
+      readonly migration_id: number;
+      readonly name: string;
+    }>`SELECT migration_id, name FROM effect_sql_migrations WHERE migration_id > ${previousId}`;
+    const missing = pending.filter(
+      ([id, name]) => !completed.some((row) => row.migration_id === id && row.name === name),
+    );
+    if (missing.length > 0) {
+      return yield* new Migrator.MigrationError({
+        kind: "Failed",
+        message: `Database migrations did not complete: ${missing.map(([id, name]) => `${id}_${name}`).join(", ")}`,
+      });
+    }
+  }
   const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
   yield* migrations.length === 0
     ? Effect.logDebug("Database schema is current")
