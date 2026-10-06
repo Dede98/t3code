@@ -1,6 +1,6 @@
 import { resolveExternalMcpServers } from "../provider/ExternalMcpServers.ts";
-import { ProviderRegistrySessionLifecycle } from "../provider/Services/ProviderRegistrySessionLifecycle.ts";
-import { ProviderRegistryRebuildBarrier } from "../provider/Services/ProviderRegistryRebuildBarrier.ts";
+import { ProviderRegistrySessionLifecycle } from "../provider/ProviderRegistrySessionLifecycle.ts";
+import { ProviderRegistryRebuildBarrier } from "../provider/ProviderRegistryRebuildBarrier.ts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -33,6 +33,13 @@ import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
+import { normalizeModelMetricLabel } from "../observability/Attributes.ts";
+import {
+  providerSessionsTotal,
+  providerTurnDuration,
+  providerTurnsTotal,
+  withMetrics,
+} from "../observability/Metrics.ts";
 import { ProviderWorkspaceMissingError } from "../provider/Errors.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as McpProviderSession from "../mcp/McpProviderSession.ts";
@@ -959,7 +966,16 @@ export const layerWithOptions = (
                   if (Option.isSome(closeExit) && Exit.isFailure(closeExit.value)) {
                     return yield* Effect.failCause(closeExit.value.cause);
                   }
-                }),
+                }).pipe(
+                  withMetrics({
+                    counter: providerSessionsTotal,
+                    attributes: {
+                      provider: entry.runtime.driver,
+                      operation: "release",
+                      reason: input.reason,
+                    },
+                  }),
+                ),
             }),
           ([entry]) =>
             Option.match(entry, {
@@ -1434,6 +1450,18 @@ export const layerWithOptions = (
               return yield* effect;
             }),
           );
+        // Every provider's turn operations pass through here, so this is where they are
+        // counted. Only turn starts are timed: until the provider accepts the turn.
+        const turnMetrics = (operation: string, model?: string) =>
+          withMetrics({
+            counter: providerTurnsTotal,
+            ...(operation === "send" ? { timer: providerTurnDuration } : {}),
+            attributes: {
+              provider: runtime.driver,
+              operation,
+              modelFamily: normalizeModelMetricLabel(model),
+            },
+          });
         const decorated: ProviderAdapterV2SessionRuntime = {
           ...runtime,
           subscribeEvents,
@@ -1542,7 +1570,9 @@ export const layerWithOptions = (
                 }),
               ).pipe(
                 Effect.andThen(observeActivity(providerSessionId, markBusy(providerSessionId))),
-                Effect.andThen(runtime.startTurn(input)),
+                Effect.andThen(
+                  runtime.startTurn(input).pipe(turnMetrics("send", input.modelSelection.model)),
+                ),
                 Effect.catch((error) =>
                   observeActivity(providerSessionId, markIdle(providerSessionId)).pipe(
                     Effect.andThen(Effect.fail(error)),
@@ -1579,15 +1609,19 @@ export const layerWithOptions = (
             : {}),
           steerTurn: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
-              Effect.andThen(runtime.steerTurn(input)),
+              Effect.andThen(runtime.steerTurn(input).pipe(turnMetrics("steer"))),
             ),
           interruptTurn: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
-              Effect.andThen(runtime.interruptTurn(input)),
+              Effect.andThen(runtime.interruptTurn(input).pipe(turnMetrics("interrupt"))),
             ),
           respondToRuntimeRequest: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
-              Effect.andThen(runtime.respondToRuntimeRequest(input)),
+              Effect.andThen(
+                runtime
+                  .respondToRuntimeRequest(input)
+                  .pipe(turnMetrics("runtime-request-response")),
+              ),
             ),
         };
         return {
@@ -1875,6 +1909,10 @@ export const layerWithOptions = (
                         cause,
                       }),
                   ),
+                  withMetrics({
+                    counter: providerSessionsTotal,
+                    attributes: { provider: adapter.driver, operation: "open" },
+                  }),
                 );
               const eventSubscribers = yield* Ref.make<
                 ReadonlyMap<number, Queue.Queue<ProviderSessionEventSignal, Cause.Done>>

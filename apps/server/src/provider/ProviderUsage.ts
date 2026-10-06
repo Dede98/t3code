@@ -1,0 +1,110 @@
+import type {
+  ProviderInstanceId,
+  ProviderUsageRefreshResult,
+  ProviderUsageStreamEvent,
+} from "@t3tools/contracts";
+import * as Context from "effect/Context";
+import type { ProviderUsageSnapshot, ServerProvider } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
+import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
+import { ProviderRegistry } from "./ProviderRegistry.ts";
+
+/** Compatibility RPCs backed exclusively by the provider registry. */
+export class ProviderUsage extends Context.Service<
+  ProviderUsage,
+  {
+    readonly refresh: (
+      providerInstanceIds?: ReadonlyArray<ProviderInstanceId>,
+    ) => Effect.Effect<ProviderUsageRefreshResult>;
+    readonly stream: Stream.Stream<ProviderUsageStreamEvent>;
+  }
+>()("t3/provider/ProviderUsage") {}
+
+/** Wire compatibility for older fork clients; the registry owns all usage state. */
+export function legacyProviderUsage(providers: readonly ServerProvider[]): ProviderUsageSnapshot[] {
+  return providers.flatMap((provider) => {
+    const limits = provider.usageLimits;
+    if (!provider.enabled || !limits || limits.unavailable || limits.windows.length === 0)
+      return [];
+    const highest = Math.max(...limits.windows.map((window) => window.usedPercent));
+    return [
+      {
+        providerInstanceId: provider.instanceId,
+        driver: provider.driver,
+        observedAt: limits.checkedAt,
+        source: "refresh" as const,
+        // Quota exhaustion does not prove a turn will be rejected (for example, paid overage).
+        status: highest >= 90 ? ("warning" as const) : ("allowed" as const),
+        windows: limits.windows.map((window) => ({
+          id: window.id,
+          label: window.label,
+          usedPercent: window.usedPercent,
+          resetsAt: window.resetsAt ?? null,
+          ...(window.windowDurationMins && window.windowDurationMins > 0
+            ? { durationMinutes: window.windowDurationMins }
+            : {}),
+        })),
+      },
+    ];
+  });
+}
+
+export const makeProviderUsage = Effect.fn("makeProviderUsage")(function* () {
+  const registry = yield* ProviderRegistry;
+  return ProviderUsage.of({
+    stream: Stream.unwrap(
+      Effect.gen(function* () {
+        // Subscribe before reading. A queued notification rereads current state rather
+        // than replaying a snapshot that may already predate the initial read.
+        const updates = yield* Queue.sliding<void>(1);
+        yield* Stream.runForEach(registry.streamChanges, () =>
+          Queue.offer(updates, undefined),
+        ).pipe(Effect.forkScoped({ startImmediately: true }));
+        return Stream.concat(Stream.make(undefined), Stream.fromQueue(updates)).pipe(
+          Stream.mapEffect(() => registry.getProviders),
+          Stream.map(legacyProviderUsage),
+          Stream.changesWith((a, b) => Equal.equals(a, b)),
+          Stream.map((usage) => ({ version: 1 as const, type: "snapshot" as const, usage })),
+        );
+      }),
+    ),
+    refresh: (requestedIds) =>
+      Effect.gen(function* () {
+        if (requestedIds === undefined) {
+          yield* registry.refresh();
+        } else {
+          yield* Effect.forEach([...new Set(requestedIds)], (id) => registry.refreshInstance(id), {
+            concurrency: 3,
+          });
+        }
+        const providers = yield* registry.getProviders;
+        const selected =
+          requestedIds === undefined
+            ? providers
+            : providers.filter((provider) => requestedIds.includes(provider.instanceId));
+        const usage = legacyProviderUsage(selected);
+        const ids = requestedIds ?? selected.map((provider) => provider.instanceId);
+        const failures = [...new Set(ids)].flatMap((providerInstanceId) => {
+          if (usage.some((snapshot) => snapshot.providerInstanceId === providerInstanceId))
+            return [];
+          const provider = selected.find(
+            (candidate) => candidate.instanceId === providerInstanceId,
+          );
+          return [
+            {
+              providerInstanceId,
+              message:
+                provider?.usageLimits?.unavailable?.message ?? "Usage limits are unavailable.",
+            },
+          ];
+        });
+        return { refreshedAt: DateTime.formatIso(yield* DateTime.now), usage, failures };
+      }),
+  });
+});
+
+export const layer = Layer.effect(ProviderUsage, makeProviderUsage());

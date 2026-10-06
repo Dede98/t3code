@@ -12,12 +12,9 @@ import { ProviderInstanceId } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
-import { ProviderRegistryRebuildBarrier } from "../provider/Services/ProviderRegistryRebuildBarrier.ts";
-import {
-  ProviderRegistryRebuildBarrierLive,
-  makeProviderRegistryRebuildBarrier,
-} from "../provider/Layers/ProviderRegistryRebuildBarrier.ts";
-import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
+import { makeProviderRegistryRebuildBarrier } from "../provider/ProviderRegistryRebuildBarrier.ts";
+import * as ProviderRegistryRebuildBarrier from "../provider/ProviderRegistryRebuildBarrier.ts";
+import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as Layer from "effect/Layer";
@@ -85,7 +82,7 @@ describe("TextGeneration.make", () => {
         }),
       );
       const generation = yield* TextGeneration.make.pipe(
-        Effect.provide(ProviderRegistryRebuildBarrierLive),
+        Effect.provide(ProviderRegistryRebuildBarrier.layer),
         Effect.provideService(
           ProviderInstanceRegistry.ProviderInstanceRegistry,
           makeStubRegistry([instance]),
@@ -130,7 +127,7 @@ describe("TextGeneration.make", () => {
       );
 
       const tg = yield* TextGeneration.make.pipe(
-        Effect.provide(ProviderRegistryRebuildBarrierLive),
+        Effect.provide(ProviderRegistryRebuildBarrier.layer),
         Effect.provideService(
           ProviderInstanceRegistry.ProviderInstanceRegistry,
           makeStubRegistry([personal, work]),
@@ -156,7 +153,7 @@ describe("TextGeneration.make", () => {
   it.effect("fails with TextGenerationError when the instance is unknown", () =>
     Effect.gen(function* () {
       const tg = yield* TextGeneration.make.pipe(
-        Effect.provide(ProviderRegistryRebuildBarrierLive),
+        Effect.provide(ProviderRegistryRebuildBarrier.layer),
         Effect.provideService(
           ProviderInstanceRegistry.ProviderInstanceRegistry,
           makeStubRegistry([]),
@@ -208,7 +205,10 @@ describe("TextGeneration.make", () => {
           }),
         );
         const tg = yield* TextGeneration.make.pipe(
-          Effect.provideService(ProviderRegistryRebuildBarrier, rebuildBarrier),
+          Effect.provideService(
+            ProviderRegistryRebuildBarrier.ProviderRegistryRebuildBarrier,
+            rebuildBarrier,
+          ),
           Effect.provideService(
             ProviderInstanceRegistry.ProviderInstanceRegistry,
             makeStubRegistry([instance]),

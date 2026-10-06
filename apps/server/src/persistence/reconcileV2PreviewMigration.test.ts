@@ -6,8 +6,8 @@ import * as NodeSqlite from "node:sqlite";
 import { assert, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
-import * as Migrator from "effect/unstable/sql/Migrator";
-import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as Migrator from "effect/sql/Migrator";
+import * as SqlClient from "effect/sql/SqlClient";
 import { runMigrations, forkIntegrationMigrationEntries } from "./Migrations.ts";
 import OrchestrationV2 from "./Migrations/055_OrchestrationV2.ts";
 import ClaudeSessionStore from "./Migrations/033_ClaudeSessionStore.ts";
@@ -100,7 +100,7 @@ it.effect.each(
         );
         assert.equal(
           observer.prepare("SELECT MAX(migration_id) AS id FROM effect_sql_migrations").get()?.id,
-          57,
+          59,
         );
         assert.ok(
           observer

@@ -13,7 +13,7 @@ import * as Schema from "effect/Schema";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
-import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as HostResources from "./HostResources.ts";
 
 export class EnvironmentCapacityError extends Schema.TaggedError<EnvironmentCapacityError>()(

@@ -1,5 +1,6 @@
+import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
-import * as Statement from "effect/unstable/sql/Statement";
+import * as Statement from "effect/sql/Statement";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -14,7 +15,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqlClient from "effect/sql/SqlClient";
 import { runMigrations } from "../persistence/Migrations.ts";
 import { ThreadLaunchService } from "../orchestration-v2/ThreadLaunchService.ts";
 import { ThreadManagementService } from "../orchestration-v2/ThreadManagementService.ts";
@@ -32,6 +33,7 @@ it.effect(
       Scheduler.layer,
       Layer.mock(ThreadLaunchService)({}),
       Layer.mock(ThreadManagementService)({}),
+      Layer.mock(SecretRequests.SecretRequests)({}),
     );
     const makeLayer = () =>
       layer.pipe(Layer.provide(dependencies), Layer.provide(NodeSqliteClient.layer({ filename })));
@@ -146,6 +148,7 @@ it.effect.each(
         launch: () => Effect.die("controlled dispatch failure"),
       }),
       Layer.mock(ThreadManagementService)({}),
+      Layer.mock(SecretRequests.SecretRequests)({}),
     );
     const service = () =>
       layer.pipe(Layer.provide(dependencies), Layer.provide(NodeSqliteClient.layer({ filename })));

@@ -4,7 +4,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
-import { CLAUDE_SESSION_STORE_CONTINUATION_KEY } from "../Services/ClaudeSessionStore.ts";
+import { CLAUDE_SESSION_STORE_CONTINUATION_KEY } from "../ClaudeSessionStore.ts";
 
 import {
   claudeSignedOutMessage,

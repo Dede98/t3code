@@ -1,3 +1,4 @@
+import { OrchestratorMcpFailure } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentCapacityReport,
@@ -14,7 +15,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
-import { McpSchema, McpServer } from "effect/unstable/ai";
+import { McpSchema, McpServer } from "effect/ai";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
@@ -22,7 +23,7 @@ import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
-import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as Settings from "../serverSettings.ts";
 import * as EnvironmentCapacity from "./EnvironmentCapacity.ts";
 import * as HostResources from "./HostResources.ts";
@@ -431,7 +432,7 @@ const client = McpSchema.McpServerClient.of({
 });
 
 function mcpLayer(options: { failWorkload?: boolean; deleted?: boolean } = {}) {
-  return McpHttpServer.EnvironmentRegistrationLive.pipe(
+  return McpHttpServer.layerEnvironmentRegistration.pipe(
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provide(
       Layer.mergeAll(
@@ -445,6 +446,17 @@ function mcpLayer(options: { failWorkload?: boolean; deleted?: boolean } = {}) {
     ),
   );
 }
+
+const decodeFailure = Schema.decodeUnknownSync(Schema.fromJsonString(OrchestratorMcpFailure));
+
+const readFailure = (result: {
+  readonly isError?: boolean | undefined;
+  readonly content: ReadonlyArray<{ readonly type: string; readonly text?: string | undefined }>;
+}) => {
+  expect(result.isError).toBe(true);
+  const text = result.content.find((part) => part.type === "text")?.text;
+  return decodeFailure(text);
+};
 
 const call = (invocation = scope) =>
   Effect.gen(function* () {
@@ -471,29 +483,29 @@ it.effect("serves capacity through the production MCP registration for a read-on
 it.effect("rejects an MCP credential without orchestration access", () =>
   Effect.gen(function* () {
     const result = yield* call({ ...scope, capabilities: new Set() });
-    expect(result.structuredContent).toMatchObject({ code: "capability_denied" });
+    expect(readFailure(result)).toMatchObject({ code: "capability_denied" });
   }).pipe(Effect.provide(mcpLayer())),
 );
 
 it.effect("rejects credentials belonging to another environment", () =>
   Effect.gen(function* () {
     const result = yield* call({ ...scope, environmentId: EnvironmentId.make("other") });
-    expect(result.structuredContent).toMatchObject({ code: "capability_denied" });
+    expect(readFailure(result)).toMatchObject({ code: "capability_denied" });
   }).pipe(Effect.provide(mcpLayer())),
 );
 
 it.effect("rejects a deleted caller", () =>
   Effect.gen(function* () {
     const result = yield* call();
-    expect(result.structuredContent).toMatchObject({ code: "thread_not_found" });
+    expect(readFailure(result)).toMatchObject({ code: "thread_not_found" });
   }).pipe(Effect.provide(mcpLayer({ deleted: true }))),
 );
 
 it.effect("returns a public error instead of zero workload when projections fail", () =>
   Effect.gen(function* () {
     const result = yield* call();
-    expect(result.structuredContent).toMatchObject({ code: "orchestration_error" });
+    expect(readFailure(result)).toMatchObject({ code: "orchestration_error" });
     expect(encodeJson(result)).not.toContain("private-db-path");
-    expect(result.structuredContent).not.toHaveProperty("workload");
+    expect(readFailure(result)).not.toHaveProperty("workload");
   }).pipe(Effect.provide(mcpLayer({ failWorkload: true }))),
 );

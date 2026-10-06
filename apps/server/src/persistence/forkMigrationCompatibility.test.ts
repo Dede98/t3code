@@ -8,9 +8,9 @@ import { assert, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import * as Migrator from "effect/unstable/sql/Migrator";
-import * as SqlClient from "effect/unstable/sql/SqlClient";
-import { forkMigrationEntries, runMigrations } from "./Migrations.ts";
+import * as Migrator from "effect/sql/Migrator";
+import * as SqlClient from "effect/sql/SqlClient";
+import { forkMigrationEntries, migrationEntries, runMigrations } from "./Migrations.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 
 const seedFork = (through = 55) =>
@@ -61,6 +61,8 @@ it.effect(
         assert.deepEqual(yield* migrate, [
           [56, "ForkOrchestrationV2"],
           [57, "RemoveRedundantProjectionIndexes"],
+          [58, "ScheduledTaskWebhooks"],
+          [59, "WebhookRelayDeliveries"],
         ]);
         // Each startup owns a fresh connection/layer.
         assert.deepEqual(yield* migrate, []);
@@ -151,6 +153,8 @@ it.effect("rolls back a failed fork foundation and retries from a fresh connecti
       [
         [56, "ForkOrchestrationV2"],
         [57, "RemoveRedundantProjectionIndexes"],
+        [58, "ScheduledTaskWebhooks"],
+        [59, "WebhookRelayDeliveries"],
       ],
     );
   }).pipe(
@@ -225,4 +229,41 @@ it.effect.each([0, 32, 52, 53, 54].map((through) => ({ through })))(
       ),
     );
   },
+);
+
+it.effect.each([57, 58])("preserves official upstream webhook ledger through %s", (through) =>
+  Effect.gen(function* () {
+    const official = [
+      ...migrationEntries.filter(([id]) => id <= 56),
+      ...migrationEntries
+        .filter(([id]) => id >= 58)
+        .map(([id, name, migration]) => [id - 1, name, migration] as const),
+    ].filter(([id]) => id <= through);
+    yield* Migrator.make({})({
+      loader: Migrator.fromRecord(
+        Object.fromEntries(official.map(([id, name, migration]) => [`${id}_${name}`, migration])),
+      ),
+    });
+    const sql = yield* SqlClient.SqlClient;
+    const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
+    yield* runMigrations();
+    assert.deepEqual(
+      yield* sql`SELECT * FROM effect_sql_migrations WHERE migration_id <= ${through} ORDER BY migration_id`,
+      history,
+    );
+    assert.deepEqual(yield* runMigrations(), []);
+    assert.equal(
+      (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 59`)[0]?.name,
+      "ClaudeSessionStore",
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'scheduled_task_webhook_relay_deliveries'`)
+        .length,
+      1,
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'claude_session_store_keys'`).length,
+      1,
+    );
+  }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
 );

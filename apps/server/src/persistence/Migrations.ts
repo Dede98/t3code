@@ -8,9 +8,9 @@
  * schema is always up to date before the application starts.
  */
 
-import * as Migrator from "effect/unstable/sql/Migrator";
+import * as Migrator from "effect/sql/Migrator";
 import * as Effect from "effect/Effect";
-import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqlClient from "effect/sql/SqlClient";
 
 // Import all migrations statically
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
@@ -70,6 +70,8 @@ import ClaudeSessionStore from "./Migrations/033_ClaudeSessionStore.ts";
 import Migration0054 from "./Migrations/055_ProjectionThreadsAutoSettleDisabledAt.ts";
 import Migration0055 from "./Migrations/055_OrchestrationV2.ts";
 import Migration0056 from "./Migrations/056_RemoveRedundantProjectionIndexes.ts";
+import Migration0057 from "./Migrations/057_ScheduledTaskWebhooks.ts";
+import Migration0058 from "./Migrations/058_WebhookRelayDeliveries.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -140,6 +142,8 @@ export const migrationEntries = [
   [55, "OrchestrationV2", Migration0055],
   [56, "RemoveRedundantProjectionIndexes", Migration0056],
   [57, "ClaudeSessionStore", ClaudeSessionStore],
+  [58, "ScheduledTaskWebhooks", Migration0057],
+  [59, "WebhookRelayDeliveries", Migration0058],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -157,6 +161,8 @@ export const forkMigrationEntries = [
   [55, "ProjectionThreadsAutoSettleDisabledAt", Migration0054],
   [56, "ForkOrchestrationV2", Migration0055],
   [57, "RemoveRedundantProjectionIndexes", Migration0056],
+  [58, "ScheduledTaskWebhooks", Migration0057],
+  [59, "WebhookRelayDeliveries", Migration0058],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -164,6 +170,8 @@ export const forkIntegrationMigrationEntries = [
   [55, "ForkOrchestrationV2", Migration0055],
   [56, "ProjectionThreadsAutoSettleDisabledAt", Migration0054],
   [57, "RemoveRedundantProjectionIndexes", Migration0056],
+  [58, "ScheduledTaskWebhooks", Migration0057],
+  [59, "WebhookRelayDeliveries", Migration0058],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -172,6 +180,8 @@ const upstreamIntegrationMigrationEntries = [
   [55, "ClaudeSessionStore", ClaudeSessionStore],
   [56, "ProjectionThreadsAutoSettleDisabledAt", Migration0054],
   [57, "RemoveRedundantProjectionIndexes", Migration0056],
+  [58, "ScheduledTaskWebhooks", Migration0057],
+  [59, "WebhookRelayDeliveries", Migration0058],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -180,6 +190,8 @@ const preview54MigrationEntries = [
   [55, "RemoveRedundantProjectionIndexes", Migration0056],
   [56, "ProjectionThreadsAutoSettleDisabledAt", Migration0054],
   [57, "ClaudeSessionStore", ClaudeSessionStore],
+  [58, "ScheduledTaskWebhooks", Migration0057],
+  [59, "WebhookRelayDeliveries", Migration0058],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -189,6 +201,15 @@ const preview53MigrationEntries = [
   [55, "RemoveRedundantProjectionIndexes", Migration0056],
   [56, "ProjectionThreadsAutoSettleDisabledAt", Migration0054],
   [57, "ClaudeSessionStore", ClaudeSessionStore],
+  [58, "ScheduledTaskWebhooks", Migration0057],
+  [59, "WebhookRelayDeliveries", Migration0058],
+] as const;
+
+const upstreamWebhookMigrationEntries = [
+  ...migrationEntries.filter(([id]) => id <= 56),
+  [57, "ScheduledTaskWebhooks", Migration0057],
+  [58, "WebhookRelayDeliveries", Migration0058],
+  [59, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -249,7 +270,9 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
         ? preview53MigrationEntries
         : has(54, "OrchestrationV2")
           ? preview54MigrationEntries
-          : migrationEntries;
+          : has(57, "ScheduledTaskWebhooks")
+            ? upstreamWebhookMigrationEntries
+            : migrationEntries;
   const expected = new Map<number, string>(entries.map(([id, name]) => [id, name]));
   // Select known fork/preview lineages without rewriting their ledger. Preserve
   // upstream's diagnostic behavior for site-local migrations sharing an id.
