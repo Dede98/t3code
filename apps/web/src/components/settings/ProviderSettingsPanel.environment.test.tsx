@@ -26,6 +26,8 @@ const commands = vi.hoisted(() => ({
   updateProvider: vi.fn(),
   uninstall: vi.fn(),
   acceptUrlAuth: vi.fn(),
+  canManageProviders: true,
+  canWriteSettings: true,
 }));
 
 const dialogs = vi.hoisted(() => ({
@@ -127,6 +129,20 @@ vi.mock("../../environments/primary", () => ({
 
 vi.mock("../../state/session", () => ({
   useEnvironmentSessionState: () => ({ data: null, hasError: false, isPending: true }),
+  useEnvironmentScope: (environmentId: EnvironmentId, scope: string) =>
+    environmentId === "remote-device" &&
+    (scope === "providers:manage"
+      ? commands.canManageProviders
+      : scope === "settings:write"
+        ? commands.canWriteSettings
+        : scope === "orchestration:read"),
+  readEnvironmentScope: (environmentId: EnvironmentId, scope: string) =>
+    environmentId === "remote-device" &&
+    (scope === "providers:manage"
+      ? commands.canManageProviders
+      : scope === "settings:write"
+        ? commands.canWriteSettings
+        : scope === "orchestration:read"),
 }));
 
 vi.mock("../../state/entities", () => ({
@@ -134,6 +150,7 @@ vi.mock("../../state/entities", () => ({
 }));
 
 import { EnvironmentProviderSettings } from "./ProviderSettingsPanel";
+import { AddProviderInstanceDialog } from "./AddProviderInstanceDialog";
 
 const environmentId = EnvironmentId.make("remote-device");
 const codexId = ProviderInstanceId.make("codex");
@@ -218,6 +235,8 @@ describe("EnvironmentProviderSettings routing", () => {
     settingsState.mutateProviderInstance
       .mockReset()
       .mockResolvedValue({ _tag: "Success", value: {} });
+    commands.canManageProviders = true;
+    commands.canWriteSettings = true;
     commands.refresh.mockReset().mockResolvedValue({ _tag: "Success" });
     commands.updateProvider.mockReset().mockResolvedValue({ _tag: "Success" });
     dialogs.confirm.mockReset().mockResolvedValue(true);
@@ -338,6 +357,22 @@ describe("EnvironmentProviderSettings routing", () => {
     });
   });
 
+  it("does not enable Claude continuation after its settings grant is revoked during confirmation", async () => {
+    const confirmation = Promise.withResolvers<boolean>();
+    dialogs.confirm.mockReturnValueOnce(confirmation.promise);
+    const continuationSwitch = visitElements(
+      renderPanel(),
+      (element) =>
+        element.props["aria-label"] === "Enable cross-account Claude thread continuation",
+    );
+    (continuationSwitch?.props.onCheckedChange as ((checked: boolean) => void) | undefined)?.(true);
+    expect(dialogs.confirm).toHaveBeenCalledOnce();
+    commands.canWriteSettings = false;
+    confirmation.resolve(true);
+    await flushPromises();
+    expect(settingsState.updateSettings).not.toHaveBeenCalled();
+  });
+
   it("opens the requested provider instance instead of the first provider", () => {
     settingsState.value = {
       ...DEFAULT_UNIFIED_SETTINGS,
@@ -383,6 +418,7 @@ describe("EnvironmentProviderSettings routing", () => {
   });
 
   it("keeps provider selection available while write controls are read only", () => {
+    commands.canWriteSettings = false;
     settingsState.value = {
       ...DEFAULT_UNIFIED_SETTINGS,
       providerInstances: {
@@ -416,7 +452,7 @@ describe("EnvironmentProviderSettings routing", () => {
     const notice = visitElements(panel, (element) => element.props.title === "Limited permissions");
     expect(notice).not.toBeNull();
 
-    expect(visitElements(panel, isRefreshButton)).toBeNull();
+    expect(visitElements(panel, isRefreshButton)).not.toBeNull();
     expect(visitElements(panel, isAddProviderButton)).toBeNull();
   });
 
@@ -429,6 +465,24 @@ describe("EnvironmentProviderSettings routing", () => {
     ).toBeNull();
     expect(visitElements(panel, isRefreshButton)).not.toBeNull();
     expect(visitElements(panel, isAddProviderButton)).not.toBeNull();
+  });
+
+  it("removes an open add-instance dialog when the provider grant is revoked", () => {
+    let panel = renderPanel();
+    const add = visitElements(panel, isAddProviderButton);
+    if (!add) throw new Error("Missing Add provider action.");
+    (add.props.onClick as () => void)();
+    panel = renderPanel();
+    expect(
+      visitElements(panel, (element) => element.type === AddProviderInstanceDialog),
+    ).not.toBeNull();
+
+    commands.canManageProviders = false;
+    panel = renderPanel({ readOnly: true });
+    expect(
+      visitElements(panel, (element) => element.type === AddProviderInstanceDialog),
+    ).toBeNull();
+    expect(settingsState.updateSettings).not.toHaveBeenCalled();
   });
 
   it.each(["provider-health-check-interval", "claude-cross-account-continuation"])(

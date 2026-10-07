@@ -1,5 +1,6 @@
 import { OrchestratorMcpFailure } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
   EnvironmentCapacityReport,
   EnvironmentId,
@@ -114,6 +115,7 @@ function dependencies(
   } = {},
 ) {
   return Layer.mergeAll(
+    NodeCrypto.layer,
     Layer.succeed(ServerEnvironment.ServerEnvironment, {
       getEnvironmentId: Effect.succeed(environmentId),
       getDescriptor: Effect.succeed(descriptor),

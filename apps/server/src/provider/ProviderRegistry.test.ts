@@ -3,7 +3,7 @@ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as CodexInstallation from "./CodexInstallation.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { describe, it, assert } from "@effect/vitest";
+import { describe, it, assert, expect } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -2377,6 +2377,123 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
           },
         ]);
       });
+
+      it.effect.each([false, true])(
+        "shares an untargeted refresh and guards rebuilds when callers cancel: %s",
+        (cancelCallers) =>
+          Effect.gen(function* () {
+            const driver = ProviderDriverKind.make("codex");
+            const instanceId = ProviderInstanceId.make("codex");
+            const provider = {
+              instanceId,
+              driver,
+              status: "ready",
+              enabled: true,
+              installed: true,
+              auth: { status: "authenticated" },
+              checkedAt: "2026-06-10T00:00:00.000Z",
+              version: "1.0.0",
+              models: [],
+              slashCommands: [],
+              skills: [],
+            } as const satisfies ServerProvider;
+            const refreshCalls = yield* Ref.make(0);
+            const probeStarted = yield* Deferred.make<void>();
+            const releaseProbe = yield* Deferred.make<void>();
+            const instances = [
+              {
+                instanceId,
+                driverKind: driver,
+                continuationIdentity: {
+                  driverKind: driver,
+                  continuationKey: "codex:instance:codex",
+                },
+                displayName: undefined,
+                enabled: true,
+                snapshot: {
+                  resolveMaintenance: () =>
+                    Effect.succeed(
+                      makeManualOnlyProviderMaintenanceCapabilities({
+                        provider: driver,
+                        packageName: null,
+                      }),
+                    ),
+                  getSnapshot: Effect.succeed(provider),
+                  refresh: Effect.gen(function* () {
+                    yield* Ref.update(refreshCalls, (count) => count + 1);
+                    yield* Deferred.succeed(probeStarted, undefined);
+                    yield* Deferred.await(releaseProbe);
+                    return provider;
+                  }),
+                  streamChanges: Stream.empty,
+                  applyUsageLimits: () => Effect.void,
+                },
+                orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+                textGeneration: {} as ProviderInstance["textGeneration"],
+              },
+            ] satisfies ReadonlyArray<ProviderInstance>;
+            const instanceRegistryLayer = Layer.succeed(
+              ProviderInstanceRegistry.ProviderInstanceRegistry,
+              {
+                getInstance: (requestedId) =>
+                  Effect.succeed(instances.find((instance) => instance.instanceId === requestedId)),
+                listInstances: Effect.succeed(instances),
+                listUnavailable: Effect.succeed([]),
+                streamChanges: Stream.empty,
+                subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), PubSub.subscribe),
+              },
+            );
+            const scope = yield* Scope.make();
+            yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+            const runtimeServices = yield* Layer.build(
+              ProviderRegistry.layer.pipe(
+                Layer.provideMerge(instanceRegistryLayer),
+                Layer.provideMerge(ProviderRegistryRebuildBarrier.layer),
+                Layer.provideMerge(
+                  ServerConfig.layerTest(process.cwd(), {
+                    prefix: "t3-provider-registry-shared-refresh-",
+                  }),
+                ),
+                Layer.provideMerge(NodeServices.layer),
+              ),
+            ).pipe(Scope.provide(scope));
+
+            yield* Effect.gen(function* () {
+              const registry = yield* ProviderRegistry.ProviderRegistry;
+              const first = yield* registry.refresh().pipe(Effect.forkChild);
+              yield* Deferred.await(probeStarted);
+              const second = yield* registry.refresh().pipe(Effect.forkChild);
+              yield* Effect.yieldNow;
+              assert.strictEqual(yield* Ref.get(refreshCalls), 1);
+              const barrier = yield* ProviderRegistryRebuildBarrier.ProviderRegistryRebuildBarrier;
+              const rebuilt = yield* Deferred.make<void>();
+              const rebuilding = yield* barrier
+                .withRebuild(Deferred.succeed(rebuilt, undefined))
+                .pipe(Effect.forkChild);
+              if (cancelCallers) {
+                yield* Fiber.interrupt(first);
+                yield* Fiber.interrupt(second);
+              }
+              yield* Effect.yieldNow;
+              assert.isFalse(yield* Deferred.isDone(rebuilt));
+              // Even after both callers leave, a later caller joins the same pass.
+              const final = yield* registry.refresh().pipe(Effect.forkChild);
+              yield* Effect.yieldNow;
+              assert.strictEqual(yield* Ref.get(refreshCalls), 1);
+              yield* Deferred.succeed(releaseProbe, undefined);
+              expect(yield* Fiber.join(final)).toEqual([expect.objectContaining(provider)]);
+              if (!cancelCallers) {
+                expect(yield* Fiber.join(first)).toEqual([expect.objectContaining(provider)]);
+                expect(yield* Fiber.join(second)).toEqual([expect.objectContaining(provider)]);
+              }
+              yield* Fiber.join(rebuilding);
+              assert.strictEqual(yield* Ref.get(refreshCalls), 1);
+
+              yield* registry.refresh();
+              assert.strictEqual(yield* Ref.get(refreshCalls), 2);
+            }).pipe(Effect.provide(runtimeServices));
+          }),
+      );
 
       it.effect("persists the merged snapshot when a live update has empty models", () =>
         Effect.gen(function* () {

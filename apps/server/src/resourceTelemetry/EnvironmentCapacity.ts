@@ -1,4 +1,3 @@
-import * as NodeCrypto from "node:crypto";
 import {
   isProviderNativeSubagentThread,
   type EnvironmentCapacityReport,
@@ -6,6 +5,8 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
+import * as Hex from "effect/encoding/Hex";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -55,19 +56,27 @@ function freshness(sampledAt: number, now: number, maxAgeMs: number) {
   return { ageMs, stale: sampledAt > now || ageMs > maxAgeMs };
 }
 
-function quotaGroupId(provider: ServerProvider) {
+const encodeQuotaIdentity = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
+
+const quotaGroupId = Effect.fn("EnvironmentCapacity.quotaGroupId")(function* (
+  provider: ServerProvider,
+) {
   const email = provider.auth.email?.trim().toLowerCase();
   const identity = email
     ? [provider.driver, "email", email]
     : provider.usageLimits?.credentialFingerprint
       ? [provider.driver, "credential", provider.usageLimits.credentialFingerprint]
       : null;
-  return identity === null
-    ? null
-    : NodeCrypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex");
-}
+  if (identity === null) return null;
+  const crypto = yield* Crypto.Crypto;
+  const digest = yield* crypto
+    .digest("SHA-256", new TextEncoder().encode(encodeQuotaIdentity(identity)))
+    .pipe(Effect.mapError((cause) => new EnvironmentCapacityError({ cause })));
+  return Hex.encode(digest);
+});
 
 const make = Effect.gen(function* () {
+  const crypto = yield* Crypto.Crypto;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const resources = yield* HostResources.HostResources;
   const registry = yield* ProviderRegistry.ProviderRegistry;
@@ -118,40 +127,45 @@ const make = Effect.gen(function* () {
           .sort(([left], [right]) => left.localeCompare(right))
           .map(([providerInstanceId, counts]) => ({ providerInstanceId, ...counts })),
       },
-      providers: providers.map((provider) => ({
-        providerInstanceId: provider.instanceId,
-        driver: provider.driver,
-        displayName: provider.displayName ?? null,
-        enabled: provider.enabled,
-        installed: provider.installed,
-        status: provider.status,
-        authStatus: provider.auth.status,
-        availability: provider.availability ?? "available",
-        checkedAt: provider.checkedAt,
-        ...freshness(Date.parse(provider.checkedAt), nowMs, 5 * 60_000),
-        quotaGroupId: quotaGroupId(provider),
-        usageLimits: provider.usageLimits
-          ? {
-              checkedAt: provider.usageLimits.checkedAt,
-              ...freshness(Date.parse(provider.usageLimits.checkedAt), nowMs, 5 * 60_000),
-              unavailableReason: provider.usageLimits.unavailable?.reason ?? null,
-              windows: provider.usageLimits.windows.map((window) => ({
-                id: window.id,
-                kind: window.kind,
-                label: window.label,
-                usedPercent: window.usedPercent,
-                remainingPercent: 100 - window.usedPercent,
-                ...(window.resetsAt === undefined ? {} : { resetsAt: window.resetsAt }),
-                ...(window.windowDurationMins === undefined
-                  ? {}
-                  : { windowDurationMins: window.windowDurationMins }),
-                resetPassed: window.resetsAt !== undefined && Date.parse(window.resetsAt) <= nowMs,
-              })),
-            }
-          : null,
-      })),
+      providers: yield* Effect.forEach(providers, (provider) =>
+        Effect.gen(function* () {
+          return {
+            providerInstanceId: provider.instanceId,
+            driver: provider.driver,
+            displayName: provider.displayName ?? null,
+            enabled: provider.enabled,
+            installed: provider.installed,
+            status: provider.status,
+            authStatus: provider.auth.status,
+            availability: provider.availability ?? "available",
+            checkedAt: provider.checkedAt,
+            ...freshness(Date.parse(provider.checkedAt), nowMs, 5 * 60_000),
+            quotaGroupId: yield* quotaGroupId(provider),
+            usageLimits: provider.usageLimits
+              ? {
+                  checkedAt: provider.usageLimits.checkedAt,
+                  ...freshness(Date.parse(provider.usageLimits.checkedAt), nowMs, 5 * 60_000),
+                  unavailableReason: provider.usageLimits.unavailable?.reason ?? null,
+                  windows: provider.usageLimits.windows.map((window) => ({
+                    id: window.id,
+                    kind: window.kind,
+                    label: window.label,
+                    usedPercent: window.usedPercent,
+                    remainingPercent: 100 - window.usedPercent,
+                    ...(window.resetsAt === undefined ? {} : { resetsAt: window.resetsAt }),
+                    ...(window.windowDurationMins === undefined
+                      ? {}
+                      : { windowDurationMins: window.windowDurationMins }),
+                    resetPassed:
+                      window.resetsAt !== undefined && Date.parse(window.resetsAt) <= nowMs,
+                  })),
+                }
+              : null,
+          };
+        }),
+      ),
     } satisfies EnvironmentCapacityReport;
-  });
+  }).pipe(Effect.provideService(Crypto.Crypto, crypto));
   return EnvironmentCapacity.of({ read });
 });
 
