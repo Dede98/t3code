@@ -358,8 +358,11 @@ describe("EnvironmentProviderSettings routing", () => {
   });
 
   it("does not enable Claude continuation after its settings grant is revoked during confirmation", async () => {
-    const confirmation = Promise.withResolvers<boolean>();
-    dialogs.confirm.mockReturnValueOnce(confirmation.promise);
+    let resolveConfirmation!: (confirmed: boolean) => void;
+    const confirmation = new Promise<boolean>((resolve) => {
+      resolveConfirmation = resolve;
+    });
+    dialogs.confirm.mockReturnValueOnce(confirmation);
     const continuationSwitch = visitElements(
       renderPanel(),
       (element) =>
@@ -368,7 +371,7 @@ describe("EnvironmentProviderSettings routing", () => {
     (continuationSwitch?.props.onCheckedChange as ((checked: boolean) => void) | undefined)?.(true);
     expect(dialogs.confirm).toHaveBeenCalledOnce();
     commands.canWriteSettings = false;
-    confirmation.resolve(true);
+    resolveConfirmation(true);
     await flushPromises();
     expect(settingsState.updateSettings).not.toHaveBeenCalled();
   });
