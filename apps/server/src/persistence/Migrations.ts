@@ -72,6 +72,8 @@ import Migration0055 from "./Migrations/055_OrchestrationV2.ts";
 import Migration0056 from "./Migrations/056_RemoveRedundantProjectionIndexes.ts";
 import Migration0057 from "./Migrations/057_ScheduledTaskWebhooks.ts";
 import Migration0058 from "./Migrations/058_WebhookRelayDeliveries.ts";
+import Migration0059 from "./Migrations/059_McpAppModelContext.ts";
+import Migration0060 from "./Migrations/060_ThreadSnapshotWindowIndexes.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -144,6 +146,8 @@ export const migrationEntries = [
   [57, "ClaudeSessionStore", ClaudeSessionStore],
   [58, "ScheduledTaskWebhooks", Migration0057],
   [59, "WebhookRelayDeliveries", Migration0058],
+  [60, "McpAppModelContext", Migration0059],
+  [61, "ThreadSnapshotWindowIndexes", Migration0060],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -163,6 +167,8 @@ export const forkMigrationEntries = [
   [57, "RemoveRedundantProjectionIndexes", Migration0056],
   [58, "ScheduledTaskWebhooks", Migration0057],
   [59, "WebhookRelayDeliveries", Migration0058],
+  [60, "McpAppModelContext", Migration0059],
+  [61, "ThreadSnapshotWindowIndexes", Migration0060],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -172,6 +178,8 @@ export const forkIntegrationMigrationEntries = [
   [57, "RemoveRedundantProjectionIndexes", Migration0056],
   [58, "ScheduledTaskWebhooks", Migration0057],
   [59, "WebhookRelayDeliveries", Migration0058],
+  [60, "McpAppModelContext", Migration0059],
+  [61, "ThreadSnapshotWindowIndexes", Migration0060],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -182,6 +190,8 @@ const upstreamIntegrationMigrationEntries = [
   [57, "RemoveRedundantProjectionIndexes", Migration0056],
   [58, "ScheduledTaskWebhooks", Migration0057],
   [59, "WebhookRelayDeliveries", Migration0058],
+  [60, "McpAppModelContext", Migration0059],
+  [61, "ThreadSnapshotWindowIndexes", Migration0060],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -192,6 +202,8 @@ const preview54MigrationEntries = [
   [57, "ClaudeSessionStore", ClaudeSessionStore],
   [58, "ScheduledTaskWebhooks", Migration0057],
   [59, "WebhookRelayDeliveries", Migration0058],
+  [60, "McpAppModelContext", Migration0059],
+  [61, "ThreadSnapshotWindowIndexes", Migration0060],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -203,6 +215,8 @@ const preview53MigrationEntries = [
   [57, "ClaudeSessionStore", ClaudeSessionStore],
   [58, "ScheduledTaskWebhooks", Migration0057],
   [59, "WebhookRelayDeliveries", Migration0058],
+  [60, "McpAppModelContext", Migration0059],
+  [61, "ThreadSnapshotWindowIndexes", Migration0060],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -210,6 +224,17 @@ const upstreamWebhookMigrationEntries = [
   [57, "ScheduledTaskWebhooks", Migration0057],
   [58, "WebhookRelayDeliveries", Migration0058],
   [59, "ClaudeSessionStore", ClaudeSessionStore],
+  [60, "McpAppModelContext", Migration0059],
+  [61, "ThreadSnapshotWindowIndexes", Migration0060],
+] as const;
+
+// Official upstream databases may already have the app migrations at 59/60.
+// Keep those records and append the fork's session store after them.
+const upstreamMcpAppMigrationEntries = [
+  ...upstreamWebhookMigrationEntries.filter(([id]) => id <= 58),
+  [59, "McpAppModelContext", Migration0059],
+  [60, "ThreadSnapshotWindowIndexes", Migration0060],
+  [61, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -270,9 +295,11 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
         ? preview53MigrationEntries
         : has(54, "OrchestrationV2")
           ? preview54MigrationEntries
-          : has(57, "ScheduledTaskWebhooks")
-            ? upstreamWebhookMigrationEntries
-            : migrationEntries;
+          : has(59, "McpAppModelContext")
+            ? upstreamMcpAppMigrationEntries
+            : has(57, "ScheduledTaskWebhooks")
+              ? upstreamWebhookMigrationEntries
+              : migrationEntries;
   const expected = new Map<number, string>(entries.map(([id, name]) => [id, name]));
   // Select known fork/preview lineages without rewriting their ledger. Preserve
   // upstream's diagnostic behavior for site-local migrations sharing an id.

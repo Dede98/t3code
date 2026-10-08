@@ -100,8 +100,15 @@ it.effect.each(
         );
         assert.equal(
           observer.prepare("SELECT MAX(migration_id) AS id FROM effect_sql_migrations").get()?.id,
-          59,
+          61,
         );
+        for (const name of [
+          "mcp_app_model_context",
+          "orchestration_v2_projection_turn_items_user_message_idx",
+          "orchestration_v2_projection_nodes_live_idx",
+        ]) {
+          assert.ok(observer.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(name));
+        }
         assert.ok(
           observer
             .prepare("PRAGMA table_info(projection_threads)")
