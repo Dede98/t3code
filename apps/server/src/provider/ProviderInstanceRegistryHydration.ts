@@ -50,8 +50,7 @@ import {
 } from "./ProviderRegistryRebuildBarrier.ts";
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
 import * as ProviderOrchestrationAdapterInfrastructure from "./ProviderOrchestrationAdapterInfrastructure.ts";
-import * as AcpRegistrySupport from "./acp/AcpRegistrySupport.ts";
-import * as AcpRegistryCatalog from "./AcpRegistryCatalog.ts";
+import * as AcpRegistrySupport from "@t3tools/provider-acp-registry/server/AcpRegistrySupport";
 import * as ProviderHostLive from "./ProviderHostLive.ts";
 import type { ProviderHost } from "@t3tools/provider-core/server/ProviderHost";
 import type * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
@@ -343,7 +342,7 @@ export const layer: Layer.Layer<
       configMap: initialConfigMap,
     }).pipe(
       Layer.provide(ProviderOrchestrationAdapterInfrastructure.layer),
-      Layer.provide(AcpRegistryCatalog.layer),
+      Layer.provide(AcpRegistrySupport.layerFromHost),
       Layer.provide(ProviderHostLive.layer),
     );
 
