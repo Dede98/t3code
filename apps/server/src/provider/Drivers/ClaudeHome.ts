@@ -5,7 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
-import { expandHomePath } from "../../pathExpansion.ts";
+import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { CLAUDE_SESSION_STORE_CONTINUATION_KEY } from "../ClaudeSessionStore.ts";
 
 const quotePath = Schema.encodeSync(Schema.fromJsonString(Schema.String));

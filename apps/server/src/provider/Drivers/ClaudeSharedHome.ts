@@ -6,7 +6,7 @@ import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
-import { expandHomePath } from "../../pathExpansion.ts";
+import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { resolveClaudeConfigDirPath } from "./ClaudeHome.ts";
 
 const entries = ["skills", "CLAUDE.md", "rules"] as const;

@@ -1,4 +1,4 @@
-import { resolveExternalMcpServers } from "../provider/ExternalMcpServers.ts";
+import { resolveExternalMcpServers } from "@t3tools/provider-core/server/externalMcpServers";
 import { ProviderRegistrySessionLifecycle } from "../provider/ProviderRegistrySessionLifecycle.ts";
 import { ProviderRegistryRebuildBarrier } from "../provider/ProviderRegistryRebuildBarrier.ts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
@@ -43,11 +43,11 @@ import {
 } from "../observability/Metrics.ts";
 import { ProviderWorkspaceMissingError } from "../provider/Errors.ts";
 import * as ProjectService from "../project/ProjectService.ts";
-import * as McpProviderSession from "../mcp/McpProviderSession.ts";
+import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as EventSink from "./EventSink.ts";
-import * as IdAllocator from "./IdAllocator.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import {
   ProviderAdapterEventStreamError,
@@ -57,7 +57,7 @@ import {
   type ProviderAdapterV2Event,
   type ProviderAdapterV2EventSubscription,
   type ProviderAdapterV2SessionRuntime,
-} from "./ProviderAdapter.ts";
+} from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 

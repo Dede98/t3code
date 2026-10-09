@@ -24,11 +24,6 @@ const deriveWithGate = (enabled: boolean) =>
   deriveProviderInstanceConfigMap(
     decodeServerSettings({
       claudeCrossAccountContinuationEnabled: enabled,
-      providers: {
-        claudeAgent: {
-          configDirPath: "~/.claude-default",
-        },
-      },
       providerInstances: {
         claude_work: {
           driver: "claudeAgent",
@@ -37,6 +32,7 @@ const deriveWithGate = (enabled: boolean) =>
             crossAccountContinuationEnabled: !enabled,
           },
         },
+        claude_empty: { driver: "claudeAgent" },
         claude_personal: {
           driver: "claudeAgent",
           config: {
@@ -58,13 +54,14 @@ const readInjectedGate = (config: unknown): unknown =>
     .crossAccountContinuationEnabled;
 
 describe("deriveProviderInstanceConfigMap Claude continuation gate", () => {
-  it("injects the global value into legacy and every explicit Claude instance", () => {
+  it("injects the global value into implicit and every explicit Claude instance", () => {
     const disabled = deriveWithGate(false);
     const enabled = deriveWithGate(true);
     const claudeIds = [
       ProviderInstanceId.make("claudeAgent"),
       ProviderInstanceId.make("claude_work"),
       ProviderInstanceId.make("claude_personal"),
+      ProviderInstanceId.make("claude_empty"),
     ];
 
     for (const instanceId of claudeIds) {
@@ -102,9 +99,15 @@ effectIt.effect(
   "coalesces changes and closes only affected idle V2 instances under the rebuild barrier",
   () =>
     Effect.gen(function* () {
-      const initial = decodeServerSettings({ providers: { codex: { binaryPath: "/old" } } });
-      const first = decodeServerSettings({ providers: { codex: { binaryPath: "/intermediate" } } });
-      const latest = decodeServerSettings({ providers: { codex: { binaryPath: "/latest" } } });
+      const initial = decodeServerSettings({
+        providerInstances: { codex: { driver: "codex", config: { binaryPath: "/old" } } },
+      });
+      const first = decodeServerSettings({
+        providerInstances: { codex: { driver: "codex", config: { binaryPath: "/intermediate" } } },
+      });
+      const latest = decodeServerSettings({
+        providerInstances: { codex: { driver: "codex", config: { binaryPath: "/latest" } } },
+      });
       const desired = yield* Ref.make<DesiredProviderRegistrySettings>({
         settings: first,
         version: 1,
@@ -164,20 +167,26 @@ effectIt.effect(
     }),
 );
 
-it("rebuilds only instances selected by changed external MCP configuration without embedding secrets", () => {
-  const settings = (token: string) =>
-    decodeServerSettings({
-      externalMcpServers: {
-        remote: {
-          enabled: true,
-          url: "https://remote.example/mcp",
-          providerInstances: ["codex"],
-          headers: [{ name: "Authorization", value: token, sensitive: true }],
+it.each([false, true])(
+  "rebuilds only MCP-selected instances without embedding secrets (explicit empty config: %s)",
+  (explicit) => {
+    const settings = (token: string) =>
+      decodeServerSettings({
+        ...(explicit
+          ? { providerInstances: { [ProviderInstanceId.make("codex")]: { driver: "codex" } } }
+          : {}),
+        externalMcpServers: {
+          remote: {
+            enabled: true,
+            url: "https://remote.example/mcp",
+            providerInstances: ["codex"],
+            headers: [{ name: "Authorization", value: token, sensitive: true }],
+          },
         },
-      },
-    });
-  const before = deriveProviderInstanceConfigMap(settings("before-secret"));
-  const after = deriveProviderInstanceConfigMap(settings("after-secret"));
-  expect([...providerInstanceIdsRequiringSettle(before, after)]).toEqual(["codex"]);
-  expect(JSON.stringify(after)).not.toContain("after-secret");
-});
+      });
+    const before = deriveProviderInstanceConfigMap(settings("before-secret"));
+    const after = deriveProviderInstanceConfigMap(settings("after-secret"));
+    expect([...providerInstanceIdsRequiringSettle(before, after)]).toEqual(["codex"]);
+    expect(JSON.stringify(after)).not.toContain("after-secret");
+  },
+);

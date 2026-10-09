@@ -97,6 +97,7 @@ function layerDesktopWindow(
     dispatchNotificationClick: () => Effect.die("unexpected notification click"),
     dispatchSnapShotEvent: () => Effect.void,
     zoomMain: () => Effect.void,
+    runMainContentsCommand: () => Effect.void,
     syncAppearance: Effect.void,
   });
 }
