@@ -30,6 +30,18 @@ its inventory as required behavior to verify, not as a command to retain today's
 Do not push, open a pull request, write to live T3 data, launch a browser, or perform computer-use
 verification unless the user explicitly requests it.
 
+## Standing toolchain approvals
+
+The user explicitly approved the following for future local upstream syncs on 2026-10-09.
+These approvals supersede older notes requiring a new confirmation each time:
+
+- Use Node 24 from `/opt/homebrew/opt/node@24/bin` for focused validation, including when the
+  ambient runtime is Node 26. Prepend that directory to the command's `PATH` and unset
+  `ELECTRON_RUN_AS_NODE`; verify the resulting Node version. No renewed approval is needed.
+- When integration requires refreshed dependencies, run `vp i --frozen-lockfile` with that
+  toolchain. If `vp` is not on `PATH`, use `node_modules/.bin/vp i --frozen-lockfile`.
+  No renewed approval is needed. This does not authorize an unfrozen install or dependency upgrades.
+
 ## Fetch and identify the integration range
 
 1. Run `git fetch upstream --prune`.
@@ -133,7 +145,34 @@ Do not rewrite either side's history and do not rebase this integration.
 
 ## Report the outcome
 
-Include:
+After every sync, provide a German inline visual summary by default, without waiting for a
+separate request. Lead with the most important behavioral changes, ordered by impact:
+
+- **Upstream highlights:** Explain the most significant new features, fixes, and architectural
+  changes, what changes in practice, and which clients or providers benefit. Base these on the
+  inspected diff and history, not commit titles alone.
+- **Impact on fork changes:** Highlight the most important changes to our custom behavior and
+  implementation. For each affected area, explain what existed before, what upstream introduced,
+  what the integrated result does, and why that solution was chosen. Explicitly distinguish fork
+  behavior retained, adapted, replaced by an upstream equivalent, or still unresolved. Include
+  significant semantic overlaps even when Git reported no conflict; do not merely say
+  "all fork changes preserved" or list conflicted filenames.
+- **Validation and remaining issues:** Show focused check results, pre-existing failures,
+  unverified behavior, and any necessary user action separately. Do not sum overlapping test runs
+  or imply live-product validation from unit tests.
+
+Keep these highlights visible in the initial view. Put the complete commit list, detailed conflict
+resolutions, and full verification evidence in tabs or expandable sections so they remain
+accessible without burying the summary. Include a compact Git status overview and label its
+snapshot time if later edits changed the worktree.
+
+When T3 Code's `html_preview` and `html_render` tools are available, build a self-contained,
+responsive HTML report, inspect it with `html_preview`, and publish it inline with `html_render`
+before the final reply. This report is requested by default; it does not require another approval
+or authorize browser verification of the live app. If inline rendering is unavailable, provide
+the same highlights and evidence directly in chat as Markdown. A file link alone is insufficient.
+
+The full report must include:
 
 - the old and new upstream tips;
 - every newly integrated upstream commit and a plain-language summary;
