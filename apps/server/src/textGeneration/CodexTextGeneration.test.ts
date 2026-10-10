@@ -1,4 +1,4 @@
-import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -149,7 +149,7 @@ function withFakeCodexEnv<A, E, R>(
     const config = decodeCodexSettings({ binaryPath: codexPath, launchArgs: input.launchArgs });
     const textGeneration = yield* makeCodexTextGeneration(
       config,
-      input.environment ? { ...(yield* HostProcessEnvironment), ...input.environment } : undefined,
+      input.environment ? { ...(yield* HostProcess.Environment), ...input.environment } : undefined,
       Effect.succeed(
         (input.models ?? []).map((slug) => ({
           slug,

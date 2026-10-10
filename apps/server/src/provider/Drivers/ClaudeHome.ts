@@ -1,5 +1,3 @@
-import * as NodeOS from "node:os";
-
 import type { ClaudeSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
@@ -7,12 +5,13 @@ import * as Schema from "effect/Schema";
 
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { CLAUDE_SESSION_STORE_CONTINUATION_KEY } from "../ClaudeSessionStore.ts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 const quotePath = Schema.encodeSync(Schema.fromJsonString(Schema.String));
 
-const resolveProcessHomePath = (baseEnv?: NodeJS.ProcessEnv): string => {
+const resolveProcessHomePath = (home: string, baseEnv?: NodeJS.ProcessEnv): string => {
   const inheritedHome = baseEnv?.HOME?.trim();
-  return inheritedHome ? expandHomePath(inheritedHome) : NodeOS.homedir();
+  return inheritedHome ? expandHomePath(inheritedHome, home) : home;
 };
 
 /**
@@ -27,15 +26,16 @@ export const resolveClaudeHomePath = Effect.fn("resolveClaudeHomePath")(function
   baseEnv?: NodeJS.ProcessEnv,
 ): Effect.fn.Return<string, never, Path.Path> {
   const path = yield* Path.Path;
+  const home = yield* HostProcess.HomeDirectory;
   const homePath = config.homePath.trim();
   if (homePath.length > 0) {
-    return path.resolve(expandHomePath(homePath));
+    return path.resolve(expandHomePath(homePath, home));
   }
   const inheritedConfigDirPath = baseEnv?.CLAUDE_CONFIG_DIR?.trim();
   if (inheritedConfigDirPath) {
-    return path.resolve(expandHomePath(inheritedConfigDirPath));
+    return path.resolve(expandHomePath(inheritedConfigDirPath, home));
   }
-  return path.resolve(resolveProcessHomePath(baseEnv), ".claude");
+  return path.resolve(resolveProcessHomePath(home, baseEnv), ".claude");
 });
 
 export const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath")(function* (
@@ -46,7 +46,8 @@ export const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath"
   const configuredPath = config.configDirPath.trim();
   const inheritedPath = baseEnv?.CLAUDE_CONFIG_DIR?.trim();
   const configDirPath = configuredPath || inheritedPath;
-  if (configDirPath) return path.resolve(expandHomePath(configDirPath));
+  if (configDirPath)
+    return path.resolve(expandHomePath(configDirPath, yield* HostProcess.HomeDirectory));
 
   // `homePath` is the legacy field used by existing profiles. Treat its
   // value as CLAUDE_CONFIG_DIR rather than overriding process HOME, which
@@ -92,7 +93,9 @@ export const makeClaudeEnvironment = Effect.fn("makeClaudeEnvironment")(function
     // compatibility test exercises it against an actual Claude executable.
     ...(memoryRoot
       ? {
-          CLAUDE_CODE_REMOTE_MEMORY_DIR: (yield* Path.Path).resolve(expandHomePath(memoryRoot)),
+          CLAUDE_CODE_REMOTE_MEMORY_DIR: (yield* Path.Path).resolve(
+            expandHomePath(memoryRoot, yield* HostProcess.HomeDirectory),
+          ),
         }
       : {}),
   };

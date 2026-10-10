@@ -6,6 +6,7 @@ import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { resolveClaudeConfigDirPath } from "./ClaudeHome.ts";
 
@@ -36,29 +37,31 @@ export const materializeClaudeSharedHome = Effect.fn("materializeClaudeSharedHom
     const configDir = yield* resolveClaudeConfigDirPath(config, environment);
     const manifestPath = path.join(configDir, ".t3-shared-home.json");
     const shared = config.sharedHomePath.trim();
-    const sharedDir = shared ? path.resolve(expandHomePath(shared)) : undefined;
+    const sharedDir = shared
+      ? path.resolve(expandHomePath(shared, yield* HostProcess.HomeDirectory))
+      : undefined;
     let owned = yield* fs.readFileString(manifestPath).pipe(
       Effect.flatMap(decodeManifest),
-      Effect.catchTag("PlatformError", (error) =>
-        error.reason._tag === "NotFound" ? Effect.succeed([]) : Effect.fail(error),
-      ),
+      Effect.catchTags({
+        PlatformError: (error) =>
+          error.reason._tag === "NotFound" ? Effect.succeed([]) : Effect.fail(error),
+      }),
     );
     if (!sharedDir && owned.length === 0) return;
 
     const canonical = Effect.fn("ClaudeSharedHome.canonical")(function* (
       value: string,
     ): Effect.fn.Return<string, PlatformError.PlatformError> {
-      return yield* fs
-        .realPath(value)
-        .pipe(
-          Effect.catchTag("PlatformError", (error) =>
+      return yield* fs.realPath(value).pipe(
+        Effect.catchTags({
+          PlatformError: (error) =>
             error.reason._tag === "NotFound" && path.dirname(value) !== value
               ? canonical(path.dirname(value)).pipe(
                   Effect.map((parent) => path.join(parent, path.basename(value))),
                 )
               : Effect.fail(error),
-          ),
-        );
+        }),
+      );
     });
     const accountRoot = yield* canonical(configDir);
     const sharedRoot = sharedDir ? yield* canonical(sharedDir) : undefined;
@@ -82,19 +85,21 @@ export const materializeClaudeSharedHome = Effect.fn("materializeClaudeSharedHom
             Effect.map((parent) => path.join(parent, path.basename(absolute))),
           );
         }),
-        Effect.catchTag("PlatformError", (error) => {
-          if (error.reason._tag === "NotFound") return Effect.succeed(undefined);
-          const cause = error.reason.cause;
-          if (
-            error.reason._tag === "Unknown" &&
-            typeof cause === "object" &&
-            cause !== null &&
-            "code" in cause &&
-            cause.code === "EINVAL"
-          ) {
-            return Effect.succeed(null);
-          }
-          return Effect.fail(error);
+        Effect.catchTags({
+          PlatformError: (error) => {
+            if (error.reason._tag === "NotFound") return Effect.succeed(undefined);
+            const cause = error.reason.cause;
+            if (
+              error.reason._tag === "Unknown" &&
+              typeof cause === "object" &&
+              cause !== null &&
+              "code" in cause &&
+              cause.code === "EINVAL"
+            ) {
+              return Effect.succeed(null);
+            }
+            return Effect.fail(error);
+          },
         }),
       );
     const conflict = (name: string) =>
