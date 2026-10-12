@@ -65,6 +65,7 @@ it.effect(
           [59, "WebhookRelayDeliveries"],
           [60, "McpAppModelContext"],
           [61, "ThreadSnapshotWindowIndexes"],
+          [62, "PullRequestReviewGuides"],
         ]);
         // Each startup owns a fresh connection/layer.
         assert.deepEqual(yield* migrate, []);
@@ -159,6 +160,7 @@ it.effect("rolls back a failed fork foundation and retries from a fresh connecti
         [59, "WebhookRelayDeliveries"],
         [60, "McpAppModelContext"],
         [61, "ThreadSnapshotWindowIndexes"],
+        [62, "PullRequestReviewGuides"],
       ],
     );
   }).pipe(
@@ -235,7 +237,7 @@ it.effect.each([0, 32, 52, 53, 54].map((through) => ({ through })))(
   },
 );
 
-it.effect.each([57, 58, 59, 60])(
+it.effect.each([57, 58, 59, 60, 61])(
   "preserves official upstream webhook ledger through %s",
   (through) =>
     Effect.gen(function* () {
@@ -281,7 +283,12 @@ it.effect.each([57, 58, 59, 60])(
       );
       assert.deepEqual(yield* runMigrations(), []);
       assert.equal(
-        (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = ${through >= 59 ? 61 : 59}`)[0]
+        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'pull_request_review_guides'`)
+          .length,
+        1,
+      );
+      assert.equal(
+        (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = ${through >= 61 ? 62 : through >= 59 ? 61 : 59}`)[0]
           ?.name,
         "ClaudeSessionStore",
       );

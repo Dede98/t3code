@@ -85,8 +85,7 @@ export interface GhosttyTheme {
   readonly foreground: GhosttyColor;
   readonly background: GhosttyColor;
   readonly cursor: GhosttyColor;
-  /** The named ANSI colors (0-15); extended colors retain Ghostty's defaults. */
-  readonly ansiColors?: readonly GhosttyColor[];
+  readonly palette?: readonly GhosttyColor[];
   /** CSS color the renderer overlays on selected cells; not sent to Ghostty. */
   readonly selectionBackground?: string;
 }
@@ -423,8 +422,8 @@ export class GhosttyTerminalCore {
       this.runtime.call("ghostty_terminal_set", this.terminal, option, color);
     }
     this.runtime.free(color, 3);
-    if (theme.ansiColors !== undefined) {
-      if (theme.ansiColors.length !== GHOSTTY_ANSI_COLOR_COUNT) {
+    if (theme.palette !== undefined) {
+      if (theme.palette.length !== GHOSTTY_ANSI_COLOR_COUNT) {
         throw new Error(`Ghostty ANSI palette must contain ${GHOSTTY_ANSI_COLOR_COUNT} colors`);
       }
       this.assertSuccess(
@@ -432,7 +431,7 @@ export class GhosttyTerminalCore {
         this.runtime.call("ghostty_terminal_get", this.terminal, 25, this.palette),
       );
       const palette = this.runtime.bytes(this.palette, GHOSTTY_COLOR_PALETTE_BYTES);
-      for (const [index, value] of theme.ansiColors.entries()) {
+      for (const [index, value] of theme.palette.entries()) {
         palette.set([value.r, value.g, value.b], index * 3);
       }
       this.assertSuccess(

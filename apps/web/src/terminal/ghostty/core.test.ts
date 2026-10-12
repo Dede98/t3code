@@ -75,7 +75,7 @@ describe("GhosttyTerminalCore browser policy", () => {
         foreground: { r: 230, g: 231, b: 232 },
         background: { r: 10, g: 11, b: 12 },
         cursor: { r: 240, g: 241, b: 242 },
-        ansiColors,
+        palette: ansiColors,
       },
       () => {},
     );
@@ -244,6 +244,26 @@ describe("GhosttyTerminalCore snapshots", () => {
       { text: "E", foreground: { r: 255, g: 255, b: 255 }, background: { r: 0, g: 0, b: 0 } },
       { text: "", foreground: { r: 255, g: 255, b: 255 }, background: { r: 0, g: 0, b: 0 } },
     ]);
+  });
+
+  it("paints ANSI colors from the theme palette and repaints them on theme change", async () => {
+    const core = await createCore();
+    const theme = {
+      foreground: { r: 255, g: 255, b: 255 },
+      background: { r: 0, g: 0, b: 0 },
+      cursor: { r: 255, g: 255, b: 255 },
+    };
+    const palette = Array.from({ length: 16 }, (_, index) => ({ r: index, g: 1, b: 2 }));
+    core.write("\x1b[31mR\x1b[38;5;196mX\x1b[0m");
+    core.setTheme({ ...theme, palette });
+    let cells = core.snapshot().rowData[0]!.cells;
+    expect(cells[0]!.foreground).toEqual({ r: 1, g: 1, b: 2 });
+    expect(cells[1]!.foreground).toEqual({ r: 255, g: 0, b: 0 });
+
+    core.setTheme({ ...theme, palette: palette.map((color) => ({ ...color, g: 9 })) });
+    cells = core.snapshot().rowData[0]!.cells;
+    expect(cells[0]!.foreground).toEqual({ r: 1, g: 9, b: 2 });
+    expect(cells[1]!.foreground).toEqual({ r: 255, g: 0, b: 0 });
   });
 
   it("reuses a grown grapheme buffer and releases it on disposal", async () => {

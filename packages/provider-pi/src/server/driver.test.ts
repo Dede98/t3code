@@ -5,6 +5,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
@@ -47,7 +48,9 @@ const personalSkill = {
 };
 
 // Respond through the real stdio transport, with a distinct command catalog for each cwd.
-const makePiSpawner = Effect.gen(function* () {
+const makePiSpawner = Effect.fnUntraced(function* (
+  discovery: { readonly state?: unknown; readonly models?: ReadonlyArray<unknown> } = {},
+) {
   const pendingCommand = yield* Deferred.make<void>();
   const launches: Array<ChildProcess.StandardCommand> = [];
   const spawner = ChildProcessSpawner.make((command) =>
@@ -92,8 +95,10 @@ const makePiSpawner = Effect.gen(function* () {
                   ],
                 }
               : request.type === "get_available_models"
-                ? { models: [{ provider: "test", id: "model" }] }
-                : {};
+                ? { models: discovery.models ?? [{ provider: "test", id: "model" }] }
+                : request.type === "get_state"
+                  ? (discovery.state ?? {})
+                  : {};
           return Queue.offer(
             stdout,
             encoder.encode(
@@ -125,7 +130,7 @@ const create = (config: Partial<PiSettings> = {}, enabled = true) =>
 it.layer(layerTest)("PiDriver workspace discovery", (it) => {
   it.effect("keeps each workspace's skills and commands separate from the machine catalog", () =>
     Effect.gen(function* () {
-      const { spawner, launches } = yield* makePiSpawner;
+      const { spawner, launches } = yield* makePiSpawner();
       const instance = yield* create({ launchArgs: '--approve --skill "extra skill"' }).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       );
@@ -180,17 +185,61 @@ it.layer(layerTest)("PiDriver workspace discovery", (it) => {
         ),
       );
       assert.isDefined(instance.snapshotForCwd);
+      const path = yield* Path.Path;
+      assert.deepEqual(instance.usageHistorySource, {
+        provider: "pi",
+        transcriptDirectory: path.resolve("/isolated-pi", "sessions"),
+      });
       const workspace = yield* instance.snapshotForCwd!("/first");
       assert.isFalse(workspace.enabled);
       assert.deepEqual(workspace.skills, []);
     }).pipe(Effect.scoped),
   );
 
+  it.effect.each([true, false])(
+    "limits discovered thinking defaults to the known active model, known=%s",
+    (known) =>
+      Effect.gen(function* () {
+        const { spawner } = yield* makePiSpawner({
+          state: {
+            thinkingLevel: "high",
+            ...(known ? { model: { provider: "test", id: "model" } } : {}),
+          },
+          models: [
+            { provider: "test", id: "model", reasoning: true },
+            { provider: "other", id: "model", reasoning: true },
+            { provider: "test", id: "other", reasoning: true },
+          ],
+        });
+        const instance = yield* create().pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        );
+        yield* instance.snapshot.refresh;
+        const snapshot = yield* instance.snapshot.getSnapshot;
+        assert.deepEqual(
+          snapshot.models.map((model) => [
+            model.slug,
+            (model.capabilities?.optionDescriptors ?? []).flatMap((descriptor) =>
+              descriptor.type === "select"
+                ? descriptor.options.filter((option) => option.isDefault).map((option) => option.id)
+                : [],
+            ),
+          ]),
+          [
+            ["default", []],
+            ["test/model", known ? ["high"] : []],
+            ["other/model", []],
+            ["test/other", []],
+          ],
+        );
+      }).pipe(Effect.scoped),
+  );
+
   it.effect(
     "fails command discovery instead of returning an empty successful workspace catalog",
     () =>
       Effect.gen(function* () {
-        const { spawner } = yield* makePiSpawner;
+        const { spawner } = yield* makePiSpawner();
         const instance = yield* create().pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         );
@@ -208,7 +257,7 @@ it.layer(layerTest)("PiDriver workspace discovery", (it) => {
 
   it.effect("times out workspace discovery that needs interactive input", () =>
     Effect.gen(function* () {
-      const { spawner, pendingCommand } = yield* makePiSpawner;
+      const { spawner, pendingCommand } = yield* makePiSpawner();
       const instance = yield* create().pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       );

@@ -30,6 +30,8 @@ import { ProviderRegistrySessionLifecycle } from "./ProviderRegistrySessionLifec
 import {
   defaultInstanceIdForDriver,
   ProviderInstanceId,
+  providerInstanceConfigEnabledFlag,
+  resolveProviderInstanceEnabled,
   type ProviderInstanceConfig,
   type ProviderInstanceConfigMap,
   ServerSettings,
@@ -130,6 +132,29 @@ export const deriveProviderInstanceConfigMap = (
       };
     }
   }
+  // A project that turns an instance on needs it alive and probed even when
+  // the machine itself has it off, or a thread in that project would route
+  // to an instance nobody ever checked in on. Fold every project's
+  // `providerInstances[id].enabled` overrides in: an instance already enabled
+  // is untouched, and one absent from settings entirely (deleted) stays out.
+  for (const overrides of Object.values(settings.projectSettingsOverrides)) {
+    for (const [rawInstanceId, projectOverride] of Object.entries(
+      overrides?.providerInstances ?? {},
+    )) {
+      if (projectOverride.enabled !== true) continue;
+      const instanceId = rawInstanceId as ProviderInstanceId;
+      const existing = merged[instanceId];
+      if (existing === undefined || resolveProviderInstanceEnabled(existing)) continue;
+      merged[instanceId] = {
+        ...existing,
+        enabled: true,
+        ...(providerInstanceConfigEnabledFlag(existing.config) === false
+          ? { config: { ...(existing.config as Record<string, unknown>), enabled: true } }
+          : {}),
+      };
+    }
+  }
+
   return merged as ProviderInstanceConfigMap;
 };
 

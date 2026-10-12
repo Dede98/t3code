@@ -79,6 +79,9 @@ const ClaudeSessionStoreTestLive = ClaudeSessionStore.layer.pipe(
   Layer.provide(SqlitePersistence.layerMemory),
 );
 
+// The mock CLIs from makeTildeProviderFixtures are scripts Windows cannot execute.
+const windowsHost = HostProcess.Platform.defaultValue() === "win32";
+
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 
 const layerBackgroundPolicyAlwaysRun = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
@@ -548,7 +551,7 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
       Effect.provide(layerTest),
     );
 
-  it.live("refreshes Claude usage after redeeming a reset", () =>
+  it.live.skipIf(windowsHost)("refreshes Claude usage after redeeming a reset", () =>
     Effect.gen(function* () {
       const { outcome, after } = yield* redeemClaudeReset({
         result: "reset",
@@ -559,14 +562,16 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
     }),
   );
 
-  it.live("reports Claude's answer when a claim changed nothing and the re-probe fails", () =>
-    Effect.gen(function* () {
-      const { outcome } = yield* redeemClaudeReset({
-        result: "already_used",
-        usageFailsAfterClaim: true,
-      });
-      expect(outcome).toMatchObject({ _tag: "Success", success: "alreadyRedeemed" });
-    }),
+  it.live.skipIf(windowsHost)(
+    "reports Claude's answer when a claim changed nothing and the re-probe fails",
+    () =>
+      Effect.gen(function* () {
+        const { outcome } = yield* redeemClaudeReset({
+          result: "already_used",
+          usageFailsAfterClaim: true,
+        });
+        expect(outcome).toMatchObject({ _tag: "Success", success: "alreadyRedeemed" });
+      }),
   );
 
   it.live(

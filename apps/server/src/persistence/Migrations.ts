@@ -74,6 +74,7 @@ import Migration0057 from "./Migrations/057_ScheduledTaskWebhooks.ts";
 import Migration0058 from "./Migrations/058_WebhookRelayDeliveries.ts";
 import Migration0059 from "./Migrations/059_McpAppModelContext.ts";
 import Migration0060 from "./Migrations/060_ThreadSnapshotWindowIndexes.ts";
+import Migration0061 from "./Migrations/061_PullRequestReviewGuides.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -148,6 +149,7 @@ export const migrationEntries = [
   [59, "WebhookRelayDeliveries", Migration0058],
   [60, "McpAppModelContext", Migration0059],
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
+  [62, "PullRequestReviewGuides", Migration0061],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -169,6 +171,7 @@ export const forkMigrationEntries = [
   [59, "WebhookRelayDeliveries", Migration0058],
   [60, "McpAppModelContext", Migration0059],
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
+  [62, "PullRequestReviewGuides", Migration0061],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -180,6 +183,7 @@ export const forkIntegrationMigrationEntries = [
   [59, "WebhookRelayDeliveries", Migration0058],
   [60, "McpAppModelContext", Migration0059],
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
+  [62, "PullRequestReviewGuides", Migration0061],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -192,6 +196,7 @@ const upstreamIntegrationMigrationEntries = [
   [59, "WebhookRelayDeliveries", Migration0058],
   [60, "McpAppModelContext", Migration0059],
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
+  [62, "PullRequestReviewGuides", Migration0061],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -204,6 +209,7 @@ const preview54MigrationEntries = [
   [59, "WebhookRelayDeliveries", Migration0058],
   [60, "McpAppModelContext", Migration0059],
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
+  [62, "PullRequestReviewGuides", Migration0061],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -217,6 +223,7 @@ const preview53MigrationEntries = [
   [59, "WebhookRelayDeliveries", Migration0058],
   [60, "McpAppModelContext", Migration0059],
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
+  [62, "PullRequestReviewGuides", Migration0061],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -226,6 +233,7 @@ const upstreamWebhookMigrationEntries = [
   [59, "ClaudeSessionStore", ClaudeSessionStore],
   [60, "McpAppModelContext", Migration0059],
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
+  [62, "PullRequestReviewGuides", Migration0061],
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -235,6 +243,14 @@ const upstreamMcpAppMigrationEntries = [
   [59, "McpAppModelContext", Migration0059],
   [60, "ThreadSnapshotWindowIndexes", Migration0060],
   [61, "ClaudeSessionStore", ClaudeSessionStore],
+  [62, "PullRequestReviewGuides", Migration0061],
+] as const;
+
+// Upstream databases that already applied review guides keep that id/name pair.
+const upstreamReviewGuideMigrationEntries = [
+  ...upstreamMcpAppMigrationEntries.filter(([id]) => id <= 60),
+  [61, "PullRequestReviewGuides", Migration0061],
+  [62, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -296,7 +312,9 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
         : has(54, "OrchestrationV2")
           ? preview54MigrationEntries
           : has(59, "McpAppModelContext")
-            ? upstreamMcpAppMigrationEntries
+            ? has(61, "PullRequestReviewGuides")
+              ? upstreamReviewGuideMigrationEntries
+              : upstreamMcpAppMigrationEntries
             : has(57, "ScheduledTaskWebhooks")
               ? upstreamWebhookMigrationEntries
               : migrationEntries;

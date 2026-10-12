@@ -17,6 +17,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
+import { piUsageReader, resolvePiSessionDirectory } from "./usage.ts";
 import { makePiTextGeneration } from "./textGeneration.ts";
 import { PiAdapterV2Driver, type PiAdapterV2DriverEnv } from "./adapter.ts";
 import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
@@ -80,12 +81,13 @@ const withInstanceIdentity =
     continuation: { groupKey: input.continuationGroupKey },
   });
 
-export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
+export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv, Path.Path> = {
   driverKind: DRIVER_KIND,
   metadata: {
     displayName: "Pi",
     supportsMultipleInstances: true,
   },
+  usage: piUsageReader,
   configSchema: PiSettings,
   defaultConfig: (): PiSettings => decodePiSettings({}),
   create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
@@ -209,6 +211,10 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
               ),
         orchestrationAdapter,
         textGeneration,
+        usageHistorySource: {
+          provider: "pi",
+          transcriptDirectory: yield* resolvePiSessionDirectory(processEnv),
+        },
       } satisfies ProviderInstance;
     }),
 };
