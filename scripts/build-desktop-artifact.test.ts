@@ -21,6 +21,7 @@ import {
   parseWslRuntimeArchiveMembers,
   DesktopDmgBackgroundSourceMissingError,
   createStageWorkspaceConfig,
+  readWorkspaceConfig,
   createStagePatchedDependencies,
   createBuildConfig,
   DESKTOP_ELECTRON_LANGUAGES,
@@ -505,6 +506,13 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       packageExtensions: stagePackageExtensions,
     });
   });
+
+  it.effect("loads the checked-in workspace configuration for desktop staging", () =>
+    Effect.gen(function* () {
+      const config = yield* readWorkspaceConfig();
+      assert.isTrue(config.allowBuilds?.electron);
+    }),
+  );
 
   it("stages pnpm 11 allowBuilds and patchedDependencies in the workspace yaml", () => {
     assert.deepStrictEqual(
