@@ -267,6 +267,44 @@ const makeMigrationLoader = (
     ),
   );
 
+// V2's schema migrations start at 55 after the legacy schema migrations. Fork
+// and preview lineages record other names there, but every lineage needs each
+// of its ids from 55 on.
+const FIRST_V2_MIGRATION_ID = 55;
+
+/**
+ * Fail before migrating when the migrator would skip one of the selected
+ * lineage's migrations from V2 on. It skips every id up to the highest
+ * recorded one, whatever name was recorded, so a database that took one of
+ * those ids for another migration would start without that schema and fail on
+ * first use. Earlier ids keep the warning below: databases with a site-local
+ * migration there still work.
+ */
+const assertV2MigrationsCanRun = Effect.fn("assertV2MigrationsCanRun")(function* (
+  entries: ReadonlyArray<readonly [number, string, unknown]>,
+  recorded: ReadonlyArray<{ readonly migration_id: number; readonly name: string }>,
+  throughId?: number,
+) {
+  const latestRecordedId = Math.max(0, ...recorded.map((row) => row.migration_id));
+  const recordedNames = new Map(recorded.map((row) => [row.migration_id, row.name]));
+  const skipped = entries.flatMap(([id, name]) => {
+    if (
+      id < FIRST_V2_MIGRATION_ID ||
+      id > latestRecordedId ||
+      (throughId !== undefined && id > throughId)
+    )
+      return [];
+    const recordedName = recordedNames.get(id);
+    if (recordedName === name) return [];
+    return [`${id}_${name} (recorded: ${recordedName ?? "nothing"})`];
+  });
+  if (skipped.length === 0) return;
+  return yield* new Migrator.MigrationError({
+    kind: "BadState",
+    message: `This database's migration history would skip required schema migrations: ${skipped.join(", ")}. The migrator skips every id up to the highest recorded id (${latestRecordedId}), regardless of name. It was probably written by a different build. Start the build that wrote it, or report this migration history so an upgrade path can be added.`,
+  });
+});
+
 /**
  * Migrator run function - no schema dumping needed
  * Uses the base Migrator.make without platform dependencies
@@ -318,6 +356,7 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
             : has(57, "ScheduledTaskWebhooks")
               ? upstreamWebhookMigrationEntries
               : migrationEntries;
+  yield* assertV2MigrationsCanRun(entries, recorded, toMigrationInclusive);
   const expected = new Map<number, string>(entries.map(([id, name]) => [id, name]));
   // Select known fork/preview lineages without rewriting their ledger. Preserve
   // upstream's diagnostic behavior for site-local migrations sharing an id.

@@ -168,6 +168,28 @@ it.effect("rolls back a failed fork foundation and retries from a fresh connecti
   );
 });
 
+it.effect("refuses to start when another migration took a fork lineage V2 id", () =>
+  Effect.gen(function* () {
+    yield* seedFork();
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`
+      INSERT INTO effect_sql_migrations (migration_id, name) VALUES (56, 'FutureMainMigration')
+    `;
+    const before = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
+
+    const exit = yield* Effect.exit(runMigrations());
+
+    assert.equal(exit._tag, "Failure");
+    assert.include(String(exit), "56_ForkOrchestrationV2 (recorded: FutureMainMigration)");
+    assert.notInclude(String(exit), "55_");
+    assert.deepEqual(yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`, before);
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_events'`).length,
+      0,
+    );
+  }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+);
+
 it.effect.each([33, 52, 53].map((through) => ({ through })))(
   "finishes a fork database at migration $through without replaying shifted migrations",
   ({ through }) => {
