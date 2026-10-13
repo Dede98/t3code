@@ -1,3 +1,6 @@
+import { type OrchestrationMessageContext, HtmlThemeSnapshot } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+
 import {
   T3_CODE_DARK_THEME_COLORS,
   T3_CODE_LIGHT_THEME_COLORS,
@@ -12,6 +15,9 @@ import {
  * its head; clients show it in a sandboxed iframe (web, desktop) or WebView
  * (mobile) and hand it the active theme as CSS custom properties.
  */
+
+const decodeHtmlTheme = Schema.decodeUnknownSync(HtmlThemeSnapshot);
+const isHtmlTheme = Schema.is(HtmlThemeSnapshot);
 
 export const HTML_RENDER_TOOL_NAME = "html_render";
 export const HTML_RENDER_MIN_HEIGHT = 80;
@@ -168,10 +174,7 @@ export const HTML_RENDER_MEASURE_FONTS: HtmlRenderFonts = {
 };
 
 /** The resolved theme a client hands an HTML render. */
-export interface HtmlRenderTheme {
-  readonly appearance: ThemeAppearance;
-  readonly variables: Readonly<Record<string, string>>;
-}
+export type HtmlRenderTheme = HtmlThemeSnapshot;
 
 // Roles themes cannot change (index.css keeps info/success fixed), plus a
 // categorical chart series after the theme's own accent.
@@ -240,14 +243,15 @@ export function htmlRenderTheme(
       "--chart-1": colors.accent,
       ...Object.fromEntries(fixed.chart.map((color, index) => [`--chart-${index + 2}`, color])),
       "--radius": "0.625rem",
-      "--font-sans": fonts.sans,
-      "--font-mono": fonts.mono,
+      "--font-sans": fonts.sans.replace(/[;{}<>\r\n]/g, ""),
+      "--font-mono": fonts.mono.replace(/[;{}<>\r\n]/g, ""),
     },
   };
 }
 
 /** Agent-facing reference for the injected variables, used in tool descriptions. */
 export const HTML_RENDER_THEME_GUIDE = [
+  "Use var(--...) for theme colors; do not define a standard fallback palette in your own :root rules. T3 provides the defaults. Preserve explicit branding only when requested.",
   "T3 injects its active theme as CSS custom properties on :root, and they follow the user's theme and light/dark mode live:",
   "--background (page background, identical to the thread around the frame), --foreground, --muted, --muted-foreground,",
   "--card, --card-foreground, --popover, --popover-foreground, --secondary, --secondary-foreground, --border, --input, --ring,",
@@ -255,6 +259,7 @@ export const HTML_RENDER_THEME_GUIDE = [
   "--destructive, --destructive-foreground, --destructive-surface, --warning, --warning-foreground, --warning-surface,",
   "--success, --success-foreground, --info, --info-foreground, --code-background, --code-foreground,",
   "--chart-1 … --chart-6 (categorical series for charts), --radius, --font-sans, --font-mono.",
+  "For external export or upload, use html_export to embed the requesting client's captured palette. Do not upload the raw source or hardcode standard colors. Explicit author CSS still overrides theme variables.",
   "The base stylesheet sets html background/color/font from these, body margin to 0, and hides the page's scrollbar; your own CSS overrides it.",
 ].join(" ");
 
@@ -347,28 +352,85 @@ function rootRule(theme: HtmlRenderTheme): string {
 // so its client can fit the frame to the page.
 const BOOTSTRAP_SCRIPT = `(function(){var s=document.getElementById("t3-theme"),n=0;if(!s)return;var b=${JSON.stringify(BASE_CSS)};function a(t){if(!t||typeof t!=="object"||!t.variables||typeof t.variables!=="object")return;var c=":root{color-scheme:"+(t.appearance==="light"?"light":"dark")+";";for(var k in t.variables){if(/^--[a-z0-9-]+$/.test(k))c+=k+":"+String(t.variables[k]).replace(/[;{}<>]/g,"")+";";}s.textContent=c+"}"+b;}try{var m=/[#&]${THEME_FRAGMENT_KEY}=([^&]*)/.exec(location.hash);if(m){a(JSON.parse(decodeURIComponent(m[1])));history.replaceState(history.state,"",location.pathname+location.search);}}catch(e){}window.addEventListener("message",function(e){var d=e.data,p=d&&d.params;if(d&&d.jsonrpc==="2.0"&&d.method===${JSON.stringify(HOST_CONTEXT_CHANGED_METHOD)}&&p&&p.styles)a({appearance:p.theme,variables:p.styles.variables});});document.addEventListener("click",function(e){var l=e.isTrusted?e.composedPath().find(function(t){return t&&t.matches&&t.matches("a[href]");}):null,u;if(!l)return;try{u=new URL(l.getAttribute("href"),document.baseURI);}catch(x){return;}if(!/^https?:$/.test(u.protocol)||u.href.split("#")[0]===location.href.split("#")[0])return;if(window.parent!==window){e.preventDefault();window.parent.postMessage({jsonrpc:"2.0",id:"t3-link-"+(++n),method:${JSON.stringify(OPEN_LINK_METHOD)},params:{url:u.href}},"*");}else{l.setAttribute("target","_blank");l.setAttribute("rel","noopener");}},true);if(window.parent!==window){var h,o,z=function(){var r=document.documentElement,v=Math.ceil(r.scrollHeight>r.clientHeight?r.scrollHeight:r.getBoundingClientRect().height);if(v===h)return;h=v;window.parent.postMessage({jsonrpc:"2.0",method:${JSON.stringify(SIZE_CHANGED_METHOD)},params:{height:v}},"*");};if(window.ResizeObserver){o=new ResizeObserver(z);o.observe(document.documentElement);}document.addEventListener("DOMContentLoaded",function(){if(o&&document.body)o.observe(document.body);z();});window.addEventListener("load",z);}})();`;
 
-function bootstrapMarkup(markup: string): string {
+function bootstrapMarkup(markup: string, theme?: HtmlRenderTheme, standalone = false): string {
   const dark = htmlRenderTheme(T3_CODE_DARK_THEME_COLORS, "dark");
   const light = htmlRenderTheme(T3_CODE_LIGHT_THEME_COLORS, "light");
   // Without a client-provided theme (a direct download, the headless preview
   // without a fragment) the page follows the OS appearance.
-  const defaultCss = `${rootRule(dark)}@media (prefers-color-scheme: light){${rootRule(light)}}${BASE_CSS}`;
+  const defaultCss = theme
+    ? `${rootRule(decodeHtmlTheme(theme))}${BASE_CSS}`
+    : `${rootRule(dark)}@media (prefers-color-scheme: light){${rootRule(light)}}${BASE_CSS}`;
   return [
     /<meta\s[^>]*charset/i.test(markup.slice(0, 4096)) ? "" : '<meta charset="utf-8">',
     /<meta\s[^>]*name\s*=\s*["']?viewport/i.test(markup)
       ? ""
       : '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    theme
+      ? `<meta name="t3-html-theme" content="${encodeURIComponent(JSON.stringify(theme))}">`
+      : "",
     `<style id="t3-theme">${defaultCss}</style>`,
-    `<script>${BOOTSTRAP_SCRIPT}</script>`,
+    standalone ? "" : `<script id="t3-html-bootstrap">${BOOTSTRAP_SCRIPT}</script>`,
   ].join("");
+}
+
+/** Capture at submission, before asynchronous uploads or an offline outbox can delay delivery. */
+export function withHtmlTheme(
+  context: OrchestrationMessageContext | undefined,
+  theme: HtmlRenderTheme,
+): OrchestrationMessageContext {
+  return { ...context, version: 1, records: context?.records ?? [], htmlTheme: theme };
+}
+
+/** Freeze a page's theme into its bytes; exported pages need no T3 host or JavaScript. */
+export function exportHtmlRender(html: string, theme: HtmlRenderTheme): string {
+  return injectHtmlRenderBootstrap(html, theme, true);
+}
+
+/** A published page retains its capture for later exports without a connected client. */
+export function readHtmlRenderTheme(html: string): HtmlRenderTheme | undefined {
+  const match = /<meta name="t3-html-theme" content="([^"]+)">/.exec(blankNonMarkup(html));
+  if (!match) return undefined;
+  try {
+    const theme: unknown = JSON.parse(decodeURIComponent(match[1]!));
+    return isHtmlTheme(theme) ? theme : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function removeHtmlRenderBootstrap(html: string): string {
+  const scan = blankNonMarkup(html, true);
+  const ranges: Array<readonly [number, number]> = [];
+  for (const match of scan.matchAll(/<(style|script)\b[^>]*>[\s\S]*?<\/\1\s*>|<meta\b[^>]*>/gi)) {
+    const original = html.slice(match.index, match.index + match[0].length);
+    if (
+      original.startsWith('<style id="t3-theme">') ||
+      original.startsWith('<meta name="t3-html-theme" ') ||
+      original === `<script>${BOOTSTRAP_SCRIPT}</script>` ||
+      original === `<script id="t3-html-bootstrap">${BOOTSTRAP_SCRIPT}</script>`
+    ) {
+      ranges.push([match.index, match.index + match[0].length]);
+    }
+  }
+  for (let index = ranges.length - 1; index >= 0; index--) {
+    const [start, end] = ranges[index]!;
+    html = html.slice(0, start) + html.slice(end);
+  }
+  return html;
 }
 
 // Comments, raw text, and template contents are blanked to the same length,
 // so offsets still line up and inert tags cannot receive the bootstrap.
-const blankNonMarkup = (html: string) => {
+const blankNonMarkup = (html: string, keepRawTags = false) => {
   const scan = html.replace(
     /<!--[\s\S]*?(?:-->|$)|<(script|style|textarea|title|xmp|iframe|noembed|noframes|noscript)\b[\s\S]*?(?:<\/\1\s*>|$)|<plaintext\b[\s\S]*$/gi,
-    (match) => " ".repeat(match.length),
+    (match, tag: string | undefined) => {
+      if (!keepRawTags || !tag) return " ".repeat(match.length);
+      const openEnd = match.indexOf(">") + 1;
+      const closeStart = match.toLowerCase().lastIndexOf(`</${tag.toLowerCase()}`);
+      if (closeStart < openEnd) return " ".repeat(match.length);
+      return match.slice(0, openEnd) + " ".repeat(closeStart - openEnd) + match.slice(closeStart);
+    },
   );
   const parts: string[] = [];
   let depth = 0;
@@ -395,9 +457,14 @@ const blankNonMarkup = (html: string) => {
  * Inserts the theme bootstrap at the start of the document head, so a page's
  * own styles and scripts come after it.
  */
-export function injectHtmlRenderBootstrap(html: string): string {
+export function injectHtmlRenderBootstrap(
+  html: string,
+  theme?: HtmlRenderTheme,
+  standalone = false,
+): string {
+  html = removeHtmlRenderBootstrap(html);
   const scan = blankNonMarkup(html);
-  const markup = bootstrapMarkup(scan);
+  const markup = bootstrapMarkup(scan, theme, standalone);
   const headOpen = /<head(?:\s[^>]*)?>/i.exec(scan);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;

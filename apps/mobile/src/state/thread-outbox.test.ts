@@ -1,3 +1,5 @@
+import { htmlRenderTheme } from "@t3tools/shared/htmlRender";
+import { T3_CODE_DARK_THEME_COLORS } from "@t3tools/shared/themePalettes";
 import { describe, expect, it } from "@effect/vitest";
 import { EnvironmentNotRegisteredError } from "@t3tools/client-runtime/connection";
 import { isTransportConnectionErrorMessage } from "@t3tools/client-runtime/errors";
@@ -120,6 +122,7 @@ describe("thread outbox", () => {
       ...queuedMessage({ messageId: "context-message", createdAt: "2026-09-06T12:00:00.000Z" }),
       text: "[Build](t3-context://v1/terminal/build-output)",
       context: {
+        htmlTheme: htmlRenderTheme(T3_CODE_DARK_THEME_COLORS, "dark"),
         version: 1,
         records: [
           {

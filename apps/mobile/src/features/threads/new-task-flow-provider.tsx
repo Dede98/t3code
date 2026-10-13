@@ -1,3 +1,5 @@
+import { withHtmlTheme } from "@t3tools/shared/htmlRender";
+import { useHtmlRenderTheme } from "../../lib/useHtmlRenderTheme";
 import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/filesystem";
 import { useEnvironmentPresentation } from "../../state/presentation";
 import { environmentSession } from "../../state/session";
@@ -1109,6 +1111,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
     return true;
   }, []);
 
+  const htmlTheme = useHtmlRenderTheme();
   const buildPendingTaskMessage = useCallback(
     (
       metadata: TurnCommandMetadata,
@@ -1155,7 +1158,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
         commandId: CommandId.make(metadata.commandId),
         text,
         attachments: draft.attachments,
-        context: draft.context,
+        context: withHtmlTheme(draft.context, htmlTheme),
         modelSelection: draftModelSelection,
         runtimeMode: draft.runtimeMode ?? defaultRuntimeMode,
         interactionMode: resolvePendingTaskInteractionMode({
@@ -1196,6 +1199,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       };
     },
     [
+      htmlTheme,
       canChooseWorkspace,
       defaultRuntimeMode,
       editingPendingProject,

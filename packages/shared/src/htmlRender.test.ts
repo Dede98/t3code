@@ -2,6 +2,9 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   HTML_RENDER_MAX_HEIGHT,
+  exportHtmlRender,
+  readHtmlRenderTheme,
+  withHtmlTheme,
   htmlRenderFrameHeight,
   htmlRenderReferencesEqual,
   htmlRenderTheme,
@@ -235,5 +238,52 @@ describe("htmlRenderFrameHeight", () => {
     const copy = readHtmlRenderReference(JSON.parse(JSON.stringify(measured)))!;
     expect(htmlRenderReferencesEqual(measured, copy)).toBe(true);
     expect(htmlRenderReferencesEqual(measured, { ...copy, heights: [[390, 1290]] })).toBe(false);
+  });
+});
+
+describe("standalone theme export", () => {
+  const theme = htmlRenderTheme(
+    { ...T3_CODE_DARK_THEME_COLORS, canvas: "#213925", accent: "#c8ff85" },
+    "dark",
+  );
+  it("embeds custom colors, fonts and appearance without a host bootstrap or OS fallback", () => {
+    const body = "<main>Revenue</main><script>window.chartReady=true;</script>";
+    const exported = exportHtmlRender(injectHtmlRenderBootstrap(body), theme);
+    expect(exported).toContain("--background:#213925;");
+    expect(exported).toContain("--accent:#c8ff85;");
+    expect(exported).toContain("--chart-1:#c8ff85;");
+    expect(exported).toContain("color-scheme:dark;");
+    expect(exported).toContain(body);
+    expect(exported).not.toContain("host-context-changed");
+    expect(exported).not.toContain("prefers-color-scheme");
+    expect(readHtmlRenderTheme(exported)).toEqual(theme);
+    expect(exportHtmlRender(exported, theme)).toBe(exported);
+  });
+  it("replaces an old capture and ignores bootstrap-looking text in inert content", () => {
+    const inert =
+      '<template><style id="t3-theme">example</style></template><!-- <style id="t3-theme">comment</style> -->';
+    const page = injectHtmlRenderBootstrap(
+      `<html><head></head><body>${inert}</body></html>`,
+      theme,
+    );
+    const light = htmlRenderTheme(T3_CODE_LIGHT_THEME_COLORS, "light");
+    const exported = exportHtmlRender(page, light);
+    expect(exported).toContain(inert);
+    expect(exported).toContain(`--background:${light.variables["--background"]};`);
+    expect(exported).not.toContain("--background:#213925;");
+    expect(readHtmlRenderTheme(exported)).toEqual(light);
+  });
+  it("captures a request without altering its composer records", () => {
+    const context = { version: 1 as const, records: [] };
+    expect(withHtmlTheme(context, theme)).toEqual({ ...context, htmlTheme: theme });
+    expect(context).toEqual({ version: 1, records: [] });
+  });
+  it("refuses values that can break out of a stylesheet", () => {
+    expect(() =>
+      exportHtmlRender("<p>x</p>", {
+        ...theme,
+        variables: { ...theme.variables, "--accent": "red;</style><script>alert(1)</script>" },
+      }),
+    ).toThrow();
   });
 });

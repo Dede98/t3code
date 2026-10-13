@@ -1,12 +1,13 @@
 // @effect-diagnostics nodeBuiltinImport:off - plain local servers stand in for LAN services.
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { describe, expect, it } from "@effect/vitest";
+import { describe, expect, it, vi } from "@effect/vitest";
 import { ThreadId } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   HTML_RENDER_MEASURE_FONTS,
   HTML_RENDER_MEASURE_WIDTHS,
   htmlRenderTheme,
+  exportHtmlRender,
 } from "@t3tools/shared/htmlRender";
 import { T3_CODE_DARK_THEME_COLORS } from "@t3tools/shared/themePalettes";
 import * as Deferred from "effect/Deferred";
@@ -24,6 +25,8 @@ import * as NodeURL from "node:url";
 import { resolveAttachmentPathById } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as HtmlRender from "./HtmlRender.ts";
+import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import * as HeadlessChrome from "./headlessChrome.ts";
 import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
 
 // Real-browser tests run only when this names a chrome-headless-shell, for
@@ -37,6 +40,11 @@ const layerHtmlRender = (
   ),
 ) =>
   HtmlRender.layer.pipe(
+    Layer.provide(
+      Layer.mock(ThreadManagement.ThreadManagementService)({
+        getThreadShell: () => Effect.succeed(null),
+      }),
+    ),
     Layer.provide(
       Layer.succeed(
         PreviewBrowser.PreviewBrowser,
@@ -404,3 +412,49 @@ describe("HtmlRender", () => {
     30_000,
   );
 });
+
+it.effect("previews an exported file without replacing its CSS or handing it a host theme", () =>
+  Effect.gen(function* () {
+    const render = yield* HtmlRender.HtmlRender;
+    const theme = htmlRenderTheme({ ...T3_CODE_DARK_THEME_COLORS, accent: "#c8ff85" }, "dark");
+    const html = exportHtmlRender("<p>Export</p>", theme);
+    const capture = vi
+      .spyOn(HeadlessChrome, "captureHtmlScreenshot")
+      .mockImplementation((input) => {
+        expect(input.html).toBe(html);
+        expect(input.urlFragment).toBe("");
+        return Effect.succeed({
+          png: "",
+          contentHeight: 80,
+          capturedHeight: 80,
+          consoleMessages: [],
+        });
+      });
+    yield* render
+      .preview({ html, standalone: true })
+      .pipe(Effect.ensuring(Effect.sync(() => capture.mockRestore())));
+  }).pipe(Effect.provide(layerHtmlRender("unused-browser"))),
+);
+
+it.effect("previews with the concrete captured palette, including a custom accent", () =>
+  Effect.gen(function* () {
+    const render = yield* HtmlRender.HtmlRender;
+    const theme = htmlRenderTheme({ ...T3_CODE_DARK_THEME_COLORS, accent: "#c8ff85" }, "dark");
+    const capture = vi
+      .spyOn(HeadlessChrome, "captureHtmlScreenshot")
+      .mockImplementation((input) => {
+        expect(
+          JSON.parse(decodeURIComponent(input.urlFragment.slice("#t3-theme=".length))),
+        ).toEqual(theme);
+        return Effect.succeed({
+          png: "",
+          contentHeight: 80,
+          capturedHeight: 80,
+          consoleMessages: [],
+        });
+      });
+    yield* render
+      .preview({ html: "<p>Preview</p>", theme })
+      .pipe(Effect.ensuring(Effect.sync(() => capture.mockRestore())));
+  }).pipe(Effect.provide(layerHtmlRender("unused-browser"))),
+);

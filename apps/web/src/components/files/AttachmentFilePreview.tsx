@@ -1,3 +1,5 @@
+import { exportHtmlRender } from "@t3tools/shared/htmlRender";
+import { useHtmlRenderTheme } from "../../hooks/useHtmlRenderTheme";
 import { filePreviewDelimiter } from "@t3tools/shared/delimitedPreview";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
@@ -187,6 +189,7 @@ export function AttachmentFilePreview(props: {
     !(delimiter && rendered) &&
     !(kind === "markdown" && rendered);
 
+  const htmlTheme = useHtmlRenderTheme();
   const save = () => {
     setSaving(true);
     void (async () => {
@@ -198,6 +201,11 @@ export function AttachmentFilePreview(props: {
           const response = await fetch(target);
           if (!response.ok) throw new Error("The file could not be loaded. Try again.");
           file = await response.blob();
+        }
+        if (props.htmlRender) {
+          file = new Blob([exportHtmlRender(await file.text(), htmlTheme)], {
+            type: "text/html;charset=utf-8",
+          });
         }
         // A Blob keeps cross-origin downloads inside the desktop client instead of
         // navigating its custom app scheme to an external browser.

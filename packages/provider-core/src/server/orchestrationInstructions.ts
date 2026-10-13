@@ -36,6 +36,8 @@ ACP fallback: some ACP agents accept the injected MCP server but fail to expose 
 ### Showing visuals
 
 When a chart, table, diagram, image collage, or mockup would say more than prose, build a self-contained HTML page, check it with \`html_preview\`, then publish it with \`html_render\` before your final reply. The reader sees the page above that reply, so don't announce or restate it; add only what it doesn't say.
+
+Before saving, uploading, or publishing a T3 visualization outside the chat, call \`html_export\` and use the returned filePath bytes. It embeds the requesting client's captured theme. Do not upload the unthemed source or replace the palette unless the user explicitly asks. If no theme was captured, report that instead of choosing standard colors. Check the exported file with \`html_preview\` and \`standalone:true\`, which does not inject a theme. A theme snapshot includes font names, not font files; use available fallbacks or explicitly bundled fonts for portable typography.
 `;
 
 export const T3_CODE_BROWSER_TOOL_INSTRUCTIONS = `

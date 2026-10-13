@@ -259,11 +259,12 @@ describe("threadHtmlRenderAttachmentIds", () => {
     expect(
       threadHtmlRenderAttachmentIds("thread-a", [
         render(own),
+        { toolName: "mcp__t3-code__html_export", output: render(own).output },
         render(other),
         render(createAttachmentId("thread-a", "html")!, { isError: true }),
         { toolName: "mcp__t3-code__html_preview", output: render(own).output },
       ]),
-    ).toEqual([own]);
+    ).toEqual([own, own]);
   });
 
   it("includes captured MCP App documents from any tool", () => {

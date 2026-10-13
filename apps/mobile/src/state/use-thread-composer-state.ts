@@ -1,3 +1,5 @@
+import { withHtmlTheme } from "@t3tools/shared/htmlRender";
+import { useHtmlRenderTheme } from "../lib/useHtmlRenderTheme";
 import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
 import { readEnvironmentScope } from "./session";
 import type { ComposerTextPaste } from "../native/T3ComposerEditor.types";
@@ -303,6 +305,7 @@ export function useThreadComposerState() {
     }
   }, [acknowledgedMessages, selectedThreadMessages]);
 
+  const htmlTheme = useHtmlRenderTheme();
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const followUpBehavior = AsyncResult.isSuccess(preferencesResult)
     ? (preferencesResult.value.followUpBehavior ?? DEFAULT_FOLLOW_UP_BEHAVIOR)
@@ -532,7 +535,7 @@ export function useThreadComposerState() {
           edit: {
             messageId: edit.messageId,
             attachments: payload.attachments,
-            ...(payload.context ? { context: payload.context } : {}),
+            context: withHtmlTheme(payload.context, htmlTheme),
           },
         },
       });
@@ -549,7 +552,7 @@ export function useThreadComposerState() {
       savingQueuedEditRef.current = false;
       setIsSavingQueuedEdit(false);
     }
-  }, [editQueuedRun, selectedEnvironmentRuntime?.serverConfig, selectedThreadShell]);
+  }, [editQueuedRun, htmlTheme, selectedEnvironmentRuntime?.serverConfig, selectedThreadShell]);
 
   const onSendMessage = useCallback(
     async (followUpOverride?: ActiveTurnComposerAction) => {
@@ -713,7 +716,7 @@ export function useThreadComposerState() {
         commandId: CommandId.make(metadata.commandId),
         text,
         attachments,
-        context: draft.context,
+        context: withHtmlTheme(draft.context, htmlTheme),
         modelSelection,
         runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
         interactionMode: resolveProviderInteractionMode(
@@ -746,6 +749,7 @@ export function useThreadComposerState() {
       return messageId;
     },
     [
+      htmlTheme,
       activeThreadBusy,
       canSteerActiveTurn,
       followUpBehavior,

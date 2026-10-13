@@ -1,3 +1,4 @@
+import { exportHtmlRender, type HtmlRenderTheme } from "@t3tools/shared/htmlRender";
 import { filePreviewDelimiter, parseDelimitedPreview } from "@t3tools/shared/delimitedPreview";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { readFilePreviewResponse } from "@t3tools/client-runtime/file-preview";
@@ -9,7 +10,11 @@ import { Alert } from "react-native";
 
 import type { FileBackedComposerAttachment } from "./composerImages";
 import { loadLocalAttachmentPreview } from "./localAttachmentPreview";
-import { downloadAndShareAttachment, shareLocalAttachment } from "./attachmentDownload";
+import {
+  downloadAndShareAttachment,
+  shareLocalAttachment,
+  shareGeneratedAttachment,
+} from "./attachmentDownload";
 import { useRefreshAssetUrl } from "../state/assets";
 import { attachmentDocumentPresentation } from "./attachmentDocumentPresentation";
 
@@ -24,6 +29,7 @@ const STALE_URL_MS = 5 * 60_000;
  * URL to a native or web renderer. Captured bytes never resolve against the workspace.
  */
 export function useAttachmentDocument(input: {
+  readonly htmlTheme?: HtmlRenderTheme;
   readonly name: string;
   readonly mimeType: string;
   readonly sizeBytes: number;
@@ -175,7 +181,19 @@ export function useAttachmentDocument(input: {
       signal: controller.signal,
     };
     try {
-      if (isLocalUri(uri)) await shareLocalAttachment({ ...request, uri });
+      if (input.htmlTheme) {
+        const response = isLocalUri(uri)
+          ? null
+          : await fetch((await refresh()) ?? uri, { signal: controller.signal });
+        if (response && !response.ok) throw new Error("Could not load the HTML export.");
+        const html = response ? await response.text() : await new File(uri).text();
+        const shared = await shareGeneratedAttachment({
+          ...request,
+          bytes: new TextEncoder().encode(exportHtmlRender(html, input.htmlTheme)),
+        });
+        if (!shared && !controller.signal.aborted)
+          throw new Error("Saving and sharing files is unavailable on this device.");
+      } else if (isLocalUri(uri)) await shareLocalAttachment({ ...request, uri });
       else await downloadAndShareAttachment({ ...request, url: (await refresh()) ?? uri });
     } catch (cause) {
       if (controller.signal.aborted) return;

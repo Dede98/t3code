@@ -1,3 +1,5 @@
+import { htmlRenderTheme } from "@t3tools/shared/htmlRender";
+import { T3_CODE_DARK_THEME_COLORS } from "@t3tools/shared/themePalettes";
 import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
 import { buildProjectThreadStartTurnInput } from "./projectThreadStartTurn";
 import {
@@ -317,4 +319,11 @@ describe("host context compatibility", () => {
     expect(serializeComposerMessageForServer(text, context, true)).toEqual({ text, context });
     expect(context.records).toEqual([terminal, review, pr]);
   });
+});
+
+it("keeps the request theme through attachment upload and context pruning", () => {
+  const htmlTheme = htmlRenderTheme(T3_CODE_DARK_THEME_COLORS, "dark");
+  const context = { version: 1 as const, htmlTheme, records: [] };
+  expect(uploadedComposerContext(context, [], [])?.htmlTheme).toEqual(htmlTheme);
+  expect(referencedComposerContext("Export this", context)?.htmlTheme).toEqual(htmlTheme);
 });

@@ -1,3 +1,5 @@
+import { withHtmlTheme } from "@t3tools/shared/htmlRender";
+import { useHtmlRenderTheme } from "../hooks/useHtmlRenderTheme";
 import { ThreadFind, ThreadFindCanvas, type ThreadFindControls } from "./chat/ThreadFindProvider";
 import { THREAD_FIND_BAR_RESERVED_HEIGHT } from "./chat/ThreadFindBar";
 import { usageLimitRecoveryBannerItem } from "./chat/UsageLimitRecoveryBanner";
@@ -1640,9 +1642,24 @@ export default function ChatView(props: ChatViewProps) {
   const setThreadInteractionMode = useOrchestrationCommand(threadEnvironment.setInteractionMode, {
     reportFailure: false,
   });
-  const startThreadTurn = useOrchestrationCommand(threadEnvironment.startTurn, {
+  const htmlTheme = useHtmlRenderTheme();
+  const startThreadTurnCommand = useOrchestrationCommand(threadEnvironment.startTurn, {
     reportFailure: false,
   });
+  const startThreadTurn = useCallback(
+    (request: Parameters<typeof startThreadTurnCommand>[0]) =>
+      startThreadTurnCommand({
+        ...request,
+        input: {
+          ...request.input,
+          message: {
+            ...request.input.message,
+            context: withHtmlTheme(request.input.message.context, htmlTheme),
+          },
+        },
+      }),
+    [startThreadTurnCommand, htmlTheme],
+  );
   const resumeThreadQueue = useOrchestrationCommand(threadEnvironment.resumeThreadQueue, {
     reportFailure: false,
   });
@@ -9222,6 +9239,7 @@ export default function ChatView(props: ChatViewProps) {
               attachments: uploads,
               context: {
                 version: 1,
+                htmlTheme,
                 records: [
                   ...new Map(
                     [

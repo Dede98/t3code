@@ -6,6 +6,7 @@ import * as Schema from "effect/Schema";
 
 import {
   COMPOSER_CONTEXT_KINDS,
+  HtmlThemeSnapshot,
   ComposerContextRecord,
   OrchestrationMessageContext,
 } from "./composerContext.ts";
@@ -308,5 +309,44 @@ describe("OrchestrationMessageContext", () => {
       dispatchMode: { type: "start_immediately" },
     });
     expect(command.type === "message.dispatch" && command.context?.records[0]?.kind).toBe("image");
+  });
+});
+
+describe("HTML theme context", () => {
+  const encodeThemeContext = Schema.encodeSync(Schema.fromJsonString(OrchestrationMessageContext));
+  const decodeThemeContext = Schema.decodeSync(Schema.fromJsonString(OrchestrationMessageContext));
+  const isThemeSnapshot = Schema.is(HtmlThemeSnapshot);
+  const htmlTheme = {
+    appearance: "dark" as const,
+    variables: {
+      "--background": "#213925",
+      "--foreground": "#fff",
+      "--accent": "#c8ff85",
+      "--font-sans": "system-ui",
+      "--font-mono": "monospace",
+    },
+  };
+  it("round-trips the captured theme alongside empty composer records", () => {
+    const context = { version: 1 as const, records: [], htmlTheme };
+    const encoded = encodeThemeContext(context);
+    expect(decodeThemeContext(encoded)).toEqual(context);
+    expect(decodeContext({ version: 1, records: [] })).toEqual({ version: 1, records: [] });
+  });
+  it("bounds the snapshot and rejects incomplete or unsafe palettes", () => {
+    const valid = isThemeSnapshot;
+    expect(valid(htmlTheme)).toBe(true);
+    expect(valid({ ...htmlTheme, variables: {} })).toBe(false);
+    expect(
+      valid({ ...htmlTheme, variables: { ...htmlTheme.variables, "--accent": "red; color:blue" } }),
+    ).toBe(false);
+    expect(
+      valid({
+        ...htmlTheme,
+        variables: {
+          ...htmlTheme.variables,
+          ...Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`--extra-${i}`, "red"])),
+        },
+      }),
+    ).toBe(false);
   });
 });

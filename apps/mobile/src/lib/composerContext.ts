@@ -184,7 +184,7 @@ export function referencedComposerContext(text: string, context?: OrchestrationM
   }
   const records = context.records.filter((record) => ids.has(record.contextId));
   if (records.length === context.records.length) return context;
-  return records.length ? { version: 1 as const, records } : undefined;
+  return records.length || context.htmlTheme ? { ...context, records } : undefined;
 }
 
 /** Uploads change attachment ids; keep context bindings attached to the same ordered file. */
@@ -196,7 +196,7 @@ export function uploadedComposerContext(
   if (!context) return undefined;
   const ids = new Map(drafts.map((draft, index) => [draft.id, uploaded[index]?.id]));
   return {
-    version: 1,
+    ...context,
     records: context.records.map((record) =>
       "attachmentId" in record
         ? { ...record, attachmentId: ids.get(record.attachmentId) ?? record.attachmentId }

@@ -192,6 +192,17 @@ export function htmlRenderFromToolItem(item: {
   return output?.isError ? undefined : output?.htmlRender;
 }
 
+/** Both inline pages and standalone exports own thread attachments. */
+export function htmlArtifactFromToolItem(item: {
+  readonly toolName: string | null | undefined;
+  readonly output?: unknown;
+}): HtmlRenderReference | undefined {
+  const name = resolveT3McpToolId(item.toolName);
+  if (name !== HTML_RENDER_TOOL_NAME && name !== "html_export") return undefined;
+  const output = compactDynamicToolOutput(item.output);
+  return output?.isError ? undefined : output?.htmlRender;
+}
+
 /**
  * The MCP App a completed tool call carries, if any. The adapter that captured
  * it put the reference in the output, beside the tool's own result. A tool's

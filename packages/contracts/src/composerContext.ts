@@ -283,9 +283,32 @@ export type ComposerContextRecord = typeof ComposerContextRecord.Type;
 export const COMPOSER_CONTEXT_MAX_RECORDS = 200;
 const COMPOSER_CONTEXT_MAX_SERIALIZED_CHARS = 16_000_000;
 
+/** Resolved client colors travel with the request, including queued and remote turns. */
+export const HtmlThemeSnapshot = Schema.Struct({
+  appearance: Schema.Literals(["light", "dark"]),
+  variables: Schema.Record(
+    Schema.String.check(Schema.isPattern(/^--[a-z0-9-]{1,64}$/)),
+    Schema.String.check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(512),
+      Schema.isPattern(/^[^;{}<>\r\n]+$/),
+    ),
+  ).check(
+    Schema.makeFilter(
+      (variables) =>
+        Object.keys(variables).length <= 64 &&
+        ["--background", "--foreground", "--accent", "--font-sans", "--font-mono"].every(
+          (key) => key in variables,
+        ),
+    ),
+  ),
+});
+export type HtmlThemeSnapshot = typeof HtmlThemeSnapshot.Type;
+
 /** Structured context riding on a user message. Undecodable records are dropped, not fatal. */
 export const OrchestrationMessageContext = Schema.Struct({
   version: Schema.Literal(1),
+  htmlTheme: Schema.optional(HtmlThemeSnapshot),
   records: Schema.Array(Schema.Unknown)
     .check(
       Schema.isMaxLength(COMPOSER_CONTEXT_MAX_RECORDS),

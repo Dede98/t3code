@@ -9,15 +9,14 @@ import {
   type HtmlRenderTheme,
 } from "@t3tools/shared/htmlRender";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, Platform, Pressable, View, type ColorValue } from "react-native";
+import { ActivityIndicator, Pressable, View, type ColorValue } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 
 import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
-import { mobileHtmlRenderTheme } from "../../lib/htmlRenderTheme";
+import { useHtmlRenderTheme } from "../../lib/useHtmlRenderTheme";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { useAssetUrlState, useRefreshAssetUrl } from "../../state/assets";
-import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 
 const ROW_BOTTOM_MARGIN = 8;
 const FULL_SCREEN_GUTTER = 16;
@@ -25,22 +24,6 @@ const FULL_SCREEN_GUTTER = 16;
 /** A render row is its frame's height plus spacing; the page's content never sizes it. */
 export function htmlRenderRowHeight(frameHeight: number) {
   return frameHeight + ROW_BOTTOM_MARGIN;
-}
-
-function useHtmlRenderTheme() {
-  const { themeId, themeAppearance, themeVariables, systemColorsActive } =
-    useAppearancePreferences();
-  return useMemo(
-    () =>
-      mobileHtmlRenderTheme({
-        themeId,
-        appearance: themeAppearance,
-        variables: themeVariables,
-        systemColors: systemColorsActive,
-        platform: Platform.OS,
-      }),
-    [themeId, themeAppearance, themeVariables, systemColorsActive],
-  );
 }
 
 function postTheme(view: WebView<object> | null, theme: HtmlRenderTheme) {

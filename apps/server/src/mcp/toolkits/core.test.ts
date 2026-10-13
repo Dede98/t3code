@@ -1,3 +1,5 @@
+import { htmlRenderTheme } from "@t3tools/shared/htmlRender";
+import { T3_CODE_DARK_THEME_COLORS } from "@t3tools/shared/themePalettes";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -282,6 +284,27 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
     expect(
       htmlRenderFromToolItem({ toolName: "mcp__t3-code__html_render", output: result.content }),
     ).toEqual(reference);
+    const exported = yield* server
+      .callTool({
+        name: "html_export",
+        arguments: {
+          attachmentId: reference!.attachmentId,
+          title: "Exported revenue",
+          theme: htmlRenderTheme(T3_CODE_DARK_THEME_COLORS, "dark"),
+        },
+      })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(exported.isError).toBe(false);
+    expect(exported.structuredContent).toMatchObject({
+      fileName: "Exported revenue.html",
+      filePath: expect.stringContaining("-html.html"),
+    });
+    expect(
+      htmlRenderFromToolItem({ toolName: "html_export", output: exported.structuredContent }),
+    ).toBeUndefined();
   }).pipe(
     Effect.provide(
       McpHttpServer.layerHtmlToolkit.pipe(
@@ -293,6 +316,12 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
         Layer.provide(FetchHttpClient.layer),
         Layer.provide(
           Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadRecords: () =>
+              Effect.succeed({
+                messages: [] as ReadonlyArray<
+                  import("@t3tools/contracts").OrchestrationV2ConversationMessage
+                >,
+              } as import("@t3tools/contracts").OrchestrationV2ThreadProjection),
             // A live run: publishing stores a page, so it needs the caller's active turn.
             getThreadShell: () =>
               Effect.succeed({

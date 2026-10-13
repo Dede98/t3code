@@ -13,6 +13,7 @@ import { AudioFilePreview } from "../../components/AudioFilePreview";
 import { ControlPillMenu } from "../../components/ControlPill";
 import { EmptyState } from "../../components/EmptyState";
 import { FilePreviewModal, type FilePreviewSource } from "../../components/FilePreviewModal";
+import { useHtmlRenderTheme } from "../../lib/useHtmlRenderTheme";
 import { useAttachmentDocument } from "../../lib/attachmentDocument";
 import { nativeViewerErrorMessage } from "../../lib/attachmentDownload";
 import { isFileBackedComposerAttachment } from "../../lib/composerImages";
@@ -183,7 +184,9 @@ export function AttachmentFileScreen(props: AttachmentFileScreenProps) {
     : undefined;
   const localAttachment =
     draftAttachment && isFileBackedComposerAttachment(draftAttachment) ? draftAttachment : null;
+  const htmlTheme = useHtmlRenderTheme();
   const document = useAttachmentDocument({
+    ...(params.htmlRender === "1" ? { htmlTheme } : {}),
     name: params.name,
     mimeType: params.mimeType,
     sizeBytes,

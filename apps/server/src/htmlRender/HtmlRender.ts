@@ -9,6 +9,10 @@ import {
   htmlRenderTheme,
   htmlRenderThemeFragment,
   injectHtmlRenderBootstrap,
+  exportHtmlRender,
+  htmlRenderFileName,
+  readHtmlRenderTheme,
+  type HtmlRenderTheme,
   type HtmlRenderReference,
 } from "@t3tools/shared/htmlRender";
 import {
@@ -28,7 +32,13 @@ import * as Stream from "effect/Stream";
 import type * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { resolveAttachmentRelativePath } from "../attachmentPaths.ts";
-import { createAttachmentId } from "../attachmentStore.ts";
+import {
+  createAttachmentId,
+  resolveAttachmentPathById,
+  parseThreadSegmentFromAttachmentId,
+  toSafeThreadAttachmentSegment,
+} from "../attachmentStore.ts";
+import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import { resolveRootCliCommand } from "../cli/invocation.ts";
 import * as ServerConfig from "../config.ts";
 import * as HeadlessChrome from "./headlessChrome.ts";
@@ -76,6 +86,37 @@ export class HtmlRenderStoreError extends Schema.TaggedError<HtmlRenderStoreErro
   }
 }
 
+export class HtmlArtifactContextError extends Schema.TaggedError<HtmlArtifactContextError>()(
+  "HtmlArtifactContextError",
+  { cause: Schema.Defect() },
+) {
+  override get message() {
+    return "The HTML request's theme context could not be read.";
+  }
+}
+export class HtmlArtifactThemeMissingError extends Schema.TaggedError<HtmlArtifactThemeMissingError>()(
+  "HtmlArtifactThemeMissingError",
+  {},
+) {
+  override get message() {
+    return "No client theme was captured for this request. Send the export request from an updated T3 client, or supply an explicitly chosen theme. Do not substitute the standard palette.";
+  }
+}
+export class HtmlArtifactSourceError extends Schema.TaggedError<HtmlArtifactSourceError>()(
+  "HtmlArtifactSourceError",
+  {},
+) {
+  override get message() {
+    return "Supply HTML or an HTML attachment from this thread.";
+  }
+}
+
+interface HtmlSourceInput {
+  readonly threadId?: ThreadId | undefined;
+  readonly html?: string | undefined;
+  readonly attachmentId?: string | undefined;
+}
+
 export type HtmlRenderPrepareError =
   | HtmlRenderImagesNotFoundError
   | HtmlRenderImageTooLargeError
@@ -108,20 +149,52 @@ export class HtmlRender extends Context.Service<
       readonly html: string;
       readonly title: string;
       readonly height: number;
-    }) => Effect.Effect<HtmlRenderReference, HtmlRenderPrepareError | HtmlRenderStoreError>;
-    /** Screenshots a page in headless Chrome, tolerating unreadable local images. */
-    readonly preview: (input: {
-      readonly html: string;
-      readonly width?: number | undefined;
-      readonly appearance?: ThemeAppearance | undefined;
+      readonly theme?: HtmlRenderTheme | undefined;
+      readonly standalone?: boolean | undefined;
     }) => Effect.Effect<
+      HtmlRenderReference,
+      | HtmlRenderPrepareError
+      | HtmlRenderStoreError
+      | HtmlArtifactContextError
+      | HtmlArtifactThemeMissingError
+    >;
+    /** Screenshots a page in headless Chrome, tolerating unreadable local images. */
+    readonly preview: (
+      input: HtmlSourceInput & {
+        readonly width?: number | undefined;
+        readonly appearance?: ThemeAppearance | undefined;
+        readonly theme?: HtmlRenderTheme | undefined;
+        readonly standalone?: boolean | undefined;
+      },
+    ) => Effect.Effect<
       HtmlPreview,
+      | HtmlArtifactContextError
+      | HtmlArtifactSourceError
       | Exclude<HtmlRenderPrepareError, HtmlRenderImagesNotFoundError>
       | PreviewBrowser.PreviewBrowserInstallError
       | PreviewBrowser.PreviewBrowserInstallingError
       | PreviewBrowser.PreviewBrowserUnsupportedError
       | PreviewBrowserHost.PreviewBrowserHostError
       | HeadlessChrome.HtmlRenderBrowserError
+    >;
+    /** Produces uploadable bytes with a concrete, persisted theme and no client bridge. */
+    readonly exportPage: (
+      input: HtmlSourceInput & {
+        readonly threadId: ThreadId;
+        readonly title: string;
+        readonly theme?: HtmlRenderTheme | undefined;
+      },
+    ) => Effect.Effect<
+      {
+        readonly htmlRender: HtmlRenderReference;
+        readonly filePath: string;
+        readonly fileName: string;
+      },
+      | HtmlRenderPrepareError
+      | HtmlRenderStoreError
+      | HtmlArtifactContextError
+      | HtmlArtifactSourceError
+      | HtmlArtifactThemeMissingError
     >;
   }
 >()("t3/htmlRender/HtmlRender") {}
@@ -335,6 +408,7 @@ const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const config = yield* ServerConfig.ServerConfig;
   const previewBrowser = yield* PreviewBrowser.PreviewBrowser;
+  const threads = yield* ThreadManagement.ThreadManagementService;
   const services = yield* Effect.context<
     FileSystem.FileSystem | Path.Path | ChildProcessSpawner.ChildProcessSpawner
   >();
@@ -401,6 +475,53 @@ const make = Effect.gen(function* () {
       Effect.withSpan("HtmlRender.measure"),
     );
 
+  const requestTheme = Effect.fn("HtmlRender.requestTheme")(function* (input: {
+    readonly threadId?: ThreadId | undefined;
+    readonly theme?: HtmlRenderTheme | undefined;
+  }) {
+    if (input.theme) return input.theme;
+    if (input.threadId === undefined) return undefined;
+    const shell = yield* threads
+      .getThreadShell(input.threadId)
+      .pipe(Effect.mapError((cause) => new HtmlArtifactContextError({ cause })));
+    if (!shell?.activeRunId) return undefined;
+    const { messages } = yield* threads
+      .getThreadRecords(input.threadId, ["messages"], {
+        messageRunIds: [shell.activeRunId],
+        messageRoles: ["user"],
+      })
+      .pipe(Effect.mapError((cause) => new HtmlArtifactContextError({ cause })));
+    // Steering belongs to this run; queued requests belong to other runs and cannot recolor it.
+    return messages.findLast((message) => message.context?.htmlTheme !== undefined)?.context
+      ?.htmlTheme;
+  });
+
+  const sourceHtml = Effect.fn("HtmlRender.sourceHtml")(function* (input: HtmlSourceInput) {
+    if ((input.html === undefined) === (input.attachmentId === undefined))
+      return yield* new HtmlArtifactSourceError({});
+    let html = input.html;
+    if (html === undefined && input.attachmentId !== undefined) {
+      if (
+        input.threadId === undefined ||
+        !input.attachmentId.endsWith("-html") ||
+        parseThreadSegmentFromAttachmentId(input.attachmentId) !==
+          toSafeThreadAttachmentSegment(input.threadId)
+      ) {
+        return yield* new HtmlArtifactSourceError({});
+      }
+      const filePath = resolveAttachmentPathById({
+        attachmentsDir: config.attachmentsDir,
+        attachmentId: input.attachmentId,
+      });
+      if (!filePath) return yield* new HtmlArtifactSourceError({});
+      html = yield* fileSystem
+        .readFileString(filePath)
+        .pipe(Effect.mapError(() => new HtmlArtifactSourceError({})));
+    }
+    if (html === undefined) return yield* new HtmlArtifactSourceError({});
+    return html;
+  });
+
   // The bootstrap goes in first so its head scan never runs over inlined image data.
   const inline = (html: string) =>
     inlineLocalImages(injectHtmlRenderBootstrap(html)).pipe(Effect.provideContext(services));
@@ -418,8 +539,19 @@ const make = Effect.gen(function* () {
     readonly html: string;
     readonly title: string;
     readonly height: number;
+    readonly theme?: HtmlRenderTheme | undefined;
+    readonly standalone?: boolean | undefined;
   }) {
-    const html = yield* prepare(input.html);
+    const theme = (yield* requestTheme(input)) ?? readHtmlRenderTheme(input.html);
+    if (input.standalone && !theme) return yield* new HtmlArtifactThemeMissingError({});
+    const inlined = yield* inlineLocalImages(
+      input.standalone && theme
+        ? exportHtmlRender(input.html, theme)
+        : injectHtmlRenderBootstrap(input.html, theme),
+    ).pipe(Effect.provideContext(services));
+    if (inlined.missing.length > 0)
+      return yield* new HtmlRenderImagesNotFoundError({ paths: inlined.missing });
+    const html = inlined.html;
     // The `-html` id suffix makes the asset route serve it as a sandboxed text/html document.
     const attachmentId = createAttachmentId(input.threadId, "html");
     const filePath =
@@ -434,7 +566,7 @@ const make = Effect.gen(function* () {
     }
     const heights = yield* fileSystem.writeFileString(filePath, html).pipe(
       Effect.mapError((cause) => new HtmlRenderStoreError({ cause })),
-      Effect.andThen(measure(html)),
+      Effect.andThen(input.standalone ? Effect.void : measure(html)),
       // Only the returned reference lets thread deletion find the page, so a
       // publish that fails or is interrupted before returning removes it.
       Effect.onError(() => fileSystem.remove(filePath, { force: true }).pipe(Effect.ignore)),
@@ -447,30 +579,40 @@ const make = Effect.gen(function* () {
     } satisfies HtmlRenderReference;
   });
 
-  const preview = Effect.fn("HtmlRender.preview")(function* (input: {
-    readonly html: string;
-    readonly width?: number | undefined;
-    readonly appearance?: ThemeAppearance | undefined;
-  }) {
+  const preview = Effect.fn("HtmlRender.preview")(function* (
+    input: HtmlSourceInput & {
+      readonly width?: number | undefined;
+      readonly appearance?: ThemeAppearance | undefined;
+      readonly theme?: HtmlRenderTheme | undefined;
+      readonly standalone?: boolean | undefined;
+    },
+  ) {
+    const html = yield* sourceHtml(input);
+    const capturedTheme = input.standalone ? undefined : yield* requestTheme(input);
     const width = Math.min(
       MAX_PREVIEW_WIDTH,
       Math.max(MIN_PREVIEW_WIDTH, Math.round(input.width ?? HTML_RENDER_COLUMN_WIDTH)),
     );
     const appearance = input.appearance ?? "dark";
-    const inlined = yield* inline(input.html);
+    const inlined = input.standalone
+      ? yield* inlineLocalImages(html).pipe(Effect.provideContext(services))
+      : yield* inline(html);
     const executable = yield* previewBrowser.executable;
-    const theme = htmlRenderTheme(
-      appearance === "light" ? T3_CODE_LIGHT_THEME_COLORS : T3_CODE_DARK_THEME_COLORS,
-      appearance,
-      HTML_RENDER_MEASURE_FONTS,
-    );
+    const theme =
+      capturedTheme ??
+      readHtmlRenderTheme(html) ??
+      htmlRenderTheme(
+        appearance === "light" ? T3_CODE_LIGHT_THEME_COLORS : T3_CODE_DARK_THEME_COLORS,
+        appearance,
+        HTML_RENDER_MEASURE_FONTS,
+      );
     const screenshot = yield* launching(executable, (noSandbox) =>
       HeadlessChrome.captureHtmlScreenshot({
         executable,
         noSandbox,
         html: inlined.html,
         width,
-        urlFragment: htmlRenderThemeFragment(theme),
+        urlFragment: input.standalone ? "" : htmlRenderThemeFragment(theme),
       }).pipe(Effect.provideContext(services)),
     );
     return {
@@ -480,7 +622,29 @@ const make = Effect.gen(function* () {
     } satisfies HtmlPreview;
   });
 
-  return HtmlRender.of({ prepare, publish, preview });
+  const exportPage = Effect.fn("HtmlRender.exportPage")(function* (
+    input: Parameters<HtmlRender["Service"]["exportPage"]>[0],
+  ) {
+    const html = yield* sourceHtml(input);
+    const theme = (yield* requestTheme(input)) ?? readHtmlRenderTheme(html);
+    if (!theme) return yield* new HtmlArtifactThemeMissingError({});
+    const reference = yield* publish({
+      threadId: input.threadId,
+      html,
+      title: input.title,
+      height: 2000,
+      theme,
+      standalone: true,
+    });
+    const filePath = resolveAttachmentPathById({
+      attachmentsDir: config.attachmentsDir,
+      attachmentId: reference.attachmentId,
+    });
+    if (!filePath) return yield* new HtmlArtifactSourceError({});
+    return { htmlRender: reference, filePath, fileName: htmlRenderFileName(input.title) };
+  });
+
+  return HtmlRender.of({ prepare, publish, preview, exportPage });
 });
 
 export const layer = Layer.effect(HtmlRender, make);
