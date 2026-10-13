@@ -7,6 +7,7 @@ import {
 } from "../../provider/ClaudeNativeResumeStore.ts";
 import type { ClaudeSessionStoreShape } from "../../provider/ClaudeSessionStore.ts";
 import { resolveClaudeConfigDirPath } from "../../provider/Drivers/ClaudeHome.ts";
+import { materializeClaudeSharedHome } from "../../provider/Drivers/ClaudeSharedHome.ts";
 
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
@@ -3361,6 +3362,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const { attachmentsDir, fileSystem, path, crypto, idAllocator, queryRunner } = adapterOptions;
+  const prepareSharedHome = materializeClaudeSharedHome(
+    adapterOptions.settings,
+    adapterOptions.environment,
+  ).pipe(
+    Effect.provideService(FileSystem.FileSystem, fileSystem),
+    Effect.provideService(Path.Path, path),
+  );
   const continuationLock = Semaphore.makeUnsafe(1);
   const liveNativeThreads = new Map<string, Effect.Effect<boolean>>();
   // Subagent model names and effort levels, including the instance's custom models.
@@ -3443,6 +3451,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
     openSession: Effect.fn("ClaudeAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
+        yield* prepareSharedHome;
         const sessionScope = yield* Effect.scope;
         const now = yield* DateTime.now;
         const session = providerSession({
@@ -8587,6 +8596,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
         const startTurn = Effect.fn("ClaudeAdapterV2.startTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
+            yield* prepareSharedHome;
             const startedAt = yield* DateTime.now;
             const nativeThreadId = yield* getNativeThreadId(turnInput.providerThread);
             const nativeTurnId = `turn:${turnInput.attemptId}`;

@@ -70,6 +70,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { Tool } from "effect/ai";
 import { formatClaudeResumeCompactionQuestion } from "@t3tools/shared/claudeCompaction";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 
@@ -1279,6 +1280,82 @@ describe("ClaudeAdapterV2 executable path", () => {
         Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
     ),
+  );
+});
+
+describe("ClaudeAdapterV2 shared home", () => {
+  it.effect.skipIf(!symlinksSupported)(
+    "blocks session and turn starts when local skills conflict with sharing",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped();
+        const configDirPath = path.join(root, "account");
+        const sharedHomePath = path.join(root, "shared");
+        const localSkills = path.join(configDirPath, "skills");
+        yield* fileSystem.makeDirectory(localSkills, { recursive: true });
+        yield* fileSystem.writeFileString(path.join(localSkills, "local.md"), "Keep");
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          settings: { ...DEFAULT_CLAUDE_SETTINGS, configDirPath, sharedHomePath },
+          environment: {},
+          attachmentsDir: root,
+          fileSystem,
+          path,
+          crypto: yield* Crypto.Crypto,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          queryRunner: {
+            allocateSessionId: Effect.succeed("native-shared-home"),
+            open: () => Effect.die("must not start Claude with conflicting skills"),
+            forkSession: () => Effect.die("unused"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        const threadId = ThreadId.make("thread-shared-home");
+        const input = {
+          threadId,
+          providerSessionId: ProviderSessionId.make("session-shared-home"),
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        };
+        const error = yield* adapter.openSession(input).pipe(Effect.flip);
+        assert.include(String(error.cause), "Cannot share Claude 'skills'");
+        assert.equal(yield* fileSystem.readFileString(path.join(localSkills, "local.md")), "Keep");
+        yield* fileSystem.rename(localSkills, path.join(root, "backup"));
+        const runtime = yield* adapter.openSession(input);
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection: input.modelSelection,
+          runtimePolicy: input.runtimePolicy,
+        });
+        yield* fileSystem.remove(localSkills);
+        yield* fileSystem.makeDirectory(localSkills);
+        yield* fileSystem.writeFileString(path.join(localSkills, "replacement.md"), "Replacement");
+        const startError = yield* runtime
+          .startTurn(
+            makeClaudeTestTurnInput({
+              threadId,
+              providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make("attempt-shared-home"),
+              text: "Do not start",
+              attachments: [],
+            }),
+          )
+          .pipe(Effect.flip);
+        assert.include(String(startError.cause), "Cannot share Claude 'skills'");
+        assert.equal(
+          yield* fileSystem.readFileString(path.join(localSkills, "replacement.md")),
+          "Replacement",
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
   );
 });
 

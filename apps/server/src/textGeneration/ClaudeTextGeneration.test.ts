@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { ClaudeSettings, ProviderInstanceId } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import { createModelSelection } from "@t3tools/shared/model";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -192,6 +193,58 @@ function withFakeClaudeEnv<A, E, R>(
 }
 
 it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
+  it.effect.skipIf(!symlinksSupported)(
+    "blocks a conflicting shared home and prepares it before retrying text generation",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped();
+        const configDirPath = path.join(root, "account");
+        const sharedHomePath = path.join(root, "shared");
+        const localSkills = path.join(configDirPath, "skills");
+        yield* fs.makeDirectory(localSkills, { recursive: true });
+        yield* fs.writeFileString(path.join(localSkills, "local.md"), "Keep");
+        yield* withFakeClaudeEnv(
+          {
+            output: JSON.stringify({ structured_output: { title: "Recovered" } }),
+            configDirMustBe: configDirPath,
+            claudeConfig: { configDirPath, sharedHomePath },
+          },
+          (textGeneration) =>
+            Effect.gen(function* () {
+              const request = {
+                cwd: root,
+                message: "title",
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("claudeAgent"),
+                  model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
+                },
+              };
+              const error = yield* textGeneration.generateThreadTitle(request).pipe(Effect.flip);
+              expect(error.detail).toContain("Cannot share Claude 'skills'");
+              expect(yield* fs.readFileString(path.join(localSkills, "local.md"))).toBe("Keep");
+              yield* fs.rename(localSkills, path.join(root, "backup"));
+              expect(yield* textGeneration.generateThreadTitle(request)).toEqual({
+                title: "Recovered",
+              });
+              expect(yield* fs.realPath(localSkills)).toBe(
+                yield* fs.realPath(path.join(sharedHomePath, "skills")),
+              );
+              // A long-lived provider must restore a missing link before the CLI
+              // can recreate an account-local directory during skill sync.
+              yield* fs.remove(localSkills);
+              expect(yield* textGeneration.generateThreadTitle(request)).toEqual({
+                title: "Recovered",
+              });
+              expect(yield* fs.realPath(localSkills)).toBe(
+                yield* fs.realPath(path.join(sharedHomePath, "skills")),
+              );
+            }),
+        );
+      }),
+  );
+
   it.effect("forwards Claude thinking settings without passing unsupported effort", () =>
     withFakeClaudeEnv(
       {

@@ -36,6 +36,7 @@ import {
 } from "@t3tools/provider-core/server/snapshotProbe";
 import { resolveClaudeSdkExecutablePath } from "./Drivers/ClaudeExecutable.ts";
 import { makeClaudeEnvironment } from "./Drivers/ClaudeHome.ts";
+import { materializeClaudeSharedHome } from "./Drivers/ClaudeSharedHome.ts";
 import { discoverClaudeSkills } from "./Drivers/ClaudeSkills.ts";
 import type { ProviderWorkspaceSnapshot } from "@t3tools/provider-core/server/driver";
 import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
@@ -475,6 +476,12 @@ export const probeClaudeWorkspaceSnapshot = Effect.fn("probeClaudeWorkspaceSnaps
   environment?: NodeJS.ProcessEnv,
 ): Effect.fn.Return<ProviderWorkspaceSnapshot, never, FileSystem.FileSystem | Path.Path> {
   if (!claudeSettings.enabled) return machineSnapshot;
+  const sharedHome = yield* materializeClaudeSharedHome(claudeSettings, environment).pipe(
+    Effect.result,
+  );
+  if (Result.isFailure(sharedHome)) {
+    return { ...machineSnapshot, status: "error", message: sharedHome.failure.message };
+  }
   const skills = yield* discoverClaudeSkills(claudeSettings, cwd, environment);
   const capabilities = yield* probeClaudeCapabilities(claudeSettings, environment, cwd, false);
   return {
@@ -525,6 +532,27 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
         status: "warning",
         auth: { status: "unknown" },
         message: "Claude is disabled in T3 Code settings.",
+      },
+    });
+  }
+
+  // Filesystem conflicts are recoverable probe failures. Throwing during driver
+  // construction leaves no live instance for Refresh to retry after a repair.
+  const sharedHome = yield* materializeClaudeSharedHome(claudeSettings, resolvedEnvironment).pipe(
+    Effect.result,
+  );
+  if (Result.isFailure(sharedHome)) {
+    return buildServerProvider({
+      presentation: CLAUDE_PRESENTATION,
+      enabled: claudeSettings.enabled,
+      checkedAt,
+      models: allModels,
+      probe: {
+        installed: false,
+        version: null,
+        status: "error",
+        auth: { status: "unknown" },
+        message: sharedHome.failure.message,
       },
     });
   }

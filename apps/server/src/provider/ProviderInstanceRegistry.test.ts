@@ -40,6 +40,7 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import type { GrokSettings } from "@t3tools/provider-grok/settings";
 import type { CursorSettings } from "@t3tools/provider-cursor/settings";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -444,6 +445,61 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
         version: "2.1.219",
       });
     }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.live.skipIf(!symlinksSupported)(
+    "keeps Claude registered through a shared-home conflict and recovers on refresh",
+    () =>
+      Effect.gen(function* () {
+        if (yield* HostProcess.isWindows) return;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const fixtures = yield* makeTildeProviderFixtures();
+        const root = yield* fs.makeTempDirectoryScoped();
+        const sharedHomePath = path.join(root, "shared");
+        const localSkills = path.join(fixtures.claudeHomePath, "skills");
+        yield* fs.makeDirectory(localSkills);
+        yield* fs.writeFileString(path.join(localSkills, "local.md"), "Keep this skill");
+        const instanceId = ProviderInstanceId.make("claude_shared_home");
+        const { registry } = yield* makeProviderInstanceRegistry<ClaudeDriverEnv>({
+          drivers: [ClaudeDriver],
+          configMap: {
+            [instanceId]: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              enabled: true,
+              config: makeClaudeConfig({
+                enabled: true,
+                binaryPath: fixtures.claudeBinaryPath,
+                configDirPath: fixtures.claudeHomePath,
+                sharedHomePath,
+              }),
+            },
+          },
+        });
+        const instance = yield* registry.getInstance(instanceId);
+        expect(instance).toBeDefined();
+        expect(yield* registry.listUnavailable).toEqual([]);
+        const blocked = yield* instance!.snapshot.refresh;
+        expect(blocked).toMatchObject({ enabled: true, status: "error" });
+        expect(blocked.message).toContain("Cannot share Claude 'skills'");
+        expect(yield* fs.readFileString(path.join(localSkills, "local.md"))).toBe(
+          "Keep this skill",
+        );
+        expect(yield* fs.exists(sharedHomePath)).toBe(false);
+
+        const backup = path.join(root, "skills-backup");
+        yield* fs.rename(localSkills, backup);
+        expect(yield* instance!.snapshot.refresh).toMatchObject({
+          enabled: true,
+          status: "ready",
+          installed: true,
+        });
+        expect(yield* fs.realPath(localSkills)).toBe(
+          yield* fs.realPath(path.join(sharedHomePath, "skills")),
+        );
+        expect(yield* fs.readFileString(path.join(backup, "local.md"))).toBe("Keep this skill");
+        expect(yield* registry.getInstance(instanceId)).toBe(instance);
+      }).pipe(Effect.provide(layerTest)),
   );
 
   it.live("reads Claude workspace identity from the explicit account config directory", () =>

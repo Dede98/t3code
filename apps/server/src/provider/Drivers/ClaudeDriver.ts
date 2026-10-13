@@ -74,7 +74,6 @@ import {
   resolveClaudeTranscriptDirPath,
   resolveClaudeConfigDirPath,
 } from "./ClaudeHome.ts";
-import { materializeClaudeSharedHome } from "./ClaudeSharedHome.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
@@ -138,17 +137,6 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
         .current(DRIVER_KIND)
         .pipe(Effect.map(resolveClaudeModelCatalog));
       const processEnv = yield* mergeProviderInstanceEnvironment(environment);
-      yield* materializeClaudeSharedHome(config, processEnv).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderDriverError({
-              driver: DRIVER_KIND,
-              instanceId,
-              detail: cause.message,
-              cause,
-            }),
-        ),
-      );
       const transcriptDirectory = yield* resolveClaudeTranscriptDirPath(config, processEnv);
       const fallbackContinuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,

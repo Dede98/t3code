@@ -71,8 +71,9 @@ shared directory, such as `~/.claude`. Other account directories must be outside
 that directory. If another account already has a local `skills`, `CLAUDE.md`, or
 `rules` entry, setup stops with a conflict. Stop its Claude sessions, back up and
 reconcile the files into the shared directory, then move the conflicting local
-entry to a backup location and retry. Existing files are never merged or
-overwritten automatically. An explicit Claude `autoMemoryDirectory`
+entry to a backup location and refresh the provider. The configuration error
+clears once the conflict is resolved; no server restart is needed. Existing files
+are never merged or overwritten automatically. An explicit Claude `autoMemoryDirectory`
 setting still overrides the default project-memory location.
 
 This integration uses Claude Code's native memory-root support, verified with
