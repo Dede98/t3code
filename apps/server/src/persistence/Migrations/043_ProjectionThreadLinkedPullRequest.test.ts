@@ -4,6 +4,7 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
+import { seedForkMigrations } from "../Migrations.testkit.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layer({ filename: ":memory:" })));
@@ -13,7 +14,7 @@ layer("043_ProjectionThreadLinkedPullRequest", (it) => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 42 });
+      yield* seedForkMigrations(42);
 
       const columnsBefore = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(projection_threads)

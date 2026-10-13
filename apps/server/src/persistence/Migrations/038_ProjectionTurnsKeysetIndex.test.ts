@@ -5,6 +5,7 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
+import { seedForkMigrations } from "../Migrations.testkit.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layer({ filename: ":memory:" })));
 
@@ -13,7 +14,7 @@ layer("038_ProjectionTurnsKeysetIndex", (it) => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 37 });
+      yield* seedForkMigrations(37);
       const indexesBefore = yield* sql<{ readonly name: string }>`
         PRAGMA index_list(projection_turns)
       `;

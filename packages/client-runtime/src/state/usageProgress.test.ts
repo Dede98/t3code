@@ -17,6 +17,7 @@ function summary(refreshing: readonly UsageProviderKind[] = []): UsageSummary {
     untilDay: UsageDay.make("2026-09-05"),
     buckets: [],
     sources: (["codex", ...refreshing] as const).map((provider) => ({
+      sourceId: provider,
       fingerprint: { hostId: "host", provider, resolvedHomePath: "/home", volumeId: "1:1" },
       status: "ok" as const,
       scannedFiles: 1,

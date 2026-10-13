@@ -10,19 +10,11 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
-import { forkMigrationEntries, migrationEntries, runMigrations } from "./Migrations.ts";
+import { migrationEntries, runMigrations } from "./Migrations.ts";
+import { seedForkMigrations } from "./Migrations.testkit.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 
-const seedFork = (through = 55) =>
-  Migrator.make({})({
-    loader: Migrator.fromRecord(
-      Object.fromEntries(
-        forkMigrationEntries
-          .filter(([id]) => id <= through)
-          .map(([id, name, migration]) => [`${id}_${name}`, migration]),
-      ),
-    ),
-  });
+const seedFork = (through = 55) => seedForkMigrations(through);
 
 it.effect(
   "upgrades the fork ledger on a snapshot and preserves the original, including WAL",

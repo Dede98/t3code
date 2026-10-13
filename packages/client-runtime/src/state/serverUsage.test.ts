@@ -59,6 +59,7 @@ const CONFIG = {
 const PRICING = { status: "unavailable" as const, source: "test", fetchedAt: null, knownModels: 0 };
 
 const cursorSource = (refreshing: boolean): UsageSource => ({
+  sourceId: "cursor",
   fingerprint: {
     hostId: "cursor.com",
     provider: "cursor",

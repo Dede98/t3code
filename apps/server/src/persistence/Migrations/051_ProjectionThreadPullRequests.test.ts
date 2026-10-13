@@ -5,6 +5,7 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
+import { seedForkMigrations } from "../Migrations.testkit.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -28,7 +29,7 @@ layer("051_ProjectionThreadPullRequests", (it) => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 50 });
+      yield* seedForkMigrations(50);
 
       yield* sql`
         INSERT INTO projection_projects (
@@ -162,7 +163,7 @@ it.layer(Layer.fresh(NodeSqliteClient.layer({ filename: ":memory:" })))(
     it.effect("keeps legacy Azure repositories distinct across organizations", () =>
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
-        yield* runMigrations({ toMigrationInclusive: 50 });
+        yield* seedForkMigrations(50);
         for (const organization of ["org-a", "org-b"]) {
           yield* sql`
           INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, linked_pull_request_json, created_at, updated_at)

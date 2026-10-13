@@ -5,6 +5,7 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
+import { seedForkMigrations } from "../Migrations.testkit.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layer({ filename: ":memory:" })));
 
@@ -13,7 +14,7 @@ layer("035_ProjectionThreadsSnoozed", (it) => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 34 });
+      yield* seedForkMigrations(34);
       const columnsBefore = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(projection_threads)
       `;

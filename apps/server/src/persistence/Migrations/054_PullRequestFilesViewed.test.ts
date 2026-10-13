@@ -4,12 +4,13 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { runMigrations } from "../Migrations.ts";
+import { seedForkMigrations } from "../Migrations.testkit.ts";
 
 it.layer(NodeSqliteClient.layer({ filename: ":memory:" }))("054_PullRequestFilesViewed", (it) => {
   it.effect("adds viewed-file storage without changing the existing fork migration history", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 53 });
+      yield* seedForkMigrations(53);
       const previousHistory = yield* sql`
         SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
       `;

@@ -4,6 +4,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { runMigrations } from "../Migrations.ts";
+import { seedForkMigrations } from "../Migrations.testkit.ts";
 import migrateActiveOrderKey from "./050_ProjectionThreadsActiveOrderKey.ts";
 
 it.layer(NodeSqliteClient.layer({ filename: ":memory:" }))(
@@ -12,7 +13,7 @@ it.layer(NodeSqliteClient.layer({ filename: ":memory:" }))(
     it.effect("migrates old threads without changing their timestamps or assigning an order", () =>
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
-        yield* runMigrations({ toMigrationInclusive: 48 });
+        yield* seedForkMigrations(48);
         const now = "2026-01-01T00:00:00.000Z";
         yield* sql`
         INSERT INTO projection_threads (

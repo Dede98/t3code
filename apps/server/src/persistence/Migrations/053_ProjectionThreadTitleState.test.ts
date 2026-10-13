@@ -4,6 +4,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { runMigrations } from "../Migrations.ts";
+import { seedForkMigrations } from "../Migrations.testkit.ts";
 
 it.layer(NodeSqliteClient.layer({ filename: ":memory:" }))(
   "053_ProjectionThreadTitleState",
@@ -13,7 +14,7 @@ it.layer(NodeSqliteClient.layer({ filename: ":memory:" }))(
       () =>
         Effect.gen(function* () {
           const sql = yield* SqlClient.SqlClient;
-          yield* runMigrations({ toMigrationInclusive: 52 });
+          yield* seedForkMigrations(52);
           yield* sql`
         INSERT INTO projection_projects
           (project_id, title, workspace_root, scripts_json, created_at, updated_at)

@@ -5,6 +5,7 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
+import { seedForkMigrations } from "../Migrations.testkit.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layer({ filename: ":memory:" })));
 
@@ -22,7 +23,8 @@ layer("033_ClaudeSessionStore", (it) => {
       `;
       assert.deepStrictEqual(tablesBefore, []);
 
-      yield* runMigrations({ toMigrationInclusive: 33 });
+      // Only the fork lineage records the session store at 33.
+      yield* seedForkMigrations(33);
 
       const tablesAfter = yield* sql<{ readonly name: string }>`
         SELECT name
