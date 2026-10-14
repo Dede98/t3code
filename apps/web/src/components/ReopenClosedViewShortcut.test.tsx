@@ -332,4 +332,15 @@ describe("root reopen shortcut", () => {
       expect.objectContaining({ command: "rightPanel.toggle" }),
     ]);
   });
+
+  it("registers recent-thread chords on shells that can forward modifier release", async () => {
+    Object.assign(window.desktopBridge!, { onThreadSwitchKey: () => () => undefined });
+    await render();
+    expect(state.setShortcuts).toHaveBeenLastCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({ command: "thread.recentPrevious" }),
+        expect.objectContaining({ command: "thread.recentNext" }),
+      ]),
+    );
+  });
 });

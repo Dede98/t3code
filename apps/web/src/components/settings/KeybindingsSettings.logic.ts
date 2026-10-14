@@ -359,6 +359,8 @@ export function buildKeybindingCommandOptions(
 }
 
 export function commandLabel(command: KeybindingCommand): string {
+  if (command === "thread.recentPrevious") return "Thread: Switch to Older Recent Thread";
+  if (command === "thread.recentNext") return "Thread: Switch to Newer Recent Thread";
   if (command === "composer.sendAlternate") return "Composer: Opposite Queue or Steer Action";
   if (command === "composer.sendBackground") return "Composer: Start in Background";
   if (command === "composer.sendAndNewThread") return "Composer: Send and Start New Thread";

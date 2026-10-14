@@ -40,6 +40,8 @@ const THREAD_KEYBINDING_COMMANDS = [
   "thread.editQueuedMessage",
   "thread.previous",
   "thread.next",
+  "thread.recentPrevious",
+  "thread.recentNext",
   "thread.copyReference",
   "thread.settle",
   "thread.pin",
@@ -164,6 +166,18 @@ export const PreviewForwardedShortcut = Schema.Struct({
   shortcut: KeybindingShortcut,
 });
 export type PreviewForwardedShortcut = typeof PreviewForwardedShortcut.Type;
+
+/** Keyboard events from a focused desktop browser guest during thread switching. */
+export interface ThreadSwitchKeyEvent {
+  type: "keydown" | "keyup";
+  key: string;
+  code: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  altKey: boolean;
+  shiftKey: boolean;
+  repeat: boolean;
+}
 
 const KeybindingWhenNodeRef = Schema.suspend(
   (): Schema.Codec<KeybindingWhenNode> => KeybindingWhenNode,

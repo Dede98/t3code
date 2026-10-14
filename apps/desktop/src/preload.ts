@@ -6,6 +6,7 @@ import type {
   DesktopPreviewRecordingFrame,
   DesktopPreviewTabState,
   DesktopSnapShotEvent,
+  ThreadSwitchKeyEvent,
 } from "@t3tools/contracts";
 import { exposeClerkBridge } from "@clerk/electron/preload";
 import { contextBridge, ipcRenderer, webFrame, webUtils } from "electron";
@@ -230,6 +231,13 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     return () => {
       ipcRenderer.removeListener(IpcChannels.MENU_ACTION_CHANNEL, wrappedListener);
     };
+  },
+  onThreadSwitchKey: (listener) => {
+    const wrappedListener = (_event: Electron.IpcRendererEvent, event: ThreadSwitchKeyEvent) => {
+      listener(event);
+    };
+    ipcRenderer.on(IpcChannels.THREAD_SWITCH_KEY_CHANNEL, wrappedListener);
+    return () => ipcRenderer.removeListener(IpcChannels.THREAD_SWITCH_KEY_CHANNEL, wrappedListener);
   },
   onSnapShotEvent: (listener) => {
     const wrappedListener = (_event: Electron.IpcRendererEvent, event: unknown) => {

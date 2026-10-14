@@ -55,6 +55,21 @@ match in a folded file opens it. Escape closes the search. This shortcut is not
 configurable. A very large uncommitted diff loads its files as you scroll, and
 find only searches the files loaded so far.
 
+## Switch between recent threads
+
+On desktop, tap `Ctrl+Tab` to return to the last thread you opened. Hold Control
+and press Tab again to select older threads; add Shift to reverse direction.
+Release Control to open the selection, or press Escape to cancel. On macOS this
+uses Control, not Command.
+
+In the web client, use `Alt+Q` and `Alt+Shift+Q`, releasing Alt (Option on macOS)
+to switch. Browsers reserve `Ctrl+Tab` for their own tabs. Change either binding
+in **Settings → Keybindings** by searching for “Recent Thread”.
+
+Recent threads include drafts and span projects and environments you have opened
+in this window. The history resets when you reload or close the window. Cycling
+does not open or mark intermediate threads as read.
+
 ## iPad
 
 With a hardware keyboard, use `Cmd+1` through `Cmd+9` to open the first nine

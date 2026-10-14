@@ -750,6 +750,77 @@ describe("PreviewManager", () => {
       ),
   );
 
+  effectIt.effect(
+    "forwards thread switching and quick modifier release only from the focused guest",
+    () =>
+      withManager((manager) =>
+        Effect.gen(function* () {
+          const preview = makeFaviconWebContents();
+          const send = vi.fn();
+          Object.assign(preview.webContents, {
+            hostWebContents: { isDestroyed: () => false, send },
+          });
+          fromId.mockReturnValue(preview.webContents);
+          getFocusedWebContents.mockReturnValue(preview.webContents as never);
+          yield* manager.createTab("tab_switch");
+          yield* manager.registerWebview("tab_switch", 42);
+          yield* manager.setForwardedShortcuts([
+            { command: "thread.recentPrevious", shortcut: parseKeybindingShortcut("ctrl+tab")! },
+            { command: "thread.recentNext", shortcut: parseKeybindingShortcut("ctrl+shift+tab")! },
+          ]);
+          const beforeInput = preview.listeners.get("before-input-event")!;
+          const input = {
+            type: "keyDown",
+            key: "Tab",
+            code: "Tab",
+            control: true,
+            meta: false,
+            alt: false,
+            shift: false,
+          };
+          const preventDefault = vi.fn();
+          beforeInput({ preventDefault } as never, input as never);
+          expect(preventDefault).toHaveBeenCalledOnce();
+          expect(send).toHaveBeenLastCalledWith("desktop:thread-switch-key", {
+            type: "keydown",
+            key: "Tab",
+            code: "Tab",
+            ctrlKey: true,
+            metaKey: false,
+            altKey: false,
+            shiftKey: false,
+            repeat: false,
+          });
+          beforeInput({ preventDefault } as never, { ...input, shift: true } as never);
+          expect(send).toHaveBeenLastCalledWith(
+            "desktop:thread-switch-key",
+            expect.objectContaining({ type: "keydown", shiftKey: true }),
+          );
+          beforeInput(
+            { preventDefault } as never,
+            { ...input, type: "keyUp", key: "Control", control: false } as never,
+          );
+          expect(send).toHaveBeenLastCalledWith(
+            "desktop:thread-switch-key",
+            expect.objectContaining({ type: "keyup", key: "Control", ctrlKey: false }),
+          );
+          expect(preventDefault).toHaveBeenCalledTimes(2);
+          beforeInput({ preventDefault } as never, { ...input, key: "Escape" } as never);
+          expect(send).toHaveBeenLastCalledWith(
+            "desktop:thread-switch-key",
+            expect.objectContaining({ type: "keydown", key: "Escape" }),
+          );
+          getFocusedWebContents.mockReturnValue(null);
+          beforeInput({ preventDefault } as never, input as never);
+          expect(send).toHaveBeenCalledTimes(4);
+          getFocusedWebContents.mockReturnValue(preview.webContents as never);
+          yield* manager.setForwardedShortcuts([]);
+          beforeInput({ preventDefault } as never, input as never);
+          expect(send).toHaveBeenCalledTimes(4);
+        }),
+      ),
+  );
+
   effectIt.effect.each([
     ["linux", "ctrl+alt+[", "[", "BracketLeft", false],
     ["win32", "ctrl+alt+8", "[", "Digit8", false],

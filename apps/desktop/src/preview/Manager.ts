@@ -62,7 +62,11 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopRendererHistory from "../telemetry/DesktopRendererHistory.ts";
-import { MENU_ACTION_CHANNEL, PREVIEW_PICTURE_IN_PICTURE_FRAME_CHANNEL } from "../ipc/channels.ts";
+import {
+  MENU_ACTION_CHANNEL,
+  PREVIEW_PICTURE_IN_PICTURE_FRAME_CHANNEL,
+  THREAD_SWITCH_KEY_CHANNEL,
+} from "../ipc/channels.ts";
 import * as DesktopBrowserHost from "./DesktopBrowserHost.ts";
 import * as PreviewPasskeys from "./Passkeys.ts";
 import * as BrowserSession from "./BrowserSession.ts";
@@ -1532,6 +1536,32 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     const beforeInput = (event: Electron.Event, input: Electron.Input): void => {
       syncMenuShortcuts(wc, input);
       const host = wc.hostWebContents;
+      // A quick modifier release can arrive before the renderer's switcher
+      // takes focus. Forward releases and cancellation too, so quick Ctrl+Tab
+      // never sticks open. Ordinary guest Escape still belongs to the page.
+      const switcherFollowUp =
+        ((input.type === "keyUp" && ["Control", "Meta", "Alt", "Shift"].includes(input.key)) ||
+          (input.type === "keyDown" && input.key === "Escape")) &&
+        forwardedShortcuts.some(
+          ({ command }) => command === "thread.recentPrevious" || command === "thread.recentNext",
+        );
+      if (
+        switcherFollowUp &&
+        host &&
+        !host.isDestroyed() &&
+        webContents.getFocusedWebContents() === wc
+      ) {
+        host.send(THREAD_SWITCH_KEY_CHANNEL, {
+          type: input.type === "keyUp" ? "keyup" : "keydown",
+          key: input.key,
+          code: input.code ?? "",
+          ctrlKey: input.control,
+          metaKey: input.meta,
+          altKey: input.alt,
+          shiftKey: input.shift,
+          repeat: false,
+        });
+      }
       const forwarded =
         input.type === "keyDown" &&
         !input.isComposing &&
@@ -1560,6 +1590,22 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         );
       if (forwarded && host) {
         event.preventDefault();
+        if (
+          forwarded.command === "thread.recentPrevious" ||
+          forwarded.command === "thread.recentNext"
+        ) {
+          host.send(THREAD_SWITCH_KEY_CHANNEL, {
+            type: "keydown",
+            key: input.key,
+            code: input.code ?? "",
+            ctrlKey: input.control,
+            metaKey: input.meta,
+            altKey: input.alt,
+            shiftKey: input.shift,
+            repeat: input.isAutoRepeat ?? false,
+          });
+          return;
+        }
         if (!input.isAutoRepeat) host.send(MENU_ACTION_CHANNEL, forwarded.command);
         return;
       }

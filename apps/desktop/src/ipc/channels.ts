@@ -10,6 +10,7 @@ export const NOTIFICATION_CLICKED_CHANNEL = "desktop:notification-clicked";
 export const OPEN_SYSTEM_SETTINGS_CHANNEL = "desktop:open-system-settings";
 export const PROBE_REMOTE_EDITORS_CHANNEL = "desktop:probe-remote-editors";
 export const MENU_ACTION_CHANNEL = "desktop:menu-action";
+export const THREAD_SWITCH_KEY_CHANNEL = "desktop:thread-switch-key";
 export const PASTE_AS_TEXT_CHANNEL = "desktop:paste-as-text";
 export const SNAP_SHOT_EVENT_CHANNEL = "desktop:snap-shot-event";
 export const WEB_LINK_OPEN_CHANNEL = "desktop:web-link-open";
