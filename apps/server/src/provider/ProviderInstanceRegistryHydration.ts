@@ -2,31 +2,6 @@
 import * as NodeCrypto from "node:crypto";
 import { resolveExternalMcpServers } from "@t3tools/provider-core/server/externalMcpServers";
 import { ProviderRegistrySessionLifecycle } from "./ProviderRegistrySessionLifecycle.ts";
-/**
- * ProviderInstanceRegistryHydration — derive a `ProviderInstanceConfigMap`
- * from `ServerSettings` and keep `ProviderInstanceRegistry` in sync with it.
- *
- * `settings.providerInstances` is the source of truth. Every built-in driver
- * with a default instance also runs at `defaultInstanceIdForDriver(kind)`
- * when that slot has no entry, using the driver's default config, so a fresh
- * install shows its built-in providers without writing settings first.
- *
- * Hot-reload
- * ----------
- * On layer build we:
- *   1. Read the current `ServerSettings` once and use it to seed the
- *      registry's initial state via `ProviderInstanceRegistry.layer`.
- *   2. Fork a daemon fiber (lifetime tied to the layer's scope) that
- *      acquires `ServerSettingsService.subscribeChanges` and calls
- *      `ProviderInstanceRegistryMutator.reconcile` on every emission.
- *
- * Failures inside the watcher are logged and swallowed so a single bad
- * settings emission cannot kill the registry. Unknown drivers and invalid
- * configs already round-trip through the registry's own "unavailable"
- * shadow bucket.
- *
- * @module provider/ProviderInstanceRegistryHydration
- */
 import {
   defaultInstanceIdForDriver,
   ProviderInstanceId,
@@ -72,11 +47,6 @@ type ProviderInstanceRegistryHydrationEnv =
   | BackgroundPolicy.BackgroundPolicy
   | ServerConfig.ServerConfig;
 
-/**
- * Explicit `providerInstances` entries plus an implicit default instance for
- * each built-in driver whose default slot is empty. Pure so the hydration
- * rule can be tested without layers.
- */
 export const deriveProviderInstanceConfigMap = (
   settings: ServerSettings,
 ): ProviderInstanceConfigMap => {

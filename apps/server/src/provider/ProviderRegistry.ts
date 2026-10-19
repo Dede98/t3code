@@ -1,32 +1,3 @@
-/**
- * ProviderRegistry - Provider snapshot service.
- *
- * Owns provider install/auth/version/model snapshots and exposes the latest
- * provider state to transport layers.
- *
- * The live layer aggregates per-instance snapshot streams into a
- * single materialized list.
- *
- * Historically this Layer composed four per-kind Live Layers
- * (`CodexProviderLive`, `ClaudeProviderLive`, …) that each exposed a
- * `ManagedServerProvider`. Those Lives were deleted during the driver /
- * instance refactor — every driver now carries its `snapshot: ManagedServerProvider`
- * bundled onto the `ProviderInstance` the registry produces.
- *
- * Each configured instance (including multi-instance setups like
- * `codex_personal` + `codex_work`) contributes one `ProviderSnapshotSource`,
- * keyed by `instanceId`. Instances whose driver is unavailable or whose
- * config failed to decode are merged from `instanceRegistry.listUnavailable`
- * as shadow snapshots so the UI can render their exact unavailable reason.
- *
- * Cache paths on disk are now keyed by `instanceId`. Because
- * `defaultInstanceIdForDriver(kind) === kind` for built-in kinds, existing
- * `<kind>.json` files remain the on-disk location for that driver's default
- * instance. Identity-less legacy cache contents are ignored and replaced by
- * the first live refresh.
- *
- * @module ProviderRegistry
- */
 import {
   defaultInstanceIdForDriver,
   isProviderWorkspaceSnapshotCurrent,
@@ -78,75 +49,39 @@ export type ProviderMaintenanceActionKind = "update";
 export class ProviderRegistry extends Context.Service<
   ProviderRegistry,
   {
-    /**
-     * Read the latest provider snapshots for every configured instance.
-     * Multiple snapshots may share the same `provider` kind (multiple
-     * instances of the same driver) and disambiguate via `instanceId`.
-     */
     readonly getProviders: Effect.Effect<ReadonlyArray<ServerProvider>>;
 
-    /**
-     * Refresh all providers, or the default instance of the specified
-     * kind when supplied.
-     *
-     * Retained for back-compat with legacy call sites (WS refresh RPC,
-     * orchestration metrics). New code should prefer `refreshInstance`.
-     *
-     * @deprecated prefer `refreshInstance` for new call sites.
-     */
     readonly refresh: (
       provider?: ProviderDriverKind,
     ) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
     /**
-     * Refresh the specific configured instance. Returns the updated snapshot
-     * list. When the instance id is unknown the call resolves with the
-     * currently cached list (no error) — matching the legacy `refresh` shim
-     * behaviour so transport layers don't have to special-case unknowns.
+     * When the instance id is unknown the call resolves with the currently
+     * cached list (no error) — matching the legacy `refresh` shim behaviour so
+     * transport layers don't have to special-case unknowns.
      */
     readonly refreshInstance: (
       instanceId: ProviderInstanceId,
     ) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
-    /**
-     * Fill the skills and slash commands snapshot for one cwd. A cwd that
-     * already has a snapshot is left alone unless `fresh` is set. A fresh scan
-     * also refreshes the instance's machine snapshot and drops other
-     * instances' snapshots for the cwd.
-     */
     readonly refreshWorkspaceSnapshot: (input: {
       readonly instanceId: ProviderInstanceId;
       readonly cwd: string;
       readonly fresh?: boolean;
     }) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
-    /**
-     * Resolve the maintenance capabilities owned by one live provider instance.
-     * Falls back to manual-only capabilities when the instance is not live.
-     * `fresh` re-derives ownership from the executable instead of the cache.
-     */
     readonly getProviderMaintenanceCapabilitiesForInstance: (
       instanceId: ProviderInstanceId,
       provider: ProviderDriverKind,
       options?: { readonly fresh?: boolean },
     ) => Effect.Effect<ProviderMaintenanceCapabilities>;
 
-    /**
-     * Apply volatile maintenance-action state to one configured instance.
-     * This state is never persisted to disk. Today only update actions are
-     * projected onto `ServerProvider.updateState`; install/auth actions can
-     * extend this action map without adding driver-scoped APIs.
-     */
     readonly setProviderMaintenanceActionState: (input: {
       readonly instanceId: ProviderInstanceId;
       readonly action: ProviderMaintenanceActionKind;
       readonly state: ServerProviderUpdateState | null;
     }) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
-    /**
-     * Stream of provider snapshot updates — one emission per aggregated
-     * change. The array contains the full current state.
-     */
     readonly streamChanges: Stream.Stream<ReadonlyArray<ServerProvider>>;
   }
 >()("t3/provider/ProviderRegistry") {}
@@ -210,16 +145,29 @@ export function upsertProviderWorkspaceSnapshot(
 }
 
 const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean => {
+  if (provider.driver === ProviderDriverKind.make("pi")) {
+    // Pi reports known auth only after RPC inventory discovery completes.
+    // An empty inventory is warning/unauthenticated; failed or interactive
+    // discovery stays ready/unknown and must keep the last known models.
+    return !(
+      provider.installed &&
+      (provider.status === "ready" || provider.status === "warning") &&
+      provider.auth.status !== "unknown"
+    );
+  }
+
   if (provider.driver === ProviderDriverKind.make("acpRegistry")) {
     // ACP Registry discovery probes return the agent's complete inventory, so
-    // a completed probe (ready and authenticated) replaces the model list —
-    // otherwise agents that rename or collapse models leave stale entries
-    // pinned forever through the snapshot cache. Readiness-only and failed
-    // probe snapshots only know the "default" placeholder and stay partial.
+    // a completed probe replaces the model list — otherwise agents that rename
+    // or collapse models leave stale entries pinned forever through the
+    // snapshot cache. Only a completed probe reports `nativeSessions`;
+    // readiness-only and failed probe snapshots only know the "default"
+    // placeholder and stay partial. Auth is no signal here: agents without
+    // sign-in stay "unknown" after every probe.
     return !(
       provider.installed &&
       provider.status === "ready" &&
-      provider.auth.status === "authenticated"
+      provider.nativeSessions !== undefined
     );
   }
 
@@ -236,7 +184,6 @@ const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean =>
     return false;
   }
 
-  // Successful discovery replaces these inventories so cached retired models disappear.
   // Antigravity's local health check does not authenticate or discover models.
   const isPendingAntigravityAuthentication =
     isAntigravity && provider.status === "warning" && provider.auth.status === "unknown";
@@ -258,12 +205,6 @@ const mergeProviderModels = (
   nextModels: ReadonlyArray<ServerProvider["models"][number]>,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
   const shouldRetainMissingModels = shouldRetainMissingProviderModels(provider);
-  // Custom rows are derived from settings and every snapshot carries the full
-  // current list, so a custom model missing from `nextModels` was removed by
-  // the user and must not be resurrected from the previous snapshot.
-  // A model the installed CLI is too old to run was offered by the pending
-  // snapshot, before the version was known; retaining it would make it
-  // selectable again.
   const updateRequiredSlugs = new Set(provider.updateRequiredModels?.map((model) => model.slug));
   const retainablePreviousModels = previousModels.filter(
     (model) => !model.isCustom && !updateRequiredSlugs.has(model.slug),
@@ -293,10 +234,7 @@ const mergeProviderModels = (
 /**
  * Antigravity's health check only initializes the agent, so after a server
  * restart it reports the account as unchecked. The saved Google login still
- * works, and the previous snapshot proves it. Carry that account state until
- * a session, refresh, or sign-out reports something new. A confirmed missing
- * installation, sign-out, disabled instance, or a changed sign-in method is
- * never overridden.
+ * works, and the previous snapshot proves it.
  */
 const carrySavedAntigravityAccount = (
   previousProvider: ServerProvider,
@@ -315,8 +253,6 @@ const carrySavedAntigravityAccount = (
   ) {
     return undefined;
   }
-  // The pending boot probe (`installed: false`, warning) and a failed probe
-  // keep their own status; only a passed health check reads as ready.
   const status =
     nextProvider.installed && nextProvider.status === "warning" ? "ready" : nextProvider.status;
   return { auth: previousProvider.auth, status };
@@ -330,8 +266,6 @@ export const mergeProviderSnapshot = (
     return nextProvider;
   }
   const savedAccount = carrySavedAntigravityAccount(previousProvider, nextProvider);
-  // "Google account access is not checked yet" describes the probe, not the
-  // account; it must not outlive the state it explained.
   const { message: _uncheckedMessage, ...nextWithoutMessage } = nextProvider;
   return {
     ...(savedAccount?.status === "ready" ? nextWithoutMessage : nextProvider),
@@ -404,20 +338,13 @@ const correlateSnapshotWithSource = (
   return Effect.succeed(snapshot);
 };
 
-/**
- * Key a snapshot for aggregation and persistence. Snapshot sources
- * must be correlated by instance id before reaching this map; missing
- * identities are defects, not runtime routing fallbacks.
- */
 const snapshotInstanceKey = (provider: ServerProvider): ProviderInstanceId => {
   return provider.instanceId;
 };
 
-// Project a live `ProviderInstance` into the aggregator's consumption
-// shape. Each call re-captures the instance's `snapshot` closures, so
-// after `ProviderInstanceRegistry` rebuilds an instance (e.g. because
-// its settings changed), a fresh source rides the new PubSub instead
-// of a closed one.
+// Each call re-captures the instance's `snapshot` closures, so after
+// `ProviderInstanceRegistry` rebuilds an instance (e.g. because its settings
+// changed), a fresh source rides the new PubSub instead of a closed one.
 const buildSnapshotSource = (instance: ProviderInstance): ProviderSnapshotSource => ({
   instanceId: instance.instanceId,
   driverKind: instance.driverKind,
@@ -437,8 +364,6 @@ export const layer = Layer.effect(
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
 
-    // Aggregator PubSub — consumers (WS gateway, etc.) subscribe here for
-    // coalesced updates across every instance.
     const changesPubSub = yield* Effect.acquireRelease(
       PubSub.unbounded<ReadonlyArray<ServerProvider>>(),
       PubSub.shutdown,
@@ -537,15 +462,9 @@ export const layer = Layer.effect(
       ReadonlyMap<ProviderInstanceId, { readonly update?: ServerProviderUpdateState | undefined }>
     >(new Map());
 
-    // Live-source registry — the dynamic counterpart to the boot-time
-    // `bootSources`. Keyed by `instanceId`; the stored `ProviderInstance`
-    // reference is used for identity equality so "no-op" reconciles
-    // (settings unchanged) skip re-subscribing + re-probing.
     const liveSubsRef = yield* Ref.make<ReadonlyMap<ProviderInstanceId, ProviderInstance>>(
       new Map(),
     );
-    // Serialize `syncLiveSources` so a rapid burst of reconciles doesn't
-    // interleave two passes clobbering each other's fiber bookkeeping.
     const syncSemaphore = yield* Semaphore.make(1);
 
     const getLiveSources: Effect.Effect<ReadonlyArray<ProviderSnapshotSource>> = Ref.get(
@@ -554,12 +473,6 @@ export const layer = Layer.effect(
 
     const persistProvider = (provider: ServerProvider) =>
       Effect.gen(function* () {
-        // Persist every instance — the file name is the instance id, so
-        // multi-instance setups (e.g. `codex_personal`, `codex_work`) each
-        // get their own cache. We resolve the path fresh so snapshots
-        // produced by newly-added instances post-boot still land on disk
-        // without the aggregator holding a stale `cachePathByInstance`
-        // entry.
         const key = snapshotInstanceKey(provider);
         const filePath = yield* resolveProviderStatusCachePath({
           cacheDir: config.providerStatusCacheDir,
@@ -743,9 +656,6 @@ export const layer = Layer.effect(
       Option.none(),
     );
 
-    // Untargeted refreshes probe every live source, so any read-scoped client
-    // can request them. Concurrent callers share one in-flight pass instead of
-    // each starting their own set of provider processes.
     const refreshAll = Effect.fn("refreshAll")(function* () {
       const claimed = yield* Ref.modify(
         refreshAllInFlightRef,
@@ -865,10 +775,6 @@ export const layer = Layer.effect(
         }
         const previousSubs = yield* Ref.get(liveSubsRef);
 
-        // Carry over subscriptions for instances whose identity is
-        // unchanged (reconcile treated them as no-op). Instances that
-        // disappeared, or were rebuilt with a different reference,
-        // fall through to the "newly-added" branch below.
         const carriedOver = new Map<ProviderInstanceId, ProviderInstance>();
         for (const [instanceId, previousInstance] of previousSubs) {
           const nextInstance = nextByInstance.get(instanceId);
@@ -877,8 +783,6 @@ export const layer = Layer.effect(
           }
         }
 
-        // Collect new/rebuilt instances in `nextByInstance` insertion
-        // order (which preserves settings-author order).
         const newlyAdded: Array<readonly [ProviderInstanceId, ProviderInstance]> = [];
         for (const [instanceId, instance] of nextByInstance) {
           if (carriedOver.has(instanceId)) {
@@ -921,10 +825,6 @@ export const layer = Layer.effect(
         }
         yield* Effect.yieldNow;
 
-        // Snapshot current state without starting a probe. Managed providers
-        // launch their startup refresh independently, so this closes the
-        // subscription race without putting external work on the registry
-        // or HTTP server construction path.
         yield* Effect.forEach(
           newlyAdded,
           ([, instance]) =>
@@ -948,8 +848,6 @@ export const layer = Layer.effect(
         }
         yield* Ref.set(liveSubsRef, nextSubs);
 
-        // Drop aggregator state for instances that have disappeared —
-        // otherwise the UI would keep rendering ghosts.
         const [previousProviders, providers] = yield* Ref.modify(
           providersRef,
           (previousProviders) => {
@@ -1039,14 +937,7 @@ export const layer = Layer.effect(
     // was dropped, which made any settings change that replaced an
     // instance never propagate to the aggregator's `providersRef`.)
     const instanceChanges = yield* instanceRegistry.subscribeChanges;
-    // Initial sync attaches subscriptions and snapshots current state for
-    // every instance present at boot. Provider probes are already running in
-    // their managed background fibers and never block this layer.
     yield* syncLiveSources;
-    // React to registry mutations — instance added / removed / rebuilt.
-    // `Stream.fromSubscription` builds a stream over the pre-acquired
-    // subscription rather than subscribing on stream start, which is
-    // what closes the race.
     yield* Stream.runForEach(
       Stream.fromSubscription(instanceChanges),
       () => syncLiveSourcesAndContinue,
@@ -1084,9 +975,6 @@ export const layer = Layer.effect(
       readonly cwd: string;
       readonly fresh?: boolean;
     }) {
-      // Fresh scans drop other instances' snapshots for this cwd first, so a
-      // composer on one of them scans again on next use, even when this
-      // instance is gone or cannot be scanned.
       if (input.fresh) {
         yield* updateProviders((providers) =>
           providers.map((candidate) =>
@@ -1124,9 +1012,7 @@ export const layer = Layer.effect(
         next.set(instance, new Set(current).add(input.cwd));
         return [true, next] as const;
       });
-      // A fresh scan never joins a running one, which may predate the change.
       if (!claimed && !input.fresh) return yield* Ref.get(providersRef);
-      // Fresh scans also re-read the machine snapshot after invalidating caches.
       const refreshMachineSnapshot = input.fresh
         ? (instance.invalidateCaches ?? Effect.void).pipe(
             Effect.andThen(refreshInstance(input.instanceId)),
@@ -1134,27 +1020,30 @@ export const layer = Layer.effect(
         : Effect.void;
       return yield* refreshMachineSnapshot.pipe(
         Effect.andThen(instance.snapshotForCwd(input.cwd)),
+        // A failed scan fails this effect, so a returned snapshot is a real
+        // inventory even while the provider's health check reports an error.
         Effect.flatMap((scopedSnapshot) =>
-          scopedSnapshot.status === "error" && scopedSnapshot.slashCommandsPending === undefined
-            ? Ref.get(providersRef)
-            : instanceRegistry.getInstance(input.instanceId).pipe(
-                Effect.flatMap((currentInstance) => {
-                  if (currentInstance !== instance) return Ref.get(providersRef);
-                  // Write only if the cwd's snapshot did not change during the
-                  // scan. A session event or another scan that landed first is newer.
-                  return updateProviders((currentProviders) =>
-                    currentProviders.map((candidate) =>
-                      candidate.instanceId === input.instanceId &&
-                      Equal.equals(workspaceSnapshotOf(candidate), scannedFrom)
-                        ? upsertProviderWorkspaceSnapshot(candidate, input.cwd, {
-                            ...scopedSnapshot,
-                            checkedAt: scannedAt,
-                          })
-                        : candidate,
-                    ),
-                  );
-                }),
-              ),
+          instanceRegistry.getInstance(input.instanceId).pipe(
+            Effect.flatMap((currentInstance) => {
+              if (currentInstance !== instance) return Ref.get(providersRef);
+              return updateProviders((currentProviders) =>
+                currentProviders.map((candidate) =>
+                  candidate.instanceId === input.instanceId &&
+                  Equal.equals(workspaceSnapshotOf(candidate), scannedFrom)
+                    ? upsertProviderWorkspaceSnapshot(candidate, input.cwd, {
+                        ...scopedSnapshot,
+                        checkedAt: scannedAt,
+                        // Unless the driver reports its own command discovery,
+                        // commands come from the health check. A failed check
+                        // leaves them unknown, so keep the last ones and retry.
+                        slashCommandsPending:
+                          scopedSnapshot.slashCommandsPending ?? scopedSnapshot.status === "error",
+                      })
+                    : candidate,
+                ),
+              );
+            }),
+          ),
         ),
         Effect.ensuring(
           claimed

@@ -59,6 +59,8 @@ it.effect(
           [61, "ThreadSnapshotWindowIndexes"],
           [62, "PullRequestReviewGuides"],
           [63, "ThreadFailureLookupIndex"],
+          [64, "DropUnusedV1Projections"],
+          [65, "CanonicalizeThreadPullRequestLinks"],
         ]);
         // Each startup owns a fresh connection/layer.
         assert.deepEqual(yield* migrate, []);
@@ -155,6 +157,8 @@ it.effect("rolls back a failed fork foundation and retries from a fresh connecti
         [61, "ThreadSnapshotWindowIndexes"],
         [62, "PullRequestReviewGuides"],
         [63, "ThreadFailureLookupIndex"],
+        [64, "DropUnusedV1Projections"],
+        [65, "CanonicalizeThreadPullRequestLinks"],
       ],
     );
   }).pipe(
@@ -253,7 +257,7 @@ it.effect.each([0, 32, 52, 53, 54].map((through) => ({ through })))(
   },
 );
 
-it.effect.each([57, 58, 59, 60, 61, 62])(
+it.effect.each([57, 58, 59, 60, 61, 62, 63, 64])(
   "preserves official upstream webhook ledger through %s",
   (through) =>
     Effect.gen(function* () {
@@ -309,7 +313,7 @@ it.effect.each([57, 58, 59, 60, 61, 62])(
         1,
       );
       assert.equal(
-        (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = ${through >= 62 ? 63 : through >= 61 ? 62 : through >= 59 ? 61 : 59}`)[0]
+        (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = ${through >= 64 ? 65 : through >= 63 ? 64 : through >= 62 ? 63 : through >= 61 ? 62 : through >= 59 ? 61 : 59}`)[0]
           ?.name,
         "ClaudeSessionStore",
       );

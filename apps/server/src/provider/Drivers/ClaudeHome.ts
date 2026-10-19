@@ -1,5 +1,6 @@
 import type { ClaudeSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
@@ -102,11 +103,23 @@ export const makeClaudeEnvironment = Effect.fn("makeClaudeEnvironment")(function
 });
 
 /**
- * Continuation identity is the config directory the CLI actually reads, so an
- * empty profile, a legacy `homePath`, an explicit `configDirPath`, and an
- * inherited `CLAUDE_CONFIG_DIR` that all land on the same directory share one
- * group and can resume each other's sessions.
+ * While it exists Claude refuses `--strict-mcp-config` and exits before
+ * initializing, but it already ignores user, project and `--mcp-config` servers
+ * on its own, so callers that pass the flag for isolation can drop it. Paths
+ * match the ones Claude Code checks.
  */
+export const hasClaudeManagedMcpConfig = Effect.fn("hasClaudeManagedMcpConfig")(function* () {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const platform = yield* HostProcess.Platform;
+  const managedMcpConfigPath =
+    platform === "darwin"
+      ? "/Library/Application Support/ClaudeCode/managed-mcp.json"
+      : platform === "win32"
+        ? "C:\\Program Files\\ClaudeCode\\managed-mcp.json"
+        : "/etc/claude-code/managed-mcp.json";
+  return yield* fileSystem.exists(managedMcpConfigPath).pipe(Effect.orElseSucceed(() => false));
+});
+
 export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationGroupKey")(
   function* (
     config: Pick<ClaudeSettings, "configDirPath" | "homePath">,

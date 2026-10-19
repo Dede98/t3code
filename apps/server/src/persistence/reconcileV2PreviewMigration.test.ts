@@ -100,7 +100,7 @@ it.effect.each(
         );
         assert.equal(
           observer.prepare("SELECT MAX(migration_id) AS id FROM effect_sql_migrations").get()?.id,
-          63,
+          65,
         );
         for (const name of [
           "mcp_app_model_context",

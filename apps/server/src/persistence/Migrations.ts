@@ -1,18 +1,7 @@
-/**
- * Migration runner with an inline loader.
- *
- * Uses Migrator.make with fromRecord to define migrations inline.
- * All migrations are statically imported - no dynamic file system loading.
- *
- * `runMigrations` is called by the SQLite persistence layer at startup, so the
- * schema is always up to date before the application starts.
- */
-
 import * as Migrator from "effect/sql/Migrator";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 
-// Import all migrations statically
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
 import Migration0002 from "./Migrations/002_OrchestrationCommandReceipts.ts";
 import Migration0003 from "./Migrations/003_CheckpointDiffBlobs.ts";
@@ -76,17 +65,9 @@ import Migration0059 from "./Migrations/059_McpAppModelContext.ts";
 import Migration0060 from "./Migrations/060_ThreadSnapshotWindowIndexes.ts";
 import Migration0061 from "./Migrations/061_PullRequestReviewGuides.ts";
 import Migration0062 from "./Migrations/062_ThreadFailureLookupIndex.ts";
+import Migration0063 from "./Migrations/063_DropUnusedV1Projections.ts";
+import Migration0064 from "./Migrations/064_CanonicalizeThreadPullRequestLinks.ts";
 
-/**
- * Migration loader with all migrations defined inline.
- *
- * Key format: "{id}_{name}" where:
- * - id: numeric migration ID (determines execution order)
- * - name: descriptive name for the migration
- *
- * Uses Migrator.fromRecord which parses the key format and
- * returns migrations sorted by ID.
- */
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
   [2, "OrchestrationCommandReceipts", Migration0002],
@@ -152,6 +133,8 @@ export const migrationEntries = [
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
   [62, "PullRequestReviewGuides", Migration0061],
   [63, "ThreadFailureLookupIndex", Migration0062],
+  [64, "DropUnusedV1Projections", Migration0063],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -175,6 +158,8 @@ export const forkMigrationEntries = [
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
   [62, "PullRequestReviewGuides", Migration0061],
   [63, "ThreadFailureLookupIndex", Migration0062],
+  [64, "DropUnusedV1Projections", Migration0063],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -188,6 +173,8 @@ export const forkIntegrationMigrationEntries = [
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
   [62, "PullRequestReviewGuides", Migration0061],
   [63, "ThreadFailureLookupIndex", Migration0062],
+  [64, "DropUnusedV1Projections", Migration0063],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -202,6 +189,8 @@ const upstreamIntegrationMigrationEntries = [
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
   [62, "PullRequestReviewGuides", Migration0061],
   [63, "ThreadFailureLookupIndex", Migration0062],
+  [64, "DropUnusedV1Projections", Migration0063],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -216,6 +205,8 @@ const preview54MigrationEntries = [
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
   [62, "PullRequestReviewGuides", Migration0061],
   [63, "ThreadFailureLookupIndex", Migration0062],
+  [64, "DropUnusedV1Projections", Migration0063],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -231,6 +222,8 @@ const preview53MigrationEntries = [
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
   [62, "PullRequestReviewGuides", Migration0061],
   [63, "ThreadFailureLookupIndex", Migration0062],
+  [64, "DropUnusedV1Projections", Migration0063],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -242,6 +235,8 @@ const upstreamWebhookMigrationEntries = [
   [61, "ThreadSnapshotWindowIndexes", Migration0060],
   [62, "PullRequestReviewGuides", Migration0061],
   [63, "ThreadFailureLookupIndex", Migration0062],
+  [64, "DropUnusedV1Projections", Migration0063],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -253,6 +248,8 @@ const upstreamMcpAppMigrationEntries = [
   [61, "ClaudeSessionStore", ClaudeSessionStore],
   [62, "PullRequestReviewGuides", Migration0061],
   [63, "ThreadFailureLookupIndex", Migration0062],
+  [64, "DropUnusedV1Projections", Migration0063],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
 ] as const;
 
 // Upstream databases that already applied review guides keep that id/name pair.
@@ -261,6 +258,8 @@ const upstreamReviewGuideMigrationEntries = [
   [61, "PullRequestReviewGuides", Migration0061],
   [62, "ClaudeSessionStore", ClaudeSessionStore],
   [63, "ThreadFailureLookupIndex", Migration0062],
+  [64, "DropUnusedV1Projections", Migration0063],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
 ] as const;
 
 // Official upstream databases may already have the failure index at 62.
@@ -269,6 +268,23 @@ const upstreamFailureIndexMigrationEntries = [
   ...upstreamReviewGuideMigrationEntries.filter(([id]) => id <= 61),
   [62, "ThreadFailureLookupIndex", Migration0062],
   [63, "ClaudeSessionStore", ClaudeSessionStore],
+  [64, "DropUnusedV1Projections", Migration0063],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+] as const;
+
+// Official databases may have used 63/64 before ever opening in the fork.
+// Append the Claude store without changing an already recorded id/name pair.
+const upstreamDropProjectionsMigrationEntries = [
+  ...upstreamFailureIndexMigrationEntries.filter(([id]) => id <= 62),
+  [63, "DropUnusedV1Projections", Migration0063],
+  [64, "ClaudeSessionStore", ClaudeSessionStore],
+  [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+] as const;
+
+const upstreamCanonicalLinksMigrationEntries = [
+  ...upstreamDropProjectionsMigrationEntries.filter(([id]) => id <= 63),
+  [64, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [65, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -323,26 +339,12 @@ const assertV2MigrationsCanRun = Effect.fn("assertV2MigrationsCanRun")(function*
   });
 });
 
-/**
- * Migrator run function - no schema dumping needed
- * Uses the base Migrator.make without platform dependencies
- */
 const run = Migrator.make({});
 
 export interface RunMigrationsOptions {
   readonly toMigrationInclusive?: number | undefined;
 }
 
-/**
- * Run all pending migrations.
- *
- * Creates the migrations tracking table (effect_sql_migrations) if it doesn't exist,
- * then runs any migrations with ID greater than the latest recorded migration.
- *
- * Returns array of [id, name] tuples for migrations that were run.
- *
- * @returns Effect containing array of executed migrations
- */
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
 }: RunMigrationsOptions = {}) {
@@ -370,7 +372,11 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
           : has(59, "McpAppModelContext")
             ? has(61, "PullRequestReviewGuides")
               ? has(62, "ThreadFailureLookupIndex")
-                ? upstreamFailureIndexMigrationEntries
+                ? has(63, "DropUnusedV1Projections")
+                  ? has(64, "CanonicalizeThreadPullRequestLinks")
+                    ? upstreamCanonicalLinksMigrationEntries
+                    : upstreamDropProjectionsMigrationEntries
+                  : upstreamFailureIndexMigrationEntries
                 : upstreamReviewGuideMigrationEntries
               : upstreamMcpAppMigrationEntries
             : has(57, "ScheduledTaskWebhooks")
