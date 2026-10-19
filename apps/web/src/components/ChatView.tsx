@@ -2253,41 +2253,43 @@ export default function ChatView(props: ChatViewProps) {
     if (!activeThread || continuationSyncIdentity === null || isSyncingContinuation) return;
     setSyncingContinuationIdentity(continuationSyncIdentity);
     const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
-    try {
-      const result = await syncThreadContinuation({
-        environmentId: activeThread.environmentId,
-        input: { threadId: activeThread.id },
-      });
-      if (result._tag === "Failure") {
-        const error = squashAtomCommandFailure(result);
+    // A bare try/finally makes React Compiler skip all of ChatView.
+    await syncThreadContinuation({
+      environmentId: activeThread.environmentId,
+      input: { threadId: activeThread.id },
+    })
+      .then((result) => {
+        if (result._tag === "Failure") {
+          const error = squashAtomCommandFailure(result);
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Could not sync Claude history",
+              data: { threadRef },
+              description: describeClaudeContinuationSyncError(error),
+            }),
+          );
+          return;
+        }
+        setSyncedContinuationIdentityByThreadId((current) => {
+          const next = new Map(current);
+          next.set(activeThread.id, continuationSyncIdentity);
+          return next;
+        });
         toastManager.add(
           stackedThreadToast({
-            type: "error",
-            title: "Could not sync Claude history",
+            type: "success",
+            title: "Claude history synced",
             data: { threadRef },
-            description: describeClaudeContinuationSyncError(error),
+            description: "The next turn can start on the selected Claude account.",
           }),
         );
-        return;
-      }
-      setSyncedContinuationIdentityByThreadId((current) => {
-        const next = new Map(current);
-        next.set(activeThread.id, continuationSyncIdentity);
-        return next;
+      })
+      .finally(() => {
+        setSyncingContinuationIdentity((current) =>
+          current === continuationSyncIdentity ? null : current,
+        );
       });
-      toastManager.add(
-        stackedThreadToast({
-          type: "success",
-          title: "Claude history synced",
-          data: { threadRef },
-          description: "The next turn can start on the selected Claude account.",
-        }),
-      );
-    } finally {
-      setSyncingContinuationIdentity((current) =>
-        current === continuationSyncIdentity ? null : current,
-      );
-    }
   };
   const modelPickerLockedProvider = supportsProviderSwitchingViaHandoff ? null : lockedProvider;
   const pullRequestsCapabilityKnown = serverConfig !== null;
