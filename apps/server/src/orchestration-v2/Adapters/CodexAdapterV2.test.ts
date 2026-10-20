@@ -2247,55 +2247,83 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
   );
 
-  it.effect("adds the session MCP server without replacing launch-argument servers", () =>
-    Effect.gen(function* () {
-      const scenario = "launch-mcp-servers";
-      yield* (yield* McpProviderSessions.McpProviderSessions).set({
-        environmentId: EnvironmentId.make("environment-codex-mcp"),
-        threadId: ThreadId.make(`thread-${scenario}`),
-        providerSessionId: `provider-session-${scenario}`,
-        providerInstanceId: ProviderInstanceId.make("codex"),
-        endpoint: "http://127.0.0.1:43123/mcp",
-        authorizationHeader: "Bearer secret-codex-token",
-        browserToolsAvailable: true,
-      });
-      const requests: Array<unknown> = [];
-      yield* makeCodexReplayHarness(
-        makeCodexReplayTranscript({
-          scenario,
-          entries: codexReplayPreamble({
-            nativeThreadId: "launch-mcp-thread",
-            nativeTurnId: "unused",
-            prompt: "unused",
-          }).slice(0, 5),
-        }),
-        () => Effect.void,
-        (method, params) =>
-          Effect.sync(() => {
-            if (method === "thread/start") requests.push(params);
+  it.effect.each([false, true])(
+    "adds session and configured MCP servers without replacing launch-argument servers (external=%s)",
+    (withExternal) =>
+      Effect.gen(function* () {
+        const scenario = "launch-mcp-servers";
+        yield* (yield* McpProviderSessions.McpProviderSessions).set({
+          environmentId: EnvironmentId.make("environment-codex-mcp"),
+          threadId: ThreadId.make(`thread-${scenario}`),
+          providerSessionId: `provider-session-${scenario}`,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          endpoint: "http://127.0.0.1:43123/mcp",
+          authorizationHeader: "Bearer secret-codex-token",
+          browserToolsAvailable: true,
+          ...(withExternal
+            ? {
+                externalMcpServers: [
+                  {
+                    name: "docs",
+                    url: "https://example.test/mcp",
+                    enabled: true,
+                    headers: [
+                      {
+                        name: "Authorization",
+                        value: "Bearer external-test-token",
+                        sensitive: true,
+                      },
+                    ],
+                  },
+                ],
+              }
+            : {}),
+        });
+        const requests: Array<unknown> = [];
+        yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario,
+            entries: codexReplayPreamble({
+              nativeThreadId: "launch-mcp-thread",
+              nativeTurnId: "unused",
+              prompt: "unused",
+            }).slice(0, 5),
           }),
-      );
-      assert.deepEqual(requests, [
-        {
-          cwd: "/workspace",
-          model: "gpt-5.4",
-          config: {
-            "tools.update_plan.enabled": true,
-            mcp_optional_startup_grace_ms: 10_000,
-            "mcp_servers.t3-code": {
-              url: "http://127.0.0.1:43123/mcp",
-              tool_timeout_sec: 3_900,
-              http_headers: { Authorization: "Bearer secret-codex-token" },
+          () => Effect.void,
+          (method, params) =>
+            Effect.sync(() => {
+              if (method === "thread/start") requests.push(params);
+            }),
+        );
+        assert.deepEqual(requests, [
+          {
+            cwd: "/workspace",
+            model: "gpt-5.4",
+            config: {
+              "tools.update_plan.enabled": true,
+              mcp_optional_startup_grace_ms: 10_000,
+              ...(withExternal
+                ? {
+                    "mcp_servers.docs": {
+                      url: "https://example.test/mcp",
+                      http_headers: { Authorization: "Bearer external-test-token" },
+                    },
+                  }
+                : {}),
+              "mcp_servers.t3-code": {
+                url: "http://127.0.0.1:43123/mcp",
+                tool_timeout_sec: 3_900,
+                http_headers: { Authorization: "Bearer secret-codex-token" },
+              },
             },
           },
-        },
-      ]);
-    }).pipe(
-      Effect.scoped,
-      Effect.provide(
-        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ]);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
       ),
-    ),
   );
 
   it.effect("replays historical and dotted MCP config while enforcing other thread config", () =>
