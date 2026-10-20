@@ -225,7 +225,9 @@ it("hot updates Tailwind classes when a source file changes in bundled dev", asy
 });
 
 it("warms the wanted lazy chunk chain and nothing else", async () => {
-  const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-warm-"));
+  const root = await NodeFSP.realpath(
+    await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-warm-")),
+  );
   let server: Awaited<ReturnType<typeof createServer>> | undefined;
 
   try {
