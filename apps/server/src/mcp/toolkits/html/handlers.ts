@@ -12,6 +12,7 @@ const INVALID_PAGE_ERRORS = new Set([
   "HtmlRenderPageTooLargeError",
   "HtmlArtifactThemeMissingError",
   "HtmlArtifactSourceError",
+  "HtmlRenderViewportHeightError",
 ]);
 
 const toFailure = (error: { readonly _tag: string; readonly message: string }) =>

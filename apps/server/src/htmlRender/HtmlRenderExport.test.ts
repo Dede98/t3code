@@ -91,6 +91,31 @@ const layerTest = (captured = true) =>
   );
 
 describe("HTML export", () => {
+  it.effect("rejects viewport heights in fitted pages while retaining standalone exports", () =>
+    Effect.gen(function* () {
+      const service = yield* HtmlRender.HtmlRender;
+      const fs = yield* FileSystem.FileSystem;
+      const html = "<style>main{min-height:100dvh}</style><main>Page</main>";
+      const published = yield* service
+        .publish({ threadId, title: "Page", height: 400, html })
+        .pipe(Effect.flip);
+      expect(published._tag).toBe("HtmlRenderViewportHeightError");
+      const previewed = yield* service.preview({ threadId, html }).pipe(Effect.flip);
+      expect(previewed._tag).toBe("HtmlRenderViewportHeightError");
+
+      const exported = yield* service.exportPage({ threadId, title: "Page", html });
+      const saved = yield* fs.readFileString(exported.filePath);
+      expect(saved).toContain("min-height:100dvh");
+      expect(readHtmlRenderTheme(saved)).toEqual(theme);
+      expect(saved).not.toContain("host-context-changed");
+
+      const attachmentPreview = yield* service
+        .preview({ threadId, attachmentId: exported.htmlRender.attachmentId })
+        .pipe(Effect.flip);
+      expect(attachmentPreview._tag).toBe("HtmlRenderViewportHeightError");
+    }).pipe(Effect.provide(layerTest())),
+  );
+
   it.effect("exports the active request's theme and inlines images without using a browser", () =>
     Effect.gen(function* () {
       const service = yield* HtmlRender.HtmlRender;
