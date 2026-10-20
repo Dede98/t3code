@@ -384,21 +384,12 @@ export interface RunMigrationsOptions {
   readonly toMigrationInclusive?: number | undefined;
 }
 
-export const runMigrations = Effect.fn("runMigrations")(function* ({
-  toMigrationInclusive,
-}: RunMigrationsOptions = {}) {
-  const sql = yield* SqlClient.SqlClient;
-  const ledger = yield* sql`SELECT name FROM sqlite_master WHERE name = 'effect_sql_migrations'`;
-  const recorded =
-    ledger.length === 0
-      ? []
-      : yield* sql<{
-          readonly migration_id: number;
-          readonly name: string;
-        }>`SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id`;
+export function selectMigrationEntries(
+  recorded: ReadonlyArray<{ readonly migration_id: number; readonly name: string }>,
+) {
   const has = (id: number, name: string) =>
     recorded.some((row) => row.migration_id === id && row.name === name);
-  const entries = has(33, "ClaudeSessionStore")
+  return has(33, "ClaudeSessionStore")
     ? has(55, "ForkOrchestrationV2")
       ? forkIntegrationMigrationEntries
       : forkMigrationEntries
@@ -425,6 +416,21 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
             : has(57, "ScheduledTaskWebhooks")
               ? upstreamWebhookMigrationEntries
               : migrationEntries;
+}
+
+export const runMigrations = Effect.fn("runMigrations")(function* ({
+  toMigrationInclusive,
+}: RunMigrationsOptions = {}) {
+  const sql = yield* SqlClient.SqlClient;
+  const ledger = yield* sql`SELECT name FROM sqlite_master WHERE name = 'effect_sql_migrations'`;
+  const recorded =
+    ledger.length === 0
+      ? []
+      : yield* sql<{
+          readonly migration_id: number;
+          readonly name: string;
+        }>`SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id`;
+  const entries = selectMigrationEntries(recorded);
   yield* assertV2MigrationsCanRun(entries, recorded, toMigrationInclusive);
   const expected = new Map<number, string>(entries.map(([id, name]) => [id, name]));
   // Select known fork/preview lineages without rewriting their ledger. Preserve

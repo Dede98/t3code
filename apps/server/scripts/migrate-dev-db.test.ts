@@ -6,6 +6,7 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../src/persistence/Migrations.ts";
+import { seedForkMigrations } from "../src/persistence/Migrations.testkit.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { runMigrateDevDb } from "./migrate-dev-db.ts";
 
@@ -16,6 +17,7 @@ const withDatabase = <A, E>(
 
 const createFixtureSource = Effect.fn("createMigrateDevDbFixtureSource")(function* (
   baseDir: string,
+  forkLineage = false,
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -26,7 +28,8 @@ const createFixtureSource = Effect.fn("createMigrateDevDbFixtureSource")(functio
     databasePath,
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations();
+      if (forkLineage) yield* seedForkMigrations(65);
+      else yield* runMigrations();
 
       yield* sql`INSERT INTO projection_projects
         (project_id, title, workspace_root, scripts_json, created_at, updated_at, deleted_at)
@@ -191,6 +194,38 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
         { sharedHome: sourceDir },
       );
       assert.include(result.executedMigrations, "55_OrchestrationV2");
+    }),
+  );
+
+  it.effect("upgrades copied fork history without renumbering applied migrations", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-fork-" });
+      const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-fork-dest-" });
+      const source = yield* createFixtureSource(sourceDir, true);
+      const history = Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        return yield* sql<{ migration_id: number; name: string }>`
+          SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id`;
+      });
+      const original = yield* withDatabase(source, history);
+
+      const result = yield* runMigrateDevDb(
+        { baseDir: destDir, source, projects: 5, threadsPerProject: 1 },
+        { sharedHome: sourceDir },
+      );
+
+      assert.deepStrictEqual(result.executedMigrations, [
+        "66_CodexUsageNativeTurnIndex",
+        "67_RepairClientSettlementTimestamps",
+      ]);
+      const migrated = yield* withDatabase(result.databasePath, history);
+      assert.deepStrictEqual(migrated.slice(0, original.length), original);
+      assert.deepStrictEqual(yield* withDatabase(source, history), original);
+      assert.deepStrictEqual(
+        result.projects.map(({ threads }) => threads),
+        [2],
+      );
     }),
   );
 
