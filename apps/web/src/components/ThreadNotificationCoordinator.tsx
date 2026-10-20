@@ -24,6 +24,7 @@ import {
   hasNotificationSound,
   playNotificationSound,
   setNotificationBadge,
+  threadNotificationTag,
   unlockNotificationAudio,
 } from "../threadNotifications";
 import { setActiveEnvironmentId } from "../state/entities";
@@ -272,13 +273,14 @@ function EnvironmentNotifications({
       try {
         const notification = new Notification(title, {
           body: thread.title,
-          tag: `${environmentId}:${thread.id}`,
+          tag: threadNotificationTag(environmentId, thread.id),
           silent: true,
         });
         onNotification(environmentId, notification.tag, () => notification.close());
         notification.addEventListener("click", () => {
           notification.close();
           window.focus();
+          void window.desktopBridge?.revealWindow?.().catch(() => undefined);
           void navigate({
             to: "/$environmentId/$threadId",
             params: { environmentId, threadId: thread.id },

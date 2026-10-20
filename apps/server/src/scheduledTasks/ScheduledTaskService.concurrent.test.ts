@@ -1,3 +1,4 @@
+import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Statement from "effect/sql/Statement";
@@ -34,6 +35,10 @@ it.effect(
       Layer.mock(ThreadLaunchService)({}),
       Layer.mock(ThreadManagementService)({}),
       Layer.mock(SecretRequests.SecretRequests)({}),
+      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+        namedProjectsRoot: directory,
+        isScratchProject: () => Effect.succeed(false),
+      }),
     );
     const makeLayer = () =>
       layer.pipe(Layer.provide(dependencies), Layer.provide(NodeSqliteClient.layer({ filename })));
@@ -149,6 +154,10 @@ it.effect.each(
       }),
       Layer.mock(ThreadManagementService)({}),
       Layer.mock(SecretRequests.SecretRequests)({}),
+      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+        namedProjectsRoot: directory,
+        isScratchProject: () => Effect.succeed(false),
+      }),
     );
     const service = () =>
       layer.pipe(Layer.provide(dependencies), Layer.provide(NodeSqliteClient.layer({ filename })));

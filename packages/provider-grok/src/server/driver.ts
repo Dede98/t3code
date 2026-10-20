@@ -1,6 +1,5 @@
-// @effect-diagnostics nodeBuiltinImport:off
 import * as HostProcess from "@t3tools/shared/HostProcess";
-
+import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { ProviderDriverKind } from "@t3tools/contracts";
 import { GrokSettings } from "../settings.ts";
 import * as Crypto from "effect/Crypto";
@@ -17,7 +16,6 @@ import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEve
 import { makeGrokTextGeneration } from "./textGeneration.ts";
 import { GrokAdapterV2Driver, type GrokAdapterV2DriverEnv } from "./adapter.ts";
 import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
-import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import {
   buildInitialGrokProviderSnapshot,
   checkGrokProviderStatus,
@@ -115,152 +113,158 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv, Path.Path> 
   configSchema: GrokSettings,
   defaultConfig: (): GrokSettings => decodeGrokSettings({}),
   usage: grokUsageReader,
-  create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
-    Effect.gen(function* () {
-      const crypto = yield* Crypto.Crypto;
-      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const httpClient = yield* HttpClient.HttpClient;
-      const latestVersions = yield* ProviderLatestVersions.ProviderLatestVersions;
-      const fileSystem = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const host = yield* ProviderHost.ProviderHost;
-      const { cwd } = host.paths;
-      const processEnv = yield* mergeProviderInstanceEnvironment(environment);
-      const grokHomeEnv = processEnv["GROK_HOME"]?.trim() ?? "";
-      const grokHome =
-        grokHomeEnv.length > 0
-          ? path.resolve(expandHomePath(grokHomeEnv, yield* HostProcess.HomeDirectory))
-          : path.join(yield* HostProcess.HomeDirectory, ".grok");
-      const continuationIdentity = defaultProviderContinuationIdentity({
-        driverKind: DRIVER_KIND,
-        instanceId,
-      });
-      const stampIdentity = withInstanceIdentity({
-        instanceId,
-        driverKind: DRIVER_KIND,
-        displayName,
-        accentColor,
-        continuationGroupKey: continuationIdentity.continuationKey,
-      });
-      const effectiveConfig = { ...config, enabled } satisfies GrokSettings;
-      const resolveMaintenance = yield* makeCachedProviderMaintenanceResolution(
-        resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
-          binaryPath: effectiveConfig.binaryPath,
-          env: processEnv,
-        }).pipe(
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-          Effect.provideService(FileSystem.FileSystem, fileSystem),
-          Effect.provideService(Path.Path, path),
-        ),
-      );
-      const orchestrationAdapter = yield* GrokAdapterV2Driver.create({
-        instanceId,
-        displayName,
-        accentColor,
-        environment,
-        enabled,
-        config,
+  create: Effect.fn("GrokDriver.create")(function* ({
+    instanceId,
+    displayName,
+    accentColor,
+    environment,
+    enabled,
+    config,
+  }) {
+    const crypto = yield* Crypto.Crypto;
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const httpClient = yield* HttpClient.HttpClient;
+    const latestVersions = yield* ProviderLatestVersions.ProviderLatestVersions;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const host = yield* ProviderHost.ProviderHost;
+    const { cwd } = host.paths;
+    const processEnv = yield* mergeProviderInstanceEnvironment(environment);
+    const grokHomeEnv = processEnv["GROK_HOME"]?.trim() ?? "";
+    const grokHome =
+      grokHomeEnv.length > 0
+        ? path.resolve(expandHomePath(grokHomeEnv, yield* HostProcess.HomeDirectory))
+        : path.join(yield* HostProcess.HomeDirectory, ".grok");
+    const continuationIdentity = defaultProviderContinuationIdentity({
+      driverKind: DRIVER_KIND,
+      instanceId,
+    });
+    const stampIdentity = withInstanceIdentity({
+      instanceId,
+      driverKind: DRIVER_KIND,
+      displayName,
+      accentColor,
+      continuationGroupKey: continuationIdentity.continuationKey,
+    });
+    const effectiveConfig = { ...config, enabled } satisfies GrokSettings;
+    const resolveMaintenance = yield* makeCachedProviderMaintenanceResolution(
+      resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
+        binaryPath: effectiveConfig.binaryPath,
+        env: processEnv,
       }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderDriverError({
-              driver: DRIVER_KIND,
-              instanceId,
-              detail: "Failed to build Grok orchestration adapter.",
-              cause,
-            }),
-        ),
-      );
-      const textGeneration = yield* makeGrokTextGeneration(effectiveConfig, processEnv);
-
-      const checkProvider = checkGrokProviderStatus(effectiveConfig, processEnv, cwd).pipe(
-        Effect.flatMap((snapshot) =>
-          effectiveConfig.enabled && snapshot.installed && snapshot.auth.status === "authenticated"
-            ? readGrokAccount(processEnv).pipe(
-                Effect.map(({ email, usageLimits }) => ({
-                  ...snapshot,
-                  auth: email ? { ...snapshot.auth, email } : snapshot.auth,
-                  usageLimits,
-                })),
-              )
-            : Effect.succeed(snapshot),
-        ),
-        Effect.map(stampIdentity),
-        Effect.provideService(HttpClient.HttpClient, httpClient),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
-        Effect.provideService(Crypto.Crypto, crypto),
-        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-      );
+      ),
+    );
+    const orchestrationAdapter = yield* GrokAdapterV2Driver.create({
+      instanceId,
+      displayName,
+      accentColor,
+      environment,
+      enabled,
+      config,
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderDriverError({
+            driver: DRIVER_KIND,
+            instanceId,
+            detail: "Failed to build Grok orchestration adapter.",
+            cause,
+          }),
+      ),
+    );
+    const textGeneration = yield* makeGrokTextGeneration(effectiveConfig, processEnv);
 
-      const snapshotSettings = yield* makeProviderSnapshotSettingsSource(effectiveConfig);
-      const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<GrokSettings>>({
-        resolveMaintenance,
-        getSettings: snapshotSettings.getSettings,
-        streamSettings: snapshotSettings.streamSettings,
-        haveSettingsChanged: haveProviderSnapshotSettingsChanged,
-        initialSnapshot: (settings) =>
-          buildInitialGrokProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
-        checkProvider,
-        enrichSnapshot: ({ settings, snapshot: currentSnapshot, publishSnapshot }) =>
-          resolveMaintenance().pipe(
-            Effect.flatMap((maintenanceCapabilities) =>
-              enrichGrokSnapshot({
-                snapshot: currentSnapshot,
-                maintenanceCapabilities,
-                enableProviderUpdateChecks: settings.enableProviderUpdateChecks,
-                publishSnapshot,
-              }),
-            ),
-            Effect.provideService(HttpClient.HttpClient, httpClient),
-            Effect.provideService(ProviderLatestVersions.ProviderLatestVersions, latestVersions),
-          ),
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderDriverError({
-              driver: DRIVER_KIND,
-              instanceId,
-              detail: "Failed to build Grok snapshot.",
-              cause,
+    const checkProvider = checkGrokProviderStatus(effectiveConfig, processEnv, cwd).pipe(
+      Effect.flatMap((snapshot) =>
+        effectiveConfig.enabled && snapshot.installed && snapshot.auth.status === "authenticated"
+          ? readGrokAccount(processEnv).pipe(
+              Effect.map(({ email, usageLimits }) => ({
+                ...snapshot,
+                auth: email ? { ...snapshot.auth, email } : snapshot.auth,
+                usageLimits,
+              })),
+            )
+          : Effect.succeed(snapshot),
+      ),
+      Effect.map(stampIdentity),
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+      Effect.provideService(Crypto.Crypto, crypto),
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    );
+
+    const snapshotSettings = yield* makeProviderSnapshotSettingsSource(effectiveConfig);
+    const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<GrokSettings>>({
+      resolveMaintenance,
+      getSettings: snapshotSettings.getSettings,
+      streamSettings: snapshotSettings.streamSettings,
+      haveSettingsChanged: haveProviderSnapshotSettingsChanged,
+      initialSnapshot: (settings) =>
+        buildInitialGrokProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
+      checkProvider,
+      enrichSnapshot: ({ settings, snapshot: currentSnapshot, publishSnapshot }) =>
+        resolveMaintenance().pipe(
+          Effect.flatMap((maintenanceCapabilities) =>
+            enrichGrokSnapshot({
+              snapshot: currentSnapshot,
+              maintenanceCapabilities,
+              enableProviderUpdateChecks: settings.enableProviderUpdateChecks,
+              publishSnapshot,
             }),
+          ),
+          Effect.provideService(HttpClient.HttpClient, httpClient),
+          Effect.provideService(ProviderLatestVersions.ProviderLatestVersions, latestVersions),
         ),
-      );
-      const snapshotForCwd = (workspaceCwd: string) =>
-        !effectiveConfig.enabled
-          ? snapshot.getSnapshot
-          : Effect.all([
-              snapshot.getSnapshot,
-              discoverGrokSkills(effectiveConfig, processEnv, workspaceCwd).pipe(
-                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderDriverError({
-                      driver: DRIVER_KIND,
-                      instanceId,
-                      detail: `Failed to discover Grok skills for '${workspaceCwd}'`,
-                      cause,
-                    }),
-                ),
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderDriverError({
+            driver: DRIVER_KIND,
+            instanceId,
+            detail: "Failed to build Grok snapshot.",
+            cause,
+          }),
+      ),
+    );
+    const snapshotForCwd = (workspaceCwd: string) =>
+      !effectiveConfig.enabled
+        ? snapshot.getSnapshot
+        : Effect.all([
+            snapshot.getSnapshot,
+            discoverGrokSkills(effectiveConfig, processEnv, workspaceCwd).pipe(
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+              Effect.mapError(
+                (cause) =>
+                  new ProviderDriverError({
+                    driver: DRIVER_KIND,
+                    instanceId,
+                    detail: `Failed to discover Grok skills for '${workspaceCwd}'`,
+                    cause,
+                  }),
               ),
-            ]).pipe(Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })));
+            ),
+          ]).pipe(Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })));
 
-      return {
-        instanceId,
-        driverKind: DRIVER_KIND,
-        continuationIdentity,
-        displayName,
-        accentColor,
-        enabled,
-        snapshot,
-        snapshotForCwd,
-        orchestrationAdapter,
-        textGeneration,
-        usageHistorySource: {
-          provider: "grok",
-          transcriptDirectory: path.join(grokHome, "sessions"),
-          fileName: "updates.jsonl",
-        },
-      } satisfies ProviderInstance;
-    }),
+    return {
+      instanceId,
+      driverKind: DRIVER_KIND,
+      continuationIdentity,
+      displayName,
+      accentColor,
+      enabled,
+      snapshot,
+      snapshotForCwd,
+      orchestrationAdapter,
+      textGeneration,
+      usageHistorySource: {
+        provider: "grok",
+        transcriptDirectory: path.join(grokHome, "sessions"),
+        fileName: "updates.jsonl",
+      },
+    } satisfies ProviderInstance;
+  }),
 };

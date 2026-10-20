@@ -67,6 +67,8 @@ import Migration0061 from "./Migrations/061_PullRequestReviewGuides.ts";
 import Migration0062 from "./Migrations/062_ThreadFailureLookupIndex.ts";
 import Migration0063 from "./Migrations/063_DropUnusedV1Projections.ts";
 import Migration0064 from "./Migrations/064_CanonicalizeThreadPullRequestLinks.ts";
+import Migration0065 from "./Migrations/065_CodexUsageNativeTurnIndex.ts";
+import Migration0066 from "./Migrations/066_RepairClientSettlementTimestamps.ts";
 
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -135,6 +137,8 @@ export const migrationEntries = [
   [63, "ThreadFailureLookupIndex", Migration0062],
   [64, "DropUnusedV1Projections", Migration0063],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -160,6 +164,8 @@ export const forkMigrationEntries = [
   [63, "ThreadFailureLookupIndex", Migration0062],
   [64, "DropUnusedV1Projections", Migration0063],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -175,6 +181,8 @@ export const forkIntegrationMigrationEntries = [
   [63, "ThreadFailureLookupIndex", Migration0062],
   [64, "DropUnusedV1Projections", Migration0063],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -191,6 +199,8 @@ const upstreamIntegrationMigrationEntries = [
   [63, "ThreadFailureLookupIndex", Migration0062],
   [64, "DropUnusedV1Projections", Migration0063],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -207,6 +217,8 @@ const preview54MigrationEntries = [
   [63, "ThreadFailureLookupIndex", Migration0062],
   [64, "DropUnusedV1Projections", Migration0063],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -224,6 +236,8 @@ const preview53MigrationEntries = [
   [63, "ThreadFailureLookupIndex", Migration0062],
   [64, "DropUnusedV1Projections", Migration0063],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -237,6 +251,8 @@ const upstreamWebhookMigrationEntries = [
   [63, "ThreadFailureLookupIndex", Migration0062],
   [64, "DropUnusedV1Projections", Migration0063],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -250,6 +266,8 @@ const upstreamMcpAppMigrationEntries = [
   [63, "ThreadFailureLookupIndex", Migration0062],
   [64, "DropUnusedV1Projections", Migration0063],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 // Upstream databases that already applied review guides keep that id/name pair.
@@ -260,6 +278,8 @@ const upstreamReviewGuideMigrationEntries = [
   [63, "ThreadFailureLookupIndex", Migration0062],
   [64, "DropUnusedV1Projections", Migration0063],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 // Official upstream databases may already have the failure index at 62.
@@ -270,6 +290,8 @@ const upstreamFailureIndexMigrationEntries = [
   [63, "ClaudeSessionStore", ClaudeSessionStore],
   [64, "DropUnusedV1Projections", Migration0063],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 // Official databases may have used 63/64 before ever opening in the fork.
@@ -279,12 +301,29 @@ const upstreamDropProjectionsMigrationEntries = [
   [63, "DropUnusedV1Projections", Migration0063],
   [64, "ClaudeSessionStore", ClaudeSessionStore],
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
 ] as const;
 
 const upstreamCanonicalLinksMigrationEntries = [
   ...upstreamDropProjectionsMigrationEntries.filter(([id]) => id <= 63),
   [64, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [65, "ClaudeSessionStore", ClaudeSessionStore],
+  [66, "CodexUsageNativeTurnIndex", Migration0065],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
+] as const;
+
+const upstreamUsageIndexMigrationEntries = [
+  ...upstreamCanonicalLinksMigrationEntries.filter(([id]) => id <= 64),
+  [65, "CodexUsageNativeTurnIndex", Migration0065],
+  [66, "ClaudeSessionStore", ClaudeSessionStore],
+  [67, "RepairClientSettlementTimestamps", Migration0066],
+] as const;
+
+const upstreamSettlementMigrationEntries = [
+  ...upstreamUsageIndexMigrationEntries.filter(([id]) => id <= 65),
+  [66, "RepairClientSettlementTimestamps", Migration0066],
+  [67, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -374,7 +413,11 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
               ? has(62, "ThreadFailureLookupIndex")
                 ? has(63, "DropUnusedV1Projections")
                   ? has(64, "CanonicalizeThreadPullRequestLinks")
-                    ? upstreamCanonicalLinksMigrationEntries
+                    ? has(65, "CodexUsageNativeTurnIndex")
+                      ? has(66, "RepairClientSettlementTimestamps")
+                        ? upstreamSettlementMigrationEntries
+                        : upstreamUsageIndexMigrationEntries
+                      : upstreamCanonicalLinksMigrationEntries
                     : upstreamDropProjectionsMigrationEntries
                   : upstreamFailureIndexMigrationEntries
                 : upstreamReviewGuideMigrationEntries

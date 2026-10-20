@@ -253,14 +253,16 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
  * worker coalesces those snapshots and waits only for sessions belonging to
  * instances that the reconciliation will remove or replace.
  */
-const layerSettingsWatcher = (initialSettings: ServerSettings | undefined) =>
+const layerSettingsWatcher = (
+  initialSettings: ServerSettings | undefined,
+  settingsChanges: Stream.Stream<ServerSettings>,
+) =>
   Layer.effectDiscard(
     Effect.gen(function* () {
       const mutator = yield* ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator;
       const lifecycle = yield* ProviderRegistrySessionLifecycle;
       const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
       const serverSettings = yield* ServerSettingsService;
-      const settingsChanges = yield* serverSettings.subscribeChanges;
       const desired = yield* Ref.make<DesiredProviderRegistrySettings>({
         settings: initialSettings,
         version: 0,
@@ -324,6 +326,8 @@ export const layer: Layer.Layer<
 > = Layer.unwrap(
   Effect.gen(function* () {
     const serverSettings = yield* ServerSettingsService;
+    // Subscribe before the seed read so construction cannot miss settings saves.
+    const settingsChanges = yield* serverSettings.subscribeChanges;
     const initialSettings: ServerSettings | undefined = yield* serverSettings.getSettings.pipe(
       Effect.orElseSucceed(() => undefined),
     );
@@ -341,7 +345,9 @@ export const layer: Layer.Layer<
       Layer.provide(ProviderHostLive.layer),
     );
 
-    return layerSettingsWatcher(initialSettings).pipe(Layer.provideMerge(layerMutable));
+    return layerSettingsWatcher(initialSettings, settingsChanges).pipe(
+      Layer.provideMerge(layerMutable),
+    );
   }),
 ) as Layer.Layer<
   ProviderInstanceRegistry.ProviderInstanceRegistry,

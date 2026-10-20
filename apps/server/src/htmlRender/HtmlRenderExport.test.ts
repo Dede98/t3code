@@ -22,6 +22,7 @@ import * as Option from "effect/Option";
 import * as ServerConfig from "../config.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as HtmlRender from "./HtmlRender.ts";
 
 const threadId = ThreadId.make("theme-export");
@@ -34,6 +35,7 @@ const theme = htmlRenderTheme(
 const otherTheme = htmlRenderTheme(T3_CODE_LIGHT_THEME_COLORS, "light");
 const layerTest = (captured = true) =>
   HtmlRender.layer.pipe(
+    Layer.provide(McpProviderSessions.layer),
     Layer.provide(
       Layer.succeed(
         PreviewBrowser.PreviewBrowser,
