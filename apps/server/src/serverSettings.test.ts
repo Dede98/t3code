@@ -1641,7 +1641,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
   );
 
   it.effect(
-    "uses the same secret lifecycle for provider config, environment, host tokens, and quota keys",
+    "uses the same secret lifecycle for provider, environment, host, quota, MCP, and EAS secrets",
     () =>
       Effect.gen(function* () {
         const service = yield* ServerSettingsModule.ServerSettingsService;
@@ -1673,6 +1673,24 @@ it.layer(NodeServices.layer)("server settings", (it) => {
               enabled: true,
             },
           },
+          easDeviceHosts: [
+            {
+              kind: "eas",
+              id: "eas",
+              label: "EAS Simulator",
+              accessToken: "expo-secret",
+              maxSessionMinutes: 30,
+              idleMinutes: 10,
+              maxConcurrentSessions: 2,
+            },
+          ],
+          externalMcpServers: {
+            [ExternalMcpServerId.make("assets")]: {
+              url: "https://asset.example/mcp",
+              enabled: true,
+              headers: [{ name: "Authorization", value: "mcp-secret", sensitive: true }],
+            },
+          },
         });
         const values = [
           "config-secret",
@@ -1681,6 +1699,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           "bitbucket-secret",
           "gitcafe-secret",
           "quota-secret",
+          "expo-secret",
+          "mcp-secret",
         ];
         const client = ServerSettingsModule.redactServerSettingsForClient(saved);
         const disk = yield* fs.readFileString(config.settingsPath);
@@ -1695,6 +1715,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           providerInstances: client.providerInstances,
           sourceControlHosts: client.sourceControlHosts,
           usageLimitSources: client.usageLimitSources,
+          easDeviceHosts: client.easDeviceHosts,
+          externalMcpServers: client.externalMcpServers,
         });
         for (const value of values) assert.include(JSON.stringify(echoed), value);
         const renamed = yield* service.updateProviderInstance({
@@ -1744,6 +1766,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           }),
           sourceControlHostSecretName({ kind: "gitcafe", field: "token", serverHost: null }),
           "usage-limit-source-aHVi",
+          "device-host-ZWFz-YWNjZXNzVG9rZW4",
+          "mcp-header-YXNzZXRz-YXV0aG9yaXphdGlvbg",
         ];
         for (const name of secretNames) {
           assert.isTrue(Option.isSome(yield* store.get(name)), name);
@@ -1756,6 +1780,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             gitcafe: { token: "" },
           },
           usageLimitSources: { [UsageLimitSourceId.make("hub")]: null },
+          easDeviceHosts: [],
+          externalMcpServers: {},
         });
         for (const name of secretNames) {
           assert.isTrue(Option.isNone(yield* store.get(name)));
