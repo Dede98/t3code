@@ -491,14 +491,14 @@ const loadSecondaryConnectionRegistration = Effect.fn(
 const PLATFORM_POLL_INTERVAL = "3 seconds";
 const SECONDARY_BEARER_REFRESH_SKEW_MS = 5_000;
 
-export function secondaryBearerExpiresAtEpochMs(
+function secondaryBearerExpiresAtEpochMs(
   issuedAtEpochMs: number,
   expiresInSeconds: number,
 ): number {
   return issuedAtEpochMs + Math.max(0, expiresInSeconds * 1_000);
 }
 
-export function secondaryBearerRefreshAtEpochMs(
+function secondaryBearerRefreshAtEpochMs(
   issuedAtEpochMs: number,
   expiresInSeconds: number,
 ): number {
@@ -527,7 +527,7 @@ export type PrimaryEnvironmentTargetRead =
       readonly cause: unknown;
     };
 
-export function readPrimaryEnvironmentTargetResult(
+function readPrimaryEnvironmentTargetResult(
   readTarget: () => PrimaryEnvironmentTarget | null = readPrimaryEnvironmentTarget,
 ): PrimaryEnvironmentTargetRead {
   try {
@@ -682,7 +682,7 @@ const layerPlatformConnectionSource = Layer.effect(
         }
       }
 
-      const topologyRead = yield* Effect.promise(readDesktopSecondaryBootstrapsResult);
+      const topologyRead = readDesktopSecondaryBootstrapsResult();
       for (const [id, cached] of secondaryRegistrationsToRetainAfterTopologyRead(
         previous,
         topologyRead,
@@ -812,11 +812,11 @@ const layerEnvironmentOwnedDataCleanup = Layer.succeed(
 const layerRpcRequestObserver = Layer.succeed(
   EnvironmentRpcRequestObserver,
   EnvironmentRpcRequestObserver.of({
-    observe: ({ environmentId, method }) =>
+    observe: ({ environmentId, environmentLabel, method }) =>
       Effect.sync(() => {
         nextObservedRpcRequestId += 1;
         const requestId = `${environmentId}:${nextObservedRpcRequestId}`;
-        trackRpcRequestSent(requestId, method, `${method} · ${environmentId}`);
+        trackRpcRequestSent(requestId, method, `${method} · ${environmentLabel}`);
         return Effect.sync(() => {
           acknowledgeRpcRequest(requestId);
         });

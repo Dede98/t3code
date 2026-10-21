@@ -1,14 +1,11 @@
 import { MessageId } from "@t3tools/contracts";
-import { act, StrictMode, useLayoutEffect } from "react";
-import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { StrictMode, useLayoutEffect } from "react";
+import { describe, expect, it, vi } from "vite-plus/test";
 
+import { render, type Screen } from "../../test/render";
 import type { TimelineEntriesInput, TimelineEntry } from "../session-logic";
 import { makeStreamingTimelineFixture } from "../test-fixtures";
 import { useIncrementalTimelineEntries } from "./useIncrementalTimelineEntries";
-
-let root: Root;
-let entries: TimelineEntry[];
 
 // A mock caller leaves allocations uncached, reproducing a compiler bailout in ChatView.
 const TimelineProbe = vi.fn(
@@ -16,10 +13,12 @@ const TimelineProbe = vi.fn(
     threadKey,
     input,
     revision,
+    onEntries,
   }: {
     threadKey: string;
     input: TimelineEntriesInput;
     revision: number;
+    onEntries: (entries: TimelineEntry[]) => void;
   }) => {
     const result = useIncrementalTimelineEntries(threadKey, {
       ...input,
@@ -27,43 +26,55 @@ const TimelineProbe = vi.fn(
       attachmentUrlById: new Map(input.attachmentUrlById),
     });
     useLayoutEffect(() => {
-      entries = result;
+      onEntries(result);
     });
     return <output>{revision}</output>;
   },
 );
 
-async function render(input: TimelineEntriesInput, revision = 0, threadKey = "draft") {
-  await act(() =>
-    root.render(
-      <StrictMode>
-        <TimelineProbe threadKey={threadKey} input={input} revision={revision} />
-      </StrictMode>,
-    ),
-  );
+function mountTimeline() {
+  let entries: TimelineEntry[] = [];
+  let screen: Screen | undefined;
+  const onEntries = (next: TimelineEntry[]) => {
+    entries = next;
+  };
+  return {
+    get entries() {
+      return entries;
+    },
+    async render(input: TimelineEntriesInput, revision = 0, threadKey = "draft") {
+      const ui = (
+        <StrictMode>
+          <TimelineProbe
+            threadKey={threadKey}
+            input={input}
+            revision={revision}
+            onEntries={onEntries}
+          />
+        </StrictMode>
+      );
+      if (screen) await screen.rerender(ui);
+      else screen = await render(ui);
+    },
+    [Symbol.asyncDispose]: async () => {
+      await screen?.[Symbol.asyncDispose]();
+    },
+  };
 }
-
-beforeEach(() => {
-  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  root = createRoot(document.createElement("div"));
-});
-
-afterEach(async () => {
-  await act(() => root.unmount());
-  vi.unstubAllGlobals();
-});
 
 describe("incremental timeline rendering", () => {
   it("can rerender an empty draft with fresh arrays and maps", async () => {
+    await using timeline = mountTimeline();
     const input = { visibleTurnItems: [], optimisticMessages: [] };
-    await render(input);
-    const previous = entries;
-    await render(input, 1);
-    expect(entries).toBe(previous);
-    expect(entries).toEqual([]);
+    await timeline.render(input);
+    const previous = timeline.entries;
+    await timeline.render(input, 1);
+    expect(timeline.entries).toBe(previous);
+    expect(timeline.entries).toEqual([]);
   });
 
   it("handles recreated feedback messages and still displays feedback edits", async () => {
+    await using timeline = mountTimeline();
     const input: TimelineEntriesInput = {
       visibleTurnItems: [],
       optimisticMessages: [],
@@ -79,11 +90,11 @@ describe("incremental timeline rendering", () => {
         },
       ],
     };
-    await render(input);
-    const previous = entries;
-    await render(input, 1);
-    expect(entries).toBe(previous);
-    await render(
+    await timeline.render(input);
+    const previous = timeline.entries;
+    await timeline.render(input, 1);
+    expect(timeline.entries).toBe(previous);
+    await timeline.render(
       {
         ...input,
         anchoredMessages: input.anchoredMessages!.map((message) => ({
@@ -93,18 +104,22 @@ describe("incremental timeline rendering", () => {
       },
       2,
     );
-    expect(entries[0]).toMatchObject({ kind: "message", message: { text: "Updated feedback" } });
+    expect(timeline.entries[0]).toMatchObject({
+      kind: "message",
+      message: { text: "Updated feedback" },
+    });
   });
 
   it("preserves history rows during streaming and clears them when switching to a draft", async () => {
+    await using timeline = mountTimeline();
     const fixture = makeStreamingTimelineFixture("First");
     const input: TimelineEntriesInput = {
       visibleTurnItems: fixture.visibleTurnItems,
       optimisticMessages: [],
     };
-    await render(input, 0, "server");
-    const history = entries[0];
-    await render(
+    await timeline.render(input, 0, "server");
+    const history = timeline.entries[0];
+    await timeline.render(
       {
         ...input,
         visibleTurnItems: fixture.visibleTurnItems.map((row) =>
@@ -116,16 +131,17 @@ describe("incremental timeline rendering", () => {
       1,
       "server",
     );
-    expect(entries[0]).toBe(history);
-    expect(entries.at(-1)).toMatchObject({
+    expect(timeline.entries[0]).toBe(history);
+    expect(timeline.entries.at(-1)).toMatchObject({
       kind: "message",
       message: { text: "First, then more" },
     });
-    await render({ visibleTurnItems: [], optimisticMessages: [] }, 2, "draft");
-    expect(entries).toEqual([]);
+    await timeline.render({ visibleTurnItems: [], optimisticMessages: [] }, 2, "draft");
+    expect(timeline.entries).toEqual([]);
   });
 
   it("updates and removes attachment previews when URL map contents change", async () => {
+    await using timeline = mountTimeline();
     const fixture = makeStreamingTimelineFixture("Image");
     const attachment = {
       type: "image" as const,
@@ -143,22 +159,22 @@ describe("incremental timeline rendering", () => {
       optimisticMessages: [],
       attachmentUrlById: new Map([[attachment.id, "https://server.test/first"]]),
     };
-    await render(input);
-    expect(entries.at(-1)).toMatchObject({
+    await timeline.render(input);
+    expect(timeline.entries.at(-1)).toMatchObject({
       message: { attachments: [{ previewUrl: "https://server.test/first" }] },
     });
-    await render(
+    await timeline.render(
       {
         ...input,
         attachmentUrlById: new Map([[attachment.id, "https://server.test/renewed"]]),
       },
       1,
     );
-    expect(entries.at(-1)).toMatchObject({
+    expect(timeline.entries.at(-1)).toMatchObject({
       message: { attachments: [{ previewUrl: "https://server.test/renewed" }] },
     });
-    await render({ ...input, attachmentUrlById: new Map() }, 2);
-    const last = entries.at(-1);
+    await timeline.render({ ...input, attachmentUrlById: new Map() }, 2);
+    const last = timeline.entries.at(-1);
     if (last?.kind !== "message") throw new Error("Expected assistant message");
     expect(last.message.attachments?.[0]).not.toHaveProperty("previewUrl");
   });

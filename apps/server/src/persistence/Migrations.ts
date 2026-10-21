@@ -69,6 +69,7 @@ import Migration0063 from "./Migrations/063_DropUnusedV1Projections.ts";
 import Migration0064 from "./Migrations/064_CanonicalizeThreadPullRequestLinks.ts";
 import Migration0065 from "./Migrations/065_CodexUsageNativeTurnIndex.ts";
 import Migration0066 from "./Migrations/066_RepairClientSettlementTimestamps.ts";
+import Migration0067 from "./Migrations/067_WebhookDedupe.ts";
 
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -139,6 +140,7 @@ export const migrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -166,6 +168,7 @@ export const forkMigrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -183,6 +186,7 @@ export const forkIntegrationMigrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -201,6 +205,7 @@ const upstreamIntegrationMigrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -219,6 +224,7 @@ const preview54MigrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -238,6 +244,7 @@ const preview53MigrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -253,6 +260,7 @@ const upstreamWebhookMigrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -268,6 +276,7 @@ const upstreamMcpAppMigrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 // Upstream databases that already applied review guides keep that id/name pair.
@@ -280,6 +289,7 @@ const upstreamReviewGuideMigrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 // Official upstream databases may already have the failure index at 62.
@@ -292,6 +302,7 @@ const upstreamFailureIndexMigrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 // Official databases may have used 63/64 before ever opening in the fork.
@@ -303,6 +314,7 @@ const upstreamDropProjectionsMigrationEntries = [
   [65, "CanonicalizeThreadPullRequestLinks", Migration0064],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 const upstreamCanonicalLinksMigrationEntries = [
@@ -311,6 +323,7 @@ const upstreamCanonicalLinksMigrationEntries = [
   [65, "ClaudeSessionStore", ClaudeSessionStore],
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 const upstreamUsageIndexMigrationEntries = [
@@ -318,12 +331,21 @@ const upstreamUsageIndexMigrationEntries = [
   [65, "CodexUsageNativeTurnIndex", Migration0065],
   [66, "ClaudeSessionStore", ClaudeSessionStore],
   [67, "RepairClientSettlementTimestamps", Migration0066],
+  [68, "WebhookDedupe", Migration0067],
 ] as const;
 
 const upstreamSettlementMigrationEntries = [
   ...upstreamUsageIndexMigrationEntries.filter(([id]) => id <= 65),
   [66, "RepairClientSettlementTimestamps", Migration0066],
   [67, "ClaudeSessionStore", ClaudeSessionStore],
+  [68, "WebhookDedupe", Migration0067],
+] as const;
+
+// Official upstream databases may already have webhook dedupe at 67.
+const upstreamWebhookDedupeMigrationEntries = [
+  ...upstreamSettlementMigrationEntries.filter(([id]) => id <= 66),
+  [67, "WebhookDedupe", Migration0067],
+  [68, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -406,7 +428,9 @@ export function selectMigrationEntries(
                   ? has(64, "CanonicalizeThreadPullRequestLinks")
                     ? has(65, "CodexUsageNativeTurnIndex")
                       ? has(66, "RepairClientSettlementTimestamps")
-                        ? upstreamSettlementMigrationEntries
+                        ? has(67, "WebhookDedupe")
+                          ? upstreamWebhookDedupeMigrationEntries
+                          : upstreamSettlementMigrationEntries
                         : upstreamUsageIndexMigrationEntries
                       : upstreamCanonicalLinksMigrationEntries
                     : upstreamDropProjectionsMigrationEntries

@@ -4954,9 +4954,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             {image.previewUrl ? (
               <ComposerImageThumbnail
                 file={image.file}
-                mode={image.source?.kind === "snap-shot" ? "snapshot" : "square"}
                 alt=""
-                className="size-full"
+                className="size-full object-cover"
                 fallback={
                   isHeicImageFile({ name: image.name, type: image.mimeType }) ? (
                     <AttachmentImage
@@ -6850,9 +6849,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                               >
                                 <ComposerImageThumbnail
                                   file={image.file}
-                                  mode={image.source?.kind === "snap-shot" ? "snapshot" : "square"}
                                   alt={image.name}
-                                  className="h-full w-full"
+                                  className="h-full w-full object-cover"
                                   fallback={
                                     isHeicImageFile({ name: image.name, type: image.mimeType }) ? (
                                       <AttachmentImage
@@ -7204,7 +7202,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       showMobilePendingAnswerActions && "max-sm:pb-12",
                       isComposerResting &&
                         "my-0 max-h-8 min-h-8 overflow-hidden py-0 whitespace-pre! leading-8",
-                      isComposerApprovalState && "min-h-10",
+                      isComposerApprovalState && "min-h-0",
                     )}
                     placeholderClassName={cn(
                       isComposerResting &&

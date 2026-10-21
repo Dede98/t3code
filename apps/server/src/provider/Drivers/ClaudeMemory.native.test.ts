@@ -309,5 +309,4 @@ it.live.skipIf(!binary)(
         }
       });
     }).pipe(Effect.provide(NodeServices.layer)),
-  30_000,
 );

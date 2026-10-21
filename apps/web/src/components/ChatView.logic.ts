@@ -72,7 +72,7 @@ import {
 export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "t3code:last-invoked-script-by-project";
 export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 
-export const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
+const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
 
 export function shouldOfferClaudeContinuationSync(input: {
   readonly enabled: boolean;
@@ -311,15 +311,6 @@ export function codexArtifactTemplatePromptToAppend(
 }
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
-
-export function resolveEffectiveInteractionMode(input: {
-  planModeEnabled: boolean;
-  composerInteractionMode: ProviderInteractionMode | null;
-  threadInteractionMode: ProviderInteractionMode | null | undefined;
-}): ProviderInteractionMode {
-  if (!input.planModeEnabled) return "default";
-  return input.composerInteractionMode ?? input.threadInteractionMode ?? "default";
-}
 
 export function shouldDockDraftHeroForSubmission(input: {
   isDraftHeroState: boolean;
@@ -563,6 +554,7 @@ export function resolveThreadMetadataUpdateForNextTurn(input: {
 }): {
   modelSelection?: ModelSelection;
   branch?: string;
+  worktreePath?: null;
 } | null {
   const nextModelSelection = input.nextModelSelection;
   const modelSelectionChanged =
@@ -577,7 +569,7 @@ export function resolveThreadMetadataUpdateForNextTurn(input: {
   }
   return {
     ...(modelSelectionChanged ? { modelSelection: nextModelSelection } : {}),
-    ...(branchChanged ? { branch: input.nextBranch } : {}),
+    ...(branchChanged ? { branch: input.nextBranch, worktreePath: null } : {}),
   };
 }
 
@@ -620,25 +612,6 @@ export function buildLocalDraftThread(
   });
 }
 
-export function shouldWriteThreadErrorToCurrentServerThread(input: {
-  serverThread:
-    | {
-        environmentId: EnvironmentId;
-        id: ThreadId;
-      }
-    | null
-    | undefined;
-  routeThreadRef: ScopedThreadRef;
-  targetThreadId: ThreadId;
-}): boolean {
-  return Boolean(
-    input.serverThread &&
-    input.targetThreadId === input.routeThreadRef.threadId &&
-    input.serverThread.environmentId === input.routeThreadRef.environmentId &&
-    input.serverThread.id === input.targetThreadId,
-  );
-}
-
 export function shouldMarkThreadVisited(input: {
   readonly viewedThreadRef: ScopedThreadRef;
   readonly activeRouteThreadRef: ScopedThreadRef | null;
@@ -664,12 +637,6 @@ export function shouldMarkThreadVisited(input: {
 
   const lastVisitedAt = input.lastVisitedAt ? Date.parse(input.lastVisitedAt) : NaN;
   return Number.isNaN(lastVisitedAt) || lastVisitedAt < threadUpdatedAt;
-}
-
-export function buildSessionErrorDismissalKey(
-  session: { readonly lastError: string | null; readonly updatedAt: string } | null | undefined,
-): string | null {
-  return session?.lastError ? `${session.updatedAt}\u0000${session.lastError}` : null;
 }
 
 /** Use the same enabled instance for the composer, provider status, and chat actions. */
@@ -919,12 +886,7 @@ export function collectUserMessageBlobPreviewUrls(message: ChatMessage): string[
 
 export { readFileAsDataUrl } from "../lib/imageCompression";
 
-export function resolveSendEnvMode(input: {
-  requestedEnvMode: DraftThreadEnvMode;
-  isGitRepo: boolean;
-}): DraftThreadEnvMode {
-  return input.isGitRepo ? input.requestedEnvMode : "local";
-}
+export { resolveSendEnvMode } from "@t3tools/shared/projectSettings";
 
 export function resolveBackgroundDraftWorkspaceOptions(input: {
   envMode: DraftThreadEnvMode;
@@ -1489,21 +1451,4 @@ export function mergeDirectPreviewAnnotation(input: {
   return { images, previewAnnotations };
 }
 
-/**
- * Whether a woken thread woke after the user last saw it. A run that completed
- * after the last visit counts as seeing it, since the user watched it finish.
- */
-export function isThreadWokeUnseen(input: {
-  readonly wokeAt: string | null;
-  readonly settled: boolean;
-  readonly lastVisitedAt: string | null | undefined;
-  readonly latestRunCompletedAt: string | null;
-}): boolean {
-  if (input.wokeAt === null || input.settled) return false;
-  const wokeAtMs = Date.parse(input.wokeAt);
-  if (Number.isNaN(wokeAtMs)) return false;
-  const seenAt = [input.lastVisitedAt, input.latestRunCompletedAt]
-    .map((value) => (value ? Date.parse(value) : NaN))
-    .filter((ms) => !Number.isNaN(ms));
-  return seenAt.every((ms) => ms < wokeAtMs);
-}
+export { isThreadWokeUnseen } from "@t3tools/client-runtime/state/thread-settled";

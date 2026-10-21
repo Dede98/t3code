@@ -100,7 +100,7 @@ it.effect.each(
         );
         assert.equal(
           observer.prepare("SELECT MAX(migration_id) AS id FROM effect_sql_migrations").get()?.id,
-          67,
+          68,
         );
         for (const name of [
           "mcp_app_model_context",
@@ -108,6 +108,7 @@ it.effect.each(
           "orchestration_v2_projection_turn_items_failed_error_idx",
           "orchestration_v2_projection_turn_items_user_message_idx",
           "orchestration_v2_projection_nodes_live_idx",
+          "scheduled_task_webhook_pending",
         ]) {
           assert.ok(observer.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(name));
         }

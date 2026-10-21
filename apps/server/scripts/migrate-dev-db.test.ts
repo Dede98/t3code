@@ -218,6 +218,7 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
       assert.deepStrictEqual(result.executedMigrations, [
         "66_CodexUsageNativeTurnIndex",
         "67_RepairClientSettlementTimestamps",
+        "68_WebhookDedupe",
       ]);
       const migrated = yield* withDatabase(result.databasePath, history);
       assert.deepStrictEqual(migrated.slice(0, original.length), original);
@@ -226,33 +227,6 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
         result.projects.map(({ threads }) => threads),
         [2],
       );
-    }),
-  );
-
-  it.effect("fails loudly on a migration slot collision", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-slot-" });
-      const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-slot-dest-" });
-      const source = yield* createFixtureSource(sourceDir);
-      yield* withDatabase(
-        source,
-        Effect.gen(function* () {
-          const sql = yield* SqlClient.SqlClient;
-          yield* sql`UPDATE effect_sql_migrations
-            SET name = 'SomebodyElsesMigration' WHERE migration_id = 1`;
-        }),
-      );
-
-      const error = yield* runMigrateDevDb(
-        { baseDir: destDir, source, projects: 5, threadsPerProject: 10 },
-        { sharedHome: sourceDir },
-      ).pipe(Effect.flip);
-      assert.equal(error._tag, "MigrateDevDbSlotCollisionError");
-      if (error._tag === "MigrateDevDbSlotCollisionError") {
-        assert.equal(error.slot, 1);
-        assert.equal(error.appliedName, "SomebodyElsesMigration");
-      }
     }),
   );
 

@@ -175,7 +175,9 @@ function EnvironmentNotifications({
             : status === "failed"
               ? "failure"
               : "input"
-          : completion !== null && completion !== prior.completion
+          : !rawThread.latestRunStopRequested &&
+              completion !== null &&
+              (prior.completion === null || completion > prior.completion)
             ? "completion"
             : null;
       const kind =

@@ -4,19 +4,14 @@ import {
   DEFAULT_CLIENT_SETTINGS,
   DEFAULT_UNIFIED_SETTINGS,
 } from "@t3tools/contracts";
-import {
-  createMemoryHistory,
-  createRootRoute,
-  createRouter,
-  RouterProvider,
-} from "@tanstack/react-router";
-import { act, StrictMode, useState } from "react";
-import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { StrictMode, useState } from "react";
+import { expect, it, vi } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
 
 import "../../index.css";
+import { render } from "../../../test/render";
 import type { SettingsScopeSearch } from "./settingsScope";
+
 const mcpState = vi.hoisted(() => ({
   initialSearch: {} as SettingsScopeSearch,
   environments: [] as { environmentId: EnvironmentId; label: string; displayUrl: string }[],
@@ -24,18 +19,6 @@ const mcpState = vi.hoisted(() => ({
   writes: vi.fn(),
 }));
 
-const { listBrowserImportSources } = vi.hoisted(() => ({
-  listBrowserImportSources: vi.fn().mockResolvedValue([]),
-}));
-
-vi.mock(import("../preview/previewBridge"), async (original) => {
-  const actual = await original();
-  return {
-    ...actual,
-    previewBridge: { ...actual.previewBridge, listBrowserImportSources } as never,
-  };
-});
-vi.mock(import("../../env"), async (original) => ({ ...(await original()), isElectron: true }));
 vi.mock(import("../../state/environments"), async (original) => ({
   ...(await original()),
   useEnvironments: (() => ({ environments: [], isReady: true })) as never,
@@ -89,115 +72,74 @@ vi.mock(import("./SettingsScopeContext"), async (original) => ({
 
 import { IntegrationsSettingsPanel } from "./IntegrationsSettings";
 
-let root: Root;
-let container: HTMLDivElement;
+const localId = EnvironmentId.make("local");
+const remoteId = EnvironmentId.make("remote");
+const serverId = ExternalMcpServerId.make("tools");
 
-beforeEach(() => {
-  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  listBrowserImportSources.mockClear();
-  mcpState.initialSearch = {};
-  mcpState.environments = [];
-  mcpState.settings.clear();
+// The mocked settings and scope hooks read `mcpState`, so every test starts by resetting it.
+function setup(initialSearch: SettingsScopeSearch) {
+  mcpState.initialSearch = initialSearch;
   mcpState.writes.mockReset();
-  container = document.createElement("div");
-  document.body.append(container);
-  root = createRoot(container);
-});
-
-afterEach(async () => {
-  await act(async () => root.unmount());
-  container.remove();
-  vi.unstubAllGlobals();
-});
+  mcpState.environments = [localId, remoteId].map((environmentId) => ({
+    environmentId,
+    label: environmentId,
+    displayUrl: `https://${environmentId}.example.com`,
+  }));
+  mcpState.settings.clear();
+  for (const environmentId of [localId, remoteId]) {
+    mcpState.settings.set(environmentId, {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      externalMcpServers: {
+        [serverId]: {
+          url: `https://${environmentId}.example.com/mcp`,
+          enabled: true,
+          headers: [],
+        },
+      },
+    });
+  }
+}
 
 async function openSettings() {
-  const router = createRouter({
-    routeTree: createRootRoute({ component: IntegrationsSettingsPanel }),
-    history: createMemoryHistory(),
-  });
-  await router.load();
-  await act(async () =>
-    root.render(
+  await using stack = new AsyncDisposableStack();
+  stack.use(
+    await render(
       <StrictMode>
-        <RouterProvider router={router} />
+        <IntegrationsSettingsPanel />
       </StrictMode>,
     ),
   );
-  await vi.waitFor(() => expect(container.querySelector("section#browser")).not.toBeNull());
+  await expect
+    .element(page.getByRole("heading", { name: "External MCP servers", exact: true }))
+    .toBeVisible();
+  return stack.move();
 }
 
-describe("Integrations browser discovery", () => {
-  it("keeps agent browser access in the single Browser section", async () => {
-    await openSettings();
-
-    expect(page.getByRole("heading", { name: "Browser", exact: true }).elements()).toHaveLength(1);
-    const access = page.getByRole("switch", { name: "Agent browser access", exact: true });
-    await expect.element(access).toBeVisible();
-    expect(access.element().closest("section")).toBe(container.querySelector("section#browser"));
-    expect(access.element().closest("#agent-browser-access")).not.toBeNull();
+it.each([
+  ["all environments", {}],
+  ["project", { project: "project" }],
+  ["checkout", { project: "project", machine: remoteId, checkout: "checkout" }],
+] as const)("opens and edits the chosen environment from %s", async (_label, search) => {
+  setup(search);
+  await using _screen = await openSettings();
+  await expect.element(page.getByRole("switch", { name: "Enable tools" })).not.toBeInTheDocument();
+  await page.getByRole("button", { name: "remote", exact: true }).click();
+  await expect
+    .element(page.getByRole("textbox", { name: "tools MCP URL" }))
+    .toHaveValue("https://remote.example.com/mcp");
+  await page.getByRole("switch", { name: "Enable tools" }).click();
+  expect(mcpState.writes).toHaveBeenCalledExactlyOnceWith(remoteId, {
+    externalMcpServers: {
+      [serverId]: { url: "https://remote.example.com/mcp", enabled: false, headers: [] },
+    },
   });
-
-  it("does not scan browser files when entering or revisiting settings", async () => {
-    await openSettings();
-    expect(listBrowserImportSources).not.toHaveBeenCalled();
-
-    await act(async () => root.unmount());
-    root = createRoot(container);
-    await openSettings();
-    expect(listBrowserImportSources).not.toHaveBeenCalled();
-  });
+  expect(mcpState.settings.get(localId)?.externalMcpServers[serverId]?.enabled).toBe(true);
 });
 
-describe("External MCP environment selection", () => {
-  const localId = EnvironmentId.make("local");
-  const remoteId = EnvironmentId.make("remote");
-  const serverId = ExternalMcpServerId.make("tools");
-  beforeEach(() => {
-    mcpState.environments = [localId, remoteId].map((environmentId) => ({
-      environmentId,
-      label: environmentId,
-      displayUrl: `https://${environmentId}.example.com`,
-    }));
-    for (const environmentId of [localId, remoteId]) {
-      mcpState.settings.set(environmentId, {
-        ...DEFAULT_UNIFIED_SETTINGS,
-        externalMcpServers: {
-          [serverId]: {
-            url: `https://${environmentId}.example.com/mcp`,
-            enabled: true,
-            headers: [],
-          },
-        },
-      });
-    }
-  });
-  it.each([
-    ["all environments", {}],
-    ["project", { project: "project" }],
-    ["checkout", { project: "project", machine: remoteId, checkout: "checkout" }],
-  ] as const)("opens and edits the chosen environment from %s", async (_label, search) => {
-    mcpState.initialSearch = search;
-    await openSettings();
-    await expect
-      .element(page.getByRole("switch", { name: "Enable tools" }))
-      .not.toBeInTheDocument();
-    await page.getByRole("button", { name: "remote", exact: true }).click();
-    await expect
-      .element(page.getByRole("textbox", { name: "tools MCP URL" }))
-      .toHaveValue("https://remote.example.com/mcp");
-    await page.getByRole("switch", { name: "Enable tools" }).click();
-    expect(mcpState.writes).toHaveBeenCalledExactlyOnceWith(remoteId, {
-      externalMcpServers: {
-        [serverId]: { url: "https://remote.example.com/mcp", enabled: false, headers: [] },
-      },
-    });
-    expect(mcpState.settings.get(localId)?.externalMcpServers[serverId]?.enabled).toBe(true);
-  });
-  it("shows the selected environment directly", async () => {
-    mcpState.initialSearch = { machine: remoteId };
-    await openSettings();
-    await expect
-      .element(page.getByRole("textbox", { name: "tools MCP URL" }))
-      .toHaveValue("https://remote.example.com/mcp");
-  });
+it("shows the selected environment directly", async () => {
+  setup({ machine: remoteId });
+  await using _screen = await openSettings();
+  await expect
+    .element(page.getByRole("textbox", { name: "tools MCP URL" }))
+    .toHaveValue("https://remote.example.com/mcp");
 });

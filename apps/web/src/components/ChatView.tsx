@@ -385,6 +385,7 @@ import { vcsEnvironment } from "../state/vcs";
 import { sourceControlEnvironment } from "../state/sourceControl";
 import { useProjectClone } from "../state/projectClones";
 import { projectCloneDisplayName, projectCloneProgressSummary } from "@t3tools/contracts";
+import { dismissProjectFileCopy, useProjectFileCopy } from "../lib/addProjectToMachine";
 import {
   type EnvironmentPresentation,
   useEnvironmentProviders,
@@ -448,7 +449,7 @@ import { ThreadDetailsPanel } from "./chat/ThreadDetailsPanel";
 import { NoActiveThreadState } from "./NoActiveThreadState";
 import {
   resolveEffectiveEnvMode,
-  resolveCheckoutBranchMismatch,
+  resolveLocalCheckoutBranchMismatch,
   shouldShowComposerContextStrip,
   shouldShowEnvironmentIndicator,
 } from "./BranchToolbar.logic";
@@ -565,10 +566,14 @@ import { ServerUpdateAction, serverUpdateStageLabel } from "./ServerUpdateAction
 import { useAutoBalanceUpdateBanner } from "./chat/useAutoBalanceUpdateBanner";
 import { ComposerServerUpdateIcon } from "./chat/ComposerServerUpdateStatus";
 import {
+  buildVersionMismatchDismissalKey,
   dismissServerUpdateFailure,
+  dismissVersionMismatch,
   isServerUpdateFailureDismissed,
+  isVersionMismatchDismissed,
   resolveServerConfigVersionMismatch,
   resolveServerSelfUpdateCapability,
+  serverUpdateGuidance,
   supportsDesktopAppUpdate,
   supportsServerUpdateThreadContinuation,
 } from "../versionSkew";
@@ -1456,7 +1461,6 @@ export default function ChatView(props: ChatViewProps) {
   const getTimelineScrollableNodeStable = useStableCallback(getTimelineScrollableNode);
   const [composerOverlayElement, setComposerOverlayElement] = useState<HTMLDivElement | null>(null);
   const [composerTimelineInset, setComposerTimelineInset] = useState(0);
-  const [composerOverlayHeight, setComposerOverlayHeight] = useState(0);
   const composerTimelineInsetRef = useRef(0);
   const [composerReservedHeight, setComposerReservedHeight] = useState(0);
   const composerReservedHeightRef = useRef(0);
@@ -1937,15 +1941,26 @@ export default function ChatView(props: ChatViewProps) {
     }
   };
   const runProjectCloneActionStable = useStableCallback(runProjectCloneAction);
+  const activeProjectFileCopy = useProjectFileCopy(activeProjectRef);
   const projectCloneSendBlockReason =
-    activeProjectClone === null
-      ? null
-      : activeProjectClone.phase === "running"
-        ? "Cloning repository"
-        : activeProjectClone.phase === "done"
-          ? null
-          : "Repository not cloned";
+    activeProjectClone?.phase === "running"
+      ? "Cloning repository"
+      : activeProjectClone !== null && activeProjectClone.phase !== "done"
+        ? "Repository not cloned"
+        : activeProjectFileCopy?.phase === "copying"
+          ? "Copying files"
+          : null;
   const projectCloneBannerItem = (() => {
+    if (activeProjectFileCopy?.phase === "failed" && activeProjectRef) {
+      return {
+        id: `project-file-copy:${activeProjectRef.projectId}`,
+        variant: "error",
+        icon: <DownloadIcon />,
+        title: activeProjectFileCopy.title,
+        description: activeProjectFileCopy.failures.join("\n"),
+        onDismiss: () => dismissProjectFileCopy(activeProjectRef),
+      };
+    }
     if (!activeProjectClone || !activeProjectRef || activeProjectClone.phase === "done") {
       return null;
     }
@@ -2171,6 +2186,10 @@ export default function ChatView(props: ChatViewProps) {
     logicalProjectEnvironments.find(
       (environment) => environment.environmentId === activeThread?.environmentId,
     ) ?? null;
+  const showComposerEnvironmentIndicator = shouldShowEnvironmentIndicator({
+    activeEnvironment: activeEnvironmentOption,
+    canPickEnvironment: hasMultipleEnvironments,
+  });
   const openPullRequestDialog = (reference?: string) => {
     if (!canCheckoutPullRequestIntoThread) {
       return;
@@ -2405,6 +2424,18 @@ export default function ChatView(props: ChatViewProps) {
     : EMPTY_AUTO_UPDATE_ENVIRONMENTS;
   const autoBalanceUpdateBanner = useAutoBalanceUpdateBanner(autoUpdateEnvironments);
   const versionMismatch = resolveServerConfigVersionMismatch(serverConfig);
+  const versionMismatchDismissKey =
+    versionMismatch && activeThread
+      ? buildVersionMismatchDismissalKey(activeThread.environmentId, versionMismatch)
+      : null;
+  const [dismissedVersionMismatchKey, setDismissedVersionMismatchKey] = useState<string | null>(
+    null,
+  );
+  const versionMismatchDismissed =
+    versionMismatchDismissKey === dismissedVersionMismatchKey ||
+    isVersionMismatchDismissed(versionMismatchDismissKey);
+  const showVersionMismatchBanner =
+    versionMismatch !== null && versionMismatchDismissKey !== null && !versionMismatchDismissed;
   const hasMultipleRegisteredEnvironments = environments.length > 1;
   const versionMismatchServerLabel =
     hasMultipleRegisteredEnvironments && activeThread
@@ -2424,30 +2455,6 @@ export default function ChatView(props: ChatViewProps) {
   const serverUpdateFailureDismissed =
     serverUpdateState === dismissedServerUpdateState ||
     isServerUpdateFailureDismissed(serverUpdateState);
-  const activeServerUpdate =
-    !automaticEnvironment &&
-    serverUpdateEnvironmentId &&
-    versionMismatch &&
-    serverUpdateState.status === "idle"
-      ? {
-          environmentId: serverUpdateEnvironmentId,
-          serverLabel:
-            activeEnvironmentOption?.label ??
-            serverConfig?.environment.label ??
-            versionMismatchServerLabel,
-          serverVersion: versionMismatch.serverVersion,
-          targetVersion: versionMismatch.clientVersion,
-          selfUpdate: versionMismatchSelfUpdate,
-          installation: versionMismatchInstallation,
-          desktopAppUpdate: versionMismatchDesktopAppUpdate,
-          threadContinuation: versionMismatchThreadContinuation,
-        }
-      : null;
-  const showComposerEnvironmentIndicator = shouldShowEnvironmentIndicator({
-    activeEnvironment: activeEnvironmentOption,
-    canPickEnvironment: hasMultipleEnvironments,
-    serverUpdateAvailable: activeServerUpdate !== null,
-  });
   const systemComposerBannerItems = (() => {
     const items: ComposerBannerStackItem[] = [];
     if (queuedProviderSwitch) {
@@ -2535,8 +2542,9 @@ export default function ChatView(props: ChatViewProps) {
     if (
       !automaticEnvironment &&
       serverUpdateEnvironmentId &&
-      serverUpdateState.status !== "idle" &&
-      !serverUpdateFailureDismissed
+      (serverUpdateState.status === "idle"
+        ? showVersionMismatchBanner
+        : !serverUpdateFailureDismissed)
     ) {
       const updateInProgress = serverUpdateState.status === "running";
       const updateFailed = serverUpdateState.status === "failed";
@@ -2545,11 +2553,39 @@ export default function ChatView(props: ChatViewProps) {
         variant: updateFailed ? "error" : "default",
         priority: updateInProgress ? "urgent" : "notice",
         icon: <ComposerServerUpdateIcon status={serverUpdateState.status} />,
-        title: `${updateFailed ? "Could not update" : "Updating"} ${versionMismatchServerLabel}`,
+        title:
+          updateInProgress || updateFailed ? (
+            `${updateFailed ? "Could not update" : "Updating"} ${versionMismatchServerLabel}`
+          ) : versionMismatch ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    className="block max-w-full cursor-help truncate rounded-sm text-left"
+                  >
+                    Server update available
+                  </button>
+                }
+              />
+              <TooltipPopup side="top">
+                {versionMismatchServerLabel} {versionMismatch.serverVersion}{" "}
+                <span aria-hidden="true">→</span> {versionMismatch.clientVersion}
+              </TooltipPopup>
+            </Tooltip>
+          ) : (
+            "Server update available"
+          ),
         description:
           serverUpdateState.status === "failed"
             ? serverUpdateState.message
-            : serverUpdateStageLabel(serverUpdateState.stage),
+            : serverUpdateState.status === "running"
+              ? serverUpdateStageLabel(serverUpdateState.stage)
+              : versionMismatchSelfUpdate !== null &&
+                  (versionMismatchSelfUpdate !== "desktop-managed" ||
+                    !versionMismatchDesktopAppUpdate)
+                ? serverUpdateGuidance(versionMismatchSelfUpdate)
+                : undefined,
         actions: updateInProgress ? (
           disconnectAction
         ) : !versionMismatch ||
@@ -2567,15 +2603,19 @@ export default function ChatView(props: ChatViewProps) {
             variant="ghost"
           />
         ),
-        ...(updateFailed
-          ? {
+        ...(updateInProgress || (!updateFailed && !versionMismatchDismissKey)
+          ? {}
+          : {
               dismissLabel: "Dismiss update notice",
               onDismiss: () => {
-                dismissServerUpdateFailure(serverUpdateState);
-                setDismissedServerUpdateState(serverUpdateState);
+                if (updateFailed) {
+                  dismissServerUpdateFailure(serverUpdateState);
+                  setDismissedServerUpdateState(serverUpdateState);
+                }
+                dismissVersionMismatch(versionMismatchDismissKey);
+                setDismissedVersionMismatchKey(versionMismatchDismissKey);
               },
-            }
-          : {}),
+            }),
       });
     }
     if (autoBalanceUpdateBanner) items.push(autoBalanceUpdateBanner);
@@ -3317,7 +3357,6 @@ export default function ChatView(props: ChatViewProps) {
     hasActiveProject: activeProject !== null && !showProviderSubagentBar,
     isGitRepo,
     showEnvironmentIndicator: showComposerEnvironmentIndicator,
-    serverUpdateAvailable: activeServerUpdate !== null,
     hostsRestingComposerControls: routeKind === "server",
   });
   const showComposerContextStrip = shouldShowComposerContextStrip({
@@ -3326,7 +3365,6 @@ export default function ChatView(props: ChatViewProps) {
     hasActiveProject: activeProject !== null && !showProviderSubagentBar,
     isGitRepo,
     showEnvironmentIndicator: showComposerEnvironmentIndicator,
-    serverUpdateAvailable: activeServerUpdate !== null,
     hostsRestingComposerControls: routeKind === "server" && restingComposerControlsVisible,
   });
   const mountComposerModelStrip =
@@ -3614,6 +3652,26 @@ export default function ChatView(props: ChatViewProps) {
     scheduleComposerFocus();
   };
   const insertArtifactTemplateStable = useStableCallback(insertArtifactTemplate);
+  const sendAppMessage = async (text: string) => {
+    if (!isServerThread || activeThreadId === null) {
+      throw new Error("Messages from apps need a started thread.");
+    }
+    const result = await startThreadTurn({
+      environmentId,
+      input: {
+        threadId: activeThreadId,
+        message: { messageId: newMessageId(), role: "user", text, attachments: [] },
+        runtimeMode,
+        interactionMode,
+        dispatchMode: "queue",
+      },
+    });
+    if (result._tag === "Failure") {
+      const error = squashAtomCommandFailure(result);
+      throw error instanceof Error ? error : new Error("Could not send the app's message.");
+    }
+  };
+  const sendAppMessageStable = useStableCallback(sendAppMessage);
   const queuedRunsControlRef = useRef<QueuedRunsControlHandle>(null);
   const addTerminalContextToDraft = (selection: TerminalContextSelection) => {
     composerRef.current?.addTerminalContext(selection);
@@ -4927,8 +4985,8 @@ export default function ChatView(props: ChatViewProps) {
     requestedEnvMode: envMode,
     isGitRepo,
   });
-  const checkoutBranchMismatch = isServerThread
-    ? resolveCheckoutBranchMismatch({
+  const localCheckoutBranchMismatch = isServerThread
+    ? resolveLocalCheckoutBranchMismatch({
         effectiveEnvMode: envMode,
         activeWorktreePath,
         activeThreadBranch,
@@ -4938,7 +4996,6 @@ export default function ChatView(props: ChatViewProps) {
   const publishComposerOverlayHeight = (height: number) => {
     const nextHeight = Math.ceil(height);
     if (nextHeight <= 0) return;
-    setComposerOverlayHeight(isDraftHeroState ? 0 : nextHeight);
     const isResting = overlayComposerIsResting({
       composerMounted: composerMountedRef.current,
       composerReportedResting: composerRestingRef.current,
@@ -5257,10 +5314,10 @@ export default function ChatView(props: ChatViewProps) {
   const nowMinute = useNowMinute();
   const activeBranchMismatchKey = branchMismatchKey(
     activeThread?.id ?? null,
-    checkoutBranchMismatch,
+    localCheckoutBranchMismatch,
   );
   const showBranchMismatchBanner = shouldShowBranchMismatchBanner({
-    hasMismatch: checkoutBranchMismatch !== null,
+    hasMismatch: localCheckoutBranchMismatch !== null,
     isDismissed: isBranchMismatchDismissedForSession(activeBranchMismatchKey),
     composerHasContent: composerHasDraftContent,
     wasShownForCurrentMismatch:
@@ -5279,7 +5336,7 @@ export default function ChatView(props: ChatViewProps) {
     if (
       !activeProjectCwd ||
       !activeThread ||
-      !checkoutBranchMismatch?.canRestoreThreadBranch ||
+      !localCheckoutBranchMismatch ||
       isRestoringThreadBranch
     ) {
       return;
@@ -5289,7 +5346,7 @@ export default function ChatView(props: ChatViewProps) {
       environmentId,
       input: {
         cwd: activeProjectCwd,
-        refName: checkoutBranchMismatch.threadBranch,
+        refName: localCheckoutBranchMismatch.threadBranch,
       },
     });
     if (checkoutResult._tag === "Failure") {
@@ -5310,7 +5367,7 @@ export default function ChatView(props: ChatViewProps) {
       setIsRestoringThreadBranch(false);
       return;
     }
-    const nextBranch = checkoutResult.value.refName ?? checkoutBranchMismatch.threadBranch;
+    const nextBranch = checkoutResult.value.refName ?? localCheckoutBranchMismatch.threadBranch;
     if (nextBranch !== activeThread.branch) {
       const updateResult = await updateThreadMetadata({
         environmentId,
@@ -5427,37 +5484,6 @@ export default function ChatView(props: ChatViewProps) {
     };
   })() as ComposerBannerStackItem | null;
 
-  const sendAppMessage = async (text: string) => {
-    if (!isServerThread || activeThreadId === null) {
-      throw new Error("Messages from apps need a started thread.");
-    }
-    const settingsResult = await persistThreadSettingsForNextTurn({
-      threadId: activeThreadId,
-      createdAt: new Date().toISOString(),
-      ...(checkoutBranchMismatch ? { branch: checkoutBranchMismatch.currentBranch } : {}),
-      runtimeMode,
-      interactionMode,
-    });
-    const result =
-      settingsResult._tag === "Failure"
-        ? settingsResult
-        : await startThreadTurn({
-            environmentId,
-            input: {
-              threadId: activeThreadId,
-              message: { messageId: newMessageId(), role: "user", text, attachments: [] },
-              runtimeMode,
-              interactionMode,
-              dispatchMode: "queue",
-            },
-          });
-    if (result._tag === "Failure") {
-      const error = squashAtomCommandFailure(result);
-      throw error instanceof Error ? error : new Error("Could not send the app's message.");
-    }
-  };
-  const sendAppMessageStable = useStableCallback(sendAppMessage);
-
   const sendStandaloneCommand = async (text: string, failureMessage: string) => {
     if (!activeThread || !clientSettingsHydrated || sendInFlightRef.current) return;
     const context = composerRef.current?.getSendContext();
@@ -5486,7 +5512,7 @@ export default function ChatView(props: ChatViewProps) {
     const settingsResult = await persistThreadSettingsForNextTurn({
       threadId,
       createdAt,
-      ...(checkoutBranchMismatch ? { branch: checkoutBranchMismatch.currentBranch } : {}),
+      ...(localCheckoutBranchMismatch ? { branch: localCheckoutBranchMismatch.currentBranch } : {}),
       runtimeMode,
       interactionMode: context.interactionMode,
     });
@@ -5577,7 +5603,6 @@ export default function ChatView(props: ChatViewProps) {
         />
       ),
       title: presentation.title,
-      descriptionPlacement: "below",
       description:
         presentation.items.length === 1 && presentation.items[0]?.childThreadId === undefined
           ? undefined
@@ -5593,7 +5618,7 @@ export default function ChatView(props: ChatViewProps) {
                       {separator}
                     </>
                   ) : (
-                    <span>
+                    <span className="whitespace-nowrap">
                       <InlineButton
                         tone="muted"
                         aria-label={`${presentation.items.length === 1 ? "Show" : "Open"} subagent ${item.label}`}
@@ -5770,7 +5795,7 @@ export default function ChatView(props: ChatViewProps) {
     ].filter((item) => item !== null);
     const usageLimitsItems = usageLimitsBanner === null ? [] : [usageLimitsBanner];
     const projectCloneItems = projectCloneBannerItem === null ? [] : [projectCloneBannerItem];
-    if (!checkoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
+    if (!localCheckoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
       return [
         ...feedbackBannerItems,
         ...limitRecoveryItems,
@@ -5799,18 +5824,18 @@ export default function ChatView(props: ChatViewProps) {
               <TooltipTrigger
                 render={
                   <code className="min-w-0 truncate font-medium text-foreground">
-                    {checkoutBranchMismatch.threadBranch}
+                    {localCheckoutBranchMismatch.threadBranch}
                   </code>
                 }
               />
               <TooltipPopup side="top">
-                This thread last ran on {checkoutBranchMismatch.threadBranch}. Sending will continue
-                on {checkoutBranchMismatch.currentBranch}.
+                This thread last ran on {localCheckoutBranchMismatch.threadBranch}. Sending will
+                continue on {localCheckoutBranchMismatch.currentBranch}.
               </TooltipPopup>
             </Tooltip>
           </span>
         ),
-        actions: checkoutBranchMismatch.canRestoreThreadBranch ? (
+        actions: (
           <Button
             size="xs"
             variant="ghost"
@@ -5819,7 +5844,7 @@ export default function ChatView(props: ChatViewProps) {
           >
             {isRestoringThreadBranch ? "Restoring..." : "Restore branch"}
           </Button>
-        ) : null,
+        ),
         dismissLabel: "Dismiss branch change notice",
         onDismiss: () => {
           dismissBranchMismatchForSession(activeBranchMismatchKey);
@@ -6286,7 +6311,9 @@ export default function ChatView(props: ChatViewProps) {
       const settingsResult = await persistThreadSettingsForNextTurn({
         threadId,
         createdAt,
-        ...(checkoutBranchMismatch ? { branch: checkoutBranchMismatch.currentBranch } : {}),
+        ...(localCheckoutBranchMismatch
+          ? { branch: localCheckoutBranchMismatch.currentBranch }
+          : {}),
         runtimeMode,
         interactionMode,
       });
@@ -7262,7 +7289,9 @@ export default function ChatView(props: ChatViewProps) {
       const settingsResult = await persistThreadSettingsForNextTurn({
         threadId: threadIdForSend,
         createdAt: messageCreatedAt,
-        ...(checkoutBranchMismatch ? { branch: checkoutBranchMismatch.currentBranch } : {}),
+        ...(localCheckoutBranchMismatch
+          ? { branch: localCheckoutBranchMismatch.currentBranch }
+          : {}),
         runtimeMode,
         interactionMode: sendInteractionMode,
       });
@@ -7616,7 +7645,7 @@ export default function ChatView(props: ChatViewProps) {
     const settingsResult = await persistThreadSettingsForNextTurn({
       threadId: threadIdForSend,
       createdAt: messageCreatedAt,
-      ...(checkoutBranchMismatch ? { branch: checkoutBranchMismatch.currentBranch } : {}),
+      ...(localCheckoutBranchMismatch ? { branch: localCheckoutBranchMismatch.currentBranch } : {}),
       runtimeMode,
       interactionMode: nextInteractionMode,
     });
@@ -7736,7 +7765,7 @@ export default function ChatView(props: ChatViewProps) {
         modelSelection: nextThreadModelSelection,
         runtimeMode: defaultRuntimeMode,
         interactionMode: "default",
-        branch: checkoutBranchMismatch?.currentBranch ?? activeThreadBranch,
+        branch: activeThreadBranch,
         worktreePath: activeThread.worktreePath,
         createdAt,
       },
@@ -8452,7 +8481,6 @@ export default function ChatView(props: ChatViewProps) {
                 onAnchorReady={onTimelineAnchorReadyStable}
                 onAnchorSizeChanged={onTimelineAnchorSizeChangedStable}
                 contentInsetEndAdjustment={composerTimelineInset}
-                composerOverlayHeight={isDraftHeroState ? 0 : composerOverlayHeight}
                 liveFollowEnabled={!paintOnlyDisplayedTimeline && timelineLiveFollowEnabled}
                 onIsAtEndChange={onIsAtEndChangeStable}
                 onContentOverflowChange={setTimelineOverflows}
@@ -8798,7 +8826,6 @@ export default function ChatView(props: ChatViewProps) {
                                 availableEnvironments={logicalProjectEnvironments}
                                 composerControlsHostRef={setRestingComposerControlsHost}
                                 contextStripVisible={showComposerContextStrip}
-                                serverUpdate={activeServerUpdate}
                               />
                             </div>
                           )}
@@ -8830,7 +8857,7 @@ export default function ChatView(props: ChatViewProps) {
 
             <BranchRestoreConfirmHost
               threadKey={activeThreadKey}
-              threadBranch={checkoutBranchMismatch?.threadBranch ?? ""}
+              threadBranch={localCheckoutBranchMismatch?.threadBranch ?? ""}
               canWriteSourceControl={canWriteSourceControl}
               onConfirm={handleSwitchCheckoutToThreadStable}
             />
