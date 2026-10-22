@@ -9,6 +9,7 @@ import {
   ClientSettingsPatch,
   DEFAULT_SERVER_SETTINGS,
   requiredScopesForProjectMutation,
+  resolveIdleCompaction,
   resolveProjectProviderInstanceEnabled,
   resolveProviderInstanceEnabled,
   ServerSettings,
@@ -153,6 +154,30 @@ describe("ClaudeSettings shared memory", () => {
         ).sharedHomePath,
       ).toBe(sharedHomePath);
     }
+  });
+});
+
+describe("resolveIdleCompaction", () => {
+  it("lets a Claude instance override the global default", () => {
+    const settings = decodeServerSettings({
+      compactIdleThreads: "off",
+      providerInstances: {
+        claude_work: { driver: "claudeAgent", config: { idleCompaction: "onReturn" } },
+        claude_personal: { driver: "claudeAgent" },
+      },
+    });
+    expect(resolveIdleCompaction(settings, ProviderInstanceId.make("claude_work"))).toBe(
+      "onReturn",
+    );
+    expect(resolveIdleCompaction(settings, ProviderInstanceId.make("claude_personal"))).toBe("off");
+    expect(resolveIdleCompaction(settings, ProviderInstanceId.make("claudeAgent"))).toBe("off");
+  });
+
+  it("keeps the legacy beta switch's behavior", () => {
+    expect(decodeServerSettings({ compactIdleThreads: true }).compactIdleThreads).toBe(
+      "beforeCacheExpires",
+    );
+    expect(decodeServerSettings({}).compactIdleThreads).toBe("onReturn");
   });
 });
 
