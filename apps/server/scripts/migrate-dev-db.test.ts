@@ -253,6 +253,7 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
         "66_CodexUsageNativeTurnIndex",
         "67_RepairClientSettlementTimestamps",
         "68_WebhookDedupe",
+        "69_ShellStopRequestIndex",
       ]);
       const migrated = yield* withDatabase(result.databasePath, history);
       assert.deepStrictEqual(migrated.slice(0, original.length), original);

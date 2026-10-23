@@ -70,6 +70,7 @@ import Migration0064 from "./Migrations/064_CanonicalizeThreadPullRequestLinks.t
 import Migration0065 from "./Migrations/065_CodexUsageNativeTurnIndex.ts";
 import Migration0066 from "./Migrations/066_RepairClientSettlementTimestamps.ts";
 import Migration0067 from "./Migrations/067_WebhookDedupe.ts";
+import Migration0068 from "./Migrations/068_ShellStopRequestIndex.ts";
 
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -141,6 +142,7 @@ export const migrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -169,6 +171,7 @@ export const forkMigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -187,6 +190,7 @@ export const forkIntegrationMigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -206,6 +210,7 @@ const upstreamIntegrationMigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -225,6 +230,7 @@ const preview54MigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -245,6 +251,7 @@ const preview53MigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -261,6 +268,7 @@ const upstreamWebhookMigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -277,6 +285,7 @@ const upstreamMcpAppMigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 // Upstream databases that already applied review guides keep that id/name pair.
@@ -290,6 +299,7 @@ const upstreamReviewGuideMigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 // Official upstream databases may already have the failure index at 62.
@@ -303,6 +313,7 @@ const upstreamFailureIndexMigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 // Official databases may have used 63/64 before ever opening in the fork.
@@ -315,6 +326,7 @@ const upstreamDropProjectionsMigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 const upstreamCanonicalLinksMigrationEntries = [
@@ -324,6 +336,7 @@ const upstreamCanonicalLinksMigrationEntries = [
   [66, "CodexUsageNativeTurnIndex", Migration0065],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 const upstreamUsageIndexMigrationEntries = [
@@ -332,6 +345,7 @@ const upstreamUsageIndexMigrationEntries = [
   [66, "ClaudeSessionStore", ClaudeSessionStore],
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 const upstreamSettlementMigrationEntries = [
@@ -339,6 +353,7 @@ const upstreamSettlementMigrationEntries = [
   [66, "RepairClientSettlementTimestamps", Migration0066],
   [67, "ClaudeSessionStore", ClaudeSessionStore],
   [68, "WebhookDedupe", Migration0067],
+  [69, "ShellStopRequestIndex", Migration0068],
 ] as const;
 
 // Official upstream databases may already have webhook dedupe at 67.
@@ -346,6 +361,14 @@ const upstreamWebhookDedupeMigrationEntries = [
   ...upstreamSettlementMigrationEntries.filter(([id]) => id <= 66),
   [67, "WebhookDedupe", Migration0067],
   [68, "ClaudeSessionStore", ClaudeSessionStore],
+  [69, "ShellStopRequestIndex", Migration0068],
+] as const;
+
+// Official upstream databases may already have the shell stop index at 68.
+const upstreamShellStopIndexMigrationEntries = [
+  ...upstreamWebhookDedupeMigrationEntries.filter(([id]) => id <= 67),
+  [68, "ShellStopRequestIndex", Migration0068],
+  [69, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -429,7 +452,9 @@ export function selectMigrationEntries(
                     ? has(65, "CodexUsageNativeTurnIndex")
                       ? has(66, "RepairClientSettlementTimestamps")
                         ? has(67, "WebhookDedupe")
-                          ? upstreamWebhookDedupeMigrationEntries
+                          ? has(68, "ShellStopRequestIndex")
+                            ? upstreamShellStopIndexMigrationEntries
+                            : upstreamWebhookDedupeMigrationEntries
                           : upstreamSettlementMigrationEntries
                         : upstreamUsageIndexMigrationEntries
                       : upstreamCanonicalLinksMigrationEntries

@@ -1,10 +1,11 @@
 import { withHtmlTheme } from "@t3tools/shared/htmlRender";
 import { useHtmlRenderTheme } from "../../lib/useHtmlRenderTheme";
+import { ActiveNewTaskContext } from "../../state/active-new-task";
 import * as Dialog from "../../components/ui/Dialog";
 import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/filesystem";
 import { useEnvironmentPresentation } from "../../state/presentation";
 import { environmentSession } from "../../state/session";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
   EnvironmentId,
@@ -167,6 +168,7 @@ export function branchBadgeLabel(input: {
 }
 
 type NewTaskFlowContextValue = {
+  readonly activeNewTask: { readonly pendingKey: string | null } | null;
   readonly projectScopes: ReadonlyArray<HomeProjectScope>;
   readonly selectedEnvironmentId: EnvironmentId | null;
   readonly selectedProjectKey: string | null;
@@ -257,7 +259,13 @@ type NewTaskFlowContextValue = {
 
 const NewTaskFlowContext = React.createContext<NewTaskFlowContextValue | null>(null);
 
-export function NewTaskFlowProvider(props: React.PropsWithChildren) {
+export function NewTaskFlowProvider(
+  props: React.PropsWithChildren<{
+    active?: boolean;
+    routeDraftId?: string;
+    routePendingTaskId?: string;
+  }>,
+) {
   const projects = useProjects();
   const threads = useThreadShells();
   const { savedConnectionsById } = useSavedRemoteConnections();
@@ -296,7 +304,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   const editingPendingTaskRef = useRef<QueuedThreadMessage | null>(null);
   const editingRevisionRef = useRef(Promise.resolve(0));
 
-  const reset = () => {
+  const reset = useCallback(() => {
     setSelectedEnvironmentId(null);
     setSelectedProjectKey(null);
     setActiveDraftKey(null);
@@ -313,7 +321,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       }
       releaseEditingQueuedMessage(editing.messageId);
     }
-  };
+  }, []);
 
   const projectsForEnvironment = pipe(
     projects,
@@ -427,7 +435,12 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       ? activeDraftKey
       : null;
   useEffect(() => {
-    if (activeDraftKey !== null || editingPendingTask !== null || selectedProject === null) {
+    if (
+      props.active === false ||
+      activeDraftKey !== null ||
+      editingPendingTask !== null ||
+      selectedProject === null
+    ) {
       return;
     }
     setActiveDraftKey(
@@ -436,7 +449,23 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
         projectId: selectedProject.id,
       }),
     );
-  }, [activeDraftKey, editingPendingTask, selectedProject]);
+  }, [activeDraftKey, editingPendingTask, selectedProject, props.active]);
+  const activePendingKey =
+    props.active === false
+      ? null
+      : props.routePendingTaskId
+        ? `pending-task:${props.routePendingTaskId}`
+        : props.routeDraftId
+          ? `draft-task:${props.routeDraftId}`
+          : editingPendingTask
+            ? `pending-task:${editingPendingTask.messageId}`
+            : selectedProjectDraftKey
+              ? `draft-task:${selectedProjectDraftKey}`
+              : null;
+  const activeNewTask = React.useMemo(
+    () => (props.active === false ? null : { pendingKey: activePendingKey }),
+    [props.active, activePendingKey],
+  );
   const selectedProjectDraft = useComposerDraft(selectedProjectDraftKey);
   const prompt = selectedProjectDraft.text;
   const attachments = selectedProjectDraft.attachments;
@@ -1146,6 +1175,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   );
 
   const value = {
+    activeNewTask,
     projectScopes,
     selectedEnvironmentId,
     selectedProjectKey,
@@ -1212,7 +1242,11 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
     setExpandedProvider,
   } satisfies NewTaskFlowContextValue;
 
-  return <NewTaskFlowContext.Provider value={value}>{props.children}</NewTaskFlowContext.Provider>;
+  return (
+    <ActiveNewTaskContext value={activeNewTask}>
+      <NewTaskFlowContext.Provider value={value}>{props.children}</NewTaskFlowContext.Provider>
+    </ActiveNewTaskContext>
+  );
 }
 
 export function useNewTaskFlow() {

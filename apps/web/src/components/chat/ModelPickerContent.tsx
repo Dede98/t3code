@@ -841,7 +841,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
               : {})}
             usageWarningInstanceIds={usageWarningInstanceIds}
             getUsageWarningTooltip={(entry: ProviderInstanceEntry) =>
-              `${entry.displayName} — ${usageAttentionByInstance.get(entry.instanceId)?.reason ?? "Usage is near its limit."}`
+              `${entry.displayName}: ${usageAttentionByInstance.get(entry.instanceId)?.reason ?? "Usage is near its limit."}`
             }
           />
         )}

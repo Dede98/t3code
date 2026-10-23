@@ -30,7 +30,7 @@ export function ProviderUsageMeter(props: {
   const percent = primary ? remainingPercent(primary) : null;
   const label = primary
     ? `${primary.usedPercent > 90 ? `${primary.label} ` : ""}${percent}% left`
-    : "Limits —";
+    : "Limits -";
 
   // Drivers without subscription limits (including API-key accounts) have no quota meter.
   if (
