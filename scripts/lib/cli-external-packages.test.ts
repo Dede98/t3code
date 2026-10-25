@@ -150,6 +150,22 @@ var x = 1;
     assert.deepStrictEqual(result.inlinedPackages, ["effect", "yaml"]);
     assert.deepStrictEqual(result.inlined, []);
   });
+
+  it("reads the plain path markers newer rolldown writes", () => {
+    const source = [
+      "// \\0rolldown/runtime.js",
+      "var x = 1;",
+      "// ../../node_modules/.pnpm/node-addon-api@7.1.1/node_modules/node-addon-api/index.js",
+      "var y = 2;",
+      "// ../../packages/contracts/src/vcs.ts",
+      "  // an ordinary comment",
+      "// TODO",
+    ].join("\n");
+    const result = findInlinedExternalPackages(source);
+
+    assert.deepStrictEqual(result.inlined, ["node-addon-api"]);
+    assert.strictEqual(result.regionCount, 3);
+  });
 });
 
 describe("findEsmImportsOfExternalPackages", () => {
