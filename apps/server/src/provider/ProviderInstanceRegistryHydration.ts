@@ -59,12 +59,9 @@ export const deriveProviderInstanceConfigMap = (
     merged[instanceId] = { driver: driver.driverKind, config: {} };
   }
 
-  // The continuation gate is global, but Claude drivers are constructed from
-  // per-instance config only. Inject the current value into every valid
-  // Claude config so a global toggle changes the structurally compared entry
-  // and causes the registry to rebuild every Claude instance. Any persisted
-  // value in an explicit instance is intentionally ignored: the global gate
-  // remains the single source of truth.
+  // The continuation gate is global but Claude drivers read per-instance config. Inject it into
+  // every Claude config so a toggle changes the compared entry and rebuilds every instance; the
+  // global gate stays the single source of truth over any persisted per-instance value.
   for (const [instanceId, entry] of Object.entries(merged)) {
     if (
       entry.driver !== "claudeAgent" ||
@@ -102,11 +99,7 @@ export const deriveProviderInstanceConfigMap = (
       };
     }
   }
-  // A project that turns an instance on needs it alive and probed even when
-  // the machine itself has it off, or a thread in that project would route
-  // to an instance nobody ever checked in on. Fold every project's
-  // `providerInstances[id].enabled` overrides in: an instance already enabled
-  // is untouched, and one absent from settings entirely (deleted) stays out.
+  // Probe project-enabled instances even if disabled machine-wide; project threads can still route to them.
   for (const overrides of Object.values(settings.projectSettingsOverrides)) {
     for (const [rawInstanceId, projectOverride] of Object.entries(
       overrides?.providerInstances ?? {},
@@ -244,14 +237,9 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
 });
 
 /**
- * Layer that consumes `ProviderInstanceRegistryMutator` and forks a
- * settings-watcher fiber. The fiber's lifetime is tied to the enclosing
- * layer scope (process lifetime in production), so it is interrupted on
- * shutdown without leaking.
- *
- * Settings emissions only replace a versioned desired snapshot. A separate
- * worker coalesces those snapshots and waits only for sessions belonging to
- * instances that the reconciliation will remove or replace.
+ * The settings watcher lives in the layer scope, so shutdown interrupts it. Emissions only
+ * replace a versioned desired snapshot; a separate worker coalesces them and waits only for
+ * sessions of instances the reconciliation will remove or replace.
  */
 const layerSettingsWatcher = (
   initialSettings: ServerSettings | undefined,
@@ -304,20 +292,9 @@ const layerSettingsWatcher = (
   );
 
 /**
- * Hydrate `ProviderInstanceRegistry` from `ServerSettings` and keep it in
- * sync with subsequent `streamChanges` emissions.
- *
- * The Layer's two halves:
- *   - `ProviderInstanceRegistry.layer` produces the registry +
- *     mutator from the initial config map. Its scope owns every
- *     per-instance child scope created during reconcile.
- *   - `layerSettingsWatcher` consumes the mutator, acquires its settings
- *     subscription before forking, and runs a daemon fiber in the same scope.
- *
- * Composing via `Layer.provideMerge` makes the watcher's deps available
- * from the mutable layer while still surfacing the registry as an output.
- * The mutator tag is technically also exposed; only this module imports
- * it, so the visibility leak is harmless in practice.
+ * The registry layer's scope owns every per-instance child scope; the watcher subscribes to
+ * settings before forking so no change between hydration and fork is lost. `provideMerge` also
+ * exposes the mutator tag, which only this module imports.
  */
 export const layer: Layer.Layer<
   ProviderInstanceRegistry.ProviderInstanceRegistry,

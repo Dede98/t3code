@@ -193,9 +193,8 @@ export function ReopenClosedViewShortcut() {
         isWeb: false,
       },
     };
-    // A focused browser page is a separate process, so these chords never reach
-    // the app's keydown listeners. The desktop claims them in the guest and
-    // sends commands back as menu actions, or keyboard events for hold-to-switch.
+    // Guest browser processes miss app keydown listeners; desktop forwards the chords as menu
+    // actions, or keyboard events for hold-to-switch.
     const commands = [
       ...(hasHistory ? (["view.reopenClosed"] as const) : []),
       ...(window.desktopBridge?.onThreadSwitchKey

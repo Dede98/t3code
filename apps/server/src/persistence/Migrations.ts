@@ -71,6 +71,7 @@ import Migration0065 from "./Migrations/065_CodexUsageNativeTurnIndex.ts";
 import Migration0066 from "./Migrations/066_RepairClientSettlementTimestamps.ts";
 import Migration0067 from "./Migrations/067_WebhookDedupe.ts";
 import Migration0068 from "./Migrations/068_ShellStopRequestIndex.ts";
+import Migration0069 from "./Migrations/069_ThreadMessageSearch.ts";
 
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -143,6 +144,7 @@ export const migrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -172,6 +174,7 @@ export const forkMigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -191,6 +194,7 @@ export const forkIntegrationMigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -211,6 +215,7 @@ const upstreamIntegrationMigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -231,6 +236,7 @@ const preview54MigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -252,6 +258,7 @@ const preview53MigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -269,6 +276,7 @@ const upstreamWebhookMigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -286,6 +294,7 @@ const upstreamMcpAppMigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 // Upstream databases that already applied review guides keep that id/name pair.
@@ -300,6 +309,7 @@ const upstreamReviewGuideMigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 // Official upstream databases may already have the failure index at 62.
@@ -314,6 +324,7 @@ const upstreamFailureIndexMigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 // Official databases may have used 63/64 before ever opening in the fork.
@@ -327,6 +338,7 @@ const upstreamDropProjectionsMigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 const upstreamCanonicalLinksMigrationEntries = [
@@ -337,6 +349,7 @@ const upstreamCanonicalLinksMigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 const upstreamUsageIndexMigrationEntries = [
@@ -346,6 +359,7 @@ const upstreamUsageIndexMigrationEntries = [
   [67, "RepairClientSettlementTimestamps", Migration0066],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 const upstreamSettlementMigrationEntries = [
@@ -354,6 +368,7 @@ const upstreamSettlementMigrationEntries = [
   [67, "ClaudeSessionStore", ClaudeSessionStore],
   [68, "WebhookDedupe", Migration0067],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 // Official upstream databases may already have webhook dedupe at 67.
@@ -362,6 +377,7 @@ const upstreamWebhookDedupeMigrationEntries = [
   [67, "WebhookDedupe", Migration0067],
   [68, "ClaudeSessionStore", ClaudeSessionStore],
   [69, "ShellStopRequestIndex", Migration0068],
+  [70, "ThreadMessageSearch", Migration0069],
 ] as const;
 
 // Official upstream databases may already have the shell stop index at 68.
@@ -369,6 +385,14 @@ const upstreamShellStopIndexMigrationEntries = [
   ...upstreamWebhookDedupeMigrationEntries.filter(([id]) => id <= 67),
   [68, "ShellStopRequestIndex", Migration0068],
   [69, "ClaudeSessionStore", ClaudeSessionStore],
+  [70, "ThreadMessageSearch", Migration0069],
+] as const;
+
+// Official upstream databases may already have message search at 69.
+const upstreamThreadMessageSearchMigrationEntries = [
+  ...upstreamShellStopIndexMigrationEntries.filter(([id]) => id <= 68),
+  [69, "ThreadMessageSearch", Migration0069],
+  [70, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -391,12 +415,9 @@ const makeMigrationLoader = (
 const FIRST_V2_MIGRATION_ID = 55;
 
 /**
- * Fail before migrating when the migrator would skip one of the selected
- * lineage's migrations from V2 on. It skips every id up to the highest
- * recorded one, whatever name was recorded, so a database that took one of
- * those ids for another migration would start without that schema and fail on
- * first use. Earlier ids keep the warning below: databases with a site-local
- * migration there still work.
+ * Fail before migrating when the migrator would skip one of the selected lineage's migrations
+ * from V2 on: it skips every id up to the highest recorded one, whatever name was recorded.
+ * Earlier ids keep the warning below; databases with a site-local migration there still work.
  */
 const assertV2MigrationsCanRun = Effect.fn("assertV2MigrationsCanRun")(function* (
   entries: ReadonlyArray<readonly [number, string, unknown]>,
@@ -453,7 +474,9 @@ export function selectMigrationEntries(
                       ? has(66, "RepairClientSettlementTimestamps")
                         ? has(67, "WebhookDedupe")
                           ? has(68, "ShellStopRequestIndex")
-                            ? upstreamShellStopIndexMigrationEntries
+                            ? has(69, "ThreadMessageSearch")
+                              ? upstreamThreadMessageSearchMigrationEntries
+                              : upstreamShellStopIndexMigrationEntries
                             : upstreamWebhookDedupeMigrationEntries
                           : upstreamSettlementMigrationEntries
                         : upstreamUsageIndexMigrationEntries

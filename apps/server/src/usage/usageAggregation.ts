@@ -1,15 +1,8 @@
 // @effect-diagnostics globalDate:off
 /**
- * Folds parsed transcript records into `(source, day, hourStart?, provider, model)` buckets.
- *
- * `Intl.DateTimeFormat` is the only reliable way to resolve a wall-clock day in
- * an arbitrary IANA zone, and it takes a `Date`. That is why the raw `Date`
- * construction is allowed here; nothing in this module reads the clock.
- *
- * Pure, so the bucketing and de-duplication rules are testable without touching
- * the filesystem or the network.
- *
- * @module usageAggregation
+ * Pure folding of transcript records into `(source, day, hourStart?, provider, model)` buckets.
+ * Raw `Date` construction is allowed because `Intl.DateTimeFormat` needs one to resolve a
+ * wall-clock day in an IANA zone; nothing here reads the clock.
  */
 import type {
   UsageBucket,
@@ -22,10 +15,7 @@ import type {
 import { EMPTY_TOTALS, type UsageRecord } from "@t3tools/provider-core/server/usage";
 import { cacheSavingsUsd, priceUsage, type RateTable } from "./usagePricing.ts";
 
-/**
- * `en-CA` yields ISO-ordered parts, which is why it is used here rather than
- * assembling the day from `Date` getters (those are host-local only).
- */
+// en-CA gives ISO-ordered parts in the requested zone; Date getters are host-local.
 function makeDayFormatter(timeZone: string): (timestampMs: number) => string {
   let format: Intl.DateTimeFormat;
   try {
@@ -43,10 +33,7 @@ function makeDayFormatter(timeZone: string): (timestampMs: number) => string {
       day: "2-digit",
     });
   }
-  // Formatting once per quarter-hour slot keeps `Intl` (about 2µs a call) off
-  // the per-record path. Named zones put midnight on a quarter hour, so their
-  // slots never split; a fixed offset such as `+00:01` can, and records in a
-  // split slot are formatted exactly.
+  // Cache quarter-hour slots to avoid per-record Intl calls; fixed-offset midnight can split slots and needs exact formatting.
   const days = new Map<number, string | null>();
   return (timestampMs) => {
     const slot = Math.floor(timestampMs / QUARTER_HOUR_MS);
@@ -112,11 +99,7 @@ export interface AggregateResult {
   readonly outOfWindow: number;
 }
 
-/**
- * De-duplication is global across the whole scan, not per file: Claude Code
- * copies a message's records forward when a session is resumed or forked, so
- * the same `dedupeKey` legitimately appears in several transcripts.
- */
+/** Deduplicates across the whole scan; Claude copies records into resumed/forked transcripts. */
 export class UsageAggregator {
   readonly #buckets = new Map<string, MutableBucket>();
   readonly #seen = new Set<string>();
@@ -234,7 +217,7 @@ export class UsageAggregator {
     return true;
   }
 
-  /** The target's own rate applies, so a provider-specific `rateModel` is dropped. */
+  // Aliases use the target's rate, replacing provider-specific rateModel.
   #mapModel(record: UsageRecord): UsageRecord {
     const model = this.#options.modelAliases?.get(record.model);
     if (model === undefined) return record;
@@ -242,11 +225,7 @@ export class UsageAggregator {
     return { ...rest, model };
   }
 
-  /**
-   * Records arrive file by file in time order, so most land in the bucket the
-   * previous record used. Checking that first skips building and hashing a
-   * key string per record.
-   */
+  // Time-ordered records usually reuse the previous bucket; avoid rebuilding its key.
   #bucketFor(
     day: string,
     hourIndex: number,

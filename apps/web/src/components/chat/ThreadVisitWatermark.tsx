@@ -1,6 +1,7 @@
 import { type ScopedThreadRef } from "@t3tools/contracts";
 import { resolveThreadLastVisitedAt } from "../Sidebar.logic";
 import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { claimThreadOpen } from "@t3tools/client-runtime/state/thread-search";
 import { useParams } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useUiStateStore } from "../../uiStateStore";
@@ -46,6 +47,48 @@ export function ThreadVisitWatermark(props: { readonly threadRef: ScopedThreadRe
   const visitThreadMutation = useAtomCommand(threadEnvironment.visit, { reportFailure: false });
   const lastDispatchedVisitRef = useRef<string | null>(null);
   const lastVisitDispatchAtRef = useRef(0);
+  const recordedOpenRef = useRef<string | null>(null);
+
+  // Opening a thread is one visit that also counts toward search ranking. A
+  // palette pick already sent it with the query. It runs before the watermark
+  // effect, which then sees this watermark as sent.
+  useEffect(() => {
+    if (!serverThread?.id) return;
+    if (recordedOpenRef.current === threadKey) return;
+    // The open also advances the watermark, so it waits for the same route and focus guard.
+    const viewedThreadRef = scopeThreadRef(serverThread.environmentId, serverThread.id);
+    if (
+      activeRouteThreadRef?.environmentId !== viewedThreadRef.environmentId ||
+      activeRouteThreadRef.threadId !== viewedThreadRef.threadId ||
+      document.visibilityState !== "visible" ||
+      !document.hasFocus()
+    )
+      return;
+    recordedOpenRef.current = threadKey;
+    // Recorded here even when the server cannot take opens, so recents follow it.
+    const claimed = claimThreadOpen(serverThread.environmentId, serverThread.id, Date.now());
+    if (!claimed || serverThread.lastVisitedAt === undefined) return;
+    lastDispatchedVisitRef.current = `${threadKey}:${serverThread.updatedAt}`;
+    lastVisitDispatchAtRef.current = Date.now();
+    void visitThreadMutation({
+      environmentId: serverThread.environmentId,
+      input: {
+        threadId: serverThread.id,
+        visitedAt: serverThread.updatedAt,
+        opened: true,
+      },
+    });
+  }, [
+    activeRouteThreadRef,
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Refocus records an open deferred while the window was in the background.
+    documentAttentionVersion,
+    threadKey,
+    serverThread?.environmentId,
+    serverThread?.id,
+    serverThread?.lastVisitedAt,
+    serverThread?.updatedAt,
+    visitThreadMutation,
+  ]);
 
   useEffect(() => {
     if (!serverThread?.id) return;
