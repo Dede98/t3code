@@ -17,7 +17,6 @@ import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 
 import * as ServerConfig from "../config.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
@@ -41,7 +40,7 @@ const layerTest = (captured = true) =>
         PreviewBrowser.PreviewBrowser,
         PreviewBrowser.PreviewBrowser.of({
           executable: Effect.die("No browser should launch in export tests"),
-          installed: Effect.succeed(Option.none()),
+          installed: Effect.succeedNone,
         }),
       ),
     ),

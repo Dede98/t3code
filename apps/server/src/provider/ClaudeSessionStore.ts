@@ -251,15 +251,13 @@ const makeClaudeSessionStore = Effect.gen(function* () {
               Effect.mapError(
                 makeStoreError("load:decodeEntry", "A stored transcript entry is invalid JSON."),
               ),
-              Effect.flatMap((entry) =>
-                isSessionStoreEntry(entry)
-                  ? Effect.succeed(entry)
-                  : Effect.fail(
-                      new ClaudeSessionStoreError({
-                        operation: "load:validateEntry",
-                        detail: "A stored transcript entry does not have a string type field.",
-                      }),
-                    ),
+              Effect.filterOrFail(
+                isSessionStoreEntry,
+                () =>
+                  new ClaudeSessionStoreError({
+                    operation: "load:validateEntry",
+                    detail: "A stored transcript entry does not have a string type field.",
+                  }),
               ),
             ),
           );

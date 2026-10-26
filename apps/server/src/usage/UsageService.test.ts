@@ -266,6 +266,7 @@ const layerService = (input: {
     ),
     Layer.provideMerge(
       Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+        // @effect-diagnostics-next-line effectSucceedWithVoid:off - This optional result requires undefined, not the wider void type.
         getInstance: () => Effect.succeed(undefined),
         listInstances: (
           input.sources ??
@@ -2686,6 +2687,7 @@ describe("UsageService", () => {
       );
 
       let orphanedAt: number | undefined;
+      // oxlint-disable-next-line t3code/no-polling-loop-in-tests -- Fixed-count scheduler interruption matrix; each iteration exercises a different interruption point.
       for (let interruptAt = 1; interruptAt <= 31; interruptAt += 1) {
         const tasks: Array<() => void> = [];
         const dispatcher: Scheduler.SchedulerDispatcher = {

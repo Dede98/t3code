@@ -3,7 +3,8 @@ import { resolveThreadLastVisitedAt } from "../Sidebar.logic";
 import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { claimThreadOpen } from "@t3tools/client-runtime/state/thread-search";
 import { useParams } from "@tanstack/react-router";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
+import { getDocumentActivity, subscribeDocumentActivity } from "~/lib/documentActivity";
 import { useUiStateStore } from "../../uiStateStore";
 import { threadEnvironment } from "../../state/threads";
 import { useThreadShell } from "../../state/entities";
@@ -24,20 +25,7 @@ export function ThreadVisitWatermark(props: { readonly threadRef: ScopedThreadRe
     strict: false,
     select: (params) => resolveThreadRouteRef(params),
   });
-  const currentThreadKeyRef = useRef(scopedThreadKey(props.threadRef));
-  useLayoutEffect(() => {
-    currentThreadKeyRef.current = scopedThreadKey(props.threadRef);
-  }, [props.threadRef]);
-  const [documentAttentionVersion, setDocumentAttentionVersion] = useState(0);
-  useEffect(() => {
-    const refreshAttention = () => setDocumentAttentionVersion((version) => version + 1);
-    window.addEventListener("focus", refreshAttention);
-    document.addEventListener("visibilitychange", refreshAttention);
-    return () => {
-      window.removeEventListener("focus", refreshAttention);
-      document.removeEventListener("visibilitychange", refreshAttention);
-    };
-  }, []);
+  const documentActivity = useSyncExternalStore(subscribeDocumentActivity, getDocumentActivity);
   const serverThread = useThreadShell(props.threadRef);
   const threadKey = scopedThreadKey(props.threadRef);
   const markThreadVisited = useUiStateStore((store) => store.markThreadVisited);
@@ -60,8 +48,8 @@ export function ThreadVisitWatermark(props: { readonly threadRef: ScopedThreadRe
     if (
       activeRouteThreadRef?.environmentId !== viewedThreadRef.environmentId ||
       activeRouteThreadRef.threadId !== viewedThreadRef.threadId ||
-      document.visibilityState !== "visible" ||
-      !document.hasFocus()
+      !documentActivity.visible ||
+      !documentActivity.focused
     )
       return;
     recordedOpenRef.current = threadKey;
@@ -80,8 +68,7 @@ export function ThreadVisitWatermark(props: { readonly threadRef: ScopedThreadRe
     });
   }, [
     activeRouteThreadRef,
-    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Refocus records an open deferred while the window was in the background.
-    documentAttentionVersion,
+    documentActivity,
     threadKey,
     serverThread?.environmentId,
     serverThread?.id,
@@ -103,8 +90,8 @@ export function ThreadVisitWatermark(props: { readonly threadRef: ScopedThreadRe
       !shouldMarkThreadVisited({
         viewedThreadRef: scopeThreadRef(serverThread.environmentId, serverThread.id),
         activeRouteThreadRef,
-        isDocumentVisible: document.visibilityState === "visible",
-        isDocumentFocused: document.hasFocus(),
+        isDocumentVisible: documentActivity.visible,
+        isDocumentFocused: documentActivity.focused,
         threadUpdatedAt: serverThread.updatedAt,
         lastVisitedAt: effectiveLastVisitedAt,
       })
@@ -119,12 +106,8 @@ export function ThreadVisitWatermark(props: { readonly threadRef: ScopedThreadRe
       const dispatchKey = `${threadKey}:${serverThread.updatedAt}`;
       if (lastDispatchedVisitRef.current === dispatchKey) return;
       const dispatch = () => {
-        if (
-          document.visibilityState !== "visible" ||
-          !document.hasFocus() ||
-          currentThreadKeyRef.current !== threadKey
-        )
-          return;
+        const activity = getDocumentActivity();
+        if (!activity.visible || !activity.focused) return;
         lastDispatchedVisitRef.current = dispatchKey;
         lastVisitDispatchAtRef.current = Date.now();
         void visitThreadMutation({
@@ -153,8 +136,7 @@ export function ThreadVisitWatermark(props: { readonly threadRef: ScopedThreadRe
     );
   }, [
     activeRouteThreadRef,
-    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Refocus rechecks the visit watermark even when the thread did not change.
-    documentAttentionVersion,
+    documentActivity,
     activeThreadLocalLastVisitedAt,
     markThreadVisited,
     threadKey,

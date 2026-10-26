@@ -471,26 +471,25 @@ const make = Effect.gen(function* () {
     ),
   );
 
-  const requestTheme = Effect.fn("HtmlRender.requestTheme")(function* (input: {
-    readonly threadId?: ThreadId | undefined;
-    readonly theme?: HtmlRenderTheme | undefined;
-  }) {
-    if (input.theme) return input.theme;
-    if (input.threadId === undefined) return undefined;
-    const shell = yield* threads
-      .getThreadShell(input.threadId)
-      .pipe(Effect.mapError((cause) => new HtmlArtifactContextError({ cause })));
-    if (!shell?.activeRunId) return undefined;
-    const { messages } = yield* threads
-      .getThreadRecords(input.threadId, ["messages"], {
+  const requestTheme = Effect.fn("HtmlRender.requestTheme")(
+    function* (input: {
+      readonly threadId?: ThreadId | undefined;
+      readonly theme?: HtmlRenderTheme | undefined;
+    }) {
+      if (input.theme) return input.theme;
+      if (input.threadId === undefined) return undefined;
+      const shell = yield* threads.getThreadShell(input.threadId);
+      if (!shell?.activeRunId) return undefined;
+      const { messages } = yield* threads.getThreadRecords(input.threadId, ["messages"], {
         messageRunIds: [shell.activeRunId],
         messageRoles: ["user"],
-      })
-      .pipe(Effect.mapError((cause) => new HtmlArtifactContextError({ cause })));
-    // Steering belongs to this run; queued requests belong to other runs and cannot recolor it.
-    return messages.findLast((message) => message.context?.htmlTheme !== undefined)?.context
-      ?.htmlTheme;
-  });
+      });
+      // Steering belongs to this run; queued requests belong to other runs and cannot recolor it.
+      return messages.findLast((message) => message.context?.htmlTheme !== undefined)?.context
+        ?.htmlTheme;
+    },
+    Effect.mapError((cause) => new HtmlArtifactContextError({ cause })),
+  );
 
   const sourceHtml = Effect.fn("HtmlRender.sourceHtml")(function* (input: HtmlSourceInput) {
     if ((input.html === undefined) === (input.attachmentId === undefined))

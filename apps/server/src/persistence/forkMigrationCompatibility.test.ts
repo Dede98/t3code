@@ -15,6 +15,7 @@ import { seedForkMigrations } from "./Migrations.testkit.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 
 const seedFork = (through = 55) => seedForkMigrations(through);
+const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 it.effect(
   "upgrades the fork ledger on a snapshot and preserves the original, including WAL",
@@ -32,7 +33,7 @@ it.effect(
         writer
           .prepare("INSERT INTO claude_session_store_keys VALUES (?, ?, ?, ?)")
           .run("-fork-project", "native-session", "session.jsonl", 1234);
-        const nativeEntry = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
+        const nativeEntry = yield* encodeJson({
           type: "user",
           uuid: "native-message",
           message: { role: "user", content: "preserved native context ".repeat(100) },

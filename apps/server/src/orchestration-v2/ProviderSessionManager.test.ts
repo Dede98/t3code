@@ -592,6 +592,9 @@ function layerTest(input: {
   );
 }
 
+const decodeServerSettings = Schema.decodeEffect(ServerSettingsSchema);
+const encodeServerSettings = Schema.encodeEffect(ServerSettingsSchema);
+
 const fakeHttpServer = HttpServer.HttpServer.of({
   address: NetAddress.inetAddressFromIpStringUnsafe("127.0.0.1", 43123),
   serve: (() => Effect.void) as HttpServer.HttpServer["Service"]["serve"],
@@ -1241,7 +1244,7 @@ it.effect(
             Effect.flatMap((hold) =>
               hold
                 ? Deferred.succeed(projectReadHeld, undefined).pipe(Effect.andThen(Effect.never))
-                : Effect.succeed(Option.some(makeBrowserAccessProject(requestedProjectId))),
+                : Effect.succeedSome(makeBrowserAccessProject(requestedProjectId)),
             ),
           ),
       });
@@ -3814,9 +3817,9 @@ it.effect.each((["provider", "mcp"] as const).map((changedSetting) => ({ changed
           runtimePolicy,
         });
         // SDK dispatch has returned, but its operation has not completed.
-        const initial = yield* Schema.decodeEffect(ServerSettingsSchema)({});
-        const encoded = yield* Schema.encodeEffect(ServerSettingsSchema)(initial);
-        const next = yield* Schema.decodeUnknownEffect(ServerSettingsSchema)({
+        const initial = yield* decodeServerSettings({});
+        const encoded = yield* encodeServerSettings(initial);
+        const next = yield* decodeServerSettings({
           ...encoded,
           ...(changedSetting === "provider"
             ? {

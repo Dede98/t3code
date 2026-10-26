@@ -93,6 +93,7 @@ export function RecentThreadSwitcher() {
     if (entry) useRecentThreadStore.getState().remember(entry);
   });
   const routeReady = draft !== null || (currentThread !== null && !currentThread.deletedAt);
+  // oxlint-disable-next-line t3code/react-effect-budget -- A committed route is only known after navigation resolves.
   useEffect(() => {
     // oxlint-disable-next-line react/set-state-in-effect -- A committed router navigation cancels the in-progress keyboard selection.
     rememberRoute(
@@ -105,6 +106,7 @@ export function RecentThreadSwitcher() {
     );
   }, [environmentId, threadId, draftId, routeReady]);
 
+  // oxlint-disable-next-line t3code/react-effect-budget -- Subscribes to the external draft store.
   useEffect(
     () =>
       useComposerDraftStore.subscribe((state, previous) => {
@@ -223,6 +225,7 @@ export function RecentThreadSwitcher() {
     }
   });
 
+  // oxlint-disable-next-line t3code/react-effect-budget -- Window and desktop key listeners need capture-phase subscription.
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => onKeyDown(event);
     const keyup = (event: KeyboardEvent) => onKeyUp(event);
@@ -249,6 +252,7 @@ export function RecentThreadSwitcher() {
   }, [updateSession]);
 
   const selectedIndex = session?.index;
+  // oxlint-disable-next-line t3code/react-effect-budget -- The selected row exists in the DOM only after the dialog renders it.
   useEffect(() => {
     listRef.current
       ?.querySelector(`#recent-thread-${selectedIndex}`)

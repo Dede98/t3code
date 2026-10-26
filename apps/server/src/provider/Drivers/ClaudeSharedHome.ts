@@ -87,6 +87,7 @@ export const materializeClaudeSharedHome = Effect.fn("materializeClaudeSharedHom
         }),
         Effect.catchTags({
           PlatformError: (error) => {
+            // @effect-diagnostics-next-line effectSucceedWithVoid:off - A missing link is undefined; null means a non-link entry.
             if (error.reason._tag === "NotFound") return Effect.succeed(undefined);
             const cause = error.reason.cause;
             if (
