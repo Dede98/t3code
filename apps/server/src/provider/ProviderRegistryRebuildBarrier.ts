@@ -22,9 +22,14 @@ export class ProviderRegistryRebuildBarrier extends Context.Service<
 export const makeProviderRegistryRebuildBarrier = Effect.gen(function* () {
   const lock = yield* Effect.tx(TxReentrantLock.make());
 
+  // Untraced: the wrapped adapter operation and registry rebuild carry their own spans.
   return ProviderRegistryRebuildBarrier.of({
-    withOperation: (effect) => TxReentrantLock.withReadLock(lock, effect),
-    withRebuild: (effect) => TxReentrantLock.withWriteLock(lock, effect),
+    withOperation: Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+      return yield* TxReentrantLock.withReadLock(lock, effect);
+    }),
+    withRebuild: Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+      return yield* TxReentrantLock.withWriteLock(lock, effect);
+    }),
   });
 });
 

@@ -70,7 +70,7 @@ vi.mock(import("./SettingsScopeContext"), async (original) => ({
   useOptionalSettingsScope: () => null,
 }));
 
-import { IntegrationsSettingsPanel } from "./IntegrationsSettings";
+import { BrowserSettingsPanel } from "./IntegrationsSettings";
 
 const localId = EnvironmentId.make("local");
 const remoteId = EnvironmentId.make("remote");
@@ -105,7 +105,7 @@ async function openSettings() {
   stack.use(
     await render(
       <StrictMode>
-        <IntegrationsSettingsPanel />
+        <BrowserSettingsPanel />
       </StrictMode>,
     ),
   );

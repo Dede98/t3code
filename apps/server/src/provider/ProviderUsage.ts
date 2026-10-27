@@ -72,38 +72,33 @@ export const makeProviderUsage = Effect.fn("makeProviderUsage")(function* () {
         );
       }),
     ),
-    refresh: (requestedIds) =>
-      Effect.gen(function* () {
-        if (requestedIds === undefined) {
-          yield* registry.refresh();
-        } else {
-          yield* Effect.forEach([...new Set(requestedIds)], (id) => registry.refreshInstance(id), {
-            concurrency: 3,
-          });
-        }
-        const providers = yield* registry.getProviders;
-        const selected =
-          requestedIds === undefined
-            ? providers
-            : providers.filter((provider) => requestedIds.includes(provider.instanceId));
-        const usage = legacyProviderUsage(selected);
-        const ids = requestedIds ?? selected.map((provider) => provider.instanceId);
-        const failures = [...new Set(ids)].flatMap((providerInstanceId) => {
-          if (usage.some((snapshot) => snapshot.providerInstanceId === providerInstanceId))
-            return [];
-          const provider = selected.find(
-            (candidate) => candidate.instanceId === providerInstanceId,
-          );
-          return [
-            {
-              providerInstanceId,
-              message:
-                provider?.usageLimits?.unavailable?.message ?? "Usage limits are unavailable.",
-            },
-          ];
+    refresh: Effect.fn("ProviderUsage.refresh")(function* (requestedIds) {
+      if (requestedIds === undefined) {
+        yield* registry.refresh();
+      } else {
+        yield* Effect.forEach([...new Set(requestedIds)], (id) => registry.refreshInstance(id), {
+          concurrency: 3,
         });
-        return { refreshedAt: DateTime.formatIso(yield* DateTime.now), usage, failures };
-      }),
+      }
+      const providers = yield* registry.getProviders;
+      const selected =
+        requestedIds === undefined
+          ? providers
+          : providers.filter((provider) => requestedIds.includes(provider.instanceId));
+      const usage = legacyProviderUsage(selected);
+      const ids = requestedIds ?? selected.map((provider) => provider.instanceId);
+      const failures = [...new Set(ids)].flatMap((providerInstanceId) => {
+        if (usage.some((snapshot) => snapshot.providerInstanceId === providerInstanceId)) return [];
+        const provider = selected.find((candidate) => candidate.instanceId === providerInstanceId);
+        return [
+          {
+            providerInstanceId,
+            message: provider?.usageLimits?.unavailable?.message ?? "Usage limits are unavailable.",
+          },
+        ];
+      });
+      return { refreshedAt: DateTime.formatIso(yield* DateTime.now), usage, failures };
+    }),
   });
 });
 

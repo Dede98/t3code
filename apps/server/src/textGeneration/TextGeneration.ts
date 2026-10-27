@@ -59,30 +59,34 @@ export const make = Effect.gen(function* () {
   const rebuildBarrier = yield* ProviderRegistryRebuildBarrier;
   const sourceControl = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
   return TextGeneration.of({
-    generateCommitMessage: (input) =>
-      rebuildBarrier.withOperation(
+    generateCommitMessage: Effect.fn("TextGeneration.generateCommitMessage")(function (input) {
+      return rebuildBarrier.withOperation(
         resolveInstance(registry, "generateCommitMessage", input.modelSelection.instanceId).pipe(
           Effect.flatMap((textGeneration) => textGeneration.generateCommitMessage(input)),
         ),
-      ),
-    generatePrContent: (input) =>
-      rebuildBarrier.withOperation(
+      );
+    }),
+    generatePrContent: Effect.fn("TextGeneration.generatePrContent")(function (input) {
+      return rebuildBarrier.withOperation(
         resolveInstance(registry, "generatePrContent", input.modelSelection.instanceId).pipe(
           Effect.flatMap((textGeneration) => textGeneration.generatePrContent(input)),
         ),
-      ),
-    generateBranchName: (input) =>
-      rebuildBarrier.withOperation(
+      );
+    }),
+    generateBranchName: Effect.fn("TextGeneration.generateBranchName")(function (input) {
+      return rebuildBarrier.withOperation(
         resolveInstance(registry, "generateBranchName", input.modelSelection.instanceId).pipe(
           Effect.flatMap((textGeneration) => textGeneration.generateBranchName(input)),
         ),
-      ),
-    generateReviewGuide: (input) =>
-      resolveInstance(registry, "generateReviewGuide", input.modelSelection.instanceId).pipe(
+      );
+    }),
+    generateReviewGuide: Effect.fn("TextGeneration.generateReviewGuide")(function (input) {
+      return resolveInstance(registry, "generateReviewGuide", input.modelSelection.instanceId).pipe(
         Effect.flatMap((textGeneration) => textGeneration.generateReviewGuide(input)),
-      ),
-    generateThreadTitle: (input) =>
-      rebuildBarrier.withOperation(
+      );
+    }),
+    generateThreadTitle: Effect.fn("TextGeneration.generateThreadTitle")(function (input) {
+      return rebuildBarrier.withOperation(
         resolveInstance(registry, "generateThreadTitle", input.modelSelection.instanceId).pipe(
           Effect.flatMap((textGeneration) =>
             Effect.gen(function* () {
@@ -98,7 +102,8 @@ export const make = Effect.gen(function* () {
             }),
           ),
         ),
-      ),
+      );
+    }),
   });
 });
 

@@ -136,7 +136,7 @@ function getIconOption(
 }
 
 function getInitialWindowBackgroundColor(shouldUseDarkColors: boolean): string {
-  return shouldUseDarkColors ? "#0a0a0a" : "#ffffff";
+  return shouldUseDarkColors ? "#000000" : "#ffffff";
 }
 
 type DisplayBounds = Pick<Electron.Rectangle, "x" | "y" | "width" | "height">;
@@ -1005,14 +1005,15 @@ export const make = Effect.gen(function* () {
         reveal: event.type === "started",
       });
     }),
-    dispatchNotificationClick: (target) =>
-      dispatchRendererEvent(NOTIFICATION_CLICKED_CHANNEL, target).pipe(
-        Effect.annotateSpans({
+    dispatchNotificationClick: Effect.fn("desktop.window.dispatchNotificationClick")(
+      function* (target) {
+        yield* Effect.annotateCurrentSpan({
           environmentId: target.environmentId,
           threadId: target.threadId,
-        }),
-        Effect.withSpan("desktop.window.dispatchNotificationClick"),
-      ),
+        });
+        yield* dispatchRendererEvent(NOTIFICATION_CLICKED_CHANNEL, target);
+      },
+    ),
     zoomMain: Effect.fn("desktop.window.zoomMain")(function* (direction) {
       yield* Effect.annotateCurrentSpan({ direction });
       const window = yield* electronWindow.main;

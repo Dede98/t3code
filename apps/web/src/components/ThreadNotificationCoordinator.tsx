@@ -24,7 +24,6 @@ import {
 
 import { getClientSettings, subscribeClientSettings } from "../hooks/useSettings";
 import { isWindowsPlatform } from "../lib/utils";
-import { setActiveEnvironmentId } from "../state/entities";
 import { environmentSummaries } from "../state/presentation";
 import { environmentShell } from "../state/shell";
 import {
@@ -360,7 +359,6 @@ export function startThreadNotifications(
   };
   const unsubscribeSettings = subscribeClientSettings(onSettings);
   const unsubscribeDesktopClick = window.desktopBridge?.onDesktopNotificationClick((target) => {
-    setActiveEnvironmentId(target.environmentId);
     void router.navigate({ to: "/$environmentId/$threadId", params: target });
   });
   const unsubscribeEnvironmentIds = registry.subscribe(

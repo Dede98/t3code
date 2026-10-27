@@ -2564,8 +2564,8 @@ export const layerWithOptions = (
       } satisfies ProviderSessionManagerV2Shape);
       if (Option.isSome(registryLifecycle)) {
         yield* registryLifecycle.value.register({
-          canRebuild: (ids) =>
-            Effect.gen(function* () {
+          canRebuild: Effect.fn("ProviderSessionManager.canRebuild")(
+            function* (ids) {
               for (const entry of (yield* Ref.get(sessions)).values()) {
                 if (!ids.has(entry.runtime.instanceId)) continue;
                 if (entry.busyTurns.size > 0) return false;
@@ -2573,10 +2573,10 @@ export const layerWithOptions = (
                   return false;
               }
               return true;
-            }).pipe(
-              Effect.timeoutOption("100 millis"),
-              Effect.map((result) => Option.isSome(result) && result.value),
-            ),
+            },
+            Effect.timeoutOption("100 millis"),
+            Effect.map((result) => Option.isSome(result) && result.value),
+          ),
           closeInstances: (ids) =>
             Effect.forEach(ids, (id) => manager.closeInstance(id), { discard: true }).pipe(
               Effect.orDie,

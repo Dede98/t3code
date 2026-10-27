@@ -18,12 +18,17 @@ export class ProviderRegistrySessionLifecycle extends Context.Service<
   static readonly layer = Layer.sync(ProviderRegistrySessionLifecycle, () => {
     let hooks: SessionLifecycle | undefined;
     return {
-      register: (next) =>
-        Effect.sync(() => {
+      register: Effect.fn("ProviderRegistrySessionLifecycle.register")(function (next) {
+        return Effect.sync(() => {
           hooks = next;
-        }),
-      canRebuild: (ids) => Effect.suspend(() => hooks?.canRebuild(ids) ?? Effect.succeed(true)),
-      closeInstances: (ids) => Effect.suspend(() => hooks?.closeInstances(ids) ?? Effect.void),
+        });
+      }),
+      canRebuild: Effect.fn("ProviderRegistrySessionLifecycle.canRebuild")(function (ids) {
+        return Effect.suspend(() => hooks?.canRebuild(ids) ?? Effect.succeed(true));
+      }),
+      closeInstances: Effect.fn("ProviderRegistrySessionLifecycle.closeInstances")(function (ids) {
+        return Effect.suspend(() => hooks?.closeInstances(ids) ?? Effect.void);
+      }),
     };
   });
 }

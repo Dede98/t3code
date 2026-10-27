@@ -11,7 +11,6 @@ import { fakeTimers, stubGlobal } from "../../test/render";
 const state = vi.hoisted(() => ({
   mode: "notifications" as ClientSettings["notificationMode"],
   navigate: vi.fn(),
-  setActiveEnvironmentId: vi.fn(),
   settingsListeners: new Set<() => void>(),
   notification: vi.fn(function (_title: string, options: NotificationOptions) {
     return Object.assign(new EventTarget(), { tag: options.tag, close: vi.fn() });
@@ -51,7 +50,6 @@ vi.mock(import("../hooks/useSettings"), async (original) => ({
     inAppNotificationsEnabled: false,
   })) as never,
 }));
-vi.mock("../state/entities", () => ({ setActiveEnvironmentId: state.setActiveEnvironmentId }));
 vi.mock(import("../threadNotifications"), async (original) => ({
   ...(await original()),
   playNotificationSound: vi.fn(),
@@ -179,7 +177,6 @@ it("uses one native desktop alert and routes its click to the owning environment
   expect(state.notification).not.toHaveBeenCalled();
 
   clicked!({ environmentId: "env-1", threadId: "thread-1" });
-  expect(state.setActiveEnvironmentId).toHaveBeenCalledWith("env-1");
   expect(state.navigate).toHaveBeenCalledWith({
     to: "/$environmentId/$threadId",
     params: { environmentId: "env-1", threadId: "thread-1" },
