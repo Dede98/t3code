@@ -111,6 +111,7 @@ describe("searchSettings", () => {
       "publish-agent-activity",
       "provider-health-check-interval",
       "cursor-keychain-usage",
+      "external-mcp-servers",
       "source-control-writer-model",
       "review-guide-model",
       "review-guide-instructions",
@@ -162,7 +163,7 @@ describe("searchSettings", () => {
     });
     expect(searchSettings("external mcp")[0]).toMatchObject({
       id: "external-mcp-servers",
-      to: "/settings/browser",
+      to: "/settings/providers",
     });
     expect(searchSettings("claude")[0]).toMatchObject({
       id: "claude-cross-account-continuation",

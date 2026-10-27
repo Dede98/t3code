@@ -100,6 +100,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { AddProviderInstanceDialog } from "./AddProviderInstanceDialog";
 import { ExpandableText } from "./ExpandableText";
+import { ExternalMcpServersSettings } from "./ExternalMcpServersSettings";
 import { ProviderInstanceCard } from "./ProviderInstanceCard";
 import { UsageProviderSettings } from "./UsageProviderSettings";
 import { ProviderSetupSection, readAntigravityAuthMethod } from "./ProviderSetupSection";
@@ -1228,6 +1229,8 @@ export function EnvironmentProviderSettings({
         />
         <CompactIdleThreadsRow />
       </SettingsSection>
+
+      <ExternalMcpServersSettings environmentId={environmentId} disabled={!canWriteSettings} />
 
       {isAddInstanceDialogOpen && !readOnly ? (
         <AddProviderInstanceDialog

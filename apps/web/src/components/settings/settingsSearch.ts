@@ -224,7 +224,8 @@ export const SETTINGS_SEARCH_ITEMS = [
   {
     id: "external-mcp-servers",
     title: "External MCP servers",
-    to: "/settings/browser",
+    to: "/settings/providers",
+    providerSettingsOnly: true,
   },
   {
     id: "storage-worktrees",
