@@ -1,3 +1,5 @@
+import { OrchestrationMessageContext } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -13,6 +15,7 @@ import { T3_CODE_DARK_THEME_COLORS, T3_CODE_LIGHT_THEME_COLORS } from "./themePa
 import { htmlRenderFromToolItem } from "./toolOutput.ts";
 
 const reference = { attachmentId: "thread-abc-123.html", title: "Chart", height: 420 };
+const decodeMessageContext = Schema.decodeSync(OrchestrationMessageContext);
 
 describe("injectHtmlRenderBootstrap", () => {
   it("puts the theme ahead of the page's own head content", () => {
@@ -187,6 +190,13 @@ describe("standalone theme export", () => {
     const context = { version: 1 as const, records: [] };
     expect(withHtmlTheme(context, theme)).toEqual({ ...context, htmlTheme: theme });
     expect(context).toEqual({ version: 1, records: [] });
+  });
+  it("gives a message without context one the server accepts", () => {
+    expect(decodeMessageContext(withHtmlTheme(undefined, theme))).toEqual({
+      version: 1,
+      records: [],
+      htmlTheme: theme,
+    });
   });
   it("refuses values that can break out of a stylesheet", () => {
     expect(() =>
