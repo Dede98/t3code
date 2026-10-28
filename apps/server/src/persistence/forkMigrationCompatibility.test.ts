@@ -12,6 +12,9 @@ import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
 import { migrationEntries, runMigrations } from "./Migrations.ts";
 import { seedForkMigrations } from "./Migrations.testkit.ts";
+import PeerLinks from "./Migrations/070_PeerLinks.ts";
+import PeerLinkFence from "./Migrations/071_PeerLinkFence.ts";
+import WaitingLinkRequestIndex from "./Migrations/072_WaitingLinkRequestIndex.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 
 const seedFork = (through = 55) => seedForkMigrations(through);
@@ -67,6 +70,9 @@ it.effect(
           [68, "WebhookDedupe"],
           [69, "ShellStopRequestIndex"],
           [70, "ThreadMessageSearch"],
+          [71, "PeerLinks"],
+          [72, "PeerLinkFence"],
+          [73, "WaitingLinkRequestIndex"],
         ]);
         // Each startup owns a fresh connection/layer.
         assert.deepEqual(yield* migrate, []);
@@ -170,6 +176,9 @@ it.effect("rolls back a failed fork foundation and retries from a fresh connecti
         [68, "WebhookDedupe"],
         [69, "ShellStopRequestIndex"],
         [70, "ThreadMessageSearch"],
+        [71, "PeerLinks"],
+        [72, "PeerLinkFence"],
+        [73, "WaitingLinkRequestIndex"],
       ],
     );
   }).pipe(
@@ -268,15 +277,18 @@ it.effect.each([0, 32, 52, 53, 54].map((through) => ({ through })))(
   },
 );
 
-it.effect.each([57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69])(
+it.effect.each([57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72])(
   "preserves official upstream webhook ledger through %s",
   (through) =>
     Effect.gen(function* () {
       const official = [
         ...migrationEntries.filter(([id]) => id <= 56),
         ...migrationEntries
-          .filter(([id]) => id >= 58)
+          .filter(([id]) => id >= 58 && id <= 70)
           .map(([id, name, migration]) => [id - 1, name, migration] as const),
+        [70, "PeerLinks", PeerLinks] as const,
+        [71, "PeerLinkFence", PeerLinkFence] as const,
+        [72, "WaitingLinkRequestIndex", WaitingLinkRequestIndex] as const,
       ].filter(([id]) => id <= through);
       yield* Migrator.make({})({
         loader: Migrator.fromRecord(
@@ -301,7 +313,29 @@ it.effect.each([57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69])(
       if (through >= 59) {
         yield* sql`INSERT INTO mcp_app_model_context ${sql.insert(appContext)}`;
       }
+      if (through >= 70) {
+        yield* sql`INSERT INTO peer_environment_links
+          (environment_id, secret_name, label, urls_json, access, linked_at, expires_at)
+          VALUES ('peer', 'kept-secret-ref', 'Peer', '[]', 'read', '2026-10-28', '2026-11-28')`;
+      }
       yield* runMigrations();
+      assert.ok(
+        (yield* sql`PRAGMA table_info(peer_environment_links)`).some(
+          (column) => column.name === "fenced",
+        ),
+      );
+      assert.equal(
+        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_waiting_link_idx'`)
+          .length,
+        1,
+      );
+      if (through >= 70) {
+        assert.equal(
+          (yield* sql`SELECT secret_name FROM peer_environment_links WHERE environment_id = 'peer'`)[0]
+            ?.secret_name,
+          "kept-secret-ref",
+        );
+      }
       assert.equal(
         (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_failed_error_idx'`)
           .length,
@@ -329,7 +363,7 @@ it.effect.each([57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69])(
         1,
       );
       assert.equal(
-        (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = ${through >= 69 ? 70 : through >= 68 ? 69 : through >= 67 ? 68 : through >= 66 ? 67 : through >= 65 ? 66 : through >= 64 ? 65 : through >= 63 ? 64 : through >= 62 ? 63 : through >= 61 ? 62 : through >= 59 ? 61 : 59}`)[0]
+        (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = ${through >= 70 ? through + 1 : through >= 69 ? 70 : through >= 68 ? 69 : through >= 67 ? 68 : through >= 66 ? 67 : through >= 65 ? 66 : through >= 64 ? 65 : through >= 63 ? 64 : through >= 62 ? 63 : through >= 61 ? 62 : through >= 59 ? 61 : 59}`)[0]
           ?.name,
         "ClaudeSessionStore",
       );

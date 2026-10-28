@@ -137,6 +137,7 @@ const savedContent = (prompt: string) => ({
   previewAnnotations: [],
   threadContexts: [],
   htmlTheme: htmlRenderTheme(T3_CODE_DARK_THEME_COLORS, "dark"),
+  environmentContexts: [],
 });
 
 const promptOf = (ref: ScopedThreadRef) =>

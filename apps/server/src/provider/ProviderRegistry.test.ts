@@ -56,6 +56,7 @@ import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEve
 import * as ProviderInstanceRegistryHydration from "./ProviderInstanceRegistryHydration.ts";
 import { makeProviderRegistryRebuildBarrier } from "./ProviderRegistryRebuildBarrier.ts";
 import * as ProviderRegistryRebuildBarrier from "./ProviderRegistryRebuildBarrier.ts";
+import * as PortScanner from "../preview/PortScanner.ts";
 import * as ServerConfig from "../config.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettingsModule from "../serverSettings.ts";
@@ -115,6 +116,7 @@ const ClaudeSessionStoreTestLive = ClaudeSessionStore.layer.pipe(
   Layer.provide(SqlitePersistence.layerMemory),
 );
 const ProviderInstanceRegistryHydrationTestLive = ProviderInstanceRegistryHydration.layer.pipe(
+  Layer.provide(PortScanner.layerTest),
   Layer.provideMerge(ProviderRegistrySessionLifecycle.layer),
   Layer.provide(ProviderRegistryRebuildBarrier.layer),
 );
@@ -125,7 +127,6 @@ const layerRegistry = ProviderRegistry.layer.pipe(
 const layerBackgroundPolicyAlwaysRun = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
   reportClientActivity: () => Effect.void,
   removeRpcClient: () => Effect.void,
-  reportHostPowerState: () => Effect.void,
   snapshot: Effect.succeed({
     hostPower: {
       source: "unknown",
@@ -145,8 +146,6 @@ const layerBackgroundPolicyAlwaysRun = Layer.mock(BackgroundPolicy.BackgroundPol
     shouldRunOpportunisticWork: true,
     updatedAt: TEST_EPOCH,
   }),
-  streamChanges: Stream.empty,
-  hasDemand: () => Effect.succeed(true),
   shouldRunScopeWork: () => Effect.succeed(true),
   shouldRunOpportunisticWork: Effect.succeed(true),
 });
