@@ -591,6 +591,14 @@ export const importClaudeNativeSessionToStore = Effect.fn(
       return { state: "already-synced" as const, snapshot: storedSnapshot };
     }
     if (!storeIsSourcePrefix) {
+      // Claude Code keeps some entries (tools-used, api-request) out of the store, so the native
+      // transcript can stop matching it. The next turn resumes from the store at this checkpoint.
+      if (
+        options.expectedAssistantUuid !== undefined &&
+        hasExpectedCheckpoint(storedSnapshot, options.expectedAssistantUuid)
+      ) {
+        return { state: "already-synced" as const, snapshot: storedSnapshot };
+      }
       const divergence = describeSnapshotDivergence(sourceSnapshot, storedSnapshot);
       return yield* storeError(
         "nativeResume:importDiverged",

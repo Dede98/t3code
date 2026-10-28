@@ -621,6 +621,32 @@ testLayer("ClaudeNativeResumeStore", (it) => {
         );
 
         assert.equal(error.operation, "nativeResume:importDiverged");
+
+        const storeHoldsCheckpoint = yield* importClaudeNativeSessionToStore(
+          sharedStore,
+          {
+            sessionId,
+            sourceConfigDirPath,
+            projectKey: PROJECT_KEY,
+            expectedAssistantUuid: "store-assistant",
+          },
+          { fileSystem, path },
+        );
+        assert.equal(storeHoldsCheckpoint.state, "already-synced");
+
+        const sourceOnlyCheckpoint = yield* Effect.flip(
+          importClaudeNativeSessionToStore(
+            sharedStore,
+            {
+              sessionId,
+              sourceConfigDirPath,
+              projectKey: PROJECT_KEY,
+              expectedAssistantUuid: "source-assistant",
+            },
+            { fileSystem, path },
+          ),
+        );
+        assert.equal(sourceOnlyCheckpoint.operation, "nativeResume:importDiverged");
         assert.equal(
           (yield* Effect.promise(() =>
             sharedStore.loadSession({ projectKey: PROJECT_KEY, sessionId }),
