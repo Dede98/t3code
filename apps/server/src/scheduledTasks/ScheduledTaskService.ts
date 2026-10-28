@@ -47,6 +47,7 @@ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as UsageLimitFailover from "../orchestration-v2/UsageLimitFailover.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { isMissedFixedTimeRun, isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
@@ -416,6 +417,7 @@ export const layer = Layer.effect(
     const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
     const secretRequests = yield* SecretRequests.SecretRequests;
     const scheduler = yield* Scheduler.Scheduler;
+    const limitFailover = yield* Effect.serviceOption(UsageLimitFailover.UsageLimitFailover);
     const readWebhookOrigin = yield* ScheduledTaskWebhookOrigin;
     const webhookPermits = yield* Ref.make<ReadonlyMap<ScheduledTaskId, Semaphore.Semaphore>>(
       new Map(),
@@ -840,6 +842,13 @@ export const layer = Layer.effect(
         const messageId = MessageId.make(`scheduled-task-message:${fireKey}`);
         // A webhook prompt was rendered from the row when the request arrived.
         const prompt = webhook?.prompt ?? active.prompt;
+        const launchModelSelection =
+          active.threadId === null && Option.isSome(limitFailover)
+            ? yield* limitFailover.value.launchSelection({
+                projectId: active.projectId,
+                modelSelection: active.modelSelection,
+              })
+            : active.modelSelection;
 
         // Capture defects and interrupts too so dispatch failures still reach markCompleted.
         const result =
@@ -850,7 +859,7 @@ export const layer = Layer.effect(
                     commandId,
                     projectId: active.projectId,
                     title: active.title,
-                    modelSelection: active.modelSelection,
+                    modelSelection: launchModelSelection,
                     runtimeMode: active.runtimeMode,
                     interactionMode: active.interactionMode,
                     workspaceStrategy: active.workspaceStrategy,

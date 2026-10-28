@@ -13,6 +13,10 @@ against the live tree and history because they can move over time.
 - The Labs alpha that moves a usage-limited thread to another same-driver account
   (`failoverLimitedThreads`, `apps/server/src/orchestration-v2/UsageLimitFailover.ts`, hooked into
   `UsageLimitRecoveryWorker`). Upstream's FAQ rejects an auto-switcher, so it never goes upstream.
+  It also patches two upstream files: `ScheduledTaskService` asks `launchSelection` for the account
+  of a new thread, and `followsCurrentConversation` in `Orchestrator.ts` calls `movedPastUsageLimit`
+  (`UsageLimitQueueFollow.ts`). That second part applies regardless of the setting, so queued runs
+  pinned to a limited account follow a manual Resume on another account too.
 - A provider registry scoped per instance.
 - Provider hydration that terminates only sessions affected by the changed provider state.
 - Claude Agent SDK compatibility with the native resume store: a null first main `load()` from a

@@ -5,6 +5,7 @@ import {
   type ModelSelection,
   type OrchestrationV2AppThread,
   type OrchestrationV2Run,
+  type ProjectId,
   type ProviderInstanceId,
   resolveProjectProviderInstanceEnabled,
   type ServerProvider,
@@ -31,6 +32,7 @@ const MIN_REMAINING_PERCENT = 10;
 // Claude caches its usage probe for five minutes, so even a refresh can return data that old.
 const MAX_LIMITS_AGE_MS = 10 * 60_000;
 const REFRESH_LIMITS_AFTER_MS = 60_000;
+const LIMITS_PROBE_TIMEOUT = "15 seconds";
 const MAX_FAILOVERS_PER_HOUR = 2;
 const FAILOVER_ID_PREFIX = "limit-failover:";
 const SCOPED_WEEKLY_PREFIX = "seven_day_";
@@ -139,27 +141,50 @@ function targetModel(provider: ServerProvider, selection: ModelSelection) {
     : null;
 }
 
-/** The tightest allowance the model draws from, or null when it is unknown or stale. */
-function remainingAllowance(
+/** Known, fresh windows the model draws from; empty when the limits are unknown or stale. */
+function applicableWindows(
   limits: ServerProviderUsageLimits | undefined,
   modelText: string,
   nowMs: number,
-): number | null {
+): ReadonlyArray<ServerProviderUsageWindow> {
   if (
     limits === undefined ||
     limits.unavailable !== undefined ||
     !(nowMs - Date.parse(limits.checkedAt) <= MAX_LIMITS_AGE_MS)
   ) {
-    return null;
+    return [];
   }
-  const windows = limits.windows.filter((window) => windowApplies(window, modelText));
-  if (windows.length === 0) return null;
-  return Math.min(
-    ...windows.map((window) =>
-      window.resetsAt !== undefined && Date.parse(window.resetsAt) <= nowMs
-        ? 100
-        : 100 - window.usedPercent,
-    ),
+  return limits.windows.filter((window) => windowApplies(window, modelText));
+}
+
+const windowRemaining = (window: ServerProviderUsageWindow, nowMs: number) =>
+  window.resetsAt !== undefined && Date.parse(window.resetsAt) <= nowMs
+    ? 100
+    : 100 - window.usedPercent;
+
+function remainingAllowance(
+  limits: ServerProviderUsageLimits | undefined,
+  modelText: string,
+  nowMs: number,
+): number | null {
+  const windows = applicableWindows(limits, modelText, nowMs);
+  return windows.length === 0
+    ? null
+    : Math.min(...windows.map((window) => windowRemaining(window, nowMs)));
+}
+
+/** Whether the account has spent the model's allowance until a reset more than 30 minutes away. */
+export function limitBlocksLaunch(
+  provider: ServerProvider,
+  modelSelection: ModelSelection,
+  nowMs: number,
+): boolean {
+  const modelText =
+    targetModel(provider, modelSelection)?.text ?? modelSelection.model.toLowerCase();
+  return applicableWindows(provider.usageLimits, modelText, nowMs).some(
+    (window) =>
+      windowRemaining(window, nowMs) < MIN_REMAINING_PERCENT &&
+      (window.resetsAt === undefined || Date.parse(window.resetsAt) - nowMs > WAIT_THRESHOLD_MS),
   );
 }
 
@@ -188,6 +213,11 @@ export interface UsageLimitFailoverShape {
   readonly attempt: (
     thread: ProjectionStore.ProjectionLimitRecoveryCandidate,
   ) => Effect.Effect<LimitFailoverOutcome>;
+  /** The account a new thread should start on: the given one unless its allowance is spent. */
+  readonly launchSelection: (input: {
+    readonly projectId: ProjectId;
+    readonly modelSelection: ModelSelection;
+  }) => Effect.Effect<ModelSelection>;
 }
 
 export class UsageLimitFailover extends Context.Service<
@@ -202,6 +232,94 @@ const make = Effect.gen(function* () {
   const continuation = yield* ProviderThreadContinuationSync.ProviderThreadContinuationSync;
   const threads = yield* ThreadManagement.ThreadManagementService;
   const settings = yield* ServerSettings.ServerSettingsService;
+
+  // Some accounts never report limits, so each is probed at most once a minute whatever it returns.
+  const lastProbeAt = new Map<ProviderInstanceId, number>();
+  const refreshStaleLimits = Effect.fn("UsageLimitFailover.refreshStaleLimits")(function* (
+    providers: ReadonlyArray<ServerProvider>,
+    instanceIds: Iterable<ProviderInstanceId>,
+    nowMs: number,
+  ) {
+    let latest = providers;
+    for (const instanceId of instanceIds) {
+      const checkedAt = latest.find((provider) => provider.instanceId === instanceId)?.usageLimits
+        ?.checkedAt;
+      const fresh =
+        checkedAt !== undefined && nowMs - Date.parse(checkedAt) <= REFRESH_LIMITS_AFTER_MS;
+      const probedRecently =
+        nowMs - (lastProbeAt.get(instanceId) ?? Number.NEGATIVE_INFINITY) < REFRESH_LIMITS_AFTER_MS;
+      if (fresh || probedRecently) continue;
+      lastProbeAt.set(instanceId, nowMs);
+      const current = latest;
+      latest = yield* registry
+        .refreshInstance(instanceId)
+        .pipe(
+          Effect.timeoutOption(LIMITS_PROBE_TIMEOUT),
+          Effect.map(Option.getOrElse(() => current)),
+        );
+    }
+    return latest;
+  });
+
+  const peersFor = (
+    providers: ReadonlyArray<ServerProvider>,
+    source: ServerProvider,
+    modelSelection: ModelSelection,
+    enabledForProject: (instanceId: ProviderInstanceId) => boolean,
+  ) =>
+    providers.filter(
+      (peer) =>
+        peer.driver === source.driver &&
+        peer.instanceId !== source.instanceId &&
+        isUsable(peer) &&
+        targetModel(peer, modelSelection) !== null &&
+        enabledForProject(peer.instanceId),
+    );
+
+  const launchSelection = Effect.fn("UsageLimitFailover.launchSelection")(
+    function* (input: { readonly projectId: ProjectId; readonly modelSelection: ModelSelection }) {
+      const preferences = yield* settings.getSettings;
+      if (!preferences.failoverLimitedThreads) return input.modelSelection;
+      const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+      const sourceId = input.modelSelection.instanceId;
+      let providers = yield* refreshStaleLimits(yield* registry.getProviders, [sourceId], nowMs);
+      const source = providers.find((provider) => provider.instanceId === sourceId);
+      if (source === undefined || !limitBlocksLaunch(source, input.modelSelection, nowMs)) {
+        return input.modelSelection;
+      }
+      // A new thread has no history to carry, so any account of the same driver can start it.
+      const eligibleInstanceIds = new Set(
+        peersFor(providers, source, input.modelSelection, (instanceId) =>
+          resolveProjectProviderInstanceEnabled(preferences, input.projectId, instanceId),
+        ).map((peer) => peer.instanceId),
+      );
+      providers = yield* refreshStaleLimits(providers, eligibleInstanceIds, nowMs);
+      const [target] = rankLimitFailoverTargets({
+        nowMs,
+        source,
+        modelSelection: input.modelSelection,
+        providers,
+        eligibleInstanceIds,
+      });
+      if (target === undefined) return input.modelSelection;
+      yield* Effect.logInfo("orchestration-v2.limit-failover.launch-moved", {
+        projectId: input.projectId,
+        sourceInstanceId: sourceId,
+        targetInstanceId: target.provider.instanceId,
+        remainingPercent: target.remainingPercent,
+      });
+      return target.modelSelection;
+    },
+    (effect, input) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("orchestration-v2.limit-failover.launch-failed", {
+            projectId: input.projectId,
+            cause,
+          }).pipe(Effect.as(input.modelSelection)),
+        ),
+      ),
+  );
 
   const attempt = Effect.fn("UsageLimitFailover.attempt")(
     function* (candidate: ProjectionStore.ProjectionLimitRecoveryCandidate) {
@@ -225,20 +343,10 @@ const make = Effect.gen(function* () {
 
       const preferences = yield* settings.getSettings;
       const eligibleInstanceIds = new Set<ProviderInstanceId>();
-      for (const peer of providers) {
-        if (
-          peer.driver !== source.driver ||
-          peer.instanceId === source.instanceId ||
-          !isUsable(peer) ||
-          targetModel(peer, run.modelSelection) === null ||
-          !resolveProjectProviderInstanceEnabled(
-            preferences,
-            projection.thread.projectId,
-            peer.instanceId,
-          )
-        ) {
-          continue;
-        }
+      const peers = peersFor(providers, source, run.modelSelection, (instanceId) =>
+        resolveProjectProviderInstanceEnabled(preferences, projection.thread.projectId, instanceId),
+      );
+      for (const peer of peers) {
         const plan = yield* Effect.option(
           switches.plan({
             projection,
@@ -248,11 +356,8 @@ const make = Effect.gen(function* () {
         // Only a native resume carries the whole conversation; a handoff summary would not.
         if (Option.isNone(plan) || plan.value.transition.type !== "restart_and_resume") continue;
         eligibleInstanceIds.add(peer.instanceId);
-        const checkedAt = peer.usageLimits?.checkedAt;
-        if (checkedAt === undefined || nowMs - Date.parse(checkedAt) > REFRESH_LIMITS_AFTER_MS) {
-          providers = yield* registry.refreshInstance(peer.instanceId);
-        }
       }
+      providers = yield* refreshStaleLimits(providers, eligibleInstanceIds, nowMs);
       const [target] = rankLimitFailoverTargets({
         nowMs,
         source,
@@ -313,7 +418,7 @@ const make = Effect.gen(function* () {
       ),
   );
 
-  return UsageLimitFailover.of({ attempt });
+  return UsageLimitFailover.of({ attempt, launchSelection });
 });
 
 export const layer = Layer.effect(UsageLimitFailover, make);

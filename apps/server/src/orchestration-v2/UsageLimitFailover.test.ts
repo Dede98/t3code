@@ -270,17 +270,74 @@ const threadProjection = (stoppedMeanwhile: boolean) =>
     ],
   }) as unknown as OrchestrationV2ThreadProjection;
 
+it.each([
+  {
+    name: "an account just under 10% with a far reset",
+    windows: [window("five_hour", "session", 91, iso(2 * 60 * MINUTE))],
+    expected: true,
+  },
+  {
+    name: "an account with exactly 10% left",
+    windows: [window("five_hour", "session", 90, iso(2 * 60 * MINUTE))],
+    expected: false,
+  },
+  {
+    name: "a spent account resetting in exactly 30 minutes",
+    windows: [window("five_hour", "session", 100, iso(30 * MINUTE))],
+    expected: false,
+  },
+  {
+    name: "a spent account resetting just after 30 minutes",
+    windows: [window("five_hour", "session", 100, iso(30 * MINUTE + 1_000))],
+    expected: true,
+  },
+  {
+    name: "an account whose weekly limit is spent while the session has room",
+    windows: [
+      window("five_hour", "session", 20),
+      window("seven_day", "weekly", 100, iso(3 * 24 * 60 * MINUTE)),
+    ],
+    expected: true,
+  },
+  { name: "an account with unknown limits", windows: [], expected: false },
+  {
+    name: "a spent account without a reset time",
+    windows: [window("primary", "session", 100)],
+    expected: true,
+  },
+  {
+    name: "an account that only spent another model's weekly limit",
+    windows: [
+      window("five_hour", "session", 20),
+      window("seven_day_sonnet", "weekly", 100, iso(3 * 24 * 60 * MINUTE)),
+    ],
+    expected: false,
+  },
+])("new threads avoid $name: $expected", ({ windows, expected }) => {
+  assert.equal(
+    UsageLimitFailover.limitBlocksLaunch(account("source", windows), selection("source"), NOW),
+    expected,
+  );
+});
+
 function failoverLayer(options: {
+  readonly failoverEnabled?: boolean;
+  readonly targetDisabledForProject?: boolean;
   readonly syncFails?: boolean;
   readonly stoppedDuringSync?: boolean;
   readonly transition?: "restart_and_resume" | "create_with_handoff";
+  readonly limitsAgeMs?: number;
 }) {
   const steps: Array<string> = [];
   const dispatched: Array<OrchestrationV2ServerCommand> = [];
+  const probes = { count: 0 };
+  const limitsCheckedAt = iso(-(options.limitsAgeMs ?? MINUTE));
   const providers = [
-    account("claude-a", [window("five_hour", "session", 100, RESET_AT)]),
-    account("claude-b", roomy),
-  ];
+    ["claude-a", [window("five_hour", "session", 100, RESET_AT)]] as const,
+    ["claude-b", roomy] as const,
+  ].map(([id, windows]) =>
+    account(id, windows, { usageLimits: { checkedAt: limitsCheckedAt, windows } }),
+  );
   let projectionReads = 0;
   const layer = UsageLimitFailover.layer.pipe(
     Layer.provide(
@@ -293,7 +350,11 @@ function failoverLayer(options: {
         }),
         Layer.mock(ProviderRegistry.ProviderRegistry)({
           getProviders: Effect.succeed(providers),
-          refreshInstance: () => Effect.succeed(providers),
+          refreshInstance: () =>
+            Effect.sync(() => {
+              probes.count += 1;
+              return providers;
+            }),
         }),
         Layer.mock(ProviderSwitchService.ProviderSwitchServiceV2)({
           plan: () =>
@@ -327,15 +388,27 @@ function failoverLayer(options: {
             }),
         }),
         ServerSettings.layerTest({
+          failoverLimitedThreads: options.failoverEnabled === true,
           providerInstances: {
             [ProviderInstanceId.make("claude-a")]: { driver: claude, enabled: true },
             [ProviderInstanceId.make("claude-b")]: { driver: claude, enabled: true },
           },
+          ...(options.targetDisabledForProject === true
+            ? {
+                projectSettingsOverrides: {
+                  [ProjectId.make("project-1")]: {
+                    providerInstances: {
+                      [ProviderInstanceId.make("claude-b")]: { enabled: false },
+                    },
+                  },
+                },
+              }
+            : {}),
         }),
       ),
     ),
   );
-  return { layer, steps, dispatched };
+  return { layer, steps, dispatched, probes };
 }
 
 it.effect.each([
@@ -383,5 +456,53 @@ it.effect.each([
     } else {
       assert.deepEqual(dispatched, []);
     }
+  }),
+);
+
+// Limits five minutes old are still usable but due for a probe.
+it.effect.each([
+  {
+    name: "keeps the stored account without probing while the switch is off",
+    failoverEnabled: false,
+    expected: "claude-a",
+    expectedProbes: 0,
+  },
+  {
+    name: "starts on an account with allowance when the stored one is spent",
+    failoverEnabled: true,
+    expected: "claude-b",
+    expectedProbes: 2,
+  },
+  {
+    name: "never starts on an account the project turned off",
+    failoverEnabled: true,
+    targetDisabledForProject: true,
+    expected: "claude-a",
+    expectedProbes: 1,
+  },
+  {
+    name: "probes each account at most once a minute",
+    failoverEnabled: true,
+    launches: 3,
+    expected: "claude-b",
+    expectedProbes: 2,
+  },
+])("launchSelection $name", ({ expected, expectedProbes, launches, ...options }) =>
+  Effect.gen(function* () {
+    const { layer, probes } = failoverLayer({ ...options, limitsAgeMs: 5 * MINUTE });
+    yield* TestClock.setTime(NOW);
+    const chosen = yield* Effect.gen(function* () {
+      const failover = yield* UsageLimitFailover.UsageLimitFailover;
+      const launch = failover.launchSelection({
+        projectId: ProjectId.make("project-1"),
+        modelSelection: selection("claude-a"),
+      });
+      let latest = yield* launch;
+      for (let index = 1; index < (launches ?? 1); index += 1) latest = yield* launch;
+      return latest;
+    }).pipe(Effect.provide(layer));
+
+    assert.deepEqual(chosen, selection(expected));
+    assert.equal(probes.count, expectedProbes);
   }),
 );

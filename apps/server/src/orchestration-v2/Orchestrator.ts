@@ -115,6 +115,7 @@ import {
   isUndeliveredMailboxSteer,
 } from "./NotificationMailbox.ts";
 import { EventSinkV2 } from "./EventSink.ts";
+import { movedPastUsageLimit } from "./UsageLimitQueueFollow.ts";
 import {
   decideGuestMessageSend,
   guestShareAfterCancelledSend,
@@ -722,21 +723,26 @@ function nextQueuedRun(
   return queuedRunsInDeliveryOrder(projection).find((run) => run.queueHeld !== true);
 }
 
+type QueueFollowProjection = Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "turnItems">;
+
 function followsCurrentConversation(
+  projection: QueueFollowProjection,
+  run: Pick<OrchestrationV2Run, "providerInstanceId" | "requestedAt">,
   message: OrchestrationV2ConversationMessage | undefined,
 ): boolean {
-  return (
-    message?.notification?.source.kind === "monitor" && !isBufferedProviderNotification(message)
-  );
+  // Buffered provider output belongs to the session that produced it.
+  if (message !== undefined && isBufferedProviderNotification(message)) return false;
+  return message?.notification?.source.kind === "monitor" || movedPastUsageLimit(projection, run);
 }
 
 function queuedRunModelSelection(
-  projection: Pick<OrchestrationV2ThreadProjection, "thread" | "messages">,
+  projection: QueueFollowProjection & Pick<OrchestrationV2ThreadProjection, "messages">,
   run: OrchestrationV2Run,
 ): ModelSelection {
   const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
-  // App-owned monitor updates follow the agent currently handling the thread.
-  return followsCurrentConversation(message)
+  // App-owned monitor updates, and messages left on a limited account the work moved past,
+  // follow the agent currently handling the thread.
+  return followsCurrentConversation(projection, run, message)
     ? projection.thread.modelSelection
     : run.modelSelection;
 }
@@ -1607,7 +1613,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const activeProviderThread = projection.providerThreads.find(
         (candidate) => candidate.id === projection.thread.activeProviderThreadId,
       );
-      const followsCurrent = followsCurrentConversation(queuedMessage);
+      const followsCurrent = followsCurrentConversation(projection, storedQueuedRun, queuedMessage);
       const targetProviderThread = followsCurrent
         ? activeProviderThread?.providerInstanceId === queuedRun.providerInstanceId
           ? activeProviderThread

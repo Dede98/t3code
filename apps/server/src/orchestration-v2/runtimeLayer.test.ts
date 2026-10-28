@@ -6482,6 +6482,7 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
           threadId,
           messageId: MessageId.make(`manual-resume:${suffix}:${reason}`),
           manualContinuationOfRunId: source.id,
+          modelSelection: { ...modelSelection, instanceId: alternateInstanceId },
           text: "Continue where you left off.",
           attachments: [],
           dispatchMode: { type: "start_immediately" as const },
@@ -6501,7 +6502,34 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
           yield* TestClock.adjust("1 minute");
           yield* orchestrator.dispatch(scheduledResume);
         }
-        assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, 3);
+        const continued = yield* orchestrator.getThreadProjection(threadId);
+        assert.lengthOf(continued.runs, 3);
+
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`manual-resume:done:${reason}`),
+              type: "run.updated",
+              threadId,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...continued.runs[2]!,
+                status: "completed",
+                completedAt: yield* DateTime.now,
+              },
+            },
+          ],
+        });
+        yield* orchestrator.resumeQueuedRuns;
+        const drained = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+          (run) => run.id === queued.id,
+        );
+        assert.equal(drained?.status, "starting");
+        // Only a usage limit carries the queue to the account the work moved to.
+        assert.equal(
+          drained?.providerInstanceId,
+          reason === "usage_limit" ? alternateInstanceId : modelSelection.instanceId,
+        );
       }),
   );
 

@@ -281,6 +281,16 @@ const layerThreadLaunchProvided = ThreadLaunchService.layer.pipe(
 const layerSecretRequestsProvided = SecretRequests.layer.pipe(
   Layer.provide(layerThreadManagementProvided),
 );
+const layerUsageLimitFailoverProvided = UsageLimitFailover.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      ProjectionStore.layer,
+      layerThreadManagementProvided,
+      layerProviderSwitchServiceProvided,
+      ProviderThreadContinuationSync.layer.pipe(Layer.provide(ProjectionStore.layer)),
+    ),
+  ),
+);
 const layerScheduledTaskProvided = ScheduledTaskService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -288,6 +298,7 @@ const layerScheduledTaskProvided = ScheduledTaskService.layer.pipe(
       layerThreadManagementProvided,
       layerManagedProjectFoldersProvided,
       layerSecretRequestsProvided,
+      layerUsageLimitFailoverProvided,
     ),
   ),
 );
@@ -374,16 +385,7 @@ export const layerProduction = Layer.mergeAll(
         ProjectionStore.layer,
         layerThreadManagementProvided,
         layerOrchestratorProvided,
-        UsageLimitFailover.layer.pipe(
-          Layer.provide(
-            Layer.mergeAll(
-              ProjectionStore.layer,
-              layerThreadManagementProvided,
-              layerProviderSwitchServiceProvided,
-              ProviderThreadContinuationSync.layer.pipe(Layer.provide(ProjectionStore.layer)),
-            ),
-          ),
-        ),
+        layerUsageLimitFailoverProvided,
       ),
     ),
   ),
