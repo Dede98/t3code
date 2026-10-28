@@ -1,5 +1,7 @@
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
+import * as UsageLimitFailover from "./UsageLimitFailover.ts";
+import * as ProviderThreadContinuationSync from "../provider/ProviderThreadContinuationSync.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -372,6 +374,16 @@ export const layerProduction = Layer.mergeAll(
         ProjectionStore.layer,
         layerThreadManagementProvided,
         layerOrchestratorProvided,
+        UsageLimitFailover.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              ProjectionStore.layer,
+              layerThreadManagementProvided,
+              layerProviderSwitchServiceProvided,
+              ProviderThreadContinuationSync.layer.pipe(Layer.provide(ProjectionStore.layer)),
+            ),
+          ),
+        ),
       ),
     ),
   ),

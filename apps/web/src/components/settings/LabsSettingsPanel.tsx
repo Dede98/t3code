@@ -21,6 +21,9 @@ export function LabsSettingsPanel() {
         {hasCloudPublicConfig() ? <GuestLinksRowWithSignIn /> : <GuestLinksRow />}
         <LinkedEnvironmentsRow />
       </SettingsSection>
+      <SettingsSection id="alpha" title="Alpha">
+        <LimitFailoverRow />
+      </SettingsSection>
       <LegacyFeaturesSection />
     </SettingsPageContainer>
   );
@@ -122,6 +125,41 @@ function LinkedEnvironmentsRow() {
             updateSettings({ linkedEnvironmentsEnabled: Boolean(checked) })
           }
           aria-label="Linked environments"
+        />
+      }
+    />
+  );
+}
+
+function LimitFailoverRow() {
+  const settings = useScopedSettings();
+  const updateSettings = useUpdateScopedSettings();
+  return (
+    <SettingsRow
+      serverScoped
+      {...searchableSetting("limit-failover")}
+      settingKeys={["failoverLimitedThreads"]}
+      description={
+        <>
+          When a usage limit stops a thread and resets in more than 30 minutes, continue it on
+          another account of the same provider that has allowance left, with the same model and
+          effort. Closer resets resume on the same account. Claude needs cross-account continuation
+          in{" "}
+          <Link to="/settings/providers" className="underline underline-offset-2">
+            Providers
+          </Link>
+          . Switching accounts automatically may break the provider&apos;s terms and get those
+          accounts suspended.
+        </>
+      }
+      control={
+        <ScopedSwitch
+          settingKeys={["failoverLimitedThreads"]}
+          checked={settings.failoverLimitedThreads}
+          onCheckedChange={(checked) =>
+            updateSettings({ failoverLimitedThreads: Boolean(checked) })
+          }
+          aria-label="Switch accounts on usage limits"
         />
       }
     />

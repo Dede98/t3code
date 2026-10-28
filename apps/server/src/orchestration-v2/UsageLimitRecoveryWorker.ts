@@ -7,6 +7,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import * as UsageLimitFailover from "./UsageLimitFailover.ts";
 
 export function limitRecoveryCommand(
   thread: ProjectionStore.ProjectionLimitRecoveryCandidate,
@@ -76,19 +77,39 @@ const makeSweep = Effect.gen(function* () {
   const threads = yield* ThreadManagement.ThreadManagementService;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const settings = yield* ServerSettings.ServerSettingsService;
+  const failover = yield* UsageLimitFailover.UsageLimitFailover;
+  // Each limit stop is judged once; a restart judges pending ones again.
+  let judgedFailovers = new Set<string>();
   return Effect.fn("UsageLimitRecoveryWorker.sweep")(function* () {
     const preferences = yield* settings.getSettings;
     const now = yield* DateTime.now;
+    const failoverEnabled = preferences.failoverLimitedThreads;
     const candidates = yield* projections.getLimitRecoveryCandidates({
       now,
-      autoResume: preferences.autoResumeLimitedThreads,
+      autoResume: preferences.autoResumeLimitedThreads || failoverEnabled,
       snooze: preferences.snoozeLimitedThreads,
     });
     const nowMs = DateTime.toEpochMillis(now);
+    const pendingFailovers = new Set<string>();
     for (const thread of candidates) {
+      let autoResume = preferences.autoResumeLimitedThreads;
+      const armed =
+        thread.limitRecovery?.runId === thread.latestRunId &&
+        thread.limitRecovery?.resetAt === thread.usageLimitResetAt;
+      if (failoverEnabled && !armed) {
+        const key = `${thread.id}:${thread.latestRunId}:${thread.usageLimitResetAt}`;
+        pendingFailovers.add(key);
+        if (!judgedFailovers.has(key)) {
+          const outcome = yield* failover.attempt(thread);
+          // A wait is judged again until the arm below lands.
+          if (outcome !== "wait") judgedFailovers.add(key);
+          if (outcome === "switched") continue;
+          if (outcome === "wait") autoResume = true;
+        }
+      }
       const command = limitRecoveryCommand(
         thread,
-        preferences.autoResumeLimitedThreads,
+        autoResume,
         nowMs,
         preferences.snoozeLimitedThreads,
       );
@@ -112,6 +133,7 @@ const makeSweep = Effect.gen(function* () {
         ),
       );
     }
+    judgedFailovers = new Set([...judgedFailovers].filter((key) => pendingFailovers.has(key)));
   });
 });
 

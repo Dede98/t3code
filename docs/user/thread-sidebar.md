@@ -242,6 +242,15 @@ The environment must be running when the reset arrives; it resumes overdue
 continuations after a restart. Stopping the thread, sending a new message,
 archiving, or settling it prevents a pending continuation from starting.
 
+With **Switch accounts on usage limits** (alpha) in **Settings → Labs**, a
+limit that resets within 30 minutes resumes on the same account. A later reset
+continues the thread on another account of the same provider that has at least
+10% of its allowance left and offers the same model and effort, and the
+continuation message names both accounts. Claude accounts need cross-account
+continuation; Codex accounts need a shared home. Delegated tasks stay on their
+account. Switching accounts automatically may break the provider's terms and
+get those accounts suspended.
+
 Choose **Snooze until reset** to hide the thread until its allowance returns.
 Snooze and auto-resume are independent: snooze alone wakes the thread without
 sending a message; enabling both wakes and continues it. **Wake now** cancels

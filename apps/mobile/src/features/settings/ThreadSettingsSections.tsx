@@ -35,6 +35,7 @@ export function SettingsLabsRouteScreen() {
         contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 18) + 18 }}
       >
         <BetaSettingsSection />
+        <AlphaSettingsSection />
         <LegacySettingsSection />
       </ScrollView>
     </SettingsScreen>
@@ -249,6 +250,47 @@ function BetaSettingsSection() {
       <Text className="px-2 text-sm text-foreground-muted">
         Let agents on a machine work on your other machines, and theirs on it. Turn it on for each
         machine. While it is off, nothing new starts over a link; tasks already running finish.
+      </Text>
+    </View>
+  );
+}
+
+/** Per machine, since each machine's worker decides for the threads it runs. */
+function AlphaSettingsSection() {
+  const { environments } = useEnvironments();
+  const connected = environments.filter(
+    (environment) => environment.connection.phase === "connected",
+  );
+  const writable = useEnvironmentsWithScope(connected, AuthSettingsWriteScope);
+  const updateSettings = useAtomCommand(serverEnvironment.updateSettings, {
+    label: "usage limit account switch update",
+    reportFailure: true,
+  });
+  if (connected.length === 0) return null;
+  return (
+    <View className="gap-3">
+      <SettingsSection title="Alpha: Switch accounts on usage limits">
+        {connected.map((environment) => (
+          <SettingsSwitchRow
+            key={environment.environmentId}
+            icon="arrow.left.arrow.right"
+            label={environment.label}
+            value={environment.serverConfig?.settings.failoverLimitedThreads === true}
+            disabled={!writable.has(environment.environmentId)}
+            onValueChange={(value) =>
+              void updateSettings({
+                environmentId: environment.environmentId,
+                input: { patch: { failoverLimitedThreads: value } },
+              })
+            }
+          />
+        ))}
+      </SettingsSection>
+      <Text className="px-2 text-sm text-foreground-muted">
+        When a usage limit stops a thread and resets in more than 30 minutes, continue it on another
+        account of the same provider that has allowance left, with the same model and effort. Closer
+        resets resume on the same account. Switching accounts automatically may break the
+        provider&apos;s terms and get those accounts suspended.
       </Text>
     </View>
   );

@@ -10,6 +10,9 @@ against the live tree and history because they can move over time.
 - Provider-usage subscriptions and manual refresh.
 - A download/update entry in the sidebar.
 - Claude cross-account continuation and manual synchronization.
+- The Labs alpha that moves a usage-limited thread to another same-driver account
+  (`failoverLimitedThreads`, `apps/server/src/orchestration-v2/UsageLimitFailover.ts`, hooked into
+  `UsageLimitRecoveryWorker`). Upstream's FAQ rejects an auto-switcher, so it never goes upstream.
 - A provider registry scoped per instance.
 - Provider hydration that terminates only sessions affected by the changed provider state.
 - Claude Agent SDK compatibility with the native resume store: a null first main `load()` from a
