@@ -246,11 +246,13 @@ With **Switch accounts on usage limits** (alpha) in **Settings → Labs**, a
 limit that resets within 30 minutes resumes on the same account. A later reset
 continues the thread on another account of the same provider that has at least
 10% of its allowance left and offers the same model and effort, and the
-continuation message names both accounts. A scheduled task that starts a new
-thread starts it on another account when its saved account is spent. Claude
-accounts need cross-account continuation; Codex accounts need a shared home.
-Delegated tasks stay on their account. Switching accounts automatically may
-break the provider's terms and get those accounts suspended.
+continuation message names both accounts. When several accounts qualify, it
+picks the one where the thread gets the largest share of the remaining
+allowance, counting threads already running there. A scheduled task that
+starts a new thread picks its account the same way when its saved account is
+spent. Claude accounts need cross-account continuation; Codex accounts need a
+shared home. Delegated tasks stay on their account. Switching accounts
+automatically may break the provider's terms and get those accounts suspended.
 
 Whenever a limited thread continues on another account, whether you pressed
 **Resume** there or the alpha moved it, messages queued while it was stopped

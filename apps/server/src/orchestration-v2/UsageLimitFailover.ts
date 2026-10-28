@@ -5,6 +5,7 @@ import {
   type ModelSelection,
   type OrchestrationV2AppThread,
   type OrchestrationV2Run,
+  type OrchestrationV2ThreadShell,
   type ProjectId,
   type ProviderInstanceId,
   resolveProjectProviderInstanceEnabled,
@@ -68,19 +69,40 @@ export function limitFailoverGate(input: {
   return recentFailovers >= MAX_FAILOVERS_PER_HOUR ? "stay" : "look";
 }
 
+const BUSY_RUN_STATUSES = new Set(["preparing", "starting", "running"]);
+
+/** Threads whose turn is drawing on each account right now, provider subagents included. */
+export function runningThreadsByInstance(
+  threads: ReadonlyArray<
+    Pick<OrchestrationV2ThreadShell, "providerInstanceId" | "activityRunStatus">
+  >,
+): ReadonlyMap<ProviderInstanceId, number> {
+  const counts = new Map<ProviderInstanceId, number>();
+  for (const thread of threads) {
+    const status = thread.activityRunStatus;
+    if (status === null || status === undefined || !BUSY_RUN_STATUSES.has(status)) continue;
+    counts.set(thread.providerInstanceId, (counts.get(thread.providerInstanceId) ?? 0) + 1);
+  }
+  return counts;
+}
+
 interface LimitFailoverTarget {
   readonly provider: ServerProvider;
   readonly modelSelection: ModelSelection;
   readonly remainingPercent: number;
+  readonly runningThreads: number;
+  /** The allowance the moved thread would share with the threads already running there. */
+  readonly sharePercent: number;
 }
 
-/** Same-driver accounts that can continue the thread, the one with the most allowance left first. */
+/** Same-driver accounts that can continue the thread, the largest share of allowance first. */
 export function rankLimitFailoverTargets(input: {
   readonly nowMs: number;
   readonly source: ServerProvider;
   readonly modelSelection: ModelSelection;
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly eligibleInstanceIds: ReadonlySet<ProviderInstanceId>;
+  readonly runningThreads: ReadonlyMap<ProviderInstanceId, number>;
 }): ReadonlyArray<LimitFailoverTarget> {
   const sourceAccount = accountKey(input.source);
   const targets: Array<LimitFailoverTarget> = [];
@@ -98,9 +120,19 @@ export function rankLimitFailoverTargets(input: {
     if (target === null) continue;
     const remainingPercent = remainingAllowance(provider.usageLimits, target.text, input.nowMs);
     if (remainingPercent === null || remainingPercent < MIN_REMAINING_PERCENT) continue;
-    targets.push({ provider, modelSelection: target.selection, remainingPercent });
+    const runningThreads = input.runningThreads.get(provider.instanceId) ?? 0;
+    targets.push({
+      provider,
+      modelSelection: target.selection,
+      remainingPercent,
+      runningThreads,
+      sharePercent: remainingPercent / (runningThreads + 1),
+    });
   }
-  return targets.toSorted((left, right) => right.remainingPercent - left.remainingPercent);
+  return targets.toSorted(
+    (left, right) =>
+      right.sharePercent - left.sharePercent || right.remainingPercent - left.remainingPercent,
+  );
 }
 
 const isUsable = (provider: ServerProvider) =>
@@ -261,6 +293,22 @@ const make = Effect.gen(function* () {
     return latest;
   });
 
+  // Spreading only matters between several accounts, and the thread overview is a wide read.
+  const runningThreadsAmong = Effect.fn("UsageLimitFailover.runningThreadsAmong")(function* (
+    eligibleInstanceIds: ReadonlySet<ProviderInstanceId>,
+  ) {
+    const none: ReadonlyMap<ProviderInstanceId, number> = new Map();
+    if (eligibleInstanceIds.size < 2) return none;
+    return yield* threads.getShellSnapshot({ location: "active" }).pipe(
+      Effect.map((snapshot) => runningThreadsByInstance(snapshot.threads)),
+      Effect.catchCause((cause) =>
+        Effect.logWarning("orchestration-v2.limit-failover.load-unknown", { cause }).pipe(
+          Effect.as(none),
+        ),
+      ),
+    );
+  });
+
   const peersFor = (
     providers: ReadonlyArray<ServerProvider>,
     source: ServerProvider,
@@ -300,6 +348,7 @@ const make = Effect.gen(function* () {
         modelSelection: input.modelSelection,
         providers,
         eligibleInstanceIds,
+        runningThreads: yield* runningThreadsAmong(eligibleInstanceIds),
       });
       if (target === undefined) return input.modelSelection;
       yield* Effect.logInfo("orchestration-v2.limit-failover.launch-moved", {
@@ -307,6 +356,7 @@ const make = Effect.gen(function* () {
         sourceInstanceId: sourceId,
         targetInstanceId: target.provider.instanceId,
         remainingPercent: target.remainingPercent,
+        runningThreads: target.runningThreads,
       });
       return target.modelSelection;
     },
@@ -364,6 +414,7 @@ const make = Effect.gen(function* () {
         modelSelection: run.modelSelection,
         providers,
         eligibleInstanceIds,
+        runningThreads: yield* runningThreadsAmong(eligibleInstanceIds),
       });
       if (target === undefined) {
         yield* Effect.logInfo("orchestration-v2.limit-failover.no-target", {
@@ -404,6 +455,7 @@ const make = Effect.gen(function* () {
         sourceInstanceId: source.instanceId,
         targetInstanceId: target.provider.instanceId,
         remainingPercent: target.remainingPercent,
+        runningThreads: target.runningThreads,
       });
       return "switched" as const;
     },

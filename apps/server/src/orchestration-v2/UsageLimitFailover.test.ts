@@ -4,6 +4,8 @@ import {
   MessageId,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ThreadProjection,
+  type OrchestrationV2ThreadShell,
+  type OrchestrationV2ThreadShellSnapshot,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -221,6 +223,7 @@ it("ranks accounts with allowance left for the same model and effort", () => {
         .map((provider) => provider.instanceId)
         .filter((instanceId) => instanceId !== "no-history"),
     ),
+    runningThreads: new Map(),
   });
 
   assert.deepEqual(
@@ -233,6 +236,73 @@ it("ranks accounts with allowance left for the same model and effort", () => {
     ],
   );
   assert.deepEqual(targets[0]?.modelSelection, selection("spend-cap"));
+});
+
+it("spreads threads by the allowance each would share with the threads already running", () => {
+  const source = account("source", [window("five_hour", "session", 100, iso(4 * 60 * MINUTE))]);
+  const used = (id: string, usedPercent: number) =>
+    account(id, [window("five_hour", "session", usedPercent)]);
+  const providers = [
+    source,
+    used("busy-roomy", 20),
+    used("idle-half", 60),
+    used("one-running", 40),
+    used("same-share-less-left", 75),
+    used("same-share-more-left", 50),
+    used("crowded", 50),
+  ];
+  const running = (id: string, count: number) => [ProviderInstanceId.make(id), count] as const;
+
+  const targets = UsageLimitFailover.rankLimitFailoverTargets({
+    nowMs: NOW,
+    source,
+    modelSelection: selection("source"),
+    providers,
+    eligibleInstanceIds: new Set(providers.map((provider) => provider.instanceId)),
+    runningThreads: new Map([
+      running("busy-roomy", 3),
+      running("one-running", 1),
+      running("same-share-more-left", 1),
+      running("crowded", 9),
+    ]),
+  });
+
+  assert.deepEqual(
+    targets.map((target) => [target.provider.instanceId, target.sharePercent]),
+    [
+      ["idle-half", 40],
+      ["one-running", 30],
+      ["same-share-more-left", 25],
+      ["same-share-less-left", 25],
+      ["busy-roomy", 20],
+      // The 10% floor applies to the allowance, so a crowded account still qualifies, last.
+      ["crowded", 5],
+    ],
+  );
+});
+
+it("counts threads whose turn is preparing, starting or running", () => {
+  const thread = (
+    instanceId: string,
+    activityRunStatus: OrchestrationV2ThreadShell["activityRunStatus"],
+  ) => ({ providerInstanceId: ProviderInstanceId.make(instanceId), activityRunStatus });
+
+  assert.deepEqual(
+    [
+      ...UsageLimitFailover.runningThreadsByInstance([
+        thread("a", "running"),
+        thread("a", "starting"),
+        thread("a", "preparing"),
+        thread("a", "waiting"),
+        thread("a", null),
+        thread("b", "running"),
+      ]),
+    ],
+    [
+      ["a", 3],
+      ["b", 1],
+    ],
+  );
 });
 
 const runId = RunId.make("run-1");
@@ -327,6 +397,9 @@ function failoverLayer(options: {
   readonly stoppedDuringSync?: boolean;
   readonly transition?: "restart_and_resume" | "create_with_handoff";
   readonly limitsAgeMs?: number;
+  /** Adds claude-c with less allowance than claude-b, which runs three threads. */
+  readonly busyPeer?: boolean;
+  readonly overviewFails?: boolean;
 }) {
   const steps: Array<string> = [];
   const dispatched: Array<OrchestrationV2ServerCommand> = [];
@@ -335,9 +408,16 @@ function failoverLayer(options: {
   const providers = [
     ["claude-a", [window("five_hour", "session", 100, RESET_AT)]] as const,
     ["claude-b", roomy] as const,
+    ...(options.busyPeer === true
+      ? [["claude-c", [window("five_hour", "session", 40)]] as const]
+      : []),
   ].map(([id, windows]) =>
     account(id, windows, { usageLimits: { checkedAt: limitsCheckedAt, windows } }),
   );
+  const busyThreads = Array.from({ length: 3 }, () => ({
+    providerInstanceId: ProviderInstanceId.make("claude-b"),
+    activityRunStatus: "running",
+  }));
   let projectionReads = 0;
   const layer = UsageLimitFailover.layer.pipe(
     Layer.provide(
@@ -386,12 +466,19 @@ function failoverLayer(options: {
               dispatched.push(command);
               return {} as unknown as Orchestrator.OrchestratorV2DispatchResult;
             }),
+          getShellSnapshot: () =>
+            options.overviewFails === true
+              ? Effect.die("thread overview unavailable")
+              : Effect.succeed({
+                  threads: busyThreads,
+                } as unknown as OrchestrationV2ThreadShellSnapshot),
         }),
         ServerSettings.layerTest({
           failoverLimitedThreads: options.failoverEnabled === true,
           providerInstances: {
             [ProviderInstanceId.make("claude-a")]: { driver: claude, enabled: true },
             [ProviderInstanceId.make("claude-b")]: { driver: claude, enabled: true },
+            [ProviderInstanceId.make("claude-c")]: { driver: claude, enabled: true },
           },
           ...(options.targetDisabledForProject === true
             ? {
@@ -435,7 +522,21 @@ it.effect.each([
     expected: "stay",
     expectedSteps: [],
   },
-])("attempt $name", ({ expected, expectedSteps, ...options }) =>
+  {
+    name: "spreads to a quieter account over a busier one with more allowance",
+    busyPeer: true,
+    expected: "switched",
+    expectedSteps: ["sync", "dispatch"],
+    expectedTarget: "claude-c",
+  },
+  {
+    name: "ranks by allowance alone when the thread overview fails",
+    busyPeer: true,
+    overviewFails: true,
+    expected: "switched",
+    expectedSteps: ["sync", "dispatch"],
+  },
+])("attempt $name", ({ expected, expectedSteps, expectedTarget, ...options }) =>
   Effect.gen(function* () {
     const { layer, steps, dispatched } = failoverLayer(options);
     yield* TestClock.setTime(NOW);
@@ -452,7 +553,7 @@ it.effect.each([
       if (command?.type !== "message.dispatch") return;
       assert.equal(command.commandId, `limit-failover:${threadId}:${runId}`);
       assert.equal(command.manualContinuationOfRunId, runId);
-      assert.deepEqual(command.modelSelection, selection("claude-b"));
+      assert.deepEqual(command.modelSelection, selection(expectedTarget ?? "claude-b"));
     } else {
       assert.deepEqual(dispatched, []);
     }
