@@ -8,7 +8,9 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Sink from "effect/Sink";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { Tool, Toolkit } from "effect/ai";
 import {
@@ -18,6 +20,7 @@ import {
   HttpServerRequest,
   HttpServerResponse,
 } from "effect/http";
+import { ChildProcessSpawner } from "effect/process";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
@@ -78,8 +81,10 @@ const serveB = (descriptor: ExecutionEnvironmentDescriptor) =>
 const makeA = (
   descriptor: ExecutionEnvironmentDescriptor,
   secrets?: typeof ServerSecretStore.layer,
+  network?: Layer.Layer<HttpClient.HttpClient>,
+  tailscale?: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>,
 ) =>
-  layerLinkingEnvironment(descriptor, secrets).pipe(
+  layerLinkingEnvironment(descriptor, secrets, network, tailscale).pipe(
     Layer.build,
     Effect.map((context) => ({
       links: Context.get(context, PeerLinks.PeerLinks),
@@ -330,6 +335,93 @@ it.effect("never sends a link's token to an address that stops answering as that
 
       // The address now answers as another environment, as a reused LAN address would.
       yield* Ref.set(b.descriptor, descriptorOf("environment-impostor", "Impostor"));
+      yield* Ref.set(b.bearers, []);
+      const failed = yield* probe(a).pipe(Effect.flip);
+      expect(failed.message).toContain("Box did not answer");
+      expect(yield* Ref.get(b.bearers)).toEqual([]);
+      expect((yield* a.links.list).map((link) => link.status)).toEqual(["unreachable"]);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+const BOX_TAILNET_ADDRESS = "100.100.1.2";
+
+/** Carries the tailnet address to the local socket, as Tailscale would. */
+const layerTailnetRoute = Layer.effect(
+  HttpClient.HttpClient,
+  Effect.gen(function* () {
+    const client = yield* HttpClient.HttpClient;
+    const fetch = yield* FetchHttpClient.Fetch;
+    return HttpClient.transform(client, (response) =>
+      Effect.provideService(response, FetchHttpClient.Fetch, (input, init) =>
+        fetch(String(input).replace(BOX_TAILNET_ADDRESS, "127.0.0.1"), init),
+      ),
+    );
+  }),
+).pipe(Layer.provide(FetchHttpClient.layer));
+
+/** This machine's `tailscale status`: running with Box as a peer while `listed` holds. */
+const layerTailscaleStatus = (listed: Ref.Ref<boolean>) =>
+  Layer.succeed(
+    ChildProcessSpawner.ChildProcessSpawner,
+    ChildProcessSpawner.make(() =>
+      Effect.map(Ref.get(listed), (running) =>
+        ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(1),
+          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          isRunning: Effect.succeed(false),
+          kill: () => Effect.void,
+          unref: Effect.succeed(Effect.void),
+          stdin: Sink.drain,
+          stdout: Stream.make(
+            new TextEncoder().encode(
+              JSON.stringify({
+                BackendState: running ? "Running" : "Stopped",
+                Peer: { "nodekey:box": { TailscaleIPs: [BOX_TAILNET_ADDRESS] } },
+              }),
+            ),
+          ),
+          stderr: Stream.empty,
+          all: Stream.empty,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+        }),
+      ),
+    ),
+  );
+
+it.effect("sends a link's token to a Tailscale IPv4 address only while Tailscale lists it", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const listed = yield* Ref.make(false);
+      const a = yield* makeA(laptop, undefined, layerTailnetRoute, layerTailscaleStatus(listed));
+      const tailnetUrl = b.url.replace("127.0.0.1", BOX_TAILNET_ADDRESS);
+
+      // Unlisted, 100.64.0.0/10 may be a carrier's or WARP's: the pairing code never goes there.
+      const pairing = yield* b.auth.issuePairingCredential();
+      const refused = yield* a.links
+        .link({ url: tailnetUrl, pairingCode: pairing.credential, access: "auto" })
+        .pipe(Effect.flip);
+      expect(refused.message).toContain("plain http");
+      expect(yield* Ref.get(b.probes)).toBe(0);
+
+      yield* a.links.link({ url: b.url, pairingCode: pairing.credential, access: "auto" });
+      yield* a.sql`UPDATE peer_environment_links SET urls_json = ${JSON.stringify([tailnetUrl])}`;
+      expect(Option.isNone(yield* a.links.describe(tailnetUrl))).toBe(true);
+
+      yield* Ref.set(listed, true);
+      yield* TestClock.adjust("5 seconds");
+      expect(Option.map(yield* a.links.describe(tailnetUrl), (peer) => peer.label)).toEqual(
+        Option.some("Box"),
+      );
+      expect((yield* a.links.list).map((link) => link.status)).toEqual(["reachable"]);
+      yield* Ref.set(b.bearers, []);
+      yield* probe(a);
+      expect((yield* Ref.get(b.bearers)).length).toBeGreaterThan(0);
+
+      yield* Ref.set(listed, false);
+      yield* TestClock.adjust("5 seconds");
       yield* Ref.set(b.bearers, []);
       const failed = yield* probe(a).pipe(Effect.flip);
       expect(failed.message).toContain("Box did not answer");

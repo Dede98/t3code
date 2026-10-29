@@ -168,6 +168,40 @@ it.effect("resends late editors without rolling back updates already sent", () =
   }),
 );
 
+it.effect("resends moved direct endpoints without rolling back updates already sent", () =>
+  Effect.gen(function* () {
+    const lan = { kind: "lan", httpBaseUrl: "http://10.0.0.2:3773/" } as const;
+    const tailnet = { kind: "tailnet", httpBaseUrl: "http://100.100.1.2:3773/" } as const;
+    const served = { kind: "tailnet", httpBaseUrl: "https://box.tail.ts.net/" } as const;
+    const settingsSent = yield* Deferred.make<void>();
+    const events = yield* withLateEditorConfig(
+      snapshotConfig({ directEndpoints: [lan, served] }),
+      Stream.make(settingsUpdated({ enableProviderUpdateChecks: false })),
+      {
+        resolveAvailableEditors: () => Effect.succeed([]),
+        resolveFileManagerRevealKind: () => Effect.succeed("file-explorer"),
+      },
+      Stream.fromEffect(Deferred.await(settingsSent)).pipe(
+        Stream.flatMap(() => Stream.make([lan], [lan, tailnet], [lan, tailnet])),
+      ),
+    ).pipe(
+      Stream.tap((event) =>
+        event.type === "settingsUpdated" ? Deferred.succeed(settingsSent, undefined) : Effect.void,
+      ),
+      Stream.runCollect,
+    );
+
+    const [first, second] = Array.from(events);
+    assert.equal(events.length, 2);
+    assert.equal(first?.type, "settingsUpdated");
+    assert.equal(second?.type, "snapshot");
+    if (second?.type === "snapshot") {
+      assert.deepEqual(second.config.directEndpoints, [lan, tailnet, served]);
+      assert.deepEqual(second.config.settings, { enableProviderUpdateChecks: false } as never);
+    }
+  }),
+);
+
 it.effect("resends a file manager reveal kind that missed the snapshot", () =>
   Effect.gen(function* () {
     const events = yield* withLateEditorConfig(
@@ -593,7 +627,10 @@ it.effect(
         Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({
           resolveTargets: () => Effect.succeed([]),
         }),
-        Layer.mock(DirectEndpoints.DirectEndpoints)({ resolve: () => Effect.succeed([]) }),
+        Layer.mock(DirectEndpoints.DirectEndpoints)({
+          resolve: () => Effect.succeed([]),
+          streamBoundEndpoints: Stream.empty,
+        }),
         Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
           scratchRoot: Effect.succeedNone,
           namedProjectsRoot: process.cwd(),
@@ -770,7 +807,10 @@ it.effect("on-demand clients get provider config without workspace snapshots", (
       Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({
         resolveTargets: () => Effect.succeed([]),
       }),
-      Layer.mock(DirectEndpoints.DirectEndpoints)({ resolve: () => Effect.succeed([]) }),
+      Layer.mock(DirectEndpoints.DirectEndpoints)({
+        resolve: () => Effect.succeed([]),
+        streamBoundEndpoints: Stream.empty,
+      }),
       Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
         scratchRoot: Effect.succeedNone,
         namedProjectsRoot: process.cwd(),

@@ -27,7 +27,13 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpApiClient from "effect/http-api/HttpApiClient";
-import { isLocalLoopbackHost, isTailnetHost } from "@t3tools/shared/hostClassification";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import {
+  isLocalLoopbackHost,
+  isSharedAddressSpaceHost,
+  isTailnetHost,
+} from "@t3tools/shared/hostClassification";
+import { readTailnetNodeAddresses } from "@t3tools/tailscale";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -41,6 +47,8 @@ const LINK_REDIRECT_URI = "http://127.0.0.1/t3code-peer-link";
  */
 const probeTimeout = (origin: string) =>
   isLocalLoopbackHost(new URL(origin).hostname) ? Duration.seconds(3) : Duration.seconds(10);
+/** How long one `tailscale status` read stands, so a stopped Tailscale stops the token soon. */
+const TAILNET_ADDRESSES_TTL = Duration.seconds(5);
 
 /** A usable link: where to reach the peer and the token to send there. */
 export interface ResolvedPeerLink {
@@ -130,7 +138,7 @@ const failStorage = (cause: unknown) =>
  * code and then the link's token travel to it, so plain http is accepted only
  * where the network already encrypts: this machine, or a Tailscale address.
  */
-const peerOrigin = (url: string) => {
+const peerOrigin = (url: string, onTailnet: (host: string) => Effect.Effect<boolean>) => {
   const parsed = URL.parse(url);
   if (parsed === null || (parsed.protocol !== "https:" && parsed.protocol !== "http:")) {
     return Effect.fail(
@@ -145,11 +153,19 @@ const peerOrigin = (url: string) => {
     !isLocalLoopbackHost(parsed.hostname) &&
     !isTailnetHost(parsed.hostname)
   ) {
-    return Effect.fail(
-      new PeerLinkError({
-        reason: "unreachable",
-        message: `${url} is plain http, which would send the link's credentials unencrypted. Use its https address, or its Tailscale address.`,
-      }),
+    return onTailnet(parsed.hostname).pipe(
+      Effect.flatMap((encrypted) =>
+        encrypted
+          ? Effect.succeed(parsed.origin)
+          : Effect.fail(
+              new PeerLinkError({
+                reason: "unreachable",
+                message: isSharedAddressSpaceHost(parsed.hostname)
+                  ? `${url} is plain http to an address this machine's Tailscale does not list as running, so the link's credentials could travel unencrypted. Start Tailscale here, or use its .ts.net name or https address.`
+                  : `${url} is plain http, which would send the link's credentials unencrypted. Use its https address, or its Tailscale address.`,
+              }),
+            ),
+      ),
     );
   }
   return Effect.succeed(parsed.origin);
@@ -166,6 +182,7 @@ const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const enabled = serverSettings.getSettings.pipe(
     Effect.map((settings) => settings.linkedEnvironmentsEnabled),
     Effect.orElseSucceed(() => false),
@@ -182,6 +199,19 @@ const make = Effect.gen(function* () {
   const peerHttpClient = HttpClient.transform(httpClient, (response) =>
     Effect.provideService(response, FetchHttpClient.RequestInit, { redirect: "manual" }),
   );
+
+  // WARP and carriers share 100.64.0.0/10; only an address this machine's running Tailscale
+  // lists is carried encrypted. Checked again before every use of the token.
+  const tailnetAddresses = yield* readTailnetNodeAddresses.pipe(
+    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    Effect.orElseSucceed((): ReadonlySet<string> => new Set()),
+    Effect.cachedWithTTL(TAILNET_ADDRESSES_TTL),
+  );
+  const onTailnet = (host: string) =>
+    isSharedAddressSpaceHost(host)
+      ? Effect.map(tailnetAddresses, (addresses) => addresses.has(host))
+      : Effect.succeed(false);
+  const originOf = (url: string) => peerOrigin(url, onTailnet);
 
   const clientFor = (origin: string) =>
     HttpApiClient.make(EnvironmentHttpApi, { baseUrl: origin }).pipe(
@@ -354,7 +384,7 @@ const make = Effect.gen(function* () {
       urls,
       (url) =>
         Effect.gen(function* () {
-          const origin = yield* peerOrigin(url);
+          const origin = yield* originOf(url);
           return { origin, descriptor: yield* describe(origin) };
         }).pipe(Effect.result),
       { concurrency: "unbounded" },
@@ -386,7 +416,7 @@ const make = Effect.gen(function* () {
 
   /** The peer at `url`, with every address checked for credentials first. */
   const answeringAt = Effect.fn("PeerLinks.answeringAt")(function* (urls: ReadonlyArray<string>) {
-    const origins = yield* Effect.forEach(urls, peerOrigin);
+    const origins = yield* Effect.forEach(urls, originOf);
     const primary = origins[0]!;
     const descriptor = yield* describe(primary);
     if (Option.isNone(descriptor)) {
@@ -479,7 +509,7 @@ const make = Effect.gen(function* () {
   });
 
   const describeUrl: PeerLinks["Service"]["describe"] = (url) =>
-    peerOrigin(url).pipe(
+    originOf(url).pipe(
       Effect.flatMap(describe),
       Effect.map(Option.map((peer) => ({ environmentId: peer.environmentId, label: peer.label }))),
       Effect.orElseSucceed(() => Option.none()),
@@ -489,10 +519,12 @@ const make = Effect.gen(function* () {
     DateTime.isLessThanOrEqualTo(link.expiresAt, now)
       ? Effect.succeed<PeerLinkStatus>("expired")
       : Effect.findFirst(link.urls, (url) =>
-          describe(url).pipe(
+          originOf(url).pipe(
+            Effect.flatMap(describe),
             Effect.map(
               (found) => Option.isSome(found) && found.value.environmentId === link.environmentId,
             ),
+            Effect.orElseSucceed(() => false),
           ),
         ).pipe(
           Effect.map((answered): PeerLinkStatus =>
@@ -560,12 +592,14 @@ const make = Effect.gen(function* () {
       // reused LAN address or a moved hostname never receives it.
       let fenced = true;
       const url = yield* Effect.findFirst(link.urls, (candidate) =>
-        describe(candidate).pipe(
+        originOf(candidate).pipe(
+          Effect.flatMap(describe),
           Effect.map((found) => {
             if (Option.isNone(found) || found.value.environmentId !== environmentId) return false;
             fenced = linkLimitsHold(found.value);
             return true;
           }),
+          Effect.orElseSucceed(() => false),
         ),
       );
       if (Option.isNone(url)) {

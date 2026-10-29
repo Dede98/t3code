@@ -10,6 +10,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import type * as HttpClient from "effect/http/HttpClient";
+import type * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as HttpServer from "effect/http/HttpServer";
 import * as HttpServerRequest from "effect/http/HttpServerRequest";
@@ -150,17 +152,24 @@ export type ServedPeer = Effect.Success<ReturnType<typeof servePeer>>;
 
 /**
  * The environment that links: its own database and secret store, reaching
- * peers over plain HTTP. Provide it to anything built on its links.
+ * peers over plain HTTP. Provide it to anything built on its links. `network`
+ * stands in for its HTTP client and `tailscale` for its `tailscale` command.
  */
 export const layerLinkingEnvironment = (
   descriptor: ExecutionEnvironmentDescriptor,
   secrets: typeof ServerSecretStore.layer = ServerSecretStore.layer,
+  network: Layer.Layer<HttpClient.HttpClient> = FetchHttpClient.layer,
+  tailscale?: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>,
 ) =>
   PeerMcpClient.layer.pipe(
     Layer.provideMerge(PeerLinks.layer),
     Layer.provideMerge(ServerSettings.layerTest({ linkedEnvironmentsEnabled: true })),
     Layer.provideMerge(Sqlite.layerMemory),
-    Layer.provide(Layer.mergeAll(secrets, FetchHttpClient.layer)),
+    Layer.provide(
+      tailscale === undefined
+        ? Layer.mergeAll(secrets, network)
+        : Layer.mergeAll(secrets, network, tailscale),
+    ),
     // Services that act for this environment, such as delegation, name it too.
     Layer.provideMerge(
       Layer.succeed(ServerEnvironment.ServerEnvironment, {

@@ -288,6 +288,11 @@ makes the pairing code itself; otherwise paste one from that machine's
 **Settings → Sharing & access**. From a terminal, use
 `t3 environment link <address> --pairing-code <code> --access <mode>`.
 
+A plain `http` address works only where the network already encrypts: a
+`.ts.net` name, or a Tailscale address that the linking machine's running
+Tailscale lists as one of its devices. Otherwise use the machine's `https`
+address.
+
 You can also ask an agent to link a machine by name, such as "delegate this to
 my vps". It shows a card in the thread where you pick the machine the same way
 and the access, then approve.

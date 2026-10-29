@@ -9,6 +9,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
 import { HttpClient } from "effect/http";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as NodeNet from "node:net";
@@ -29,13 +30,29 @@ type NetworkInterfacesMap = ReturnType<typeof NodeOS.networkInterfaces>;
 
 // Stay below the config discovery timeout so slow Tailscale drops only the tailnet name.
 const TAILSCALE_ENDPOINT_TIMEOUT = Duration.seconds(3);
+// Laptops switch networks and Tailscale can connect after startup; a check reads only interfaces.
+const ADDRESS_CHECK_INTERVAL = Duration.seconds(30);
 
 export class DirectEndpoints extends Context.Service<
   DirectEndpoints,
   {
     readonly resolve: () => Effect.Effect<ReadonlyArray<ServerDirectEndpoint>>;
+    /** This machine's own plain-http endpoints, read now and then every 30 seconds. */
+    readonly streamBoundEndpoints: Stream.Stream<ReadonlyArray<ServerDirectEndpoint>>;
   }
 >()("t3/environment/DirectEndpoints") {}
+
+/**
+ * `bound` in place of the plain-http endpoints. A Tailscale Serve address stays
+ * as proven when the client subscribed: a probe during a network switch can fail.
+ */
+export const replaceBoundEndpoints = (
+  current: ReadonlyArray<ServerDirectEndpoint>,
+  bound: ReadonlyArray<ServerDirectEndpoint>,
+): ReadonlyArray<ServerDirectEndpoint> => [
+  ...bound,
+  ...current.filter((endpoint) => !endpoint.httpBaseUrl.startsWith("http:")),
+];
 
 // Credentials travel over HTTP; public IPs leak them and hostnames can resolve differently per client.
 const isAdvertisableAddress = (address: string): boolean =>
@@ -119,15 +136,17 @@ export const make = Effect.gen(function* () {
     : Effect.succeed(false);
   yield* Effect.forkDetach(onCloudVm);
 
+  const boundEndpoints = Effect.gen(function* () {
+    return resolveBoundEndpoints({
+      host: config.host,
+      port: config.port,
+      interfaces: NodeOS.networkInterfaces(),
+      onCloudVm: yield* onCloudVm,
+    });
+  });
+
   const resolve = Effect.gen(function* () {
-    const endpoints = [
-      ...resolveBoundEndpoints({
-        host: config.host,
-        port: config.port,
-        interfaces: NodeOS.networkInterfaces(),
-        onCloudVm: yield* onCloudVm,
-      }),
-    ];
+    const endpoints = [...(yield* boundEndpoints)];
     // Serve setup can fail without stopping startup; advertise only after it answers as this server.
     if (config.tailscaleServeEnabled) {
       const servedUrl = yield* readTailscaleStatus.pipe(
@@ -159,6 +178,9 @@ export const make = Effect.gen(function* () {
     resolve: Effect.fn("DirectEndpoints.resolve")(function () {
       return resolve;
     }),
+    streamBoundEndpoints: isLoopbackHost(config.host)
+      ? Stream.empty
+      : Stream.tick(ADDRESS_CHECK_INTERVAL).pipe(Stream.mapEffect(() => boundEndpoints)),
   });
 });
 

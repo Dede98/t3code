@@ -79,6 +79,7 @@ import {
   type RelayClientInstallProgressEvent,
   type ServerConfig as ClientServerConfig,
   type ServerConfigStreamEvent,
+  type ServerDirectEndpoint,
   type ServerLifecycleStreamEvent,
   type ServerProvider,
   type FilesystemBrowseFailure,
@@ -317,6 +318,7 @@ export const withLateEditorConfig = <E, R>(
   config: ClientServerConfig,
   liveUpdates: Stream.Stream<ServerConfigStreamEvent, E, R>,
   launcher: EditorDiscovery,
+  boundEndpoints: Stream.Stream<ReadonlyArray<ServerDirectEndpoint>> = Stream.empty,
 ) => {
   const lateEditorConfig = Stream.fromEffect(launcher.resolveAvailableEditors()).pipe(
     Stream.filter(
@@ -336,11 +338,23 @@ export const withLateEditorConfig = <E, R>(
     Stream.map((editorConfig) => ({ type: "editorsResolved" as const, editorConfig })),
   );
 
-  return Stream.merge(liveUpdates, lateEditorConfig).pipe(
+  const boundEndpointReads = boundEndpoints.pipe(
+    Stream.map((bound) => ({ type: "boundEndpointsRead" as const, bound })),
+  );
+
+  return Stream.merge(liveUpdates, Stream.merge(lateEditorConfig, boundEndpointReads)).pipe(
     Stream.mapAccum(
       (): ClientServerConfig => config,
       (current, event): readonly [ClientServerConfig, ReadonlyArray<ServerConfigStreamEvent>] => {
         switch (event.type) {
+          // A network switch or a late Tailscale moves them; older clients reject new event types.
+          case "boundEndpointsRead": {
+            const previous = current.directEndpoints ?? [];
+            const directEndpoints = DirectEndpoints.replaceBoundEndpoints(previous, event.bound);
+            if (JSON.stringify(directEndpoints) === JSON.stringify(previous)) return [current, []];
+            const next = { ...current, directEndpoints };
+            return [next, [{ version: 1, type: "snapshot", config: next }]];
+          }
           case "editorsResolved": {
             const {
               availableEditors: _editors,
@@ -3184,7 +3198,12 @@ export const layerWsRpc = (
 
               return Stream.concat(
                 rpcInitialItems([{ version: 1 as const, type: "snapshot" as const, config }]),
-                withLateEditorConfig(config, liveUpdates, externalLauncher),
+                withLateEditorConfig(
+                  config,
+                  liveUpdates,
+                  externalLauncher,
+                  directEndpoints.streamBoundEndpoints,
+                ),
               );
             }),
           ),

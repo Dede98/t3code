@@ -339,6 +339,42 @@ export const readTailscaleExitNode = readTailscaleOutput("status", ["status", "-
   Effect.flatMap(parseTailscaleExitNode),
 );
 
+const TailscaleNodeJson = Schema.Struct({ TailscaleIPs: Schema.optional(Schema.Unknown) });
+
+const TailscaleNodesJson = Schema.Struct({
+  BackendState: Schema.optional(Schema.Unknown),
+  Self: Schema.optional(TailscaleNodeJson),
+  Peer: Schema.optional(Schema.Record(Schema.String, TailscaleNodeJson)),
+});
+
+const decodeTailscaleNodesJson = Schema.decodeEffect(Schema.fromJsonString(TailscaleNodesJson));
+
+/** Tailnet IPv4 addresses of this machine and its peers, and none unless Tailscale is running. */
+export const parseTailnetNodeAddresses = (
+  rawStatusJson: string,
+): Effect.Effect<ReadonlySet<string>, TailscaleStatusParseError> =>
+  decodeTailscaleNodesJson(rawStatusJson).pipe(
+    Effect.mapError((cause) => new TailscaleStatusParseError({ cause })),
+    Effect.map((parsed) => {
+      const addresses = new Set<string>();
+      if (parsed.BackendState !== "Running") return addresses;
+      for (const node of [parsed.Self, ...Object.values(parsed.Peer ?? {})]) {
+        const ips = node?.TailscaleIPs;
+        if (!Array.isArray(ips)) continue;
+        for (const address of ips) {
+          if (typeof address === "string" && isTailscaleIpv4Address(address)) {
+            addresses.add(address);
+          }
+        }
+      }
+      return addresses;
+    }),
+  );
+
+export const readTailnetNodeAddresses = readTailscaleOutput("status", ["status", "--json"]).pipe(
+  Effect.flatMap(parseTailnetNodeAddresses),
+);
+
 const TailscalePrefsJson = Schema.Struct({
   RunSSH: Schema.optional(Schema.Unknown),
   WantRunning: Schema.optional(Schema.Unknown),

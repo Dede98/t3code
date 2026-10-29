@@ -17,6 +17,11 @@ against the live tree and history because they can move over time.
   of a new thread, and `followsCurrentConversation` in `Orchestrator.ts` calls `movedPastUsageLimit`
   (`UsageLimitQueueFollow.ts`). That second part applies regardless of the setting, so queued runs
   pinned to a limited account follow a manual Resume on another account too.
+- Linked environments over Tailscale IPv4: `PeerLinks` accepts plain http to a 100.64.0.0/10
+  address only while the local running Tailscale lists it (`readTailnetNodeAddresses` in
+  `packages/tailscale`), re-checked before every token use. Server-config subscriptions re-send a
+  snapshot when the machine's own addresses change (`DirectEndpoints.streamBoundEndpoints`,
+  `withLateEditorConfig` in `ws.ts`). Drop it only if upstream ships an equivalent.
 - A provider registry scoped per instance.
 - Provider hydration that terminates only sessions affected by the changed provider state.
 - Claude Agent SDK compatibility with the native resume store: a null first main `load()` from a

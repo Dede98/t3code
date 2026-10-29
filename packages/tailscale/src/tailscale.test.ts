@@ -9,6 +9,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import {
   ensureTailscaleServe,
+  parseTailnetNodeAddresses,
   parseTailscaleExitNode,
   parseTailscaleSshEnabled,
   parseTailscaleStatus,
@@ -127,6 +128,29 @@ describe("tailscale", () => {
 
       assert.equal(yield* parseTailscaleExitNode(tailscaleStatusJson), null);
     }),
+  );
+
+  it.effect.each([
+    { backendState: "Running", expected: ["100.100.100.100", "100.82.210.79"] },
+    { backendState: "Stopped", expected: [] },
+    { backendState: undefined, expected: [] },
+  ])(
+    "lists tailnet node addresses only while running: $backendState",
+    ({ backendState, expected }) =>
+      Effect.gen(function* () {
+        const addresses = yield* parseTailnetNodeAddresses(
+          JSON.stringify({
+            BackendState: backendState,
+            Self: { TailscaleIPs: ["100.100.100.100", "fd7a:115c:a1e0::1"] },
+            Peer: {
+              "nodekey:a": { TailscaleIPs: ["100.82.210.79", "fd7a:115c:a1e0::2"] },
+              "nodekey:b": { TailscaleIPs: ["192.168.1.20"] },
+              "nodekey:c": {},
+            },
+          }),
+        );
+        assert.deepEqual([...addresses], expected);
+      }),
   );
 
   it.effect("reads the HTTPS serve capability from the status capability map", () =>
