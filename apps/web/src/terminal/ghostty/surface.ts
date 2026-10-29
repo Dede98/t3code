@@ -350,7 +350,7 @@ function isTerminalPasteShortcut(
   return isMacPlatform(platform) ? event.metaKey : event.ctrlKey && event.shiftKey;
 }
 
-export function isLinuxTerminalPlatform(platform = navigator.platform): boolean {
+function isLinuxTerminalPlatform(platform = navigator.platform): boolean {
   return platform.toLowerCase().includes("linux");
 }
 

@@ -38,7 +38,7 @@ export class ElectronNotification extends Context.Service<
   }
 >()("@t3tools/desktop/electron/ElectronNotification") {}
 
-export const make = Effect.sync(() => {
+const make = Effect.sync(() => {
   const activeByKey = new Map<string, Electron.Notification>();
 
   const show: ElectronNotification["Service"]["show"] = (input) =>

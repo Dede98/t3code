@@ -7,7 +7,7 @@ export type ProviderUsageAttention = {
   readonly reason: string;
 };
 
-export function currentUsageWindows(limits: ServerProviderUsageLimits | undefined, now: number) {
+function currentUsageWindows(limits: ServerProviderUsageLimits | undefined, now: number) {
   if (!limits || limits.unavailable) return [];
   return limits.windows.filter(
     (window) => window.resetsAt === undefined || Date.parse(window.resetsAt) > now,

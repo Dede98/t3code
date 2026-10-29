@@ -8,13 +8,14 @@ import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
 import { describe, expect } from "vite-plus/test";
 
-import { ProviderInstanceId } from "@t3tools/contracts";
+import { ProviderInstanceId, type ServerProvider } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import { makeProviderRegistryRebuildBarrier } from "../provider/ProviderRegistryRebuildBarrier.ts";
 import * as ProviderRegistryRebuildBarrier from "../provider/ProviderRegistryRebuildBarrier.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 
@@ -44,7 +45,9 @@ const makeStubInstance = (
     },
     displayName: undefined,
     enabled: true,
-    snapshot: {} as ProviderInstance["snapshot"],
+    snapshot: {
+      getSnapshot: Effect.succeed({ instanceId } as ServerProvider),
+    } as ProviderInstance["snapshot"],
     orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
     textGeneration,
   }) satisfies ProviderInstance;
@@ -94,9 +97,12 @@ describe("TextGeneration.make", () => {
             makeStubRegistry([instance]),
           ),
           Effect.provide(
-            Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
-              resolveLink: () => Effect.die("No link lookup expected"),
-            }),
+            Layer.mergeAll(
+              Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+                resolveLink: () => Effect.die("No link lookup expected"),
+              }),
+              ServerSettings.layerTest(),
+            ),
           ),
         );
 
