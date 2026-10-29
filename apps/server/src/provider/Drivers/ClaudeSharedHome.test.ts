@@ -3,8 +3,10 @@ import { expect, it } from "@effect/vitest";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 
+import * as ServerConfig from "../../config.ts";
 import { materializeClaudeSharedHome } from "./ClaudeSharedHome.ts";
 import { discoverClaudeSkills } from "./ClaudeSkills.ts";
 
@@ -101,6 +103,40 @@ it.layer(NodeServices.layer)("ClaudeSharedHome", (it) => {
         expect(yield* fs.readFileString(path.join(config.configDirPath, "CLAUDE.md"))).toBe(
           "Private again",
         );
+      }),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "a T3 server without sharing leaves another server's links in place",
+    () =>
+      Effect.gen(function* () {
+        const { fs, path, config } = yield* fixture;
+        const server = (name: string) =>
+          ServerConfig.ServerConfig.pipe(
+            Effect.provide(ServerConfig.layerTest(process.cwd(), { prefix: `t3-shared-${name}-` })),
+          );
+        const sharing = yield* server("sharing");
+        const other = yield* server("other");
+        const on = (server: ServerConfig.ServerConfig["Service"]) =>
+          Effect.provideService(ServerConfig.ServerConfig, server);
+        const off = { ...config, sharedHomePath: "" };
+        const linked = Effect.forEach(["skills", "CLAUDE.md", "rules"], (name) =>
+          fs
+            .readLink(path.join(config.configDirPath, name))
+            .pipe(Effect.option, Effect.map(Option.isSome)),
+        );
+
+        // A journal from before links named their server.
+        yield* materializeClaudeSharedHome(config);
+        yield* materializeClaudeSharedHome(off).pipe(on(other));
+        expect(yield* linked).toEqual([true, true, true]);
+
+        yield* materializeClaudeSharedHome(config).pipe(on(sharing));
+        yield* materializeClaudeSharedHome(off).pipe(on(other));
+        expect(yield* linked).toEqual([true, true, true]);
+
+        yield* materializeClaudeSharedHome(off).pipe(on(sharing));
+        expect(yield* linked).toEqual([false, false, false]);
       }),
   );
 

@@ -1,6 +1,7 @@
 import type { ClaudeSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
@@ -8,11 +9,19 @@ import * as Semaphore from "effect/Semaphore";
 
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
+import * as ServerConfig from "../../config.ts";
 import { resolveClaudeConfigDirPath } from "./ClaudeHome.ts";
 
 const entries = ["skills", "CLAUDE.md", "rules"] as const;
 const Manifest = Schema.fromJsonString(
-  Schema.Array(Schema.Struct({ name: Schema.Literals(entries), target: Schema.String })),
+  Schema.Array(
+    Schema.Struct({
+      name: Schema.Literals(entries),
+      target: Schema.String,
+      // The state directory of the T3 server that made the link; older journals have none.
+      owner: Schema.optionalKey(Schema.String),
+    }),
+  ),
 );
 const decodeManifest = Schema.decodeUnknownEffect(Manifest);
 const encodeManifest = Schema.encodeEffect(Manifest);
@@ -24,8 +33,9 @@ export class ClaudeSharedHomeError extends Schema.TaggedError<ClaudeSharedHomeEr
 ) {}
 
 /** Share only Claude's user-authored context. The journal records links we own,
- * so clearing the setting never removes a user's pre-existing file or link.
- * Each journal update precedes link creation, allowing interrupted setup to retry.
+ * so clearing the setting never removes a user's pre-existing file or link, and a
+ * server without the setting never removes another T3 server's links in the same
+ * config directory. Each journal update precedes link creation, so setup can retry.
  */
 export const materializeClaudeSharedHome = Effect.fn("materializeClaudeSharedHome")(
   function* (
@@ -35,6 +45,12 @@ export const materializeClaudeSharedHome = Effect.fn("materializeClaudeSharedHom
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const configDir = yield* resolveClaudeConfigDirPath(config, environment);
+    const owner = Option.getOrUndefined(
+      Option.map(
+        yield* Effect.serviceOption(ServerConfig.ServerConfig),
+        (server) => server.stateDir,
+      ),
+    );
     const manifestPath = path.join(configDir, ".t3-shared-home.json");
     const shared = config.sharedHomePath.trim();
     const sharedDir = shared
@@ -113,13 +129,19 @@ export const materializeClaudeSharedHome = Effect.fn("materializeClaudeSharedHom
       Effect.gen(function* () {
         const link = path.join(configDir, name);
         const current = yield* readLink(link);
-        const previous = owned.find((entry) => entry.name === name)?.target;
+        const entry = owned.find((candidate) => candidate.name === name);
         const target =
           sharedRoot && sharedRoot !== accountRoot ? path.join(sharedRoot, name) : undefined;
+        // A server that shares adopts an ownerless entry; one that does not never removes it.
+        const ours =
+          entry !== undefined &&
+          (entry.owner === owner || (entry.owner === undefined && target !== undefined));
+        const previous = ours ? entry.target : undefined;
         if (previous && current !== undefined && current !== previous) return yield* conflict(name);
         if (target && current !== undefined && current !== previous && current !== target)
           return yield* conflict(name);
-        return { name, link, current, previous, target };
+        const adopt = ours && entry.owner === undefined && owner !== undefined;
+        return { name, link, current, previous, target, adopt };
       }),
     );
 
@@ -142,15 +164,21 @@ export const materializeClaudeSharedHome = Effect.fn("materializeClaudeSharedHom
         yield* fs.makeDirectory(path.join(sharedRoot, name), { recursive: true });
       }
     }
-    for (const { name, link, current, previous, target } of plan) {
-      if (current === target && current !== undefined) continue;
+    for (const { name, link, current, previous, target, adopt } of plan) {
+      if (current === target && current !== undefined) {
+        if (adopt && owner !== undefined && previous === target) {
+          owned = owned.map((entry) => (entry.name === name ? { ...entry, owner } : entry));
+          yield* save();
+        }
+        continue;
+      }
       if (previous) {
         if (current !== undefined) yield* fs.remove(link);
         owned = owned.filter((entry) => entry.name !== name);
         yield* save();
       }
       if (target) {
-        owned = [...owned, { name, target }];
+        owned = [...owned, owner === undefined ? { name, target } : { name, target, owner }];
         yield* save();
         // CLAUDE.md may not exist yet. A dangling link lets a later edit become
         // visible to all accounts without copying or creating instruction text.
