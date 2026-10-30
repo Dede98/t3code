@@ -5,7 +5,6 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ServerSettings,
-  type ServerSettings as ServerSettingsType,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
@@ -52,7 +51,7 @@ const deriveWithGate = (enabled: boolean) =>
             homePath: "~/.codex-work",
           },
         },
-      } as unknown as ServerSettingsType["providerInstances"],
+      } as unknown as (typeof ServerSettings.Encoded)["providerInstances"],
     }),
   );
 

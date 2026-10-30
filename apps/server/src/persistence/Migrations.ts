@@ -75,6 +75,7 @@ import Migration0069 from "./Migrations/069_ThreadMessageSearch.ts";
 import Migration0070 from "./Migrations/070_PeerLinks.ts";
 import Migration0071 from "./Migrations/071_PeerLinkFence.ts";
 import Migration0072 from "./Migrations/072_WaitingLinkRequestIndex.ts";
+import Migration0073 from "./Migrations/073_ActiveTurnItemIndexes.ts";
 
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -151,6 +152,7 @@ export const migrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -184,6 +186,7 @@ export const forkMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -207,6 +210,7 @@ export const forkIntegrationMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -231,6 +235,7 @@ const upstreamIntegrationMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -255,6 +260,7 @@ const preview54MigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -280,6 +286,7 @@ const preview53MigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -301,6 +308,7 @@ const upstreamWebhookMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -322,6 +330,7 @@ const upstreamMcpAppMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 // Upstream databases that already applied review guides keep that id/name pair.
@@ -340,6 +349,7 @@ const upstreamReviewGuideMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 // Official upstream databases may already have the failure index at 62.
@@ -358,6 +368,7 @@ const upstreamFailureIndexMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 // Official databases may have used 63/64 before ever opening in the fork.
@@ -375,6 +386,7 @@ const upstreamDropProjectionsMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 const upstreamCanonicalLinksMigrationEntries = [
@@ -389,6 +401,7 @@ const upstreamCanonicalLinksMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 const upstreamUsageIndexMigrationEntries = [
@@ -402,6 +415,7 @@ const upstreamUsageIndexMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 const upstreamSettlementMigrationEntries = [
@@ -414,6 +428,7 @@ const upstreamSettlementMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 // Official upstream databases may already have webhook dedupe at 67.
@@ -426,6 +441,7 @@ const upstreamWebhookDedupeMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 // Official upstream databases may already have the shell stop index at 68.
@@ -437,6 +453,7 @@ const upstreamShellStopIndexMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 // Official upstream databases may already have message search at 69.
@@ -447,6 +464,7 @@ const upstreamThreadMessageSearchMigrationEntries = [
   [71, "PeerLinks", Migration0070],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 // Keep official peer-link ledger entries and append the missing Claude store.
@@ -456,6 +474,7 @@ const upstreamPeerLinksMigrationEntries = [
   [71, "ClaudeSessionStore", ClaudeSessionStore],
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 const upstreamPeerLinkFenceMigrationEntries = [
@@ -463,12 +482,20 @@ const upstreamPeerLinkFenceMigrationEntries = [
   [71, "PeerLinkFence", Migration0071],
   [72, "ClaudeSessionStore", ClaudeSessionStore],
   [73, "WaitingLinkRequestIndex", Migration0072],
+  [74, "ActiveTurnItemIndexes", Migration0073],
 ] as const;
 
 const upstreamWaitingLinkRequestMigrationEntries = [
   ...upstreamPeerLinkFenceMigrationEntries.filter(([id]) => id <= 71),
   [72, "WaitingLinkRequestIndex", Migration0072],
   [73, "ClaudeSessionStore", ClaudeSessionStore],
+  [74, "ActiveTurnItemIndexes", Migration0073],
+] as const;
+
+const upstreamActiveTurnItemIndexesMigrationEntries = [
+  ...upstreamWaitingLinkRequestMigrationEntries.filter(([id]) => id <= 72),
+  [73, "ActiveTurnItemIndexes", Migration0073],
+  [74, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -554,7 +581,9 @@ export function selectMigrationEntries(
                               ? has(70, "PeerLinks")
                                 ? has(71, "PeerLinkFence")
                                   ? has(72, "WaitingLinkRequestIndex")
-                                    ? upstreamWaitingLinkRequestMigrationEntries
+                                    ? has(73, "ActiveTurnItemIndexes")
+                                      ? upstreamActiveTurnItemIndexesMigrationEntries
+                                      : upstreamWaitingLinkRequestMigrationEntries
                                     : upstreamPeerLinkFenceMigrationEntries
                                   : upstreamPeerLinksMigrationEntries
                                 : upstreamThreadMessageSearchMigrationEntries

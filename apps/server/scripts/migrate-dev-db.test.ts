@@ -265,6 +265,10 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
       assert.deepStrictEqual(result.executedMigrations, [
         "69_ShellStopRequestIndex",
         "70_ThreadMessageSearch",
+        "71_PeerLinks",
+        "72_PeerLinkFence",
+        "73_WaitingLinkRequestIndex",
+        "74_ActiveTurnItemIndexes",
       ]);
       const migrated = yield* withDatabase(result.databasePath, history);
       assert.deepStrictEqual(migrated.slice(0, original.length), original);

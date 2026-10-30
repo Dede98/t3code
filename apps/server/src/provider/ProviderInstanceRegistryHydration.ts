@@ -12,6 +12,7 @@ import {
   type ProviderInstanceConfigMap,
   ServerSettings,
 } from "@t3tools/contracts";
+import type * as Crypto from "effect/Crypto";
 import * as Equal from "effect/Equal";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -23,6 +24,7 @@ import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 
 import { ServerSettingsService } from "../serverSettings.ts";
+import * as SecretResolver from "../secrets/SecretResolver.ts";
 import { BUILT_IN_DRIVERS, type BuiltInDriversEnv } from "./builtInDrivers.ts";
 import * as ProviderInstanceRegistryMutator from "./ProviderInstanceRegistryMutator.ts";
 import {
@@ -53,6 +55,8 @@ type ProviderInstanceRegistryHydrationEnv =
   | ServerConfig.ServerConfig
   | Path.Path
   | FileSystem.FileSystem
+  // Secret provider reads.
+  | Crypto.Crypto
   // The Claude runner counts its CLIs as running agents for port discovery.
   | PortScanner.PortDiscovery;
 
@@ -347,7 +351,8 @@ const layerSettingsWatcher = (
  * exposes the mutator tag, which only this module imports.
  */
 export const layer: Layer.Layer<
-  ProviderInstanceRegistry.ProviderInstanceRegistry,
+  | ProviderInstanceRegistry.ProviderInstanceRegistry
+  | ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator,
   never,
   ProviderInstanceRegistryHydrationEnv
 > = Layer.unwrap(
@@ -373,6 +378,7 @@ export const layer: Layer.Layer<
       Layer.provide(ProviderOrchestrationAdapterInfrastructure.layer),
       Layer.provide(AcpRegistrySupport.layerFromHost),
       Layer.provide(ProviderHostLive.layer),
+      Layer.provide(SecretResolver.layer),
     );
 
     return layerSettingsWatcher(initialSettings, settingsChanges).pipe(
@@ -380,7 +386,8 @@ export const layer: Layer.Layer<
     );
   }),
 ) as Layer.Layer<
-  ProviderInstanceRegistry.ProviderInstanceRegistry,
+  | ProviderInstanceRegistry.ProviderInstanceRegistry
+  | ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator,
   never,
   ProviderInstanceRegistryHydrationEnv
 >;

@@ -15,6 +15,7 @@ import { seedForkMigrations } from "./Migrations.testkit.ts";
 import PeerLinks from "./Migrations/070_PeerLinks.ts";
 import PeerLinkFence from "./Migrations/071_PeerLinkFence.ts";
 import WaitingLinkRequestIndex from "./Migrations/072_WaitingLinkRequestIndex.ts";
+import ActiveTurnItemIndexes from "./Migrations/073_ActiveTurnItemIndexes.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 
 const seedFork = (through = 55) => seedForkMigrations(through);
@@ -73,6 +74,7 @@ it.effect(
           [71, "PeerLinks"],
           [72, "PeerLinkFence"],
           [73, "WaitingLinkRequestIndex"],
+          [74, "ActiveTurnItemIndexes"],
         ]);
         // Each startup owns a fresh connection/layer.
         assert.deepEqual(yield* migrate, []);
@@ -179,6 +181,7 @@ it.effect("rolls back a failed fork foundation and retries from a fresh connecti
         [71, "PeerLinks"],
         [72, "PeerLinkFence"],
         [73, "WaitingLinkRequestIndex"],
+        [74, "ActiveTurnItemIndexes"],
       ],
     );
   }).pipe(
@@ -277,7 +280,7 @@ it.effect.each([0, 32, 52, 53, 54].map((through) => ({ through })))(
   },
 );
 
-it.effect.each([57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72])(
+it.effect.each([57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73])(
   "preserves official upstream webhook ledger through %s",
   (through) =>
     Effect.gen(function* () {
@@ -289,6 +292,7 @@ it.effect.each([57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72])
         [70, "PeerLinks", PeerLinks] as const,
         [71, "PeerLinkFence", PeerLinkFence] as const,
         [72, "WaitingLinkRequestIndex", WaitingLinkRequestIndex] as const,
+        [73, "ActiveTurnItemIndexes", ActiveTurnItemIndexes] as const,
       ].filter(([id]) => id <= through);
       yield* Migrator.make({})({
         loader: Migrator.fromRecord(
@@ -349,6 +353,11 @@ it.effect.each([57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72])
       );
       assert.equal(
         (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_stop_request_idx'`)
+          .length,
+        1,
+      );
+      assert.equal(
+        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_active_ordinal_idx'`)
           .length,
         1,
       );

@@ -125,7 +125,6 @@ import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
 import {
-  buildActiveShellSnapshot,
   bufferShellLiveStream,
   coalesceShellApplicationEvents,
   composeShellStreamWithEnrichment,
@@ -135,7 +134,7 @@ import {
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemFromThreadShell,
   shellStreamItemsFromInitialSnapshot,
-  shellSnapshotForSubscriber,
+  loadSubscriberShellSnapshot,
   shellStreamItemsFromResumeSnapshot,
   shouldPublishShellApplicationEvent,
   skipUnchangedThreadShells,
@@ -1026,21 +1025,23 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       },
     );
     const loadSnapshot = Effect.fn("ws.orchestrationV2.loadShellSnapshot")(function* () {
-      const base = buildActiveShellSnapshot(
-        yield* loadShellSnapshotParts({
-          sql,
-          readThreads: threadManagement.readShellSnapshot({ location: "active" }),
-          listProjects: projects.listShells(),
-          latestSequence: applicationEvents.latestApplicationSequence,
-        }),
-      );
-      const forSubscriber = shellSnapshotForSubscriber(base, {
-        omitIdleSubagents: input.omitIdleSubagents === true,
-        omitOlderSettled: input.omitOlderSettled === true,
-        now: yield* DateTime.now,
+      const forSubscriber = yield* loadSubscriberShellSnapshot({
+        sql,
+        listShellIndex: threadManagement.listActiveShellIndex(),
+        readThreads: (threadIds) =>
+          threadManagement.readShellSnapshot({
+            location: "active",
+            ...(threadIds === undefined ? {} : { threadIds }),
+          }),
+        listProjects: projects.listShells(),
+        latestSequence: applicationEvents.latestApplicationSequence,
+        options: {
+          omitIdleSubagents: input.omitIdleSubagents === true,
+          omitOlderSettled: input.omitOlderSettled === true,
+        },
       });
       subagentThreadIds = forSubscriber.subagentThreadIds;
-      const enriched = yield* enrichProjectShells(base.projects);
+      const enriched = yield* enrichProjectShells(forSubscriber.snapshot.projects);
       return {
         snapshot: {
           ...forSubscriber.snapshot,
@@ -1810,6 +1811,8 @@ export const layerWsRpc = (
           threadSnapshotPagination: true,
           threadFind: true,
           threadFindProgressive: true,
+          secretProviderSettings: true,
+          secretReferences: true,
           ...Option.match(scratchWorkspaceRoot, {
             onNone: () => ({}),
             onSome: (root) => ({ scratchWorkspaceRoot: root }),
@@ -1931,6 +1934,8 @@ export const layerWsRpc = (
             ),
           ),
         [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: (input) => threadManagement.stopWorkflow(input),
+        [ORCHESTRATION_V2_WS_METHODS.forceStopThread]: (input) =>
+          threadManagement.forceStopThread(input),
         [ORCHESTRATION_V2_WS_METHODS.getWorkflowScript]: (input) =>
           readWorkflowScript({ scriptPath: input.scriptPath }),
         [ORCHESTRATION_V2_WS_METHODS.getTurnItem]: (input) =>
@@ -2329,9 +2334,11 @@ export const layerWsRpc = (
                   cwd: input.cwd,
                   fresh: input.fresh === true,
                 })
-              : input.instanceId !== undefined
-                ? providerRegistry.refreshInstance(input.instanceId)
-                : providerRegistry.refresh();
+              : input.reloadSecrets === true
+                ? providerRegistry.reloadSecretsAndRefresh(input.instanceId)
+                : input.instanceId !== undefined
+                  ? providerRegistry.refreshInstance(input.instanceId)
+                  : providerRegistry.refresh();
             if (input.refreshModels) {
               const instances = yield* providerInstances.listInstances;
               for (const instance of instances) {

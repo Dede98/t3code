@@ -71,6 +71,7 @@ import type {
   ProviderWorkspaceSnapshot,
 } from "@t3tools/provider-core/server/driver";
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
+import * as ProviderInstanceRegistryMutator from "./ProviderInstanceRegistryMutator.ts";
 import * as ProviderRegistry from "./ProviderRegistry.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "@t3tools/provider-core/server/maintenanceResolver";
@@ -106,6 +107,10 @@ const withBundledCompatibility = (snapshot: ServerProvider) =>
     ModelManifest.BUNDLED_MODEL_MANIFEST.compatibility,
   );
 
+const layerUnusedMutator = Layer.mock(
+  ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator,
+)({});
+
 const layerTestHttpClient = Layer.succeed(
   HttpClient.HttpClient,
   HttpClient.make((request) =>
@@ -121,6 +126,7 @@ const ProviderInstanceRegistryHydrationTestLive = ProviderInstanceRegistryHydrat
   Layer.provide(ProviderRegistryRebuildBarrier.layer),
 );
 const layerRegistry = ProviderRegistry.layer.pipe(
+  Layer.provide(layerUnusedMutator),
   Layer.provideMerge(ProviderRegistryRebuildBarrier.layer),
 );
 
@@ -1403,6 +1409,7 @@ it.layer(
         yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
         const runtimeServices = yield* Layer.build(
           ProviderRegistry.layer.pipe(
+            Layer.provide(layerUnusedMutator),
             Layer.provideMerge(instanceRegistryLayer),
             Layer.provideMerge(
               Layer.succeed(
@@ -1485,6 +1492,7 @@ it.layer(
         yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
         const runtimeServices = yield* Layer.build(
           ProviderRegistry.layer.pipe(
+            Layer.provide(layerUnusedMutator),
             Layer.provideMerge(instanceRegistryLayer),
             Layer.provideMerge(
               Layer.succeed(
@@ -1564,6 +1572,7 @@ it.layer(
         yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
         const runtimeServices = yield* Layer.build(
           ProviderRegistry.layer.pipe(
+            Layer.provide(layerUnusedMutator),
             Layer.provideMerge(instanceRegistryLayer),
             Layer.provideMerge(
               Layer.succeed(
@@ -1885,6 +1894,7 @@ it.layer(
           yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
           const runtimeServices = yield* Layer.build(
             ProviderRegistry.layer.pipe(
+              Layer.provide(layerUnusedMutator),
               Layer.provideMerge(instanceRegistryLayer),
               Layer.provideMerge(ProviderRegistryRebuildBarrier.layer),
               Layer.provideMerge(
@@ -2412,7 +2422,7 @@ it.layer(
                 "cursor",
                 "grok",
                 "opencode",
-              ),
+              ) as unknown as (typeof ServerSettings.Encoded)["providerInstances"],
             }),
           ),
         );
@@ -2492,7 +2502,7 @@ it.layer(
                   enabled: false,
                   config: { arbitrary: "payload" },
                 },
-              } as unknown as ContractServerSettings["providerInstances"],
+              } as unknown as (typeof ServerSettings.Encoded)["providerInstances"],
             }),
           ),
         );
