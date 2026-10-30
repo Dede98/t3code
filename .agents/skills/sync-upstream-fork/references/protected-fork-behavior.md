@@ -26,6 +26,10 @@ against the live tree and history because they can move over time.
   are probed (`PortScanner.ts`). This is a verbatim backport of upstream PR #26289 for issue
   #26279, because probes broke tests whose processes inherit `T3CODE_THREAD_ID`. Once upstream
   merges #26289 or another fix for #26279, take upstream's version.
+- New threads read run-stop state only through the shell-gated detail ref (`useThreadRunStop` in
+  `entities.ts`, `threadDetailRef` in `useThreadLifecycle`), so a draft's 404 cannot park the thread
+  as deleted and leave its chat empty. This is a verbatim backport of upstream PR #27452 for issue
+  #27443. Once upstream merges #27452 or another fix for #27443, take upstream's version.
 - A provider registry scoped per instance.
 - Provider hydration that terminates only sessions affected by the changed provider state.
 - Claude Agent SDK compatibility with the native resume store: a null first main `load()` from a

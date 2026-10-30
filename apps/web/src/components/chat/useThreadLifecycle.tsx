@@ -50,7 +50,12 @@ import { composerDraftHasUserContent, useComposerDraftStore } from "../../compos
 import { useEnvironmentScope } from "~/state/session";
 import { threadEnvironment } from "../../state/threads";
 import { vcsEnvironment } from "../../state/vcs";
-import { useChildThreadInputs, readThreadShell, waitForThreadShell } from "../../state/entities";
+import {
+  useChildThreadInputs,
+  readThreadShell,
+  useThreadRunStop,
+  waitForThreadShell,
+} from "../../state/entities";
 import { environmentShell } from "../../state/shell";
 import { ThreadStatusLine } from "./ThreadStatusLine";
 import { useStartThreadTurn } from "./useStartThreadTurn";
@@ -66,15 +71,8 @@ import {
   runStopNowItem,
 } from "./ThreadActivityBanners";
 import { useForceStopThread } from "./useForceStopThread";
-import { useAtomValue } from "@effect/atom-react";
-import type { RunStopPresentation } from "@t3tools/client-runtime/state/thread-execution";
-import { Atom } from "effect/reactivity";
-import { environmentThreadDetails } from "../../state/threads";
 import type { useLocalDispatchState } from "./useLocalDispatchState";
 const RELATED_THREAD_SHELL_WAIT_MS = 1_000;
-const NO_RUN_STOP_ATOM = Atom.make<RunStopPresentation | null>(null).pipe(
-  Atom.withLabel("web-thread-run-stop:empty"),
-);
 
 type PendingThreadRequests = ReturnType<typeof usePendingThreadRequests>;
 type LocalDispatchState = ReturnType<typeof useLocalDispatchState>;
@@ -88,6 +86,8 @@ interface ThreadLifecycleInput {
   readonly activeThread: EnvironmentThreadShell | undefined;
   readonly activeThreadId: ThreadId | null;
   readonly activeThreadRef: ScopedThreadRef | null;
+  /** Null until the thread's detail may load; see resolveThreadDetailRef. */
+  readonly threadDetailRef: ScopedThreadRef | null;
   readonly activeThreadKey: string | null;
   readonly activeThreadShell: EnvironmentThreadShell | null;
   readonly activeLatestRun: EnvironmentThreadShell["latestRun"];
@@ -139,6 +139,7 @@ export function useThreadLifecycle(input: ThreadLifecycleInput) {
     activeThread,
     activeThreadId,
     activeThreadRef,
+    threadDetailRef,
     activeThreadKey,
     activeThreadShell,
     activeLatestRun,
@@ -522,9 +523,7 @@ export function useThreadLifecycle(input: ThreadLifecycleInput) {
       : null;
 
   const forceStop = useForceStopThread(environmentId);
-  const anyRunStop = useAtomValue(
-    activeThreadRef ? environmentThreadDetails.runStopAtom(activeThreadRef) : NO_RUN_STOP_ATOM,
-  );
+  const anyRunStop = useThreadRunStop(threadDetailRef);
   // A background Stop matters only while that work is still pending.
   const runStop = anyRunStop?.background && activeBackgroundTasks.length === 0 ? null : anyRunStop;
   const runStopNow =
