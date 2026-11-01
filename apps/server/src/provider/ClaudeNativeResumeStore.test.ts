@@ -407,7 +407,7 @@ testLayer("ClaudeNativeResumeStore", (it) => {
     ),
   );
 
-  it.effect("still rejects reordered or changed queue operations", () =>
+  it.effect("keeps a mirrored store whose bookkeeping entries diverge from the source", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const sessionId = "00000000-0000-4000-8000-000000000087";
@@ -423,34 +423,41 @@ testLayer("ClaudeNativeResumeStore", (it) => {
           path.join(projectDirectory, `${sessionId}.jsonl`),
           [
             encodeUnknownJsonString({ type: "user", uuid: "queue-user" }),
+            encodeUnknownJsonString({ type: "tools-used", tools: ["Bash"] }),
+            encodeUnknownJsonString({ type: "api-request", requestId: "native-only" }),
             encodeUnknownJsonString({ type: "queue-operation", operation: "enqueue" }),
             encodeUnknownJsonString({ type: "assistant", uuid: ASSISTANT_UUID }),
             "",
           ].join("\n"),
         );
+        const storedEntries = [
+          { type: "user", uuid: "queue-user" },
+          { type: "queue-operation", operation: "enqueue" },
+          { type: "tools-used", tools: ["Bash"] },
+          { type: "assistant", uuid: ASSISTANT_UUID },
+        ];
         yield* Effect.promise(() =>
           sharedStore.replaceSession({
             projectKey: PROJECT_KEY,
             sessionId,
-            entries: [
-              { type: "user", uuid: "queue-user" },
-              { type: "queue-operation", operation: "dequeue" },
-              { type: "assistant", uuid: ASSISTANT_UUID },
-            ],
+            entries: storedEntries,
             subkeys: [],
           }),
         );
 
-        const error = yield* Effect.flip(
-          importClaudeNativeSessionToStore(
-            sharedStore,
-            { sessionId, sourceConfigDirPath, projectKey: PROJECT_KEY },
-            { fileSystem, path },
-          ),
+        const result = yield* importClaudeNativeSessionToStore(
+          sharedStore,
+          { sessionId, sourceConfigDirPath, projectKey: PROJECT_KEY },
+          { fileSystem, path },
         );
 
-        assert.equal(error.operation, "nativeResume:importDiverged");
-        assert.include(error.detail, "Main ordered transcript entry 2 differs");
+        assert.equal(result.state, "already-synced");
+        assert.deepStrictEqual(
+          (yield* Effect.promise(() =>
+            sharedStore.loadSession({ projectKey: PROJECT_KEY, sessionId }),
+          ))?.entries,
+          storedEntries,
+        );
       }),
     ),
   );

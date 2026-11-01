@@ -74,6 +74,22 @@ function hasExpectedCheckpoint(
   return snapshot.entries.some((entry) => entry.uuid === expectedAssistantUuid);
 }
 
+const CONVERSATION_ENTRY_TYPES = new Set<string>([
+  "user",
+  "assistant",
+  ...MAIN_TRANSCRIPT_STATE_TYPES,
+]);
+
+/** Claude orders bookkeeping entries (tools-used, queue-operation) differently per transcript. */
+function storeHoldsSourceConversation(
+  storedSnapshot: ClaudeSessionSnapshot,
+  sourceSnapshot: ClaudeSessionSnapshot,
+): boolean {
+  const conversation = (snapshot: ClaudeSessionSnapshot) =>
+    snapshot.entries.filter((entry) => CONVERSATION_ENTRY_TYPES.has(entry.type));
+  return mainEntriesArePrefix(conversation(sourceSnapshot), conversation(storedSnapshot));
+}
+
 function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -592,10 +608,12 @@ export const importClaudeNativeSessionToStore = Effect.fn(
     }
     if (!storeIsSourcePrefix) {
       // Claude Code keeps some entries (tools-used, api-request) out of the store, so the native
-      // transcript can stop matching it. The next turn resumes from the store at this checkpoint.
+      // transcript can stop matching it. The next turn resumes from the store at this checkpoint,
+      // or, without one, from a store that already holds every source message.
       if (
-        options.expectedAssistantUuid !== undefined &&
-        hasExpectedCheckpoint(storedSnapshot, options.expectedAssistantUuid)
+        options.expectedAssistantUuid === undefined
+          ? storeHoldsSourceConversation(storedSnapshot, sourceSnapshot)
+          : hasExpectedCheckpoint(storedSnapshot, options.expectedAssistantUuid)
       ) {
         return { state: "already-synced" as const, snapshot: storedSnapshot };
       }
