@@ -127,8 +127,26 @@ export const piUsageFormat: TranscriptUsageFormat<typeof PiScanState.Type> = {
 export const resolvePiSessionDirectory = Effect.fn("resolvePiSessionDirectory")(function* (
   environment: NodeJS.ProcessEnv,
 ) {
-  const path = yield* Path.Path;
-  const home = yield* HostProcess.HomeDirectory;
+  return resolvePiSessionsDir(environment, yield* HostProcess.HomeDirectory, yield* Path.Path);
+});
+
+export const piUsageReader: ProviderUsageReader<PiSettings, Path.Path> = {
+  kind: "transcripts",
+  provider: "pi",
+  format: piUsageFormat,
+  directories: Effect.fn("piUsageReader.directories")(function* ({ environment }) {
+    const path = yield* Path.Path;
+    const home = yield* HostProcess.HomeDirectory;
+    return [{ dir: resolvePiSessionsDir(environment, home, path) }];
+  }),
+};
+
+/** Where Pi stores session JSONL files for a provider environment, matching Pi's own lookup. */
+export function resolvePiSessionsDir(
+  environment: NodeJS.ProcessEnv,
+  home: string,
+  path: Path.Path,
+): string {
   const sessionDir = environment.PI_CODING_AGENT_SESSION_DIR?.trim();
   if (sessionDir) return path.resolve(expandHomePath(sessionDir, home));
   const agentDir = environment.PI_CODING_AGENT_DIR?.trim();
@@ -136,12 +154,4 @@ export const resolvePiSessionDirectory = Effect.fn("resolvePiSessionDirectory")(
     agentDir ? expandHomePath(agentDir, home) : path.join(home, ".pi", "agent"),
     "sessions",
   );
-});
-
-export const piUsageReader: ProviderUsageReader<PiSettings, Path.Path> = {
-  kind: "transcripts",
-  provider: "pi",
-  format: piUsageFormat,
-  directories: ({ environment }) =>
-    resolvePiSessionDirectory(environment).pipe(Effect.map((dir) => [{ dir }])),
-};
+}

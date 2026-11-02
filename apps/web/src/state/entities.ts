@@ -26,7 +26,6 @@ import type {
   ThreadId,
 } from "@t3tools/contracts";
 import type { ThreadCheckpointSummary } from "@t3tools/client-runtime/state/thread-checkpoints";
-import type { RunStopPresentation } from "@t3tools/client-runtime/state/thread-execution";
 import { Atom } from "effect/reactivity";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentProjects } from "./projects";
@@ -57,9 +56,6 @@ const EMPTY_THREAD_SHELL_ATOM = Atom.make<EnvironmentThreadShell | null>(null).p
 const EMPTY_THREAD_PROJECTION_ATOM = Atom.make<EnvironmentThread | null>(null).pipe(
   Atom.withLabel("web-thread-projection:empty"),
 );
-const NO_RUN_STOP_ATOM = Atom.make<RunStopPresentation | null>(null).pipe(
-  Atom.withLabel("web-thread-run-stop:empty"),
-);
 const EMPTY_THREAD_STATUS_ATOM = Atom.make<EnvironmentThreadStatus>("empty").pipe(
   Atom.withLabel("web-thread-status:empty"),
 );
@@ -69,6 +65,9 @@ const EMPTY_VISIBLE_TURN_ITEMS_ATOM = Atom.make(EMPTY_VISIBLE_TURN_ITEMS).pipe(
 const EMPTY_CHECKPOINT_SUMMARIES_ATOM = Atom.make<ReadonlyArray<ThreadCheckpointSummary>>(
   Object.freeze([]),
 ).pipe(Atom.withLabel("web-thread-checkpoint-summaries:empty"));
+const EMPTY_ASSISTANT_MESSAGE_TEXT_ATOM = Atom.make<string | null>(null).pipe(
+  Atom.withLabel("web-assistant-message-text:empty"),
+);
 const EMPTY_LAST_VISITED_AT_ATOM = Atom.make<DateTime.Utc | null>(null).pipe(
   Atom.withLabel("web-thread-last-visited:empty"),
 );
@@ -105,6 +104,23 @@ export function useServerConfigs() {
 export function useThreadShells(enabled = true): ReadonlyArray<EnvironmentThreadShell> {
   return useAtomValue(
     enabled ? environmentThreadShells.threadShellsAtom : EMPTY_THREAD_SHELLS_ATOM,
+  );
+}
+
+/** Whether any connected environment is hiding tagged threads right now. */
+export function useAnyEnvironmentHiding(): boolean {
+  return useAtomValue(environmentThreadShells.anyEnvironmentHidingAtom);
+}
+
+/** Keys of threads the tag filter hides from display, by `threadKey`. */
+export function useHiddenThreadKeys(): ReadonlySet<string> {
+  return useAtomValue(environmentThreadShells.hiddenThreadKeysAtom);
+}
+
+/** Thread shells minus those the tag filter hides, for lists that show threads to the user. */
+export function useVisibleThreadShells(enabled = true): ReadonlyArray<EnvironmentThreadShell> {
+  return useAtomValue(
+    enabled ? environmentThreadShells.visibleThreadShellsAtom : EMPTY_THREAD_SHELLS_ATOM,
   );
 }
 
@@ -196,18 +212,6 @@ export function useThreadHistory(ref: ScopedThreadRef | null): ThreadHistoryMeta
   );
 }
 
-/**
- * Run-stop state for a thread whose detail may load. Pass the detail ref, never a draft's ref:
- * a draft's detail read 404s and parks the thread as deleted, even after the server creates it.
- */
-export function threadRunStopAtom(ref: ScopedThreadRef | null) {
-  return ref === null ? NO_RUN_STOP_ATOM : environmentThreadDetails.runStopAtom(ref);
-}
-
-export function useThreadRunStop(ref: ScopedThreadRef | null): RunStopPresentation | null {
-  return useAtomValue(threadRunStopAtom(ref));
-}
-
 export function resolveThreadDetailRef(
   ref: ScopedThreadRef | null,
   options: {
@@ -225,6 +229,29 @@ export function useThreadVisibleTurnItems(
     ref === null
       ? EMPTY_VISIBLE_TURN_ITEMS_ATOM
       : environmentThreadDetails.visibleTurnItemsAtom(ref),
+  );
+}
+
+/** Visible turn items held through streamed assistant text; see useAssistantMessageText. */
+export function useTimelineVisibleTurnItems(
+  ref: ScopedThreadRef | null,
+): ReadonlyArray<OrchestrationV2ProjectedTurnItem> {
+  return useAtomValue(
+    ref === null
+      ? EMPTY_VISIBLE_TURN_ITEMS_ATOM
+      : environmentThreadDetails.timelineVisibleTurnItemsAtom(ref),
+  );
+}
+
+/** One assistant message's live text, or null when the thread does not hold the item. */
+export function useAssistantMessageText(
+  ref: ScopedThreadRef | null,
+  itemId: string | undefined,
+): string | null {
+  return useAtomValue(
+    ref === null || itemId === undefined
+      ? EMPTY_ASSISTANT_MESSAGE_TEXT_ATOM
+      : environmentThreadDetails.assistantMessageTextAtom(ref, itemId),
   );
 }
 

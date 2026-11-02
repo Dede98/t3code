@@ -1,3 +1,4 @@
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
@@ -32,6 +33,7 @@ it.effect(
     const dependencies = Layer.mergeAll(
       NodeCrypto.layer,
       Scheduler.layer,
+      ManagedPolicy.layerTest(),
       Layer.mock(ThreadLaunchService)({}),
       Layer.mock(ThreadManagementService)({}),
       Layer.mock(SecretRequests.SecretRequests)({}),
@@ -142,15 +144,22 @@ it.effect.each(
     (["schedule", "disable", "delete"] as const).map((change) => ({ recovery, change })),
   ),
 )(
-  "recovery=$recovery preserves a concurrent $change after its schedule read",
+  "recovery=$recovery preserves a concurrent $change made while the run dispatches",
   ({ recovery, change }) => {
+    // Completion reads the schedule and writes in one write transaction, so an edit on another
+    // connection can only land while the dispatch is in flight.
+    let dispatching: Effect.Effect<void> = Effect.void;
     const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-schedule-completion-"));
     const filename = NodePath.join(directory, "statev2.sqlite");
     const dependencies = Layer.mergeAll(
       NodeCrypto.layer,
       Scheduler.layer,
+      ManagedPolicy.layerTest(),
       Layer.mock(ThreadLaunchService)({
-        launch: () => Effect.die("controlled dispatch failure"),
+        launch: () =>
+          Effect.suspend(() => dispatching).pipe(
+            Effect.andThen(Effect.die("controlled dispatch failure")),
+          ),
       }),
       Layer.mock(ThreadManagementService)({}),
       Layer.mock(SecretRequests.SecretRequests)({}),
@@ -186,25 +195,18 @@ it.effect.each(
           const { task } = yield* runner.upsert(input);
           const beforeCompletion = yield* Deferred.make<void>();
           const releaseCompletion = yield* Deferred.make<void>();
+          dispatching = Deferred.succeed(beforeCompletion, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseCompletion)),
+          );
           let completionWrites = 0;
           const running = yield* runner.runNow({ id: task.id }).pipe(
-            Effect.provideService(Statement.CurrentTransformer, (statement) => {
-              const query = statement.compile()[0];
-              if (
-                query.includes("run_count = run_count + 1") &&
-                recovery &&
-                completionWrites++ === 0
-              ) {
-                return Effect.die("controlled completion write failure");
-              }
-              return query.includes("UPDATE scheduled_tasks") &&
-                query.includes("run_count = run_count + 1")
-                ? Deferred.succeed(beforeCompletion, undefined).pipe(
-                    Effect.andThen(Deferred.await(releaseCompletion)),
-                    Effect.as(statement),
-                  )
-                : Effect.succeed(statement);
-            }),
+            Effect.provideService(Statement.CurrentTransformer, (statement) =>
+              recovery &&
+              statement.compile()[0].includes("run_count = run_count + 1") &&
+              completionWrites++ === 0
+                ? Effect.die("controlled completion write failure")
+                : Effect.succeed(statement),
+            ),
             Effect.exit,
             Effect.forkScoped,
           );
@@ -221,7 +223,8 @@ it.effect.each(
           const edited = (yield* editor.list()).tasks[0];
           yield* Deferred.succeed(releaseCompletion, undefined);
           const outcome = yield* Fiber.join(running);
-          assert.equal(outcome._tag, recovery ? "Failure" : "Success");
+          // A deleted row has nothing to record, so no completion write can fail.
+          assert.equal(outcome._tag, recovery && change !== "delete" ? "Failure" : "Success");
           const saved = (yield* editor.list()).tasks[0];
           if (change === "delete") assert.isUndefined(saved);
           else {

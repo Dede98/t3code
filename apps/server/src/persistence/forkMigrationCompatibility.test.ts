@@ -16,6 +16,10 @@ import PeerLinks from "./Migrations/070_PeerLinks.ts";
 import PeerLinkFence from "./Migrations/071_PeerLinkFence.ts";
 import WaitingLinkRequestIndex from "./Migrations/072_WaitingLinkRequestIndex.ts";
 import ActiveTurnItemIndexes from "./Migrations/073_ActiveTurnItemIndexes.ts";
+import ExcludeAttachmentPlaceholders from "./Migrations/074_ExcludeAttachmentPlaceholdersFromSearch.ts";
+import SubagentDeliveryState from "./Migrations/075_SubagentDeliveryState.ts";
+import ProjectionProjectsPinArchive from "./Migrations/076_ProjectionProjectsPinArchive.ts";
+import RepairBooleanSettledOverride from "./Migrations/077_RepairBooleanSettledOverride.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 
 const seedFork = (through = 55) => seedForkMigrations(through);
@@ -75,6 +79,10 @@ it.effect(
           [72, "PeerLinkFence"],
           [73, "WaitingLinkRequestIndex"],
           [74, "ActiveTurnItemIndexes"],
+          [75, "ExcludeAttachmentPlaceholdersFromSearch"],
+          [76, "SubagentDeliveryState"],
+          [77, "ProjectionProjectsPinArchive"],
+          [78, "RepairBooleanSettledOverride"],
         ]);
         // Each startup owns a fresh connection/layer.
         assert.deepEqual(yield* migrate, []);
@@ -182,6 +190,10 @@ it.effect("rolls back a failed fork foundation and retries from a fresh connecti
         [72, "PeerLinkFence"],
         [73, "WaitingLinkRequestIndex"],
         [74, "ActiveTurnItemIndexes"],
+        [75, "ExcludeAttachmentPlaceholdersFromSearch"],
+        [76, "SubagentDeliveryState"],
+        [77, "ProjectionProjectsPinArchive"],
+        [78, "RepairBooleanSettledOverride"],
       ],
     );
   }).pipe(
@@ -280,116 +292,128 @@ it.effect.each([0, 32, 52, 53, 54].map((through) => ({ through })))(
   },
 );
 
-it.effect.each([57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73])(
-  "preserves official upstream webhook ledger through %s",
-  (through) =>
-    Effect.gen(function* () {
-      const official = [
-        ...migrationEntries.filter(([id]) => id <= 56),
-        ...migrationEntries
-          .filter(([id]) => id >= 58 && id <= 70)
-          .map(([id, name, migration]) => [id - 1, name, migration] as const),
-        [70, "PeerLinks", PeerLinks] as const,
-        [71, "PeerLinkFence", PeerLinkFence] as const,
-        [72, "WaitingLinkRequestIndex", WaitingLinkRequestIndex] as const,
-        [73, "ActiveTurnItemIndexes", ActiveTurnItemIndexes] as const,
-      ].filter(([id]) => id <= through);
-      yield* Migrator.make({})({
-        loader: Migrator.fromRecord(
-          Object.fromEntries(official.map(([id, name, migration]) => [`${id}_${name}`, migration])),
-        ),
-      });
-      const sql = yield* SqlClient.SqlClient;
-      const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
-      const appContext =
-        through >= 59
-          ? [
-              {
-                thread_id: "thread",
-                item_id: "item",
-                server: "server",
-                tool: "tool",
-                text: "preserved",
-                updated_at: "2026-10-08",
-              },
-            ]
-          : [];
-      if (through >= 59) {
-        yield* sql`INSERT INTO mcp_app_model_context ${sql.insert(appContext)}`;
-      }
-      if (through >= 70) {
-        yield* sql`INSERT INTO peer_environment_links
+it.effect.each([
+  57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77,
+])("preserves official upstream webhook ledger through %s", (through) =>
+  Effect.gen(function* () {
+    const official = [
+      ...migrationEntries.filter(([id]) => id <= 56),
+      ...migrationEntries
+        .filter(([id]) => id >= 58 && id <= 70)
+        .map(([id, name, migration]) => [id - 1, name, migration] as const),
+      [70, "PeerLinks", PeerLinks] as const,
+      [71, "PeerLinkFence", PeerLinkFence] as const,
+      [72, "WaitingLinkRequestIndex", WaitingLinkRequestIndex] as const,
+      [73, "ActiveTurnItemIndexes", ActiveTurnItemIndexes] as const,
+      [74, "ExcludeAttachmentPlaceholdersFromSearch", ExcludeAttachmentPlaceholders] as const,
+      [75, "SubagentDeliveryState", SubagentDeliveryState] as const,
+      [76, "ProjectionProjectsPinArchive", ProjectionProjectsPinArchive] as const,
+      [77, "RepairBooleanSettledOverride", RepairBooleanSettledOverride] as const,
+    ].filter(([id]) => id <= through);
+    yield* Migrator.make({})({
+      loader: Migrator.fromRecord(
+        Object.fromEntries(official.map(([id, name, migration]) => [`${id}_${name}`, migration])),
+      ),
+    });
+    const sql = yield* SqlClient.SqlClient;
+    const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
+    const appContext =
+      through >= 59
+        ? [
+            {
+              thread_id: "thread",
+              item_id: "item",
+              server: "server",
+              tool: "tool",
+              text: "preserved",
+              updated_at: "2026-10-08",
+            },
+          ]
+        : [];
+    if (through >= 59) {
+      yield* sql`INSERT INTO mcp_app_model_context ${sql.insert(appContext)}`;
+    }
+    if (through >= 70) {
+      yield* sql`INSERT INTO peer_environment_links
           (environment_id, secret_name, label, urls_json, access, linked_at, expires_at)
           VALUES ('peer', 'kept-secret-ref', 'Peer', '[]', 'read', '2026-10-28', '2026-11-28')`;
-      }
-      yield* runMigrations();
-      assert.ok(
-        (yield* sql`PRAGMA table_info(peer_environment_links)`).some(
-          (column) => column.name === "fenced",
-        ),
-      );
+    }
+    yield* runMigrations();
+    assert.ok(
+      (yield* sql`PRAGMA table_info(peer_environment_links)`).some(
+        (column) => column.name === "fenced",
+      ),
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_waiting_link_idx'`)
+        .length,
+      1,
+    );
+    if (through >= 70) {
       assert.equal(
-        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_waiting_link_idx'`)
-          .length,
-        1,
+        (yield* sql`SELECT secret_name FROM peer_environment_links WHERE environment_id = 'peer'`)[0]
+          ?.secret_name,
+        "kept-secret-ref",
       );
-      if (through >= 70) {
-        assert.equal(
-          (yield* sql`SELECT secret_name FROM peer_environment_links WHERE environment_id = 'peer'`)[0]
-            ?.secret_name,
-          "kept-secret-ref",
-        );
-      }
-      assert.equal(
-        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_failed_error_idx'`)
-          .length,
-        1,
-      );
-      assert.deepEqual(yield* sql`SELECT * FROM mcp_app_model_context`, appContext);
-      assert.equal(
-        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_nodes_live_idx'`)
-          .length,
-        1,
-      );
-      assert.equal(
-        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_stop_request_idx'`)
-          .length,
-        1,
-      );
-      assert.equal(
-        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_active_ordinal_idx'`)
-          .length,
-        1,
-      );
-      assert.deepEqual(
-        yield* sql`SELECT * FROM effect_sql_migrations WHERE migration_id <= ${through} ORDER BY migration_id`,
-        history,
-      );
-      assert.deepEqual(yield* runMigrations(), []);
-      assert.equal(
-        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'pull_request_review_guides'`)
-          .length,
-        1,
-      );
-      assert.equal(
-        (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = ${through >= 70 ? through + 1 : through >= 69 ? 70 : through >= 68 ? 69 : through >= 67 ? 68 : through >= 66 ? 67 : through >= 65 ? 66 : through >= 64 ? 65 : through >= 63 ? 64 : through >= 62 ? 63 : through >= 61 ? 62 : through >= 59 ? 61 : 59}`)[0]
-          ?.name,
-        "ClaudeSessionStore",
-      );
-      assert.equal(
-        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'scheduled_task_webhook_relay_deliveries'`)
-          .length,
-        1,
-      );
-      assert.equal(
-        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'scheduled_task_webhook_pending'`)
-          .length,
-        1,
-      );
-      assert.equal(
-        (yield* sql`SELECT name FROM sqlite_master WHERE name = 'claude_session_store_keys'`)
-          .length,
-        1,
-      );
-    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+    }
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_failed_error_idx'`)
+        .length,
+      1,
+    );
+    assert.deepEqual(yield* sql`SELECT * FROM mcp_app_model_context`, appContext);
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_nodes_live_idx'`)
+        .length,
+      1,
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_stop_request_idx'`)
+        .length,
+      1,
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_turn_items_active_ordinal_idx'`)
+        .length,
+      1,
+    );
+    assert.ok(
+      (yield* sql`PRAGMA table_info(projection_projects)`).some(
+        (column) => column.name === "pinned_at",
+      ),
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_subagents_settled_idx'`)
+        .length,
+      1,
+    );
+    assert.deepEqual(
+      yield* sql`SELECT * FROM effect_sql_migrations WHERE migration_id <= ${through} ORDER BY migration_id`,
+      history,
+    );
+    assert.deepEqual(yield* runMigrations(), []);
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'pull_request_review_guides'`).length,
+      1,
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = ${through >= 70 ? through + 1 : through >= 69 ? 70 : through >= 68 ? 69 : through >= 67 ? 68 : through >= 66 ? 67 : through >= 65 ? 66 : through >= 64 ? 65 : through >= 63 ? 64 : through >= 62 ? 63 : through >= 61 ? 62 : through >= 59 ? 61 : 59}`)[0]
+        ?.name,
+      "ClaudeSessionStore",
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'scheduled_task_webhook_relay_deliveries'`)
+        .length,
+      1,
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'scheduled_task_webhook_pending'`)
+        .length,
+      1,
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'claude_session_store_keys'`).length,
+      1,
+    );
+  }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
 );

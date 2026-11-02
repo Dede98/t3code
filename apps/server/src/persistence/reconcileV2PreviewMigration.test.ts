@@ -100,7 +100,7 @@ it.effect.each(
         );
         assert.equal(
           observer.prepare("SELECT MAX(migration_id) AS id FROM effect_sql_migrations").get()?.id,
-          74,
+          78,
         );
         for (const name of [
           "mcp_app_model_context",
@@ -113,6 +113,7 @@ it.effect.each(
           "scheduled_task_webhook_pending",
           "orchestration_v2_projection_turn_items_stop_request_idx",
           "orchestration_v2_projection_turn_items_active_ordinal_idx",
+          "orchestration_v2_projection_subagents_settled_idx",
         ]) {
           assert.ok(observer.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(name));
         }
@@ -121,6 +122,12 @@ it.effect.each(
             .prepare("PRAGMA table_info(projection_threads)")
             .all()
             .some((row) => row.name === "auto_settle_disabled_at"),
+        );
+        assert.ok(
+          observer
+            .prepare("PRAGMA table_info(projection_projects)")
+            .all()
+            .some((row) => row.name === "pinned_at"),
         );
         assert.ok(
           observer

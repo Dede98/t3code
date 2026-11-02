@@ -2,12 +2,18 @@ import { CommandId, MessageId, type OrchestrationV2Command } from "@t3tools/cont
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Stream from "effect/Stream";
+import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
+import * as DueHint from "../scheduling/DueHint.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import { forkParked } from "../serverActivation.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as UsageLimitFailover from "./UsageLimitFailover.ts";
+
+const MAX_OVERDUE_ARM_MS = 24 * 60 * 60 * 1000;
 
 export function limitRecoveryCommand(
   thread: ProjectionStore.ProjectionLimitRecoveryCandidate,
@@ -35,6 +41,7 @@ export function limitRecoveryCommand(
   const identity = `${thread.id}:${thread.latestRunId}:${resetMs}`;
   const recovery = thread.limitRecovery;
   if (recovery?.runId !== thread.latestRunId || recovery.resetAt !== thread.usageLimitResetAt) {
+    if (nowMs - resetMs > MAX_OVERDUE_ARM_MS) return null;
     if (!autoResume && (!snooze || resetMs <= nowMs)) return null;
     return {
       type: "thread.metadata.update",
@@ -72,6 +79,15 @@ export function limitRecoveryCommand(
   };
 }
 
+// Events that can make a thread a candidate or change its command; streaming items cannot.
+const affectsLimitRecovery = (event: OrchestrationV2DomainEvent) =>
+  event.type.startsWith("thread.") ||
+  event.type === "run.created" ||
+  event.type === "run.updated" ||
+  event.type === "runtime-request.updated" ||
+  event.type.startsWith("provider-session.") ||
+  (event.type === "turn-item.updated" && event.payload.type === "error");
+
 const makeSweep = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const threads = yield* ThreadManagement.ThreadManagementService;
@@ -80,17 +96,27 @@ const makeSweep = Effect.gen(function* () {
   const failover = yield* UsageLimitFailover.UsageLimitFailover;
   // Each limit stop is judged once; a restart judges pending ones again.
   let judgedFailovers = new Set<string>();
+  const due = DueHint.make();
+  yield* forkParked(
+    Stream.runForEach(orchestrator.streamDomainEvents, (event) =>
+      affectsLimitRecovery(event) ? due.invalidate : Effect.void,
+    ),
+  );
+  yield* forkParked(Stream.runForEach(settings.streamChanges, () => due.invalidate));
   return Effect.fn("UsageLimitRecoveryWorker.sweep")(function* () {
-    const preferences = yield* settings.getSettings;
     const now = yield* DateTime.now;
+    const nowMs = DateTime.toEpochMillis(now);
+    if (yield* due.isIdle(nowMs)) return;
+    const readVersion = yield* due.version;
+    const preferences = yield* settings.getSettings;
     const failoverEnabled = preferences.failoverLimitedThreads;
     const candidates = yield* projections.getLimitRecoveryCandidates({
       now,
       autoResume: preferences.autoResumeLimitedThreads || failoverEnabled,
       snooze: preferences.snoozeLimitedThreads,
     });
-    const nowMs = DateTime.toEpochMillis(now);
     const pendingFailovers = new Set<string>();
+    let acted = false;
     for (const thread of candidates) {
       let autoResume = preferences.autoResumeLimitedThreads;
       const armed =
@@ -100,6 +126,7 @@ const makeSweep = Effect.gen(function* () {
         const key = `${thread.id}:${thread.latestRunId}:${thread.usageLimitResetAt}`;
         pendingFailovers.add(key);
         if (!judgedFailovers.has(key)) {
+          acted = true;
           const outcome = yield* failover.attempt(thread);
           // A wait is judged again until the arm below lands.
           if (outcome !== "wait") judgedFailovers.add(key);
@@ -114,6 +141,7 @@ const makeSweep = Effect.gen(function* () {
         preferences.snoozeLimitedThreads,
       );
       if (command === null) continue;
+      acted = true;
       yield* Effect.gen(function* () {
         if (command.type === "thread.metadata.update" && command.limitRecovery != null) {
           yield* orchestrator.autoArmLimitRecovery({
@@ -134,6 +162,10 @@ const makeSweep = Effect.gen(function* () {
       );
     }
     judgedFailovers = new Set([...judgedFailovers].filter((key) => pendingFailovers.has(key)));
+    // A sweep that acted, or failed to, re-checks on the next tick.
+    if (acted) return;
+    const wakeAt = yield* projections.getLimitRecoveryWakeAt(now);
+    yield* due.record(readVersion, wakeAt ?? Infinity, nowMs);
   });
 });
 

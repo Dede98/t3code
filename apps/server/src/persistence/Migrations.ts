@@ -76,6 +76,10 @@ import Migration0070 from "./Migrations/070_PeerLinks.ts";
 import Migration0071 from "./Migrations/071_PeerLinkFence.ts";
 import Migration0072 from "./Migrations/072_WaitingLinkRequestIndex.ts";
 import Migration0073 from "./Migrations/073_ActiveTurnItemIndexes.ts";
+import Migration0074 from "./Migrations/074_ExcludeAttachmentPlaceholdersFromSearch.ts";
+import Migration0075 from "./Migrations/075_SubagentDeliveryState.ts";
+import Migration0076 from "./Migrations/076_ProjectionProjectsPinArchive.ts";
+import Migration0077 from "./Migrations/077_RepairBooleanSettledOverride.ts";
 
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -153,6 +157,10 @@ export const migrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -187,6 +195,10 @@ export const forkMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -211,6 +223,10 @@ export const forkIntegrationMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -236,6 +252,10 @@ const upstreamIntegrationMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -261,6 +281,10 @@ const preview54MigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -287,6 +311,10 @@ const preview53MigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -309,6 +337,10 @@ const upstreamWebhookMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -331,6 +363,10 @@ const upstreamMcpAppMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 // Upstream databases that already applied review guides keep that id/name pair.
@@ -350,6 +386,10 @@ const upstreamReviewGuideMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 // Official upstream databases may already have the failure index at 62.
@@ -369,6 +409,10 @@ const upstreamFailureIndexMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 // Official databases may have used 63/64 before ever opening in the fork.
@@ -387,6 +431,10 @@ const upstreamDropProjectionsMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 const upstreamCanonicalLinksMigrationEntries = [
@@ -402,6 +450,10 @@ const upstreamCanonicalLinksMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 const upstreamUsageIndexMigrationEntries = [
@@ -416,6 +468,10 @@ const upstreamUsageIndexMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 const upstreamSettlementMigrationEntries = [
@@ -429,6 +485,10 @@ const upstreamSettlementMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 // Official upstream databases may already have webhook dedupe at 67.
@@ -442,6 +502,10 @@ const upstreamWebhookDedupeMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 // Official upstream databases may already have the shell stop index at 68.
@@ -454,6 +518,10 @@ const upstreamShellStopIndexMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 // Official upstream databases may already have message search at 69.
@@ -465,6 +533,10 @@ const upstreamThreadMessageSearchMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 // Keep official peer-link ledger entries and append the missing Claude store.
@@ -475,6 +547,10 @@ const upstreamPeerLinksMigrationEntries = [
   [72, "PeerLinkFence", Migration0071],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 const upstreamPeerLinkFenceMigrationEntries = [
@@ -483,6 +559,10 @@ const upstreamPeerLinkFenceMigrationEntries = [
   [72, "ClaudeSessionStore", ClaudeSessionStore],
   [73, "WaitingLinkRequestIndex", Migration0072],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 const upstreamWaitingLinkRequestMigrationEntries = [
@@ -490,12 +570,51 @@ const upstreamWaitingLinkRequestMigrationEntries = [
   [72, "WaitingLinkRequestIndex", Migration0072],
   [73, "ClaudeSessionStore", ClaudeSessionStore],
   [74, "ActiveTurnItemIndexes", Migration0073],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
 ] as const;
 
 const upstreamActiveTurnItemIndexesMigrationEntries = [
   ...upstreamWaitingLinkRequestMigrationEntries.filter(([id]) => id <= 72),
   [73, "ActiveTurnItemIndexes", Migration0073],
   [74, "ClaudeSessionStore", ClaudeSessionStore],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
+] as const;
+
+// Official upstream databases may already have 074-077 before opening in the fork.
+const upstreamAttachmentSearchMigrationEntries = [
+  ...upstreamActiveTurnItemIndexesMigrationEntries.filter(([id]) => id <= 73),
+  [74, "ExcludeAttachmentPlaceholdersFromSearch", Migration0074],
+  [75, "ClaudeSessionStore", ClaudeSessionStore],
+  [76, "SubagentDeliveryState", Migration0075],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
+] as const;
+
+const upstreamSubagentDeliveryMigrationEntries = [
+  ...upstreamAttachmentSearchMigrationEntries.filter(([id]) => id <= 74),
+  [75, "SubagentDeliveryState", Migration0075],
+  [76, "ClaudeSessionStore", ClaudeSessionStore],
+  [77, "ProjectionProjectsPinArchive", Migration0076],
+  [78, "RepairBooleanSettledOverride", Migration0077],
+] as const;
+
+const upstreamProjectPinArchiveMigrationEntries = [
+  ...upstreamSubagentDeliveryMigrationEntries.filter(([id]) => id <= 75),
+  [76, "ProjectionProjectsPinArchive", Migration0076],
+  [77, "ClaudeSessionStore", ClaudeSessionStore],
+  [78, "RepairBooleanSettledOverride", Migration0077],
+] as const;
+
+const upstreamSettledOverrideRepairMigrationEntries = [
+  ...upstreamProjectPinArchiveMigrationEntries.filter(([id]) => id <= 76),
+  [77, "RepairBooleanSettledOverride", Migration0077],
+  [78, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -553,7 +672,7 @@ export interface RunMigrationsOptions {
   readonly toMigrationInclusive?: number | undefined;
 }
 
-export function selectMigrationEntries(
+function selectMigrationEntries(
   recorded: ReadonlyArray<{ readonly migration_id: number; readonly name: string }>,
 ) {
   const has = (id: number, name: string) =>
@@ -582,7 +701,15 @@ export function selectMigrationEntries(
                                 ? has(71, "PeerLinkFence")
                                   ? has(72, "WaitingLinkRequestIndex")
                                     ? has(73, "ActiveTurnItemIndexes")
-                                      ? upstreamActiveTurnItemIndexesMigrationEntries
+                                      ? has(74, "ExcludeAttachmentPlaceholdersFromSearch")
+                                        ? has(75, "SubagentDeliveryState")
+                                          ? has(76, "ProjectionProjectsPinArchive")
+                                            ? has(77, "RepairBooleanSettledOverride")
+                                              ? upstreamSettledOverrideRepairMigrationEntries
+                                              : upstreamProjectPinArchiveMigrationEntries
+                                            : upstreamSubagentDeliveryMigrationEntries
+                                          : upstreamAttachmentSearchMigrationEntries
+                                        : upstreamActiveTurnItemIndexesMigrationEntries
                                       : upstreamWaitingLinkRequestMigrationEntries
                                     : upstreamPeerLinkFenceMigrationEntries
                                   : upstreamPeerLinksMigrationEntries

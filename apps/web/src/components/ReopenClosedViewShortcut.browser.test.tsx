@@ -277,4 +277,11 @@ describe("root reopen shortcut", () => {
       ]),
     );
   });
+  it("forwards address-bar focus from a focused desktop page", async () => {
+    setup();
+    await using _shortcut = await renderShortcut();
+    expect(state.setShortcuts).toHaveBeenLastCalledWith(
+      expect.arrayContaining([expect.objectContaining({ command: "preview.focusUrl" })]),
+    );
+  });
 });
