@@ -52,9 +52,7 @@ it("edits only the environment the providers page selected", async () => {
       <ExternalMcpServersSettings environmentId={remoteId} />
     </StrictMode>,
   );
-  await expect
-    .element(page.getByRole("textbox", { name: "tools MCP URL" }))
-    .toHaveValue("https://remote.example.com/mcp");
+  await expect.element(page.getByText("https://remote.example.com/mcp")).toBeVisible();
   await page.getByRole("switch", { name: "Enable tools" }).click();
   expect(mcpState.writes).toHaveBeenCalledExactlyOnceWith(remoteId, {
     externalMcpServers: {

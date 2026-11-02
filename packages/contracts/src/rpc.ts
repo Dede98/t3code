@@ -7,6 +7,15 @@ import {
 } from "./orchestrationV2.ts";
 import { OrchestrationDispatchCommandError } from "./orchestrationDispatch.ts";
 import {
+  ExternalMcpOAuthCancelInput,
+  ExternalMcpOAuthCompleteInput,
+  ExternalMcpOAuthError,
+  ExternalMcpOAuthServerInput,
+  ExternalMcpOAuthStartInput,
+  ExternalMcpOAuthStatus,
+  ExternalMcpOAuthStatuses,
+} from "./externalMcpOAuth.ts";
+import {
   McpAppCallToolInput,
   McpAppCallToolResult,
   McpAppReadResourceInput,
@@ -600,6 +609,11 @@ export const WS_METHODS = {
   sourceControlSignInStart: "sourceControl.signInStart",
   sourceControlSignInWait: "sourceControl.signInWait",
   sourceControlSignInCancel: "sourceControl.signInCancel",
+  externalMcpOAuthSubscribe: "externalMcp.oauth.subscribe",
+  externalMcpOAuthStart: "externalMcp.oauth.start",
+  externalMcpOAuthComplete: "externalMcp.oauth.complete",
+  externalMcpOAuthCancel: "externalMcp.oauth.cancel",
+  externalMcpOAuthLogout: "externalMcp.oauth.logout",
   sourceControlAppAccess: "sourceControl.appAccess",
   sourceControlStarred: "sourceControl.starred",
   projectCloneStart: "projectClone.start",
@@ -1231,6 +1245,37 @@ const WsSourceControlCloneRepositoryRpc = Rpc.make(WS_METHODS.sourceControlClone
   payload: SourceControlCloneRepositoryInput,
   success: SourceControlCloneRepositoryResult,
   error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
+});
+
+const WsExternalMcpOAuthSubscribeRpc = Rpc.make(WS_METHODS.externalMcpOAuthSubscribe, {
+  payload: Schema.Struct({}),
+  success: ExternalMcpOAuthStatuses,
+  stream: true,
+});
+
+const WsExternalMcpOAuthStartRpc = Rpc.make(WS_METHODS.externalMcpOAuthStart, {
+  payload: ExternalMcpOAuthStartInput,
+  success: ExternalMcpOAuthStatus,
+  error: Schema.Union([ExternalMcpOAuthError, EnvironmentAuthorizationError]),
+});
+
+// Takes the redirect URL the browser landed on when the server could not receive it.
+const WsExternalMcpOAuthCompleteRpc = Rpc.make(WS_METHODS.externalMcpOAuthComplete, {
+  payload: ExternalMcpOAuthCompleteInput,
+  success: ExternalMcpOAuthStatus,
+  error: Schema.Union([ExternalMcpOAuthError, EnvironmentAuthorizationError]),
+});
+
+const WsExternalMcpOAuthCancelRpc = Rpc.make(WS_METHODS.externalMcpOAuthCancel, {
+  payload: ExternalMcpOAuthCancelInput,
+  success: ExternalMcpOAuthStatus,
+  error: Schema.Union([ExternalMcpOAuthError, EnvironmentAuthorizationError]),
+});
+
+const WsExternalMcpOAuthLogoutRpc = Rpc.make(WS_METHODS.externalMcpOAuthLogout, {
+  payload: ExternalMcpOAuthServerInput,
+  success: ExternalMcpOAuthStatus,
+  error: Schema.Union([ExternalMcpOAuthError, EnvironmentAuthorizationError]),
 });
 
 // Starts a device-flow sign-in the server finishes on its own, so a client can leave meanwhile.
@@ -2010,6 +2055,11 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 ) {}
 
 export const WsRpcGroup = RpcGroup.make(
+  WsExternalMcpOAuthSubscribeRpc,
+  WsExternalMcpOAuthStartRpc,
+  WsExternalMcpOAuthCompleteRpc,
+  WsExternalMcpOAuthCancelRpc,
+  WsExternalMcpOAuthLogoutRpc,
   WsGuestShareCreateRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,

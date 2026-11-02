@@ -51,6 +51,20 @@ describe("RPC authorization scopes", () => {
     );
   });
 
+  it("keeps external MCP sign-ins, which store credentials every agent can use, behind settings write", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.externalMcpOAuthSubscribe)).toBe(
+      AuthOrchestrationReadScope,
+    );
+    for (const method of [
+      WS_METHODS.externalMcpOAuthStart,
+      WS_METHODS.externalMcpOAuthComplete,
+      WS_METHODS.externalMcpOAuthCancel,
+      WS_METHODS.externalMcpOAuthLogout,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthSettingsWriteScope);
+    }
+  });
+
   it("separates passive terminal observation from operations that can change a shell", () => {
     for (const method of [WS_METHODS.terminalObserve, WS_METHODS.subscribeTerminalMetadata]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthTerminalReadScope);

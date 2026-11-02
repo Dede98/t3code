@@ -75,6 +75,8 @@ import * as ProviderInstanceRegistryHydration from "./provider/ProviderInstanceR
 import * as ProjectSettingsOverrideSweep from "./provider/ProjectSettingsOverrideSweep.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
+import * as ExternalMcpOAuth from "./mcp/ExternalMcpOAuth.ts";
+import * as ExternalMcpProxy from "./mcp/ExternalMcpProxy.ts";
 import * as PeerForwarding from "./peer/PeerForwarding.ts";
 import * as RemoteDelegation from "./peer/RemoteDelegation.ts";
 import * as PeerLinkRequests from "./peer/PeerLinkRequests.ts";
@@ -696,6 +698,8 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
   Layer.provideMerge(ProviderRegistry.layer),
   Layer.provideMerge(layerProviderInstanceRegistryHydration),
+  // Sign-ins change which external MCP servers provider instances attach.
+  Layer.provideMerge(ExternalMcpOAuth.layer),
   // Provider hydration builds the Claude runner, which reports agents to the same scanner the
   // terminal and preview layers share.
   Layer.provideMerge(layerPortScanner),
@@ -793,6 +797,7 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerHttp.layerAttachmentUploadRoute,
     GuestHttp.layer,
     DeviceHubProxy.layer,
+    ExternalMcpProxy.layer,
     ServerBrowserStream.routeLayer,
     ServerHttp.layerStaticAndDevRoute,
     Ws.layer,

@@ -256,6 +256,7 @@ import * as SourceControlDiscovery from "./sourceControl/SourceControlDiscovery.
 import * as OtlpEndpointCheck from "./observability/OtlpEndpointCheck.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as SourceControlSignIn from "./sourceControl/SourceControlSignIn.ts";
+import * as ExternalMcpOAuth from "./mcp/ExternalMcpOAuth.ts";
 import * as SourceControlBuiltInDrivers from "./sourceControl/builtInDrivers.ts";
 import * as SourceControlProviderRegistry from "./sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
@@ -1431,6 +1432,7 @@ export const layerWsRpc = (
       const sourceControlRepositories =
         yield* SourceControlRepositoryService.SourceControlRepositoryService;
       const sourceControlSignIn = yield* SourceControlSignIn.SourceControlSignIn;
+      const externalMcpOAuth = yield* ExternalMcpOAuth.ExternalMcpOAuth;
       const withPullRequestViewer = pullRequests.withRoutingCredential;
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
       const sessions = yield* SessionStore.SessionStore;
@@ -2749,6 +2751,11 @@ export const layerWsRpc = (
           sourceControlRepositories.lookupRepository(input),
         [WS_METHODS.sourceControlCloneRepository]: (input) =>
           sourceControlRepositories.cloneRepository(input),
+        [WS_METHODS.externalMcpOAuthSubscribe]: () => externalMcpOAuth.statuses,
+        [WS_METHODS.externalMcpOAuthStart]: (input) => externalMcpOAuth.start(input),
+        [WS_METHODS.externalMcpOAuthComplete]: (input) => externalMcpOAuth.complete(input),
+        [WS_METHODS.externalMcpOAuthCancel]: (input) => externalMcpOAuth.cancel(input),
+        [WS_METHODS.externalMcpOAuthLogout]: (input) => externalMcpOAuth.logout(input),
         [WS_METHODS.sourceControlSignInStart]: (input) => sourceControlSignIn.start(input),
         [WS_METHODS.sourceControlSignInWait]: (input) => sourceControlSignIn.wait(input),
         [WS_METHODS.sourceControlSignInCancel]: (input) => sourceControlSignIn.cancel(input),

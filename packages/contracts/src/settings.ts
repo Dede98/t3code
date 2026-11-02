@@ -93,6 +93,18 @@ const ExternalMcpUrl = TrimmedNonEmptyString.check(
   }),
 );
 
+/** Tokens never live here: settings changes rebuild provider instances. */
+export const ExternalMcpAuth = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("none") }),
+  Schema.Struct({
+    type: Schema.Literal("oauth"),
+    scopes: Schema.optionalKey(Schema.Array(TrimmedNonEmptyString.check(Schema.isMaxLength(256)))),
+    /** For authorization servers without dynamic client registration. */
+    clientId: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
+  }),
+]);
+export type ExternalMcpAuth = typeof ExternalMcpAuth.Type;
+
 export const ExternalMcpServerConfig = Schema.Struct({
   displayName: Schema.optionalKey(TrimmedNonEmptyString),
   url: ExternalMcpUrl,
@@ -106,7 +118,16 @@ export const ExternalMcpServerConfig = Schema.Struct({
     ),
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   providerInstances: Schema.optionalKey(Schema.Array(ProviderInstanceId)),
-});
+  /** Absent means static headers only. */
+  auth: Schema.optionalKey(ExternalMcpAuth),
+}).check(
+  Schema.makeFilter(
+    (server) =>
+      server.auth?.type !== "oauth" ||
+      !server.headers.some((header) => header.name.toLowerCase() === "authorization") ||
+      "OAuth MCP servers get their Authorization header from sign-in; remove the static one.",
+  ),
+);
 export type ExternalMcpServerConfig = typeof ExternalMcpServerConfig.Type;
 
 // ── Client Settings (local-only) ───────────────────────────────

@@ -1,4 +1,7 @@
-import { resolveExternalMcpServers } from "@t3tools/provider-core/server/externalMcpServers";
+import {
+  proxyOAuthExternalMcpServers,
+  resolveExternalMcpServers,
+} from "@t3tools/provider-core/server/externalMcpServers";
 import { ProviderRegistrySessionLifecycle } from "../provider/ProviderRegistrySessionLifecycle.ts";
 import { ProviderRegistryRebuildBarrier } from "../provider/ProviderRegistryRebuildBarrier.ts";
 import { AgentScope } from "@t3tools/shared/AgentScope";
@@ -47,6 +50,7 @@ import { ProviderWorkspaceMissingError } from "../provider/Errors.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ExternalMcpOAuth from "../mcp/ExternalMcpOAuth.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as EventSink from "./EventSink.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
@@ -342,6 +346,7 @@ export const layerWithOptions = (
       const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
       /** Unreadable settings must preserve explicit browser-access opt-outs. */
       const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
+      const externalMcpOAuth = yield* Effect.serviceOption(ExternalMcpOAuth.ExternalMcpOAuth);
       const projectService = yield* Effect.serviceOption(ProjectService.ProjectService);
       const eventSink = yield* EventSink.EventSinkV2;
       const commandOutput = yield* CommandOutputHub.CommandOutputHub;
@@ -468,6 +473,9 @@ export const layerWithOptions = (
                   ? resolveExternalMcpServers(
                       yield* serverSettings.value.getSettings.pipe(Effect.orDie),
                       providerInstanceId,
+                      Option.isSome(externalMcpOAuth)
+                        ? yield* externalMcpOAuth.value.connectedServerIds
+                        : undefined,
                     )
                   : [];
                 const subagent = yield* projectionStore.getThread(threadId).pipe(
@@ -498,7 +506,13 @@ export const layerWithOptions = (
                     // A credential issued while the lineage read failed is replaced once it works.
                     (resolved.thread.subagent === true) === subagent
                   ) {
-                    yield* mcpSessions.set({ ...existing, externalMcpServers });
+                    yield* mcpSessions.set({
+                      ...existing,
+                      externalMcpServers: proxyOAuthExternalMcpServers(
+                        externalMcpServers,
+                        existing,
+                      ),
+                    });
                     return { mcpCredentialId: existing.providerSessionId, issued: false };
                   }
                   dropMcpCredentialReservation(threadId, existing.providerSessionId);
@@ -513,7 +527,10 @@ export const layerWithOptions = (
                 });
                 yield* mcpSessions.set({
                   ...credential.config,
-                  externalMcpServers,
+                  externalMcpServers: proxyOAuthExternalMcpServers(
+                    externalMcpServers,
+                    credential.config,
+                  ),
                 });
                 reserveMcpCredential(threadId, credential.config.providerSessionId);
                 return { mcpCredentialId: credential.config.providerSessionId, issued: true };

@@ -1269,6 +1269,31 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:provider:auth-logout",
       tag: WS_METHODS.providerAuthLogout,
     }),
+    externalMcpOAuthStatuses: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:external-mcp:oauth-statuses",
+      tag: WS_METHODS.externalMcpOAuthSubscribe,
+      idleTtlMs: 0,
+    }),
+    startExternalMcpOAuth: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:external-mcp:oauth-start",
+      tag: WS_METHODS.externalMcpOAuthStart,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input.serverId]),
+      },
+    }),
+    completeExternalMcpOAuth: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:external-mcp:oauth-complete",
+      tag: WS_METHODS.externalMcpOAuthComplete,
+    }),
+    cancelExternalMcpOAuth: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:external-mcp:oauth-cancel",
+      tag: WS_METHODS.externalMcpOAuthCancel,
+    }),
+    logoutExternalMcpOAuth: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:external-mcp:oauth-logout",
+      tag: WS_METHODS.externalMcpOAuthLogout,
+    }),
     providerInstallState: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:provider:install-state",
       tag: WS_METHODS.providerInstallSubscribe,
