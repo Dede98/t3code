@@ -14,6 +14,7 @@ import {
 } from "@t3tools/contracts";
 import type * as Crypto from "effect/Crypto";
 import * as Equal from "effect/Equal";
+import * as Option from "effect/Option";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -39,6 +40,7 @@ import * as ProviderHostLive from "./ProviderHostLive.ts";
 import type * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import type * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as ServerConfig from "../config.ts";
+import * as ExternalMcpOAuth from "../mcp/ExternalMcpOAuth.ts";
 import type * as PortScanner from "../preview/PortScanner.ts";
 
 type ProviderInstanceRegistryHydrationEnv =
@@ -63,6 +65,7 @@ type ProviderInstanceRegistryHydrationEnv =
 
 export const deriveProviderInstanceConfigMap = (
   settings: ServerSettings,
+  connectedOAuthMcpServers?: ReadonlySet<string>,
 ): ProviderInstanceConfigMap => {
   const merged: Record<string, ProviderInstanceConfig> = { ...settings.providerInstances };
 
@@ -106,7 +109,13 @@ export const deriveProviderInstanceConfigMap = (
           ...entry.config,
           externalMcpConfiguration: NodeCrypto.createHash("sha256")
             .update(
-              JSON.stringify(resolveExternalMcpServers(settings, ProviderInstanceId.make(id))),
+              JSON.stringify(
+                resolveExternalMcpServers(
+                  settings,
+                  ProviderInstanceId.make(id),
+                  connectedOAuthMcpServers,
+                ),
+              ),
             )
             .digest("hex"),
         },
@@ -178,6 +187,8 @@ export const seedDevReplayInstance = Effect.fn(
 
 export interface DesiredProviderRegistrySettings {
   readonly settings: ServerSettings | undefined;
+  /** An MCP sign-in or sign-out changes which servers sessions get, like a settings edit. */
+  readonly connectedOAuthMcpServers?: ReadonlySet<string>;
   readonly version: number;
 }
 
@@ -228,7 +239,10 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
       continue;
     }
 
-    const desiredConfigMap = deriveProviderInstanceConfigMap(desired.settings);
+    const desiredConfigMap = deriveProviderInstanceConfigMap(
+      desired.settings,
+      desired.connectedOAuthMcpServers,
+    );
     const affectedInstanceIds = providerInstanceIdsRequiringSettle(
       appliedConfigMap,
       desiredConfigMap,
@@ -259,7 +273,10 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
               configMap: appliedConfigMap,
             };
           }
-          const latestConfigMap = deriveProviderInstanceConfigMap(latest.settings);
+          const latestConfigMap = deriveProviderInstanceConfigMap(
+            latest.settings,
+            latest.connectedOAuthMcpServers,
+          );
           const latestAffectedInstanceIds = providerInstanceIdsRequiringSettle(
             appliedConfigMap,
             latestConfigMap,
@@ -299,6 +316,8 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
 const layerSettingsWatcher = (
   initialSettings: ServerSettings | undefined,
   settingsChanges: Stream.Stream<ServerSettings>,
+  initialConnectedOAuthMcpServers: ReadonlySet<string>,
+  connectedOAuthMcpServersChanges: Stream.Stream<ReadonlySet<string>>,
 ) =>
   Layer.effectDiscard(
     Effect.gen(function* () {
@@ -308,6 +327,7 @@ const layerSettingsWatcher = (
       const serverSettings = yield* ServerSettingsService;
       const desired = yield* Ref.make<DesiredProviderRegistrySettings>({
         settings: initialSettings,
+        connectedOAuthMcpServers: initialConnectedOAuthMcpServers,
         version: 0,
       });
 
@@ -317,11 +337,22 @@ const layerSettingsWatcher = (
         initialAppliedConfigMap:
           initialSettings === undefined
             ? ({} as ProviderInstanceConfigMap)
-            : deriveProviderInstanceConfigMap(initialSettings),
+            : deriveProviderInstanceConfigMap(initialSettings, initialConnectedOAuthMcpServers),
         lifecycle,
         mutator,
         rebuildBarrier,
       }).pipe(Effect.forkScoped);
+
+      yield* connectedOAuthMcpServersChanges.pipe(
+        Stream.runForEach((connectedOAuthMcpServers) =>
+          Ref.update(desired, (current) => ({
+            ...current,
+            connectedOAuthMcpServers,
+            version: current.version + 1,
+          })),
+        ),
+        Effect.forkScoped,
+      );
 
       yield* settingsChanges.pipe(
         Stream.mapEffect(() =>
@@ -337,6 +368,7 @@ const layerSettingsWatcher = (
           next === undefined
             ? Effect.void
             : Ref.update(desired, (current) => ({
+                ...current,
                 settings: next,
                 version: current.version + 1,
               })),
@@ -367,10 +399,14 @@ export const layer: Layer.Layer<
     const initialSettings: ServerSettings | undefined = yield* serverSettings.getSettings.pipe(
       Effect.orElseSucceed(() => undefined),
     );
+    const externalMcpOAuth = yield* Effect.serviceOption(ExternalMcpOAuth.ExternalMcpOAuth);
+    const initialConnectedOAuthMcpServers = Option.isSome(externalMcpOAuth)
+      ? yield* externalMcpOAuth.value.connectedServerIds
+      : new Set<string>();
     const initialConfigMap =
       initialSettings === undefined
         ? ({} as ProviderInstanceConfigMap)
-        : deriveProviderInstanceConfigMap(initialSettings);
+        : deriveProviderInstanceConfigMap(initialSettings, initialConnectedOAuthMcpServers);
 
     // Drivers launch from the host environment, minus launch overrides a policy ignores.
     const hostEnvironment = ManagedProviders.providerHostEnvironment(
@@ -392,9 +428,14 @@ export const layer: Layer.Layer<
       Layer.provide(SecretResolver.layer),
     );
 
-    return layerSettingsWatcher(initialSettings, settingsChanges).pipe(
-      Layer.provideMerge(layerMutable),
-    );
+    return layerSettingsWatcher(
+      initialSettings,
+      settingsChanges,
+      initialConnectedOAuthMcpServers,
+      Option.isSome(externalMcpOAuth)
+        ? externalMcpOAuth.value.connectedServerIdsChanges
+        : Stream.empty,
+    ).pipe(Layer.provideMerge(layerMutable));
   }),
 ) as Layer.Layer<
   | ProviderInstanceRegistry.ProviderInstanceRegistry

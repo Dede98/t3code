@@ -5,11 +5,14 @@ import { useState } from "react";
 import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "~/hooks/useSettings";
 import { cn } from "~/lib/utils";
 import { ensureLocalApi } from "~/localApi";
+import { useEnvironmentQuery } from "~/state/query";
+import { serverEnvironment } from "~/state/server";
 
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
 import { Input } from "../ui/input";
 import { Switch } from "../ui/switch";
+import { ExternalMcpOAuthControls } from "./ExternalMcpOAuthControls";
 import { SettingsSection } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 
@@ -24,6 +27,12 @@ export function ExternalMcpServersSettings({
   const servers = settings.externalMcpServers;
   const providerInstances = settings.providerInstances;
   const updateSettings = useUpdateEnvironmentSettings(environmentId);
+  const hasOAuthServer = Object.values(servers).some((server) => server.auth?.type === "oauth");
+  const oauthStatuses = useEnvironmentQuery(
+    hasOAuthServer
+      ? serverEnvironment.externalMcpOAuthStatuses({ environmentId, input: {} })
+      : null,
+  ).data;
   const [newId, setNewId] = useState("");
   const [newUrl, setNewUrl] = useState("");
   const validId = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(newId) && newId !== "t3-code";
@@ -51,7 +60,8 @@ export function ExternalMcpServersSettings({
         settings.json. Codex currently supports sensitive Authorization: Bearer headers only; other
         configured headers still apply to Claude, Cursor, Grok, and T3-managed OpenCode. External
         OpenCode runtimes do not support this integration. Servers apply to every project on this
-        environment.
+        environment. OAuth servers are reached through this environment, which keeps and refreshes
+        the sign-in.
       </p>
       {Object.entries(servers).map(([id, server]) => (
         <div
@@ -97,6 +107,14 @@ export function ExternalMcpServersSettings({
               <Trash2Icon className="size-4" />
             </Button>
           </div>
+          <ExternalMcpOAuthControls
+            environmentId={environmentId}
+            serverId={id}
+            server={server}
+            status={oauthStatuses?.[id as keyof typeof oauthStatuses]}
+            disabled={disabled}
+            onChange={(next) => replaceServer(id, next)}
+          />
           <div className="space-y-2">
             {server.headers.map((header, index) => (
               <div key={header.name} className="flex items-center gap-2">

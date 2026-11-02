@@ -40,6 +40,11 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.sourceControlSignInStart]: AuthSettingsWriteScope,
   [WS_METHODS.sourceControlSignInWait]: AuthSettingsWriteScope,
   [WS_METHODS.sourceControlSignInCancel]: AuthSettingsWriteScope,
+  // An MCP sign-in stores a credential every agent here can use, as a secret header does.
+  [WS_METHODS.externalMcpOAuthStart]: AuthSettingsWriteScope,
+  [WS_METHODS.externalMcpOAuthComplete]: AuthSettingsWriteScope,
+  [WS_METHODS.externalMcpOAuthCancel]: AuthSettingsWriteScope,
+  [WS_METHODS.externalMcpOAuthLogout]: AuthSettingsWriteScope,
   [WS_METHODS.projectCloneStart]: AuthSourceControlWriteScope,
   [WS_METHODS.projectCloneCancel]: AuthSourceControlWriteScope,
   [WS_METHODS.projectCloneRetry]: AuthSourceControlWriteScope,

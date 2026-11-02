@@ -22,9 +22,27 @@ External servers are independent of T3 Code's built-in browser MCP server. Disab
 access does not disable external servers, and `t3-code` is reserved as the built-in server name.
 
 Only HTTPS endpoints are accepted, except for `http://localhost`, `http://127.0.0.1`, and
-`http://[::1]` during local development. OAuth, SSE, stdio servers, and per-thread credentials are
-not supported.
+`http://[::1]` during local development. SSE, stdio servers, and per-thread credentials are not
+supported.
 
 Do not put credentials in the endpoint URL. Username/password URL fields are rejected. Query
 parameters are sent as part of the URL and may appear in provider diagnostics or upstream server
 logs, so use a secret header for credentials instead.
+
+## Signing in with OAuth
+
+For servers that use OAuth, such as hosted MCP servers that ask you to sign in, turn on **Sign in
+with OAuth** for the server and select **Sign in**. Your browser opens the server's sign-in page.
+
+- When the browser runs on the same machine as the T3 server, T3 Code finishes the sign-in on its
+  own. Otherwise the browser lands on a `127.0.0.1` page that does not load; copy that page's full
+  URL into the field under the server and select **Continue**.
+- The T3 server keeps the sign-in and refreshes it. Agents reach the server through T3 Code, so
+  every provider instance selected for the server can use it, and no token is passed to the
+  providers.
+- A server is attached only while it is signed in. Signing in or out applies to running threads
+  once their sessions are idle.
+- Turning OAuth off, removing the server, or changing its URL deletes the sign-in. **Sign out**
+  keeps the server's client registration, so signing in again is quicker.
+- If the authorization server does not support dynamic client registration, enter a client ID
+  registered there. It must accept `http://127.0.0.1` redirect URIs on any port.

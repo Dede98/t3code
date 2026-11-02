@@ -208,6 +208,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.deviceAction]: AuthOrchestrationOperateScope,
   [WS_METHODS.subscribeDeviceState]: AuthOrchestrationReadScope,
   [WS_METHODS.subscribeServerConfig]: AuthOrchestrationReadScope,
+  [WS_METHODS.externalMcpOAuthSubscribe]: AuthOrchestrationReadScope,
   [WS_METHODS.subscribeProviderUsage]: AuthOrchestrationReadScope,
   [WS_METHODS.refreshProviderUsage]: AuthOrchestrationOperateScope,
   [WS_METHODS.subscribeServerLifecycle]: AuthOrchestrationReadScope,
