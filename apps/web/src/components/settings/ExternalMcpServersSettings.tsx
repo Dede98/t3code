@@ -1,18 +1,30 @@
-import type { EnvironmentId, ExternalMcpHeader } from "@t3tools/contracts";
-import { Plus as PlusIcon, Trash2Icon } from "lucide-react";
+import { useAtomValue } from "@effect/atom-react";
+import type {
+  EnvironmentId,
+  ExternalMcpOAuthStatus,
+  ExternalMcpServerConfig,
+  ExternalMcpServerId,
+} from "@t3tools/contracts";
+import { EllipsisIcon, PlusIcon } from "lucide-react";
 import { useState } from "react";
 
 import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "~/hooks/useSettings";
 import { cn } from "~/lib/utils";
 import { ensureLocalApi } from "~/localApi";
 import { useEnvironmentQuery } from "~/state/query";
-import { serverEnvironment } from "~/state/server";
+import { providersIgnoringCheckedAtAtom, serverEnvironment } from "~/state/server";
 
+import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
-import { Checkbox } from "../ui/checkbox";
-import { Input } from "../ui/input";
+import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "../ui/menu";
 import { Switch } from "../ui/switch";
-import { ExternalMcpOAuthControls } from "./ExternalMcpOAuthControls";
+import {
+  ExternalMcpOAuthStatusLine,
+  ExternalMcpSignInPanel,
+  useExternalMcpOAuth,
+} from "./ExternalMcpOAuthControls";
+import { ExternalMcpServerEditor } from "./ExternalMcpServerEditor";
+import type { ExternalMcpServerDraft } from "./externalMcpServerDraft";
 import { SettingsSection } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 
@@ -25,231 +37,182 @@ export function ExternalMcpServersSettings({
 }) {
   const settings = useEnvironmentSettings(environmentId);
   const servers = settings.externalMcpServers;
-  const providerInstances = settings.providerInstances;
   const updateSettings = useUpdateEnvironmentSettings(environmentId);
+  const providers = useAtomValue(providersIgnoringCheckedAtAtom(environmentId));
   const hasOAuthServer = Object.values(servers).some((server) => server.auth?.type === "oauth");
   const oauthStatuses = useEnvironmentQuery(
     hasOAuthServer
       ? serverEnvironment.externalMcpOAuthStatuses({ environmentId, input: {} })
       : null,
   ).data;
-  const [newId, setNewId] = useState("");
-  const [newUrl, setNewUrl] = useState("");
-  const validId = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(newId) && newId !== "t3-code";
+  // Null id adds a server.
+  const [editing, setEditing] = useState<{
+    readonly id: ExternalMcpServerId | null;
+    readonly draft?: ExternalMcpServerDraft;
+  } | null>(null);
 
-  const replaceServer = (id: string, next: (typeof servers)[keyof typeof servers] | null) => {
-    const updated = { ...servers } as Record<string, (typeof servers)[keyof typeof servers]>;
+  const replaceServer = (
+    id: ExternalMcpServerId,
+    next: ExternalMcpServerConfig | null,
+    onFailed?: () => void,
+  ) => {
+    const updated = { ...servers };
     if (next) updated[id] = next;
     else delete updated[id];
-    updateSettings({ externalMcpServers: updated as typeof servers });
+    updateSettings({ externalMcpServers: updated }, onFailed ? { onFailed } : undefined);
   };
 
-  const addServer = () => {
-    const id = newId.trim();
-    const url = newUrl.trim();
-    if (!validId || !url || servers[id as keyof typeof servers]) return;
-    replaceServer(id, { url, headers: [], enabled: true });
-    setNewId("");
-    setNewUrl("");
-  };
+  // Settings keys are decoded server ids.
+  const entries = Object.entries(servers) as Array<[ExternalMcpServerId, ExternalMcpServerConfig]>;
 
   return (
-    <SettingsSection {...searchableSetting("external-mcp-servers")}>
-      <p className="px-3 text-sm text-muted-foreground sm:px-4">
-        Streamable HTTP servers are attached to new provider sessions. Secrets are stored outside
-        settings.json. Codex currently supports sensitive Authorization: Bearer headers only; other
-        configured headers still apply to Claude, Cursor, Grok, and T3-managed OpenCode. External
-        OpenCode runtimes do not support this integration. Servers apply to every project on this
-        environment. OAuth servers are reached through this environment, which keeps and refreshes
-        the sign-in.
-      </p>
-      {Object.entries(servers).map(([id, server]) => (
-        <div
-          key={id}
-          inert={disabled}
-          aria-disabled={disabled || undefined}
-          className={cn(
-            "mx-3 space-y-3 rounded-lg border p-3 sm:mx-4",
-            disabled && "opacity-50 select-none",
-          )}
+    <SettingsSection
+      {...searchableSetting("external-mcp-servers")}
+      headerAction={
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={disabled}
+          onClick={() => setEditing({ id: null })}
         >
-          <div className="flex items-center gap-2">
-            <Input
-              className="max-w-48"
-              defaultValue={server.displayName ?? ""}
-              placeholder={id}
-              onBlur={(event) => {
-                const displayName = event.currentTarget.value.trim();
-                const { displayName: _omit, ...withoutDisplayName } = server;
-                replaceServer(id, displayName ? { ...server, displayName } : withoutDisplayName);
-              }}
-              aria-label={`${id} display name`}
+          <PlusIcon className="size-3.5" /> Add server
+        </Button>
+      }
+    >
+      <div inert={disabled} className={cn(disabled && "opacity-50 select-none")}>
+        {entries.length === 0 ? (
+          <p className="px-3 py-4 text-sm text-muted-foreground sm:px-4">
+            Give agents the tools of a remote MCP server, such as your issue tracker or asset store.
+            Servers sign in with OAuth or send fixed headers.
+          </p>
+        ) : (
+          entries.map(([id, server]) => (
+            <ExternalMcpServerRow
+              key={id}
+              environmentId={environmentId}
+              id={id}
+              server={server}
+              status={oauthStatuses?.[id]}
+              onEdit={() => setEditing({ id })}
+              onChange={(next) => replaceServer(id, next)}
             />
-            <Input
-              defaultValue={server.url}
-              onBlur={(event) =>
-                replaceServer(id, { ...server, url: event.currentTarget.value.trim() })
-              }
-              aria-label={`${id} MCP URL`}
-            />
-            <Switch
-              checked={server.enabled}
-              onCheckedChange={(enabled) => replaceServer(id, { ...server, enabled })}
-              aria-label={`Enable ${id}`}
-            />
-            <Button
-              type="button"
-              size="icon-sm"
-              variant="ghost"
-              onClick={() => replaceServer(id, null)}
-              aria-label={`Delete ${id}`}
-            >
-              <Trash2Icon className="size-4" />
-            </Button>
+          ))
+        )}
+        {entries.length > 0 ? (
+          <p className="border-t border-border/60 px-3 py-2.5 text-xs text-muted-foreground sm:px-4">
+            Every project on this environment gets these servers. Changes reach running threads once
+            their sessions are idle.
+          </p>
+        ) : null}
+      </div>
+      {editing ? (
+        <ExternalMcpServerEditor
+          serverId={editing.id}
+          server={editing.id === null ? undefined : servers[editing.id]}
+          initialDraft={editing.draft}
+          takenIds={new Set(Object.keys(servers))}
+          providers={providers}
+          onSave={(id, next, draft) => {
+            const reopen = { id: editing.id, draft };
+            replaceServer(id as ExternalMcpServerId, next, () => setEditing(reopen));
+            setEditing(null);
+          }}
+          onClose={() => setEditing(null)}
+        />
+      ) : null}
+    </SettingsSection>
+  );
+}
+
+function ExternalMcpServerRow({
+  environmentId,
+  id,
+  server,
+  status,
+  onEdit,
+  onChange,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly id: string;
+  readonly server: ExternalMcpServerConfig;
+  readonly status: ExternalMcpOAuthStatus | undefined;
+  readonly onEdit: () => void;
+  readonly onChange: (next: ExternalMcpServerConfig | null) => void;
+}) {
+  const oauth = server.auth?.type === "oauth";
+  const actions = useExternalMcpOAuth(environmentId, id);
+  const name = server.displayName ?? id;
+  const connected = status?.state === "connected";
+  const flow = status?.flow ?? null;
+
+  async function remove() {
+    const confirmed = await ensureLocalApi().dialogs.confirm(
+      `Remove ${name}? Its stored secrets${oauth ? " and sign-in" : ""} are deleted.`,
+      { variant: "destructive" },
+    );
+    if (confirmed) onChange(null);
+  }
+
+  return (
+    <div className="border-t border-border/60 px-3 py-3 first:border-t-0 sm:px-4">
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <p className="truncate text-sm font-medium">{name}</p>
+            <Badge size="sm" variant="outline">
+              {oauth ? "OAuth" : server.headers.length > 0 ? "Headers" : "No auth"}
+            </Badge>
+            {!server.enabled ? (
+              <Badge size="sm" variant="secondary">
+                Off
+              </Badge>
+            ) : null}
           </div>
-          <ExternalMcpOAuthControls
-            environmentId={environmentId}
-            serverId={id}
-            server={server}
-            status={oauthStatuses?.[id as keyof typeof oauthStatuses]}
-            disabled={disabled}
-            onChange={(next) => replaceServer(id, next)}
-          />
-          <div className="space-y-2">
-            {server.headers.map((header, index) => (
-              <div key={header.name} className="flex items-center gap-2">
-                <Input
-                  defaultValue={header.name}
-                  placeholder="Header name"
-                  onBlur={(event) => {
-                    const headers = [...server.headers];
-                    headers[index] = { ...header, name: event.currentTarget.value.trim() };
-                    replaceServer(id, { ...server, headers });
-                  }}
-                  aria-label={`${id} header ${index + 1} name`}
-                />
-                <Input
-                  defaultValue={header.valueRedacted ? "" : header.value}
-                  type={header.sensitive ? "password" : "text"}
-                  placeholder={header.valueRedacted ? "Stored secret - enter to replace" : "Value"}
-                  autoComplete="off"
-                  onBlur={(event) => {
-                    if (header.valueRedacted && !event.currentTarget.value) return;
-                    const headers = [...server.headers];
-                    headers[index] = {
-                      ...header,
-                      value: event.currentTarget.value,
-                      valueRedacted: false,
-                    };
-                    replaceServer(id, { ...server, headers });
-                  }}
-                  aria-label={`${id} header ${index + 1} value`}
-                />
-                <label className="flex items-center gap-1 text-xs text-muted-foreground">
-                  <Checkbox
-                    checked={header.sensitive}
-                    onCheckedChange={async (checked) => {
-                      const sensitive = Boolean(checked);
-                      if (!sensitive && header.sensitive && header.valueRedacted) {
-                        const confirmed = await ensureLocalApi().dialogs.confirm(
-                          `Stop storing ${header.name} as a secret? The stored value will be deleted.`,
-                          { variant: "destructive" },
-                        );
-                        if (!confirmed) return;
-                      }
-                      const headers = [...server.headers];
-                      headers[index] = {
-                        ...header,
-                        sensitive,
-                        ...(!sensitive ? { value: "", valueRedacted: false } : {}),
-                      };
-                      replaceServer(id, { ...server, headers });
-                    }}
-                  />
-                  Secret
-                </label>
-                <Button
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  onClick={() =>
-                    replaceServer(id, {
-                      ...server,
-                      headers: server.headers.filter((_, candidate) => candidate !== index),
-                    })
-                  }
-                  aria-label={`Delete ${id} header ${index + 1}`}
-                >
-                  <Trash2Icon className="size-4" />
-                </Button>
-              </div>
-            ))}
+          <p className="truncate text-xs text-muted-foreground">{server.url}</p>
+          {oauth ? <ExternalMcpOAuthStatusLine status={status} error={actions.error} /> : null}
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {oauth && !connected && !flow ? (
             <Button
               type="button"
               size="sm"
               variant="outline"
-              onClick={() =>
-                replaceServer(id, {
-                  ...server,
-                  headers: [
-                    ...server.headers,
-                    {
-                      name: `X-MCP-Header-${server.headers.length + 1}`,
-                      value: "",
-                      sensitive: true,
-                    } satisfies ExternalMcpHeader,
-                  ],
-                })
-              }
+              disabled={actions.pending || status === undefined}
+              onClick={() => void actions.signIn()}
             >
-              <PlusIcon className="size-4" /> Add header
+              Sign in
             </Button>
-          </div>
-          <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-            <span>Provider instances:</span>
-            {Object.entries(providerInstances).map(([instanceId, instance]) => {
-              const checked = server.providerInstances?.includes(instanceId as never) ?? true;
-              return (
-                <label key={instanceId} className="flex items-center gap-1">
-                  <Checkbox
-                    checked={checked}
-                    onCheckedChange={(selected) => {
-                      const current = server.providerInstances ?? Object.keys(providerInstances);
-                      const next = selected
-                        ? [...new Set([...current, instanceId])]
-                        : current.filter((candidate) => candidate !== instanceId);
-                      replaceServer(id, { ...server, providerInstances: next as never });
-                    }}
-                  />
-                  {instance.displayName || instanceId}
-                </label>
-              );
-            })}
-          </div>
+          ) : null}
+          <Switch
+            checked={server.enabled}
+            onCheckedChange={(enabled) => onChange({ ...server, enabled })}
+            aria-label={`Enable ${name}`}
+          />
+          <Menu>
+            <MenuTrigger
+              render={<Button size="icon-sm" variant="ghost" aria-label={`${name} actions`} />}
+            >
+              <EllipsisIcon className="size-4" />
+            </MenuTrigger>
+            <MenuPopup align="end">
+              <MenuItem onClick={onEdit}>Edit…</MenuItem>
+              {oauth && connected ? (
+                <MenuItem onClick={() => void actions.signIn()}>Sign in again</MenuItem>
+              ) : null}
+              {oauth && (connected || status?.state === "needs-login") ? (
+                <MenuItem onClick={() => void actions.signOut()}>Sign out</MenuItem>
+              ) : null}
+              <MenuSeparator />
+              <MenuItem variant="destructive" onClick={() => void remove()}>
+                Remove
+              </MenuItem>
+            </MenuPopup>
+          </Menu>
         </div>
-      ))}
-      <div
-        inert={disabled}
-        aria-disabled={disabled || undefined}
-        className={cn(
-          "mx-3 flex gap-2 rounded-lg border border-dashed p-3 sm:mx-4",
-          disabled && "opacity-50 select-none",
-        )}
-      >
-        <Input
-          value={newId}
-          onChange={(event) => setNewId(event.target.value)}
-          placeholder="server-id"
-        />
-        <Input
-          value={newUrl}
-          onChange={(event) => setNewUrl(event.target.value)}
-          placeholder="https://example.com/mcp"
-        />
-        <Button type="button" onClick={addServer} disabled={!validId || !newUrl.trim()}>
-          Add server
-        </Button>
       </div>
-    </SettingsSection>
+      {oauth && flow ? (
+        <ExternalMcpSignInPanel key={flow.flowId} serverName={name} flow={flow} actions={actions} />
+      ) : null}
+    </div>
   );
 }
