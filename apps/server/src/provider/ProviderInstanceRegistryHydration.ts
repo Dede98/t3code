@@ -12,9 +12,9 @@ import {
   type ProviderInstanceConfigMap,
   ServerSettings,
 } from "@t3tools/contracts";
-import type * as Crypto from "effect/Crypto";
 import * as Equal from "effect/Equal";
 import * as Option from "effect/Option";
+import type * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -59,7 +59,7 @@ type ProviderInstanceRegistryHydrationEnv =
   | Path.Path
   | FileSystem.FileSystem
   // Secret provider reads.
-  | Crypto.Crypto
+  | SecureRandom.SecureRandom
   // The Claude runner counts its CLIs as running agents for port discovery.
   | PortScanner.PortDiscovery;
 

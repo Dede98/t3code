@@ -20,6 +20,7 @@ import ExcludeAttachmentPlaceholders from "./Migrations/074_ExcludeAttachmentPla
 import SubagentDeliveryState from "./Migrations/075_SubagentDeliveryState.ts";
 import ProjectionProjectsPinArchive from "./Migrations/076_ProjectionProjectsPinArchive.ts";
 import RepairBooleanSettledOverride from "./Migrations/077_RepairBooleanSettledOverride.ts";
+import DropOrchestrationEventCorrelationIndex from "./Migrations/078_DropOrchestrationEventCorrelationIndex.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 
 const seedFork = (through = 55) => seedForkMigrations(through);
@@ -83,6 +84,7 @@ it.effect(
           [76, "SubagentDeliveryState"],
           [77, "ProjectionProjectsPinArchive"],
           [78, "RepairBooleanSettledOverride"],
+          [79, "DropOrchestrationEventCorrelationIndex"],
         ]);
         // Each startup owns a fresh connection/layer.
         assert.deepEqual(yield* migrate, []);
@@ -194,6 +196,7 @@ it.effect("rolls back a failed fork foundation and retries from a fresh connecti
         [76, "SubagentDeliveryState"],
         [77, "ProjectionProjectsPinArchive"],
         [78, "RepairBooleanSettledOverride"],
+        [79, "DropOrchestrationEventCorrelationIndex"],
       ],
     );
   }).pipe(
@@ -293,7 +296,7 @@ it.effect.each([0, 32, 52, 53, 54].map((through) => ({ through })))(
 );
 
 it.effect.each([
-  57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77,
+  57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
 ])("preserves official upstream webhook ledger through %s", (through) =>
   Effect.gen(function* () {
     const official = [
@@ -309,6 +312,11 @@ it.effect.each([
       [75, "SubagentDeliveryState", SubagentDeliveryState] as const,
       [76, "ProjectionProjectsPinArchive", ProjectionProjectsPinArchive] as const,
       [77, "RepairBooleanSettledOverride", RepairBooleanSettledOverride] as const,
+      [
+        78,
+        "DropOrchestrationEventCorrelationIndex",
+        DropOrchestrationEventCorrelationIndex,
+      ] as const,
     ].filter(([id]) => id <= through);
     yield* Migrator.make({})({
       loader: Migrator.fromRecord(
@@ -317,21 +325,17 @@ it.effect.each([
     });
     const sql = yield* SqlClient.SqlClient;
     const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
-    const appContext =
-      through >= 59
-        ? [
-            {
-              thread_id: "thread",
-              item_id: "item",
-              server: "server",
-              tool: "tool",
-              text: "preserved",
-              updated_at: "2026-10-08",
-            },
-          ]
-        : [];
+    const appContextRow = {
+      thread_id: "thread",
+      item_id: "item",
+      server: "server",
+      tool: "tool",
+      text: "preserved",
+      updated_at: "2026-10-08",
+    };
+    const appContext = through >= 59 ? [appContextRow] : [];
     if (through >= 59) {
-      yield* sql`INSERT INTO mcp_app_model_context ${sql.insert(appContext)}`;
+      yield* sql`INSERT INTO mcp_app_model_context ${sql.insert(appContextRow)}`;
     }
     if (through >= 70) {
       yield* sql`INSERT INTO peer_environment_links
@@ -362,6 +366,11 @@ it.effect.each([
       1,
     );
     assert.deepEqual(yield* sql`SELECT * FROM mcp_app_model_context`, appContext);
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'idx_orch_events_correlation_id'`)
+        .length,
+      0,
+    );
     assert.equal(
       (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_nodes_live_idx'`)
         .length,

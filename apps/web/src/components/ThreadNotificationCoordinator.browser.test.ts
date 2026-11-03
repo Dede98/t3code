@@ -1,4 +1,3 @@
-import { WORKING_EXIT_GRACE_MS } from "@t3tools/client-runtime/state/thread-inbox";
 import type { AnyRouter } from "@tanstack/react-router";
 import type { ClientSettings } from "@t3tools/contracts/settings";
 import * as DateTime from "effect/DateTime";
@@ -131,7 +130,10 @@ function setup(
   stack.use(
     stubGlobal("Notification", Object.assign(state.notification, { permission: "granted" })),
   );
-  window.desktopBridge = bridge as NonNullable<typeof window.desktopBridge>;
+  window.desktopBridge = {
+    onNotificationBadgeClear: () => () => {},
+    ...bridge,
+  } as NonNullable<typeof window.desktopBridge>;
   stack.defer(() => {
     delete window.desktopBridge;
   });
@@ -145,7 +147,7 @@ function setup(
     },
     async complete(completedAt: string) {
       testRegistry.set(shellAtom("env-1"), shell(completedAt));
-      await vi.advanceTimersByTimeAsync(WORKING_EXIT_GRACE_MS);
+      await vi.advanceTimersByTimeAsync(0);
     },
     changeSettings: () => {
       for (const listener of state.settingsListeners) listener();

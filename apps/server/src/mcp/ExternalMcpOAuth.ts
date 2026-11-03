@@ -14,7 +14,8 @@ import {
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as Digest from "effect/crypto/Digest";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -218,7 +219,8 @@ const make = Effect.gen(function* () {
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const serverSettings = yield* ServerSettingsService;
   const httpClient = yield* HttpClient.HttpClient;
-  const crypto = yield* Crypto.Crypto;
+  const random = yield* SecureRandom.SecureRandom;
+  const digest = yield* Digest.Digest;
   // Open sign-in listeners close with the service.
   const serviceScope = yield* Effect.scope;
   // Guards state and secret writes only; network calls run outside it.
@@ -240,7 +242,7 @@ const make = Effect.gen(function* () {
   const withHttp = <A, E>(effect: Effect.Effect<A, E, HttpClient.HttpClient>) =>
     Effect.provideService(effect, HttpClient.HttpClient, httpClient);
   const randomToken = (bytes: number) =>
-    crypto.randomBytes(bytes).pipe(Effect.orDie, Effect.map(Base64Url.encode));
+    random.randomBytes(bytes).pipe(Effect.orDie, Effect.map(Base64Url.encode));
 
   const persist = (serverId: string, record: StoredRecord | undefined) =>
     (record === undefined
@@ -395,7 +397,7 @@ const make = Effect.gen(function* () {
       const { token: _token, needsLogin: _needsLogin, ...kept } = existing;
       return { ...kept, ...toRecordEndpoints(discovered) } satisfies StoredRecord;
     }
-    const [high = 0, low = 0] = yield* crypto.randomBytes(2).pipe(Effect.orDie);
+    const [high = 0, low = 0] = yield* random.randomBytes(2).pipe(Effect.orDie);
     // Fixed per registration: authorization servers may match the redirect URI exactly.
     const port = 49_152 + (((high << 8) | low) % 16_000);
     const redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`;
@@ -566,7 +568,9 @@ const make = Effect.gen(function* () {
           yield* setRecord(input.serverId, record);
           const verifier = yield* randomToken(32);
           const challenge = Base64Url.encode(
-            yield* crypto.digest("SHA-256", new TextEncoder().encode(verifier)).pipe(Effect.orDie),
+            yield* digest
+              .digest(Digest.sha256, new TextEncoder().encode(verifier))
+              .pipe(Effect.orDie),
           );
           const oauthState = yield* randomToken(24);
           const flowId = yield* randomToken(16);

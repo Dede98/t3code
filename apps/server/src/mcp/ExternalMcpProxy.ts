@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
+import * as HttpMethod from "effect/http/HttpMethod";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as HttpServerRequest from "effect/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
@@ -99,10 +100,14 @@ const handler = Effect.gen(function* () {
     return HttpServerResponse.text("Not Found", { status: 404 });
   }
   const name = server.displayName ?? serverId;
+  const method = request.method;
+  if (!HttpMethod.isHttpMethod(method)) {
+    return HttpServerResponse.text("Method Not Allowed", { status: 405 });
+  }
 
   // Buffered so a request the upstream refuses can be replayed once with a refreshed token.
   const body =
-    request.method === "GET" || request.method === "HEAD" || request.method === "DELETE"
+    method === "GET" || method === "HEAD" || method === "DELETE"
       ? undefined
       : yield* request.arrayBuffer;
   const headers: Record<string, string> = {};
@@ -114,7 +119,7 @@ const handler = Effect.gen(function* () {
 
   const send = (token: string) =>
     httpClient.execute(
-      HttpClientRequest.make(request.method)(server.url).pipe(
+      HttpClientRequest.make(method)(server.url).pipe(
         HttpClientRequest.setHeaders({ ...headers, authorization: `Bearer ${token}` }),
         body === undefined
           ? (self) => self

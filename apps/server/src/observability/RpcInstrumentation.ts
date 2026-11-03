@@ -150,6 +150,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.externalMcpOAuthComplete]: "mcp",
   [WS_METHODS.externalMcpOAuthCancel]: "mcp",
   [WS_METHODS.externalMcpOAuthLogout]: "mcp",
+  [WS_METHODS.sourceControlStar]: "source-control",
   [WS_METHODS.projectCloneStart]: "source-control",
   [WS_METHODS.projectCloneCancel]: "source-control",
   [WS_METHODS.projectCloneRetry]: "source-control",

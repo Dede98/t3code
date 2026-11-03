@@ -1,4 +1,5 @@
 import type { SessionKey, SessionStore, SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
+import * as Arr from "effect/Array";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
 import * as Clock from "effect/Clock";
@@ -121,14 +122,6 @@ function normalizeKey(
   });
 }
 
-function chunksOf<A>(values: ReadonlyArray<A>, size: number): ReadonlyArray<ReadonlyArray<A>> {
-  const chunks: Array<ReadonlyArray<A>> = [];
-  for (let offset = 0; offset < values.length; offset += size) {
-    chunks.push(values.slice(offset, offset + size));
-  }
-  return chunks;
-}
-
 function isSessionStoreEntry(value: unknown): value is SessionStoreEntry {
   return (
     typeof value === "object" &&
@@ -206,7 +199,7 @@ const makeClaudeSessionStore = Effect.gen(function* () {
           `;
 
           yield* Effect.forEach(
-            chunksOf(encodedEntries, MAX_ENTRIES_PER_INSERT),
+            Arr.chunksOf(encodedEntries, MAX_ENTRIES_PER_INSERT),
             (entryChunk) =>
               sql`
                 INSERT INTO claude_session_store_entries ${sql.insert(entryChunk)}
@@ -488,21 +481,20 @@ const makeClaudeSessionStore = Effect.gen(function* () {
             DELETE FROM claude_session_store_keys
             WHERE session_id = ${snapshot.sessionId}
           `;
-          yield* sql`
-            INSERT INTO claude_session_store_keys ${sql.insert(
-              encodedByKey.map(({ key }) => ({
-                project_key: snapshot.projectKey,
-                session_id: snapshot.sessionId,
-                subpath: key.subpath,
-                mtime_ms: mtime,
-              })),
-            )}
-          `;
+          if (Arr.isReadonlyArrayNonEmpty(encodedByKey)) {
+            const keyRows = Arr.map(encodedByKey, ({ key }) => ({
+              project_key: snapshot.projectKey,
+              session_id: snapshot.sessionId,
+              subpath: key.subpath,
+              mtime_ms: mtime,
+            }));
+            yield* sql`INSERT INTO claude_session_store_keys ${sql.insert(keyRows)}`;
+          }
           yield* Effect.forEach(
             encodedByKey,
             ({ rows }) =>
               Effect.forEach(
-                chunksOf(rows, MAX_ENTRIES_PER_INSERT),
+                Arr.chunksOf(rows, MAX_ENTRIES_PER_INSERT),
                 (entryChunk) =>
                   sql`
                     INSERT INTO claude_session_store_entries ${sql.insert(entryChunk)}

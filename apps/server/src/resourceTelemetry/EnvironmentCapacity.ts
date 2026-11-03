@@ -5,7 +5,7 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as Digest from "effect/crypto/Digest";
 import * as Hex from "effect/encoding/Hex";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -68,15 +68,15 @@ const quotaGroupId = Effect.fn("EnvironmentCapacity.quotaGroupId")(function* (
       ? [provider.driver, "credential", provider.usageLimits.credentialFingerprint]
       : null;
   if (identity === null) return null;
-  const crypto = yield* Crypto.Crypto;
-  const digest = yield* crypto
-    .digest("SHA-256", new TextEncoder().encode(encodeQuotaIdentity(identity)))
+  const digestService = yield* Digest.Digest;
+  const digest = yield* digestService
+    .digest(Digest.sha256, new TextEncoder().encode(encodeQuotaIdentity(identity)))
     .pipe(Effect.mapError((cause) => new EnvironmentCapacityError({ cause })));
   return Hex.encode(digest);
 });
 
 const make = Effect.gen(function* () {
-  const crypto = yield* Crypto.Crypto;
+  const digest = yield* Digest.Digest;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const resources = yield* HostResources.HostResources;
   const registry = yield* ProviderRegistry.ProviderRegistry;
@@ -165,7 +165,7 @@ const make = Effect.gen(function* () {
         }),
       ),
     } satisfies EnvironmentCapacityReport;
-  }).pipe(Effect.provideService(Crypto.Crypto, crypto));
+  }).pipe(Effect.provideService(Digest.Digest, digest));
   return EnvironmentCapacity.of({ read });
 });
 

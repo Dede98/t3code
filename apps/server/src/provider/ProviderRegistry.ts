@@ -82,6 +82,17 @@ export class ProviderRegistry extends Context.Service<
       readonly fresh?: boolean;
     }) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
+    /**
+     * Drop T3-owned model caches before an explicit model refresh. Pass the
+     * target of the refresh that follows. Background and ordinary refreshes
+     * keep their cache timers and must not call this.
+     */
+    readonly invalidateModelCaches: (input: {
+      readonly instanceId?: ProviderInstanceId | undefined;
+      readonly cwd?: string | undefined;
+      readonly fresh?: boolean | undefined;
+    }) => Effect.Effect<void>;
+
     readonly getProviderMaintenanceCapabilitiesForInstance: (
       instanceId: ProviderInstanceId,
       provider: ProviderDriverKind,
@@ -331,10 +342,7 @@ const buildSnapshotSource = (instance: ProviderInstance): ProviderSnapshotSource
   instanceId: instance.instanceId,
   driverKind: instance.driverKind,
   getSnapshot: instance.snapshot.getSnapshot,
-  // Manual registry refreshes bypass cached probes; background health checks retain their TTL.
-  refresh: (instance.invalidateCaches ?? Effect.void).pipe(
-    Effect.andThen(instance.snapshot.refresh),
-  ),
+  refresh: instance.snapshot.refresh,
   streamChanges: instance.snapshot.streamChanges,
 });
 
@@ -624,7 +632,9 @@ export const layer = Layer.effect(
     const refreshOneSource = Effect.fn("refreshOneSource")(function* (
       providerSource: ProviderSnapshotSource,
     ) {
+      // Enrichment can publish a newer snapshot before refresh returns its pre-enrichment probe.
       return yield* providerSource.refresh.pipe(
+        Effect.andThen(providerSource.getSnapshot),
         Effect.flatMap((nextProvider) =>
           correlateSnapshotWithSource(providerSource, nextProvider).pipe(
             Effect.flatMap(syncProvider),
@@ -1082,6 +1092,34 @@ export const layer = Layer.effect(
       return yield* Fiber.join(claim.scan);
     });
 
+    const invalidateModelCaches = Effect.fn("ProviderRegistry.invalidateModelCaches")(function* (
+      input: Parameters<ProviderRegistry["Service"]["invalidateModelCaches"]>[0],
+    ) {
+      yield* manifestService.forceRefresh;
+      const instances = yield* instanceRegistry.listInstances;
+      yield* Effect.forEach(
+        instances.filter(
+          (instance) => input.instanceId === undefined || input.instanceId === instance.instanceId,
+        ),
+        (instance) =>
+          Effect.gen(function* () {
+            yield* instance.invalidateCaches ?? Effect.void;
+            // Instance and full refreshes resolve installer metadata fresh
+            // themselves; a cached workspace refresh needs it resolved here.
+            const maintenance = yield* instance.snapshot.resolveMaintenance({
+              fresh:
+                input.instanceId !== undefined && input.cwd !== undefined && input.fresh !== true,
+            });
+            yield* Effect.forEach(
+              latestProviderVersionCacheKeys(maintenance),
+              latestVersions.invalidate,
+              { discard: true },
+            );
+          }),
+        { concurrency: "unbounded", discard: true },
+      );
+    });
+
     return {
       getProviders: Ref.get(providersRef),
       refresh: (provider?: ProviderDriverKind) =>
@@ -1094,6 +1132,7 @@ export const layer = Layer.effect(
         refreshWorkspaceSnapshot(input).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshAfterUpdate: (provider, instanceId) =>
         rebuildBarrier.withOperation(refreshAfterUpdate(provider, instanceId)),
+      invalidateModelCaches,
       getProviderMaintenanceCapabilitiesForInstance,
       setProviderMaintenanceActionState,
       get streamChanges() {

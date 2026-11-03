@@ -436,7 +436,7 @@ const client = McpSchema.McpServerClient.of({
 function mcpLayer(options: { failWorkload?: boolean; deleted?: boolean } = {}) {
   return McpHttpServer.layerEnvironmentToolkit.pipe(
     Layer.provide(EnvironmentCapacity.layer),
-    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
     Layer.provide(
       Layer.mergeAll(
         dependencies(options),
