@@ -21,6 +21,7 @@ import SubagentDeliveryState from "./Migrations/075_SubagentDeliveryState.ts";
 import ProjectionProjectsPinArchive from "./Migrations/076_ProjectionProjectsPinArchive.ts";
 import RepairBooleanSettledOverride from "./Migrations/077_RepairBooleanSettledOverride.ts";
 import DropOrchestrationEventCorrelationIndex from "./Migrations/078_DropOrchestrationEventCorrelationIndex.ts";
+import DelegatedRecoveryIndexes from "./Migrations/079_DelegatedRecoveryIndexes.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 
 const seedFork = (through = 55) => seedForkMigrations(through);
@@ -85,6 +86,7 @@ it.effect(
           [77, "ProjectionProjectsPinArchive"],
           [78, "RepairBooleanSettledOverride"],
           [79, "DropOrchestrationEventCorrelationIndex"],
+          [80, "DelegatedRecoveryIndexes"],
         ]);
         // Each startup owns a fresh connection/layer.
         assert.deepEqual(yield* migrate, []);
@@ -197,6 +199,7 @@ it.effect("rolls back a failed fork foundation and retries from a fresh connecti
         [77, "ProjectionProjectsPinArchive"],
         [78, "RepairBooleanSettledOverride"],
         [79, "DropOrchestrationEventCorrelationIndex"],
+        [80, "DelegatedRecoveryIndexes"],
       ],
     );
   }).pipe(
@@ -296,7 +299,7 @@ it.effect.each([0, 32, 52, 53, 54].map((through) => ({ through })))(
 );
 
 it.effect.each([
-  57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+  57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
 ])("preserves official upstream webhook ledger through %s", (through) =>
   Effect.gen(function* () {
     const official = [
@@ -317,6 +320,7 @@ it.effect.each([
         "DropOrchestrationEventCorrelationIndex",
         DropOrchestrationEventCorrelationIndex,
       ] as const,
+      [79, "DelegatedRecoveryIndexes", DelegatedRecoveryIndexes] as const,
     ].filter(([id]) => id <= through);
     yield* Migrator.make({})({
       loader: Migrator.fromRecord(
@@ -393,6 +397,11 @@ it.effect.each([
     );
     assert.equal(
       (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_subagents_settled_idx'`)
+        .length,
+      1,
+    );
+    assert.equal(
+      (yield* sql`SELECT name FROM sqlite_master WHERE name = 'orchestration_v2_projection_runs_delegated_delivery_idx'`)
         .length,
       1,
     );

@@ -3,7 +3,10 @@ import {
   ClaudeSettings,
   CodexSettings,
   EasDeviceHostConfig,
+  type ExternalMcpServerId,
+  type ProviderInstanceConfig,
   type ServerSettings,
+  type SettingsSecretValue,
   SimlockDeviceHostConfig,
   UsageLimitSourceConfig,
   isSecretReference,
@@ -58,16 +61,20 @@ export interface SettingsSecret {
 }
 
 type SecretValue = Pick<SettingsSecret, "value" | "redacted">;
+type SecretSlotName = (field: string, serverHost: string | null) => string;
+type SecretFieldsMapper = (
+  fields: Readonly<Record<string, unknown>>,
+  secretFields: ReadonlyArray<string>,
+  name: SecretSlotName,
+) => Record<string, unknown>;
+type ProviderEnvironment = NonNullable<ProviderInstanceConfig["environment"]>;
+type ExternalMcpHeaders = ServerSettings["externalMcpServers"][ExternalMcpServerId]["headers"];
 
 export function mapSettingsSecrets(
   settings: ServerSettings,
   map: (secret: SettingsSecret) => SecretValue,
 ): ServerSettings {
-  const mapFields = (
-    fields: Readonly<Record<string, unknown>>,
-    secretFields: ReadonlyArray<string>,
-    name: (field: string, serverHost: string | null) => string,
-  ) => {
+  const mapFields: SecretFieldsMapper = (fields, secretFields, name) => {
     const next = { ...fields };
     for (const field of secretFields) {
       if (!(field in next) || isSecretReference(next[field])) continue;
@@ -88,6 +95,95 @@ export function mapSettingsSecrets(
     return next;
   };
 
+  return mapSecretFieldGroups(
+    settings,
+    mapFields,
+    (instanceId, environment) =>
+      environment.map((variable) => {
+        const { valueRedacted: _omit, ...rest } = variable;
+        // A secret reference is not itself secret; storage sees the value cleared.
+        const reference = typeof variable.value === "string" ? undefined : variable.value;
+        const result = map({
+          secretName: `provider-env-${encode(instanceId)}-${encode(variable.name)}`,
+          kind: "environment",
+          value: typeof variable.value === "string" ? variable.value : "",
+          redacted: reference === undefined && variable.valueRedacted === true,
+          sensitive: variable.sensitive,
+          providerInstanceId: instanceId,
+          environmentVariable: variable.name,
+        });
+        if (reference !== undefined) return { ...rest, value: reference };
+        return {
+          ...rest,
+          value: result.value,
+          ...(result.redacted ? { valueRedacted: true } : {}),
+        };
+      }),
+    (serverId, headers) =>
+      headers.map((header) => {
+        const result = map({
+          secretName: `mcp-header-${encode(serverId)}-${encode(header.name.toLowerCase())}`,
+          kind: "mcp-header",
+          value: header.value,
+          redacted: header.valueRedacted === true,
+          sensitive: header.sensitive,
+          providerInstanceId: serverId,
+          environmentVariable: header.name,
+        });
+        const { valueRedacted: _omit, ...rest } = header;
+        return {
+          ...rest,
+          value: result.value,
+          ...(result.redacted ? { valueRedacted: true } : {}),
+        };
+      }),
+  );
+}
+
+/**
+ * Maps each value a secret field holds, literal or reference, with the secret name of its slot.
+ * Provider environment variables are left as they are.
+ */
+export function mapSettingsSecretValues(
+  settings: ServerSettings,
+  map: (value: SettingsSecretValue, secretName: string) => SettingsSecretValue,
+): ServerSettings {
+  const mapValue = (value: unknown, secretName: string) =>
+    typeof value === "string" || isSecretReference(value) ? map(value, secretName) : value;
+  return mapSecretFieldGroups(settings, (fields, secretFields, name) => {
+    const next = { ...fields };
+    for (const field of secretFields) {
+      if (!(field in next)) continue;
+      const value = next[field];
+      next[field] =
+        value !== null &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        !isSecretReference(value)
+          ? Object.fromEntries(
+              Object.entries(value).map(([serverHost, entry]) => [
+                serverHost,
+                mapValue(entry, name(field, serverHost.trim().toLowerCase())),
+              ]),
+            )
+          : mapValue(value, name(field, null));
+    }
+    return next;
+  });
+}
+
+function mapSecretFieldGroups(
+  settings: ServerSettings,
+  mapFields: SecretFieldsMapper,
+  mapEnvironment: (instanceId: string, environment: ProviderEnvironment) => ProviderEnvironment = (
+    _instanceId,
+    environment,
+  ) => environment,
+  mapMcpHeaders: (serverId: string, headers: ExternalMcpHeaders) => ExternalMcpHeaders = (
+    _serverId,
+    headers,
+  ) => headers,
+): ServerSettings {
   const providerInstances = Object.fromEntries(
     Object.entries(settings.providerInstances).map(([instanceId, instance]) => {
       const config = instance.config;
@@ -107,28 +203,7 @@ export function mapSettingsSecrets(
               }
             : {}),
           ...(instance.environment
-            ? {
-                environment: instance.environment.map((variable) => {
-                  const { valueRedacted: _omit, ...rest } = variable;
-                  // A secret reference is not itself secret; storage sees the value cleared.
-                  const reference = typeof variable.value === "string" ? undefined : variable.value;
-                  const result = map({
-                    secretName: `provider-env-${encode(instanceId)}-${encode(variable.name)}`,
-                    kind: "environment",
-                    value: typeof variable.value === "string" ? variable.value : "",
-                    redacted: reference === undefined && variable.valueRedacted === true,
-                    sensitive: variable.sensitive,
-                    providerInstanceId: instanceId,
-                    environmentVariable: variable.name,
-                  });
-                  if (reference !== undefined) return { ...rest, value: reference };
-                  return {
-                    ...rest,
-                    value: result.value,
-                    ...(result.redacted ? { valueRedacted: true } : {}),
-                  };
-                }),
-              }
+            ? { environment: mapEnvironment(instanceId, instance.environment) }
             : {}),
         },
       ];
@@ -164,23 +239,7 @@ export function mapSettingsSecrets(
       serverId,
       {
         ...server,
-        headers: server.headers.map((header) => {
-          const result = map({
-            secretName: `mcp-header-${encode(serverId)}-${encode(header.name.toLowerCase())}`,
-            kind: "mcp-header",
-            value: header.value,
-            redacted: header.valueRedacted === true,
-            sensitive: header.sensitive,
-            providerInstanceId: serverId,
-            environmentVariable: header.name,
-          });
-          const { valueRedacted: _omit, ...rest } = header;
-          return {
-            ...rest,
-            value: result.value,
-            ...(result.redacted ? { valueRedacted: true } : {}),
-          };
-        }),
+        headers: mapMcpHeaders(serverId, server.headers),
       },
     ]),
   ) as ServerSettings["externalMcpServers"];

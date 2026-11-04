@@ -283,6 +283,7 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
         "77_ProjectionProjectsPinArchive",
         "78_RepairBooleanSettledOverride",
         "79_DropOrchestrationEventCorrelationIndex",
+        "80_DelegatedRecoveryIndexes",
       ]);
       const migrated = yield* withDatabase(result.databasePath, history);
       assert.deepStrictEqual(migrated.slice(0, original.length), original);

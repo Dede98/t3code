@@ -11,10 +11,8 @@ import {
 import { useRef, useState } from "react";
 import { Platform, View } from "react-native";
 
-import {
-  AndroidHeaderIconButton,
-  AndroidScreenHeader,
-} from "../../components/ui/AndroidScreenHeader";
+import { AndroidHeaderIconButton } from "../../components/ui/AndroidScreenHeader";
+import { AppBar } from "../../components/ui/AppBar";
 import { Menu } from "../../components/ui/Menu";
 import { FilePreviewModal, type FilePreviewSource } from "../../components/FilePreviewModal";
 import { useHtmlRenderTheme } from "../../lib/useHtmlRenderTheme";
@@ -244,7 +242,8 @@ export function AttachmentFileScreen(props: AttachmentFileScreenProps) {
         }}
       />
       {isAndroid ? (
-        <AndroidScreenHeader
+        <AppBar
+          embedded
           title={params.name}
           subtitle={subtitle}
           onBack={handleBack}

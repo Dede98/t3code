@@ -23,6 +23,7 @@ import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as AuthHttp from "../auth/http.ts";
 import * as McpOAuth from "../auth/McpOAuth.ts";
 import * as McpOAuthHttp from "../auth/mcpOAuthHttp.ts";
+import type * as SqlClient from "effect/sql/SqlClient";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -157,16 +158,26 @@ export type ServedPeer = Effect.Success<ReturnType<typeof servePeer>>;
  * peers over plain HTTP. Provide it to anything built on its links. `network`
  * stands in for its HTTP client and `tailscale` for its `tailscale` command.
  */
-export const layerLinkingEnvironment = (
+export const layerLinkingEnvironment = <E = never>(
   descriptor: ExecutionEnvironmentDescriptor,
   secrets: typeof ServerSecretStore.layer = ServerSecretStore.layer,
-  network: Layer.Layer<HttpClient.HttpClient> = FetchHttpClient.layer,
-  tailscale?: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>,
+  {
+    network = FetchHttpClient.layer,
+    tailscale,
+    database = Sqlite.layerMemory,
+  }: {
+    readonly network?: Layer.Layer<HttpClient.HttpClient> | undefined;
+    readonly tailscale?: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner> | undefined;
+    readonly database?: Layer.Layer<
+      SqlClient.SqlClient,
+      E | Layer.Error<typeof Sqlite.layerMemory>
+    >;
+  } = {},
 ) =>
   PeerMcpClient.layer.pipe(
     Layer.provideMerge(PeerLinks.layer),
     Layer.provideMerge(ServerSettings.layerTest({ linkedEnvironmentsEnabled: true })),
-    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(database),
     Layer.provide(
       tailscale === undefined
         ? Layer.mergeAll(secrets, network)

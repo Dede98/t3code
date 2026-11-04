@@ -82,6 +82,8 @@ import Migration0076 from "./Migrations/076_ProjectionProjectsPinArchive.ts";
 import Migration0077 from "./Migrations/077_RepairBooleanSettledOverride.ts";
 import Migration0078 from "./Migrations/078_DropOrchestrationEventCorrelationIndex.ts";
 
+import Migration0079 from "./Migrations/079_DelegatedRecoveryIndexes.ts";
+
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
   [2, "OrchestrationCommandReceipts", Migration0002],
@@ -163,6 +165,7 @@ export const migrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -202,6 +205,7 @@ export const forkMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -231,6 +235,7 @@ export const forkIntegrationMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -261,6 +266,7 @@ const upstreamIntegrationMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -291,6 +297,7 @@ const preview54MigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -322,6 +329,7 @@ const preview53MigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -349,6 +357,7 @@ const upstreamWebhookMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -376,6 +385,7 @@ const upstreamMcpAppMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 // Upstream databases that already applied review guides keep that id/name pair.
@@ -400,6 +410,7 @@ const upstreamReviewGuideMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 // Official upstream databases may already have the failure index at 62.
@@ -424,6 +435,7 @@ const upstreamFailureIndexMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 // Official databases may have used 63/64 before ever opening in the fork.
@@ -447,6 +459,7 @@ const upstreamDropProjectionsMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamCanonicalLinksMigrationEntries = [
@@ -467,6 +480,7 @@ const upstreamCanonicalLinksMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamUsageIndexMigrationEntries = [
@@ -486,6 +500,7 @@ const upstreamUsageIndexMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamSettlementMigrationEntries = [
@@ -504,6 +519,7 @@ const upstreamSettlementMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 // Official upstream databases may already have webhook dedupe at 67.
@@ -522,6 +538,7 @@ const upstreamWebhookDedupeMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 // Official upstream databases may already have the shell stop index at 68.
@@ -539,6 +556,7 @@ const upstreamShellStopIndexMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 // Official upstream databases may already have message search at 69.
@@ -555,6 +573,7 @@ const upstreamThreadMessageSearchMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 // Keep official peer-link ledger entries and append the missing Claude store.
@@ -570,6 +589,7 @@ const upstreamPeerLinksMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamPeerLinkFenceMigrationEntries = [
@@ -583,6 +603,7 @@ const upstreamPeerLinkFenceMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamWaitingLinkRequestMigrationEntries = [
@@ -595,6 +616,7 @@ const upstreamWaitingLinkRequestMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamActiveTurnItemIndexesMigrationEntries = [
@@ -606,6 +628,7 @@ const upstreamActiveTurnItemIndexesMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 // Official upstream databases may already have 074-077 before opening in the fork.
@@ -617,6 +640,7 @@ const upstreamAttachmentSearchMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamSubagentDeliveryMigrationEntries = [
@@ -626,6 +650,7 @@ const upstreamSubagentDeliveryMigrationEntries = [
   [77, "ProjectionProjectsPinArchive", Migration0076],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamProjectPinArchiveMigrationEntries = [
@@ -634,6 +659,7 @@ const upstreamProjectPinArchiveMigrationEntries = [
   [77, "ClaudeSessionStore", ClaudeSessionStore],
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamSettledOverrideRepairMigrationEntries = [
@@ -641,12 +667,21 @@ const upstreamSettledOverrideRepairMigrationEntries = [
   [77, "RepairBooleanSettledOverride", Migration0077],
   [78, "ClaudeSessionStore", ClaudeSessionStore],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
 ] as const;
 
 const upstreamDropCorrelationIndexMigrationEntries = [
   ...upstreamSettledOverrideRepairMigrationEntries.filter(([id]) => id <= 77),
   [78, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [79, "ClaudeSessionStore", ClaudeSessionStore],
+  [80, "DelegatedRecoveryIndexes", Migration0079],
+] as const;
+
+// Official upstream databases may already have delegated recovery indexes at 79.
+const upstreamDelegatedRecoveryIndexesMigrationEntries = [
+  ...upstreamDropCorrelationIndexMigrationEntries.filter(([id]) => id <= 78),
+  [79, "DelegatedRecoveryIndexes", Migration0079],
+  [80, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -738,7 +773,9 @@ function selectMigrationEntries(
                                           ? has(76, "ProjectionProjectsPinArchive")
                                             ? has(77, "RepairBooleanSettledOverride")
                                               ? has(78, "DropOrchestrationEventCorrelationIndex")
-                                                ? upstreamDropCorrelationIndexMigrationEntries
+                                                ? has(79, "DelegatedRecoveryIndexes")
+                                                  ? upstreamDelegatedRecoveryIndexesMigrationEntries
+                                                  : upstreamDropCorrelationIndexMigrationEntries
                                                 : upstreamSettledOverrideRepairMigrationEntries
                                               : upstreamProjectPinArchiveMigrationEntries
                                             : upstreamSubagentDeliveryMigrationEntries
