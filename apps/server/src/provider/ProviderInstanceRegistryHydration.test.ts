@@ -4,6 +4,8 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  SecretProviderId,
+  SecretProviderKind,
   ServerSettings,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -156,6 +158,7 @@ effectIt.effect(
             ),
         },
         mutator: {
+          reloadSecrets: () => Effect.void,
           reconcile: (map) =>
             Effect.gen(function* () {
               expect(exclusive).toBe(true);
@@ -324,3 +327,62 @@ describe("seedDevReplayInstance", () => {
     ),
   );
 });
+
+effectIt.effect.each([
+  { from: undefined, to: "Personal", reloads: 1 },
+  { from: "Personal", to: "Personal", reloads: 0 },
+  // A label is not read by any vault, so renaming a provider retries nothing.
+  { from: "Personal", to: "Renamed", reloads: 0 },
+])("retries unreadable secrets only when a secret provider changes ($from -> $to)", (row) =>
+  Effect.gen(function* () {
+    const settings = (label: string | undefined) =>
+      decodeServerSettings(
+        label === undefined
+          ? {}
+          : {
+              secretProviders: {
+                [SecretProviderId.make("personal")]: {
+                  kind: SecretProviderKind.make("one_password"),
+                  label,
+                  config: { account: "my" },
+                },
+              },
+            },
+      );
+    const initial = settings(row.from);
+    const target = settings(row.to);
+    const desired = yield* Ref.make<DesiredProviderRegistrySettings>({
+      settings: target,
+      version: 1,
+    });
+    // The reload runs after the barrier, so a second unchanged pass marks the first one done.
+    const secondPass = yield* Deferred.make<void>();
+    let passes = 0;
+    let reloads = 0;
+    yield* runProviderRegistryReconcileWorker({
+      desired,
+      initialAppliedVersion: 0,
+      initialAppliedConfigMap: deriveProviderInstanceConfigMap(initial),
+      initialAppliedSettings: initial,
+      lifecycle: {
+        register: () => Effect.void,
+        canRebuild: () => Effect.succeed(true),
+        closeInstances: () => Effect.void,
+      },
+      rebuildBarrier: {
+        withRebuild: (effect) =>
+          Effect.suspend(() =>
+            ++passes === 1
+              ? effect.pipe(Effect.tap(() => Ref.set(desired, { settings: target, version: 2 })))
+              : Deferred.succeed(secondPass, undefined).pipe(Effect.andThen(effect)),
+          ),
+      },
+      mutator: {
+        reconcile: () => Effect.void,
+        reloadSecrets: () => Effect.sync(() => void reloads++),
+      },
+    }).pipe(Effect.forkScoped);
+    yield* Deferred.await(secondPass);
+    expect(reloads).toBe(row.reloads);
+  }),
+);

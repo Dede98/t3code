@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
+import * as NodeUtil from "node:util";
 import { resolveExternalMcpServers } from "@t3tools/provider-core/server/externalMcpServers";
 import { ProviderRegistrySessionLifecycle } from "./ProviderRegistrySessionLifecycle.ts";
 import {
@@ -185,6 +186,10 @@ export const seedDevReplayInstance = Effect.fn(
   });
 });
 
+// A label is display-only, so only kind and config can change what a vault returns.
+const vaultConfigs = (settings: ServerSettings) =>
+  Object.entries(settings.secretProviders).map(([id, { kind, config }]) => [id, kind, config]);
+
 export interface DesiredProviderRegistrySettings {
   readonly settings: ServerSettings | undefined;
   /** An MCP sign-in or sign-out changes which servers sessions get, like a settings edit. */
@@ -211,10 +216,12 @@ export interface ProviderRegistryReconcileWorkerOptions {
   readonly desired: Ref.Ref<DesiredProviderRegistrySettings>;
   readonly initialAppliedVersion: number;
   readonly initialAppliedConfigMap: ProviderInstanceConfigMap;
+  /** The settings the registry was built from; secret provider changes are compared to them. */
+  readonly initialAppliedSettings?: ServerSettings | undefined;
   readonly lifecycle: ProviderRegistrySessionLifecycle["Service"];
   readonly mutator: Pick<
     ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator["Service"],
-    "reconcile"
+    "reconcile" | "reloadSecrets"
   >;
   readonly rebuildBarrier: Pick<ProviderRegistryRebuildBarrierShape, "withRebuild">;
   readonly pollIntervalMs?: number;
@@ -231,6 +238,8 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
   const pollIntervalMs = options.pollIntervalMs ?? 100;
   let appliedVersion = options.initialAppliedVersion;
   let appliedConfigMap = options.initialAppliedConfigMap;
+  let appliedSecretProviders =
+    options.initialAppliedSettings && vaultConfigs(options.initialAppliedSettings);
 
   while (true) {
     const desired = yield* Ref.get(options.desired);
@@ -271,6 +280,7 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
             return {
               version: latest.version,
               configMap: appliedConfigMap,
+              secretProviders: appliedSecretProviders,
             };
           }
           const latestConfigMap = deriveProviderInstanceConfigMap(
@@ -289,6 +299,7 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
           return {
             version: latest.version,
             configMap: latestConfigMap,
+            secretProviders: vaultConfigs(latest.settings),
           };
         }),
       )
@@ -303,8 +314,15 @@ export const runProviderRegistryReconcileWorker = Effect.fn(
       yield* Effect.sleep(pollIntervalMs);
       continue;
     }
+    // Reconcile leaves instances parked on an unreadable secret alone, and a corrected secret
+    // provider is what can make them readable. Outside the barrier: a vault unlock can wait.
+    const { secretProviders } = reconcileExit.value;
+    if (!NodeUtil.isDeepStrictEqual(appliedSecretProviders, secretProviders)) {
+      yield* options.mutator.reloadSecrets();
+    }
     appliedVersion = reconcileExit.value.version;
     appliedConfigMap = reconcileExit.value.configMap;
+    appliedSecretProviders = secretProviders;
   }
 });
 
@@ -338,6 +356,7 @@ const layerSettingsWatcher = (
           initialSettings === undefined
             ? ({} as ProviderInstanceConfigMap)
             : deriveProviderInstanceConfigMap(initialSettings, initialConnectedOAuthMcpServers),
+        initialAppliedSettings: initialSettings,
         lifecycle,
         mutator,
         rebuildBarrier,

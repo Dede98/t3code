@@ -871,8 +871,8 @@ testLayer("ClaudeNativeResumeStore", (it) => {
           fileSystem,
           path,
         });
-        const result = yield* Effect.result(
-          Effect.tryPromise(() => resumeStore.load({ projectKey: PROJECT_KEY, sessionId })),
+        const result = yield* Effect.exit(
+          Effect.promise(() => resumeStore.load({ projectKey: PROJECT_KEY, sessionId })),
         );
         assert.equal(result._tag, "Failure");
       }),

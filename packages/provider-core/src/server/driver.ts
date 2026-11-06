@@ -85,6 +85,8 @@ export interface ProviderUsageHistorySource {
   readonly transcriptDirectory: string;
   /** Optional basename filter for providers whose session folders contain unrelated logs. */
   readonly fileName?: string | undefined;
+  /** More roots in the same format, such as sessions a launch argument moved elsewhere. */
+  readonly additionalTranscriptDirectories?: ReadonlyArray<string> | undefined;
 }
 
 export interface ProviderContinuationIdentity {

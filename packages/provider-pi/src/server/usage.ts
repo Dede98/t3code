@@ -8,12 +8,14 @@ import {
   parseTimestampMs,
   tokenCount,
   totalTokens,
+  type ProviderUsageInstance,
   type ProviderUsageReader,
   type TranscriptUsageFormat,
   type UsageRecord,
 } from "@t3tools/provider-core/server/usage";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import type { PiSettings } from "../settings.ts";
+import { PI_ARGUMENTS_WITH_VALUES, resolvePiLaunchArgs } from "./mcpInjection.ts";
 
 const PiScanState = Schema.Struct({ sessionId: Schema.mutableKey(Schema.String) });
 const Usage = Schema.Struct({
@@ -130,16 +132,45 @@ export const resolvePiSessionDirectory = Effect.fn("resolvePiSessionDirectory")(
   return resolvePiSessionsDir(environment, yield* HostProcess.HomeDirectory, yield* Path.Path);
 });
 
+export const resolvePiUsageDirectories = Effect.fn("piUsageReader.directories")(function* ({
+  config,
+  environment,
+}: Pick<ProviderUsageInstance<PiSettings>, "config" | "environment">) {
+  const path = yield* Path.Path;
+  const home = yield* HostProcess.HomeDirectory;
+  const platform = yield* HostProcess.Platform;
+  const launchHome = (platform === "win32" ? environment.USERPROFILE : environment.HOME) || home;
+  const sessionDirArg = config === undefined ? undefined : piLaunchSessionDir(config.launchArgs);
+  const launchDir =
+    sessionDirArg === undefined ? undefined : expandHomePath(sessionDirArg, launchHome);
+  // --session-dir moves only T3-launched sessions; terminal sessions stay in Pi's own directory.
+  return [
+    ...(launchDir !== undefined && path.isAbsolute(launchDir)
+      ? [{ dir: path.resolve(launchDir) }]
+      : []),
+    { dir: resolvePiSessionsDir(environment, home, path) },
+  ];
+});
+
 export const piUsageReader: ProviderUsageReader<PiSettings, Path.Path> = {
   kind: "transcripts",
   provider: "pi",
   format: piUsageFormat,
-  directories: Effect.fn("piUsageReader.directories")(function* ({ environment }) {
-    const path = yield* Path.Path;
-    const home = yield* HostProcess.HomeDirectory;
-    return [{ dir: resolvePiSessionsDir(environment, home, path) }];
-  }),
+  directories: resolvePiUsageDirectories,
 };
+
+function piLaunchSessionDir(launchArgs: string): string | undefined {
+  const resolved = resolvePiLaunchArgs(launchArgs);
+  if (!resolved.ok) return undefined;
+  let sessionDir: string | undefined;
+  for (let index = 0; index < resolved.args.length; index += 1) {
+    const arg = resolved.args[index];
+    if (arg === undefined || !PI_ARGUMENTS_WITH_VALUES.has(arg)) continue;
+    index += 1;
+    if (arg === "--session-dir") sessionDir = resolved.args[index] || undefined;
+  }
+  return sessionDir;
+}
 
 /** Where Pi stores session JSONL files for a provider environment, matching Pi's own lookup. */
 export function resolvePiSessionsDir(

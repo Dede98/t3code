@@ -168,6 +168,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
       {
         scopedLimitNames,
         onUsageLimits: (update) => snapshot.applyUsageLimits(update),
+        modelCatalog,
         ...(effectiveConfig.crossAccountContinuationEnabled
           ? { sessionStore: claudeSessionStore }
           : {}),

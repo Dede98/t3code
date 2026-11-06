@@ -10,7 +10,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
-import { piUsageReader, resolvePiSessionDirectory } from "./usage.ts";
+import { piUsageReader, resolvePiSessionDirectory, resolvePiUsageDirectories } from "./usage.ts";
 import { makePiTextGeneration } from "./textGeneration.ts";
 import { PiAdapterV2Driver, type PiAdapterV2DriverEnv } from "./adapter.ts";
 import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
@@ -120,6 +120,15 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv, Path.Path> = {
       ),
     );
 
+    const transcriptDirectory = yield* resolvePiSessionDirectory(processEnv);
+    // A --session-dir launch argument moves T3-launched sessions; terminal sessions stay put.
+    const launchDirectories = (yield* resolvePiUsageDirectories({
+      config: effectiveConfig,
+      environment: processEnv,
+    }).pipe(Effect.provideService(Path.Path, pathService)))
+      .map(({ dir }) => dir)
+      .filter((dir) => dir !== transcriptDirectory);
+
     const orchestrationAdapter = yield* PiAdapterV2Driver.create({
       instanceId,
       displayName,
@@ -215,7 +224,10 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv, Path.Path> = {
       textGeneration,
       usageHistorySource: {
         provider: "pi",
-        transcriptDirectory: yield* resolvePiSessionDirectory(processEnv),
+        transcriptDirectory,
+        ...(launchDirectories.length === 0
+          ? {}
+          : { additionalTranscriptDirectories: launchDirectories }),
       },
     } satisfies ProviderInstance;
   }),

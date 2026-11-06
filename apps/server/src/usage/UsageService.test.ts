@@ -55,21 +55,31 @@ import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as AntigravityUsage from "../provider/Drivers/AntigravityUsage.ts";
 import * as ProviderHostLive from "../provider/ProviderHostLive.ts";
 import { totalTokens, type UsageRecord } from "@t3tools/provider-core/server/usage";
-import { resolvePiSessionDirectory } from "@t3tools/provider-pi/server/usage";
+import {
+  resolvePiSessionDirectory,
+  resolvePiUsageDirectories,
+} from "@t3tools/provider-pi/server/usage";
+import { PiSettings } from "@t3tools/provider-pi/settings";
 import * as UsageService from "./UsageService.ts";
 import * as MuseSdk from "../../../../packages/provider-muse/src/server/sdk.ts";
 import { MuseUsageHome } from "@t3tools/provider-muse/server";
 import { makeScanCacheWriter, SCAN_CACHE_FILE_NAME } from "./usageScanCache.ts";
 
 vi.mock("node:fs/promises", { spy: true });
-vi.mock("../../../../packages/provider-muse/src/server/sdk.ts", async (importOriginal) => ({
-  ...(await importOriginal<typeof MuseSdk>()),
-  createMuseSdkHostEffect: vi.fn(() =>
-    Effect.try(() => {
-      throw new Error("Muse is not installed in this test");
-    }),
-  ),
-}));
+vi.mock("../../../../packages/provider-muse/src/server/sdk.ts", async (importOriginal) => {
+  const original = await importOriginal<typeof MuseSdk>();
+  return {
+    ...original,
+    createMuseSdkHostEffect: vi.fn(() =>
+      Effect.fail(
+        new original.MuseSdkError({
+          operation: "start",
+          cause: new Error("Muse is not installed in this test"),
+        }),
+      ),
+    ),
+  };
+});
 
 describe("collectUsageTranscriptSources", () => {
   it("keeps every distinct provider root while collapsing shared homes", () => {
@@ -151,6 +161,7 @@ describe("collectUsageTranscriptSources", () => {
   });
 });
 const encodeUnknownJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const DEFAULT_PI_SETTINGS = Schema.decodeSync(PiSettings)({});
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeUnknownJsonString = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -282,8 +293,7 @@ const layerService = (input: {
     ),
     Layer.provideMerge(
       Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
-        // @effect-diagnostics-next-line effectSucceedWithVoid:off - This optional result requires undefined, not the wider void type.
-        getInstance: () => Effect.succeed(undefined),
+        getInstance: () => Effect.undefined,
         listInstances: (
           input.sources ??
           Effect.gen(function* () {
@@ -1407,11 +1417,27 @@ describe("UsageService", () => {
   it.live("discovers Pi history in its default home and directory overrides", () =>
     Effect.gen(function* () {
       const { home, settings } = yield* setup;
-      for (const [agentDir, sessionDir, relativeDir] of [
-        [undefined, undefined, ".pi/agent/sessions"],
-        ["~/custom-pi", undefined, "custom-pi/sessions"],
-        ["~/ignored-pi", "~/custom-sessions", "custom-sessions"],
-        ["~/ignored-pi", NodePath.join(home, "absolute-sessions"), "absolute-sessions"],
+      for (const [agentDir, sessionDir, relativeDir, launchArgs, instanceHome, platform] of [
+        [undefined, undefined, ".pi/agent/sessions", undefined],
+        ["~/custom-pi", undefined, "custom-pi/sessions", undefined],
+        ["~/ignored-pi", "~/custom-sessions", "custom-sessions", undefined],
+        ["~/ignored-pi", NodePath.join(home, "absolute-sessions"), "absolute-sessions", undefined],
+        ["~/ignored-pi", undefined, "launch-sessions", "--session-dir ~/launch-sessions"],
+        [
+          "~/ignored-pi",
+          undefined,
+          "instance-home /launch-sessions",
+          "--session-dir ~/launch-sessions",
+          "instance-home ",
+        ],
+        [
+          "~/ignored-pi",
+          undefined,
+          "windows-profile/launch-sessions",
+          "--session-dir ~/launch-sessions",
+          "windows-profile",
+          "win32",
+        ],
       ] as const) {
         const dir = NodePath.join(home, relativeDir);
         yield* Effect.promise(async () => {
@@ -1450,11 +1476,68 @@ describe("UsageService", () => {
             layerService({
               prefix: "usage-pi-" + relativeDir.replaceAll("/", "-"),
               home,
-              settings,
+              settings:
+                launchArgs === undefined
+                  ? settings
+                  : {
+                      ...settings,
+                      providerInstances: {
+                        ...settings.providerInstances,
+                        [ProviderInstanceId.make("pi")]: {
+                          driver: ProviderDriverKind.make("pi"),
+                          config: { launchArgs },
+                          environment:
+                            instanceHome === undefined
+                              ? []
+                              : [
+                                  {
+                                    name: platform === "win32" ? "USERPROFILE" : "HOME",
+                                    value: NodePath.join(home, instanceHome),
+                                    sensitive: false,
+                                  },
+                                ],
+                        },
+                      },
+                    },
               environment: {
                 PI_CODING_AGENT_DIR: agentDir,
                 PI_CODING_AGENT_SESSION_DIR: sessionDir,
               },
+              platform: platform ?? "linux",
+              // Usage roots come from the Pi instance, whose driver adds a launch directory.
+              ...(launchArgs === undefined
+                ? {}
+                : {
+                    sources: Effect.gen(function* () {
+                      const environment = {
+                        ...(yield* HostProcess.Environment),
+                        ...(instanceHome === undefined
+                          ? {}
+                          : {
+                              [platform === "win32" ? "USERPROFILE" : "HOME"]: NodePath.join(
+                                home,
+                                instanceHome,
+                              ),
+                            }),
+                      };
+                      const transcriptDirectory = yield* resolvePiSessionDirectory(environment);
+                      const directories = yield* resolvePiUsageDirectories({
+                        config: { ...DEFAULT_PI_SETTINGS, launchArgs },
+                        environment,
+                      });
+                      return [
+                        {
+                          usageHistorySource: {
+                            provider: "pi" as const,
+                            transcriptDirectory,
+                            additionalTranscriptDirectories: directories
+                              .map(({ dir }) => dir)
+                              .filter((dir) => dir !== transcriptDirectory),
+                          },
+                        },
+                      ];
+                    }).pipe(Effect.provide(PlatformNodePath.layer)),
+                  }),
             }),
           ),
           Effect.provideService(HostProcess.HomeDirectory, home),

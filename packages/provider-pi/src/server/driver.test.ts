@@ -204,6 +204,23 @@ it.layer(layerTest)("PiDriver workspace discovery", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("reads usage from a --session-dir launch argument and Pi's own sessions", () =>
+    Effect.gen(function* () {
+      const instance = yield* create({ launchArgs: "--session-dir /pi-launch" }, false).pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die("Disabled Pi must not spawn")),
+        ),
+      );
+      const path = yield* Path.Path;
+      assert.deepEqual(instance.usageHistorySource, {
+        provider: "pi",
+        transcriptDirectory: path.resolve("/isolated-pi", "sessions"),
+        additionalTranscriptDirectories: [path.resolve("/pi-launch")],
+      });
+    }).pipe(Effect.scoped),
+  );
+
   it.effect.each([true, false])(
     "limits discovered thinking defaults to the known active model, known=%s",
     (known) =>

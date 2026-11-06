@@ -21,12 +21,12 @@ against the live tree and history because they can move over time.
   address only while the local running Tailscale lists it (`readTailnetNodeAddresses` in
   `packages/tailscale`), re-checked before every token use. Server-config subscriptions re-send a
   snapshot when the machine's own addresses change (`DirectEndpoints.streamBoundEndpoints`,
-  `withLateEditorConfig` in `ws.ts`). Drop it only if upstream ships an equivalent.
+  `withLateConfigDiscovery` in `ws.ts`). Drop it only if upstream ships an equivalent.
 - A provider registry scoped per instance.
 - Provider hydration that terminates only sessions affected by the changed provider state.
 - Claude Agent SDK compatibility with the native resume store: a null first main `load()` from a
   custom session store must still mean native resume. The fork follows upstream's SDK version
-  (`0.3.276` as of 2026-09-21); before accepting a further bump, re-run the real-SDK server suites
+  (`0.3.316` as of 2026-11-06); before accepting a further bump, re-run the real-SDK server suites
   and the opt-in native memory test against the new version.
 - Desktop notifications.
 - The local macOS signing workflow.

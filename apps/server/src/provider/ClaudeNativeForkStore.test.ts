@@ -76,8 +76,8 @@ it.effect(
         assert.include(forkText, "selected full history ".repeat(100));
         assert.notInclude(forkText, "unrelated");
         assert.notEqual(fork.sessionId, sessionId);
-        const retry = yield* Effect.result(
-          Effect.tryPromise(() =>
+        const retry = yield* Effect.exit(
+          Effect.promise(() =>
             store.append(
               {
                 projectKey: "-workspace",

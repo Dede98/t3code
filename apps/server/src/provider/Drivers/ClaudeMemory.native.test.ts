@@ -9,6 +9,7 @@ import * as NodeUtil from "node:util";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeSettings } from "@t3tools/contracts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { expect, it } from "@effect/vitest";
@@ -53,7 +54,7 @@ it.live.skipIf(!binary)(
                 sharedHomePath: shared ? NodePath.join(root, "shared") : "",
               }),
               {
-                PATH: process.env.PATH,
+                PATH: (yield* HostProcess.Environment).PATH,
                 HOME: NodePath.join(root, "home"),
                 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
                 DISABLE_AUTOUPDATER: "1",

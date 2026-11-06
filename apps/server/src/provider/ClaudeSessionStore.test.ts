@@ -222,8 +222,8 @@ storeLayer("ClaudeSessionStore", (it) => {
       const sql = yield* SqlClient.SqlClient;
       const key = mainKey("project-corrupt", "00000000-0000-4000-8000-000000000006");
 
-      const invalidSubpathResult = yield* Effect.result(
-        Effect.tryPromise(() => store.append({ ...key, subpath: "" }, [{ type: "user" }])),
+      const invalidSubpathResult = yield* Effect.exit(
+        Effect.promise(() => store.append({ ...key, subpath: "" }, [{ type: "user" }])),
       );
       assert.equal(invalidSubpathResult._tag, "Failure");
 
@@ -234,7 +234,7 @@ storeLayer("ClaudeSessionStore", (it) => {
         WHERE session_id = ${key.sessionId}
       `;
 
-      const corruptLoadResult = yield* Effect.result(Effect.tryPromise(() => store.load(key)));
+      const corruptLoadResult = yield* Effect.exit(Effect.promise(() => store.load(key)));
       assert.equal(corruptLoadResult._tag, "Failure");
     }),
   );

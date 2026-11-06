@@ -3,6 +3,7 @@ import * as NodeOS from "node:os";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import { CLAUDE_SESSION_STORE_CONTINUATION_KEY } from "../ClaudeSessionStore.ts";
@@ -120,7 +121,9 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
         expect(yield* resolveClaudeHomePath(config)).toBe(resolved);
         expect(yield* resolveClaudeTranscriptDirPath(config)).toBe(path.join(resolved, "projects"));
         expect((yield* makeClaudeEnvironment(config)).CLAUDE_CONFIG_DIR).toBe(resolved);
-        expect((yield* makeClaudeEnvironment(config)).HOME).toBe(process.env.HOME);
+        expect((yield* makeClaudeEnvironment(config)).HOME).toBe(
+          (yield* HostProcess.Environment).HOME,
+        );
         expect(yield* makeClaudeContinuationGroupKey(config)).toBe(`claude:home:${resolved}`);
         expect(yield* makeClaudeCapabilitiesCacheKey({ binaryPath: "claude", ...config })).toBe(
           `claude\0claude:home:${resolved}\0`,

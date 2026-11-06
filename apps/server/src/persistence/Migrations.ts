@@ -81,8 +81,8 @@ import Migration0075 from "./Migrations/075_SubagentDeliveryState.ts";
 import Migration0076 from "./Migrations/076_ProjectionProjectsPinArchive.ts";
 import Migration0077 from "./Migrations/077_RepairBooleanSettledOverride.ts";
 import Migration0078 from "./Migrations/078_DropOrchestrationEventCorrelationIndex.ts";
-
 import Migration0079 from "./Migrations/079_DelegatedRecoveryIndexes.ts";
+import Migration0080 from "./Migrations/080_ScheduledTaskThreadMode.ts";
 
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -166,6 +166,7 @@ export const migrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -206,6 +207,7 @@ export const forkMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -236,6 +238,7 @@ export const forkIntegrationMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -267,6 +270,7 @@ const upstreamIntegrationMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const preview54MigrationEntries = [
@@ -298,6 +302,7 @@ const preview54MigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const preview53MigrationEntries = [
@@ -330,6 +335,7 @@ const preview53MigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -358,6 +364,7 @@ const upstreamWebhookMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -386,6 +393,7 @@ const upstreamMcpAppMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // Upstream databases that already applied review guides keep that id/name pair.
@@ -411,6 +419,7 @@ const upstreamReviewGuideMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // Official upstream databases may already have the failure index at 62.
@@ -436,6 +445,7 @@ const upstreamFailureIndexMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // Official databases may have used 63/64 before ever opening in the fork.
@@ -460,6 +470,7 @@ const upstreamDropProjectionsMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamCanonicalLinksMigrationEntries = [
@@ -481,6 +492,7 @@ const upstreamCanonicalLinksMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamUsageIndexMigrationEntries = [
@@ -501,6 +513,7 @@ const upstreamUsageIndexMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamSettlementMigrationEntries = [
@@ -520,6 +533,7 @@ const upstreamSettlementMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // Official upstream databases may already have webhook dedupe at 67.
@@ -539,6 +553,7 @@ const upstreamWebhookDedupeMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // Official upstream databases may already have the shell stop index at 68.
@@ -557,6 +572,7 @@ const upstreamShellStopIndexMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // Official upstream databases may already have message search at 69.
@@ -574,6 +590,7 @@ const upstreamThreadMessageSearchMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // Keep official peer-link ledger entries and append the missing Claude store.
@@ -590,6 +607,7 @@ const upstreamPeerLinksMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamPeerLinkFenceMigrationEntries = [
@@ -604,6 +622,7 @@ const upstreamPeerLinkFenceMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamWaitingLinkRequestMigrationEntries = [
@@ -617,6 +636,7 @@ const upstreamWaitingLinkRequestMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamActiveTurnItemIndexesMigrationEntries = [
@@ -629,6 +649,7 @@ const upstreamActiveTurnItemIndexesMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // Official upstream databases may already have 074-077 before opening in the fork.
@@ -641,6 +662,7 @@ const upstreamAttachmentSearchMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamSubagentDeliveryMigrationEntries = [
@@ -651,6 +673,7 @@ const upstreamSubagentDeliveryMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamProjectPinArchiveMigrationEntries = [
@@ -660,6 +683,7 @@ const upstreamProjectPinArchiveMigrationEntries = [
   [78, "RepairBooleanSettledOverride", Migration0077],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamSettledOverrideRepairMigrationEntries = [
@@ -668,6 +692,7 @@ const upstreamSettledOverrideRepairMigrationEntries = [
   [78, "ClaudeSessionStore", ClaudeSessionStore],
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 const upstreamDropCorrelationIndexMigrationEntries = [
@@ -675,6 +700,7 @@ const upstreamDropCorrelationIndexMigrationEntries = [
   [78, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [79, "ClaudeSessionStore", ClaudeSessionStore],
   [80, "DelegatedRecoveryIndexes", Migration0079],
+  [81, "ScheduledTaskThreadMode", Migration0080],
 ] as const;
 
 // Official upstream databases may already have delegated recovery indexes at 79.
@@ -682,6 +708,14 @@ const upstreamDelegatedRecoveryIndexesMigrationEntries = [
   ...upstreamDropCorrelationIndexMigrationEntries.filter(([id]) => id <= 78),
   [79, "DelegatedRecoveryIndexes", Migration0079],
   [80, "ClaudeSessionStore", ClaudeSessionStore],
+  [81, "ScheduledTaskThreadMode", Migration0080],
+] as const;
+
+// Official upstream databases may already have the scheduled task thread mode at 80.
+const upstreamScheduledTaskThreadModeMigrationEntries = [
+  ...upstreamDelegatedRecoveryIndexesMigrationEntries.filter(([id]) => id <= 79),
+  [80, "ScheduledTaskThreadMode", Migration0080],
+  [81, "ClaudeSessionStore", ClaudeSessionStore],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -774,7 +808,9 @@ function selectMigrationEntries(
                                             ? has(77, "RepairBooleanSettledOverride")
                                               ? has(78, "DropOrchestrationEventCorrelationIndex")
                                                 ? has(79, "DelegatedRecoveryIndexes")
-                                                  ? upstreamDelegatedRecoveryIndexesMigrationEntries
+                                                  ? has(80, "ScheduledTaskThreadMode")
+                                                    ? upstreamScheduledTaskThreadModeMigrationEntries
+                                                    : upstreamDelegatedRecoveryIndexesMigrationEntries
                                                   : upstreamDropCorrelationIndexMigrationEntries
                                                 : upstreamSettledOverrideRepairMigrationEntries
                                               : upstreamProjectPinArchiveMigrationEntries

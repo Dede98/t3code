@@ -100,7 +100,7 @@ it.effect.each(
         );
         assert.equal(
           observer.prepare("SELECT MAX(migration_id) AS id FROM effect_sql_migrations").get()?.id,
-          80,
+          81,
         );
         for (const name of [
           "mcp_app_model_context",
@@ -129,6 +129,12 @@ it.effect.each(
             .prepare("PRAGMA table_info(projection_projects)")
             .all()
             .some((row) => row.name === "pinned_at"),
+        );
+        assert.ok(
+          observer
+            .prepare("PRAGMA table_info(scheduled_tasks)")
+            .all()
+            .some((row) => row.name === "thread_mode"),
         );
         assert.ok(
           observer

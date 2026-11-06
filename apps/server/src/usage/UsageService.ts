@@ -374,10 +374,20 @@ export const make = Effect.gen(function* () {
   ) {
     const instances = yield* providerInstanceRegistry.listInstances;
     const volumes = new Map<string, string>();
-    const sources = yield* Effect.forEach(instances, (instance) =>
+    const roots = instances.flatMap(({ usageHistorySource: source }) =>
+      source === undefined
+        ? []
+        : [
+            // Like upstream's readers, extra roots come first for first-copy dedupe.
+            ...(source.additionalTranscriptDirectories ?? []).map((transcriptDirectory) => ({
+              ...source,
+              transcriptDirectory,
+            })),
+            source,
+          ],
+    );
+    const sources = yield* Effect.forEach(roots, (source) =>
       Effect.gen(function* () {
-        const source = instance.usageHistorySource;
-        if (source === undefined) return {};
         const sourceKey = source.provider + "\0" + source.transcriptDirectory;
         const previous = sourceCache.get(sourceKey);
         // Keep canonical paths and fingerprints stable after root cleanup, including aliases.
