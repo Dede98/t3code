@@ -279,8 +279,11 @@ export const layer = HttpApiBuilder.group(
               sessions.cookieName,
               sessions.legacyCookieName,
             );
+            // Re-set on use: the browser drops a cookie at the deadline it was given,
+            // and a session's deadline moves with use. Also migrates a legacy cookie.
             if (
-              credential?.source === "legacy-cookie" &&
+              credential !== undefined &&
+              EnvironmentAuth.isBrowserCookieCredential(credential.source) &&
               result.authenticated &&
               result.sessionMethod === "browser-session-cookie" &&
               result.expiresAt

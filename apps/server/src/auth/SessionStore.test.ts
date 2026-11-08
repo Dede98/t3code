@@ -2,6 +2,7 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -132,6 +133,81 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("SessionStore.lay
       yield* TestClock.adjust(Duration.minutes(1));
       yield* Fiber.join(watcher);
       yield* sessions.awaitInvalidation(client.sessionId);
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(layerSessionStore(), TestClock.layer()))),
+  );
+
+  it.effect.each([
+    {
+      name: "a 30-day session",
+      ttl: undefined,
+      verifications: [
+        { day: 20, expiresOnDay: 50 },
+        { day: 20.5, expiresOnDay: 50 },
+        { day: 45, expiresOnDay: 75 },
+        { day: 75, expiresOnDay: null },
+      ],
+    },
+    {
+      name: "a 7-day session",
+      ttl: Duration.days(7),
+      verifications: [
+        { day: 6, expiresOnDay: 7 },
+        { day: 7, expiresOnDay: null },
+      ],
+    },
+  ] as const)("expires $name only after the expected idle time", (testCase) =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issuedAt = yield* DateTime.now;
+      const issued = yield* sessions.issue({
+        subject: "one-time-token",
+        method: "bearer-access-token",
+        ...(testCase.ttl ? { ttl: testCase.ttl } : {}),
+      });
+      let day = 0;
+      for (const step of testCase.verifications) {
+        yield* TestClock.adjust(Duration.days(step.day - day));
+        day = step.day;
+        if (step.expiresOnDay === null) {
+          // A socket opened on an expired session closes at once instead of renewing it.
+          yield* sessions.awaitInvalidation(issued.sessionId);
+          const error = yield* Effect.flip(sessions.verify(issued.token));
+          expect(error._tag).toBe("SessionTokenExpiredError");
+        } else {
+          const verified = yield* sessions.verify(issued.token);
+          expect(verified.expiresAt?.epochMilliseconds).toBe(
+            DateTime.add(issuedAt, { days: step.expiresOnDay }).epochMilliseconds,
+          );
+        }
+      }
+    }).pipe(Effect.provide(Layer.merge(layerSessionStore(), TestClock.layer()))),
+  );
+
+  it.effect("keeps a connected bearer socket and its session alive past 30 days", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issuedAt = yield* DateTime.now;
+      const client = yield* sessions.issue({
+        subject: "one-time-token",
+        method: "bearer-access-token",
+      });
+      yield* sessions.markConnected(client.sessionId);
+      const invalidated = yield* Deferred.make<void>();
+      const watcher = yield* sessions
+        .awaitInvalidation(client.sessionId)
+        .pipe(
+          Effect.andThen(Deferred.succeed(invalidated, undefined)),
+          Effect.forkScoped({ startImmediately: true }),
+        );
+      yield* TestClock.adjust(Duration.hours(31 * 24 + 12));
+      expect(yield* Deferred.isDone(invalidated)).toBe(false);
+      // Without any request, the open socket renewed the session daily, last on day 31.
+      const verified = yield* sessions.verify(client.token);
+      expect(verified.expiresAt?.epochMilliseconds).toBe(
+        DateTime.add(issuedAt, { days: 61 }).epochMilliseconds,
+      );
+      yield* sessions.revoke(client.sessionId);
+      yield* Fiber.join(watcher);
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(layerSessionStore(), TestClock.layer()))),
   );
 

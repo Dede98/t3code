@@ -610,6 +610,13 @@ it.effect("tells the agent to link again once the peer revokes the link or it ex
       });
       yield* probe(a);
 
+      // Use keeps the link alive on both sides past its first 30 days.
+      yield* TestClock.adjust(Duration.days(16));
+      yield* probe(a);
+      yield* TestClock.adjust(Duration.days(20));
+      yield* probe(a);
+      expect((yield* a.links.list).map((link) => link.status)).toEqual(["reachable"]);
+
       yield* TestClock.adjust(Duration.days(31));
       expect((yield* a.links.list).map((link) => link.status)).toEqual(["expired"]);
       yield* Ref.set(b.bearers, []);

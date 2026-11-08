@@ -39,6 +39,7 @@ import {
 import { readTailnetNodeAddresses } from "@t3tools/tailscale";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
@@ -651,18 +652,27 @@ const make = Effect.gen(function* () {
 
   const recordOutcome: PeerLinks["Service"]["recordOutcome"] = (environmentId, outcome) =>
     DateTime.now.pipe(
-      Effect.flatMap((now) =>
-        outcome.error === null
+      Effect.flatMap((now) => {
+        const isoIn = (offset: Duration.Duration) =>
+          DateTime.formatIso(DateTime.add(now, { milliseconds: Duration.toMillis(offset) }));
+        // The peer just verified the link's session, which slides it there by the
+        // same rule, so the local deadline follows it.
+        return outcome.error === null
           ? sql`
               UPDATE peer_environment_links
-              SET last_reached_at = ${DateTime.formatIso(now)}, last_error = NULL
+              SET last_reached_at = ${DateTime.formatIso(now)}, last_error = NULL,
+                expires_at = CASE
+                  WHEN expires_at <= ${isoIn(SessionStore.SESSION_RENEWAL_WINDOW)}
+                  THEN ${isoIn(SessionStore.DEFAULT_SESSION_TTL)}
+                  ELSE expires_at
+                END
               WHERE environment_id = ${environmentId}
             `
           : sql`
               UPDATE peer_environment_links SET last_error = ${outcome.error}
               WHERE environment_id = ${environmentId}
-            `,
-      ),
+            `;
+      }),
       Effect.asVoid,
       Effect.ignoreCause({ log: true }),
     );

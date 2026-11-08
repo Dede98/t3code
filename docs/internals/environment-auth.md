@@ -27,6 +27,20 @@ model. DPoP binds a token to a client's proof key; an invalid proof must fail
 rather than fall back to bearer authentication. The OAuth token-exchange
 vocabulary gives these grants a familiar meaning.
 
+### Sessions in use do not expire
+
+A paired client keeps its token for good: the App Store app and older clients
+cannot take a new one. So the session row's `expires_at`, not the signed `exp`,
+decides expiry, as the row's scopes decide authority. A session issued for at
+least 30 days moves its deadline to 30 days from now when it is used, at most
+once a day, by a verified request or a socket held open
+([SessionStore](../../apps/server/src/auth/SessionStore.ts)). Revocation and 30
+idle days end it, so a narrow token, such as a read-only MCP agent's, lasts
+until it is revoked or goes idle. DPoP sessions keep their hour and renew by re-minting. A peer
+link mirrors the rule on each successful call, because the linking side refuses
+an expired link before sending its token
+([PeerLinks](../../apps/server/src/peer/PeerLinks.ts)).
+
 ### Guest links are not sessions
 
 A [guest link](../user/guest-links.md) gives one browser read access to one
