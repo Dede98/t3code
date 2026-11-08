@@ -92,6 +92,13 @@ export const SetAuthSessionLastConnectedAtInput = Schema.Struct({
 });
 export type SetAuthSessionLastConnectedAtInput = typeof SetAuthSessionLastConnectedAtInput.Type;
 
+export const ExtendAuthSessionExpiryInput = Schema.Struct({
+  sessionId: AuthSessionId,
+  now: Schema.DateTimeUtcFromString,
+  expiresAt: Schema.DateTimeUtcFromString,
+});
+export type ExtendAuthSessionExpiryInput = typeof ExtendAuthSessionExpiryInput.Type;
+
 export class AuthSessionRepository extends Context.Service<
   AuthSessionRepository,
   {
@@ -119,6 +126,10 @@ export class AuthSessionRepository extends Context.Service<
     readonly setLastConnectedAt: (
       input: SetAuthSessionLastConnectedAtInput,
     ) => Effect.Effect<void, AuthSessionRepositoryError>;
+    /** Moves an active session's deadline later; never earlier, never for a revoked or expired one. */
+    readonly extendExpiry: (
+      input: ExtendAuthSessionExpiryInput,
+    ) => Effect.Effect<boolean, AuthSessionRepositoryError>;
   }
 >()("t3/persistence/AuthSessions/AuthSessionRepository") {}
 
@@ -321,6 +332,21 @@ export const make = Effect.gen(function* () {
       `,
   });
 
+  const extendExpiryRows = SqlSchema.findAll({
+    Request: ExtendAuthSessionExpiryInput,
+    Result: Schema.Struct({ sessionId: AuthSessionId }),
+    execute: ({ sessionId, now, expiresAt }) =>
+      sql`
+        UPDATE auth_sessions
+        SET expires_at = ${expiresAt}
+        WHERE session_id = ${sessionId}
+          AND revoked_at IS NULL
+          AND expires_at > ${now}
+          AND expires_at < ${expiresAt}
+        RETURNING session_id AS "sessionId"
+      `,
+  });
+
   const revokeSessionRows = SqlSchema.findAll({
     Request: RevokeAuthSessionInput,
     Result: Schema.Struct({ sessionId: AuthSessionId }),
@@ -480,6 +506,18 @@ export const make = Effect.gen(function* () {
       ),
     );
 
+  const extendExpiry: AuthSessionRepository["Service"]["extendExpiry"] = (input) =>
+    extendExpiryRows(input).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "AuthSessionRepository.extendExpiry:query",
+          "AuthSessionRepository.extendExpiry:decodeRows",
+          { sessionId: input.sessionId },
+        ),
+      ),
+      Effect.map((rows) => rows.length > 0),
+    );
+
   return {
     create,
     createReplacingActive,
@@ -489,6 +527,7 @@ export const make = Effect.gen(function* () {
     revoke,
     revokeAllExcept,
     setLastConnectedAt,
+    extendExpiry,
   } satisfies AuthSessionRepository["Service"];
 });
 

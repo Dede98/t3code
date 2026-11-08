@@ -152,6 +152,21 @@ it.effect("sets the selected browser session cookies through the HTTP route", ()
           expect(restrictedCookies).toHaveLength(1);
           expect(restrictedCookies[0]).toMatch(/^t3_session_/);
           expect(restrictedCookies[0]).not.toContain("t3_dev_session_");
+
+          // A used cookie is set again with its session's expiry, which moves with use.
+          const restrictedCookieHeader = restrictedCookies[0]?.split(";", 1)[0] ?? "";
+          const sessionResponse = await environmentA.handler(
+            new Request("http://127.0.0.1/api/auth/session", {
+              headers: { cookie: restrictedCookieHeader },
+            }),
+            requestContext,
+          );
+          expect(sessionResponse.status).toBe(200);
+          expect(sessionResponse.headers.getSetCookie()).toEqual([
+            expect.stringMatching(
+              new RegExp(`^${RegExp.escape(restrictedCookieHeader)};.*Expires=`),
+            ),
+          ]);
         }),
       ([environmentA, environmentB]) =>
         Effect.promise(() => Promise.all([environmentA.dispose(), environmentB.dispose()])),

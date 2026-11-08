@@ -408,7 +408,10 @@ export class SessionStore extends Context.Service<
       SessionCredentialInternalError
     >;
     readonly streamChanges: Stream.Stream<SessionCredentialChange>;
-    /** Completes when a live socket's session is revoked or expires without a renewal for its DPoP key. */
+    /**
+     * Completes when a live socket's session is revoked or expires without a renewal for its DPoP key.
+     * While it waits, it renews a sliding session, since an open socket is use.
+     */
     readonly awaitInvalidation: (
       sessionId: AuthSessionId,
       proofKeyThumbprint?: string,
@@ -425,8 +428,33 @@ export class SessionStore extends Context.Service<
 >()("t3/auth/SessionStore") {}
 
 const SIGNING_SECRET_NAME = "server-signing-key";
-const DEFAULT_SESSION_TTL = Duration.days(30);
+export const DEFAULT_SESSION_TTL = Duration.days(30);
+// A sliding session renews at most this often, so it ends one TTL after its last use, give or take this.
+const SESSION_RENEWAL_INTERVAL = Duration.days(1);
+/** A sliding session used with this much or less left gets a full TTL again. */
+export const SESSION_RENEWAL_WINDOW = Duration.subtract(
+  DEFAULT_SESSION_TTL,
+  SESSION_RENEWAL_INTERVAL,
+);
 const DEFAULT_WEBSOCKET_TOKEN_TTL = Duration.minutes(5);
+
+/**
+ * Paired clients keep their token for good, so a session issued for at least the
+ * default TTL slides on its stored deadline instead. DPoP sessions renew by re-minting.
+ */
+const slides = (row: AuthSessions.AuthSessionRecord) =>
+  row.method !== "dpop-access-token" &&
+  row.expiresAt.epochMilliseconds - row.issuedAt.epochMilliseconds >=
+    Duration.toMillis(DEFAULT_SESSION_TTL);
+
+/** The deadline a sliding session used at `now` moves to, once it is in its renewal window. */
+const renewedSessionExpiry = (
+  expiresAt: DateTime.Utc,
+  now: DateTime.Utc,
+): Option.Option<DateTime.Utc> =>
+  expiresAt.epochMilliseconds - now.epochMilliseconds > Duration.toMillis(SESSION_RENEWAL_WINDOW)
+    ? Option.none()
+    : Option.some(DateTime.add(now, { milliseconds: Duration.toMillis(DEFAULT_SESSION_TTL) }));
 
 const SessionClaims = Schema.Struct({
   v: Schema.Literals([1, 2]),
@@ -579,6 +607,43 @@ const make = Effect.gen(function* () {
       }),
     );
   });
+
+  const publishSession = (sessionId: AuthSessionId) =>
+    loadActiveSession(sessionId).pipe(
+      Effect.flatMap((session) =>
+        Option.isSome(session) ? emitUpsert(session.value) : Effect.void,
+      ),
+      Effect.ignoreCause({ log: true }),
+    );
+
+  // Runs on every verified request, so it adds no span unless it writes.
+  const renewIfDue = (
+    row: AuthSessions.AuthSessionRecord,
+    now: DateTime.Utc,
+  ): Effect.Effect<DateTime.Utc> => {
+    if (!slides(row) || row.expiresAt.epochMilliseconds <= now.epochMilliseconds) {
+      return Effect.succeed(row.expiresAt);
+    }
+    const renewed = renewedSessionExpiry(row.expiresAt, now);
+    if (Option.isNone(renewed)) return Effect.succeed(row.expiresAt);
+    return authSessions
+      .extendExpiry({ sessionId: row.sessionId, now, expiresAt: renewed.value })
+      .pipe(
+        Effect.withSpan("SessionStore.renewIfDue"),
+        // Still valid until its current deadline; the next request or socket wake retries.
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to renew session.").pipe(
+            Effect.annotateLogs({ sessionId: row.sessionId, cause }),
+            Effect.as(false),
+          ),
+        ),
+        Effect.flatMap((extended) =>
+          extended
+            ? publishSession(row.sessionId).pipe(Effect.as(renewed.value))
+            : Effect.succeed(row.expiresAt),
+        ),
+      );
+  };
 
   const markConnected: SessionStore["Service"]["markConnected"] = (sessionId) =>
     Ref.modify(connectedSessionsRef, (current) => {
@@ -800,19 +865,10 @@ const make = Effect.gen(function* () {
         Effect.mapError((cause) => new InvalidSessionTokenPayloadError({ cause })),
       );
 
-      const observedAt = yield* DateTime.now;
-      const expiresAt = DateTime.make(claims.exp);
-      if (Option.isNone(expiresAt)) {
+      if (Option.isNone(DateTime.make(claims.exp))) {
         return yield* new InvalidSessionExpirationClaimError({
           sessionId: claims.sid,
           expirationClaim: claims.exp,
-        });
-      }
-      if (claims.exp <= observedAt.epochMilliseconds) {
-        return yield* new SessionTokenExpiredError({
-          sessionId: claims.sid,
-          expiresAt: expiresAt.value,
-          observedAt,
         });
       }
 
@@ -832,13 +888,23 @@ const make = Effect.gen(function* () {
           revokedAt: row.value.revokedAt,
         });
       }
+      // The row's deadline is authoritative, like its scopes, because sliding sessions move it.
+      const observedAt = yield* DateTime.now;
+      if (row.value.expiresAt.epochMilliseconds <= observedAt.epochMilliseconds) {
+        return yield* new SessionTokenExpiredError({
+          sessionId: claims.sid,
+          expiresAt: row.value.expiresAt,
+          observedAt,
+        });
+      }
+      const expiresAt = yield* renewIfDue(row.value, observedAt);
 
       return {
         sessionId: claims.sid,
         token,
         method: claims.method,
         client: toClientMetadata(row.value.client),
-        expiresAt: expiresAt.value,
+        expiresAt,
         subject: claims.sub,
         scopes: row.value.scopes,
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
@@ -1068,13 +1134,24 @@ const make = Effect.gen(function* () {
           }
         });
         let current = original.value;
+        const renewalInterval = Duration.toMillis(SESSION_RENEWAL_INTERVAL);
         while (true) {
           const rows = yield* Effect.forEach(chain, readRow);
-          if (rows.some((row) => Option.isNone(row) || row.value.revokedAt !== null)) return;
+          const latest = rows.at(-1);
+          if (
+            latest === undefined ||
+            Option.isNone(latest) ||
+            rows.some((row) => Option.isNone(row) || row.value.revokedAt !== null)
+          ) {
+            return;
+          }
+          current = latest.value;
           const now = yield* DateTime.now;
-          const remaining = current.expiresAt.epochMilliseconds - now.epochMilliseconds;
+          const expiresAt = yield* renewIfDue(current, now);
+          const remaining = expiresAt.epochMilliseconds - now.epochMilliseconds;
           if (remaining > 0) {
-            yield* Effect.raceFirst(nextRemoval, Effect.sleep(Duration.millis(remaining)));
+            const wakeIn = slides(current) ? Math.min(remaining, renewalInterval) : remaining;
+            yield* Effect.raceFirst(nextRemoval, Effect.sleep(Duration.millis(wakeIn)));
             continue;
           }
           const successorId =

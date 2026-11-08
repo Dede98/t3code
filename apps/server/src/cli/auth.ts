@@ -53,6 +53,14 @@ const ttlFlag = Flag.String("ttl").pipe(
   Flag.optional,
 );
 
+const sessionTtlFlag = Flag.String("ttl").pipe(
+  Flag.withSchema(DurationFromString),
+  Flag.withDescription(
+    "TTL, for example `1h` or `7d`. Defaults to 30 days; a session of 30 days or more renews while it is used.",
+  ),
+  Flag.optional,
+);
+
 const jsonFlag = Flag.Boolean("json").pipe(
   Flag.withDescription("Emit JSON instead of human-readable output."),
   Flag.withDefault(false),
@@ -169,7 +177,7 @@ const pairingCommand = Command.make("pairing").pipe(
 const sessionIssueCommand = Command.make("issue", {
   ...authLocationFlags,
   scopes: authScopesFlag(AuthStandardClientScopes),
-  ttl: ttlFlag,
+  ttl: sessionTtlFlag,
   label: labelFlag,
   subject: subjectFlag,
   tokenOnly: tokenOnlyFlag,
