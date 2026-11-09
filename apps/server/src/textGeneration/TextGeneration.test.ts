@@ -17,6 +17,7 @@ import * as ProviderRegistryRebuildBarrier from "../provider/ProviderRegistryReb
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TextGeneration from "./TextGeneration.ts";
+import * as TextGenerators from "./TextGenerators.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 
 const makeStubTextGeneration = (
@@ -103,6 +104,7 @@ describe("TextGeneration.make", () => {
               Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
                 resolveLink: () => Effect.die("No link lookup expected"),
               }),
+              Layer.mock(TextGenerators.TextGenerators)({ runner: () => Effect.undefined }),
               ServerSettings.layerTest(),
             ),
           ),

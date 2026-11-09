@@ -22,15 +22,20 @@ const Theme = Schema.optional(HtmlThemeSnapshot).annotate({
 });
 
 const Html = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(512_000)).annotate({
-  description: "A complete, self-contained HTML document.",
+  description: "Inline HTML.",
+});
+
+const HtmlPath = Schema.String.annotate({
+  description: "Absolute .html file path.",
 });
 
 const PAGE_RULES =
-  "Inline <style> and <script>. Local images as absolute paths are inlined. Remote URLs load as-is.";
+  "Self-contained: inline <style> and <script>. Local images as absolute paths are inlined. Remote URLs load as-is.";
 
 export const HtmlPreviewTool = Tool.make("html_preview", {
-  description: `Check an HTML page (html or a thread attachmentId) before html_render. Returns PNG, contentHeight, and console output. If it says the browser is still installing, call again in a minute. ${PAGE_RULES} Theme and layout rules are in html_render.`,
+  description: `Check an HTML page (html, an .html path, or a thread attachmentId) before html_render. Returns PNG, contentHeight, and console output. ${PAGE_RULES} Theme and layout rules are in html_render.`,
   parameters: Schema.Struct({
+    path: Schema.optional(HtmlPath),
     html: Schema.optional(Html),
     attachmentId: Schema.optional(Schema.String.check(Schema.isMaxLength(256))),
     theme: Theme,
@@ -84,7 +89,8 @@ export const HtmlPreviewTool = Tool.make("html_preview", {
 const HtmlRenderTool = Tool.make(HTML_RENDER_TOOL_NAME, {
   description: `Show a finished HTML page (chart, diagram, mockup) inline in this thread, above your final reply. Do not announce or restate the page. Frame fits height to ${HTML_RENDER_MAX_FIT_HEIGHT}px. On mobile, content past the given height scrolls. ${HTML_RENDER_LAYOUT_GUIDE} ${HTML_RENDER_THEME_GUIDE}`,
   parameters: Schema.Struct({
-    html: Html,
+    path: Schema.optional(HtmlPath),
+    html: Schema.optional(Html),
     theme: Theme,
     title: Schema.String.check(
       Schema.isMinLength(1),
@@ -119,8 +125,9 @@ const HtmlRenderTool = Tool.make(HTML_RENDER_TOOL_NAME, {
 
 const HtmlExportTool = Tool.make("html_export", {
   description:
-    "Export a T3 visualization as standalone HTML with the requesting client's captured theme embedded. Before uploading, publishing, or saving a visualization outside T3, call this tool and upload the returned filePath bytes. Supply either the original html or an attachmentId from this thread. The file works without T3 theme injection. A missing captured theme is an error; only pass theme when the user explicitly chose another palette. Preview the returned htmlRender.attachmentId with html_preview standalone:true. Remote scripts and fonts still require their own network access.",
+    "Export a T3 visualization as standalone HTML with the requesting client's captured theme embedded. Before uploading, publishing, or saving a visualization outside T3, call this tool and upload the returned filePath bytes. Supply the original html, its .html path, or an attachmentId from this thread. The file works without T3 theme injection. A missing captured theme is an error; only pass theme when the user explicitly chose another palette. Preview the returned htmlRender.attachmentId with html_preview standalone:true. Remote scripts and fonts still require their own network access.",
   parameters: Schema.Struct({
+    path: Schema.optional(HtmlPath),
     html: Schema.optional(Html),
     attachmentId: Schema.optional(Schema.String.check(Schema.isMaxLength(256))),
     title: Schema.String.check(

@@ -9,7 +9,7 @@ import { useRef, useState } from "react";
 import { View } from "react-native";
 
 import { AppBar, type AppBarMenu } from "../../components/ui/AppBar";
-import { FilePreviewModal, type FilePreviewSource } from "../../components/FilePreviewModal";
+import { FilePreviewModal, type FilePreviewSource } from "../../components/ui/FilePreviewModal";
 import { useHtmlRenderTheme } from "../../lib/useHtmlRenderTheme";
 import { useAttachmentDocument } from "../../lib/attachmentDocument";
 import { nativeViewerErrorMessage } from "../../lib/attachmentDownload";

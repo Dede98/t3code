@@ -1,6 +1,7 @@
 import type { ThreadId } from "@t3tools/contracts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { isNetworkPath } from "@t3tools/shared/path";
 import {
   clampHtmlRenderHeight,
   HTML_RENDER_COLUMN_WIDTH,
@@ -26,12 +27,13 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import type * as Path from "effect/Path";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import type * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
+import { openMediaFile } from "../assets/MediaFile.ts";
 import { resolveAttachmentRelativePath } from "../attachmentPaths.ts";
 import {
   createAttachmentId,
@@ -39,6 +41,7 @@ import {
   parseThreadSegmentFromAttachmentId,
   toSafeThreadAttachmentSegment,
 } from "../attachmentStore.ts";
+import { makeIsServerInternalPath } from "../auth/serverInternalPaths.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import { resolveRootCliCommand } from "../cli/invocation.ts";
 import * as ServerConfig from "../config.ts";
@@ -49,7 +52,28 @@ import * as PreviewBrowserHost from "../preview/PreviewBrowserHost.ts";
 const MIB = 1024 * 1024;
 const MAX_IMAGE_BYTES = 10 * MIB;
 const MAX_PAGE_BYTES = 25 * MIB;
+const HTML_FILE_EXTENSION = /\.html?$/i;
+// Like the image check, judge the bytes: a renamed .env or key does not start like a page.
+const HTML_DOCUMENT_START = /^\s*<(?:!doctype\s+html|html)[\s>]/i;
 const formatMib = (bytes: number) => `${(bytes / MIB).toFixed(1)} MiB`;
+
+export class HtmlRenderFileError extends Schema.TaggedError<HtmlRenderFileError>()(
+  "HtmlRenderFileError",
+  { path: Schema.String, cause: Schema.optional(Schema.Defect()) },
+) {
+  override get message(): string {
+    return `${this.path} is not a readable HTML document. Pass an absolute path to a regular .html file that starts with <!doctype html> or <html>, or pass html instead.`;
+  }
+}
+
+export class HtmlRenderFileTooLargeError extends Schema.TaggedError<HtmlRenderFileTooLargeError>()(
+  "HtmlRenderFileTooLargeError",
+  { path: Schema.String, sizeBytes: Schema.Number },
+) {
+  override get message(): string {
+    return `${this.path} is ${formatMib(this.sizeBytes)}; a page must be at most ${formatMib(MAX_PAGE_BYTES)}.`;
+  }
+}
 
 export class HtmlRenderImagesNotFoundError extends Schema.TaggedError<HtmlRenderImagesNotFoundError>()(
   "HtmlRenderImagesNotFoundError",
@@ -133,14 +157,8 @@ export class HtmlArtifactSourceError extends Schema.TaggedError<HtmlArtifactSour
   {},
 ) {
   override get message() {
-    return "Supply HTML or an HTML attachment from this thread.";
+    return "Supply HTML, an .html path, or an HTML attachment from this thread.";
   }
-}
-
-interface HtmlSourceInput {
-  readonly threadId?: ThreadId | undefined;
-  readonly html?: string | undefined;
-  readonly attachmentId?: string | undefined;
 }
 
 export type HtmlRenderPrepareError =
@@ -148,6 +166,16 @@ export type HtmlRenderPrepareError =
   | HtmlRenderImageTooLargeError
   | HtmlRenderPageTooLargeError
   | HtmlRenderViewportHeightError;
+
+export type HtmlRenderSource =
+  | { readonly html: string }
+  | { readonly path: string }
+  | { readonly attachmentId: string };
+
+type HtmlRenderSourceError =
+  | HtmlRenderFileError
+  | HtmlRenderFileTooLargeError
+  | HtmlArtifactSourceError;
 
 export interface HtmlPreview {
   readonly png: string;
@@ -162,15 +190,17 @@ export class HtmlRender extends Context.Service<
   HtmlRender,
   {
     readonly prepare: (html: string) => Effect.Effect<string, HtmlRenderPrepareError>;
-    readonly publish: (input: {
-      readonly threadId: ThreadId;
-      readonly html: string;
-      readonly title: string;
-      readonly height: number;
-      readonly theme?: HtmlRenderTheme | undefined;
-      readonly standalone?: boolean | undefined;
-    }) => Effect.Effect<
+    readonly publish: (
+      input: HtmlRenderSource & {
+        readonly threadId: ThreadId;
+        readonly title: string;
+        readonly height: number;
+        readonly theme?: HtmlRenderTheme | undefined;
+        readonly standalone?: boolean | undefined;
+      },
+    ) => Effect.Effect<
       HtmlRenderReference,
+      | HtmlRenderSourceError
       | HtmlRenderPrepareError
       | HtmlRenderStoreError
       | HtmlArtifactContextError
@@ -178,7 +208,8 @@ export class HtmlRender extends Context.Service<
     >;
     /** Screenshots a page in headless Chrome, tolerating unreadable local images. */
     readonly preview: (
-      input: HtmlSourceInput & {
+      input: HtmlRenderSource & {
+        readonly threadId?: ThreadId | undefined;
         readonly width?: number | undefined;
         readonly appearance?: ThemeAppearance | undefined;
         readonly theme?: HtmlRenderTheme | undefined;
@@ -186,8 +217,8 @@ export class HtmlRender extends Context.Service<
       },
     ) => Effect.Effect<
       HtmlPreview,
+      | HtmlRenderSourceError
       | HtmlArtifactContextError
-      | HtmlArtifactSourceError
       | Exclude<HtmlRenderPrepareError, HtmlRenderImagesNotFoundError>
       | PreviewBrowser.PreviewBrowserInstallError
       | PreviewBrowser.PreviewBrowserInstallingError
@@ -197,7 +228,7 @@ export class HtmlRender extends Context.Service<
     >;
     /** Produces uploadable bytes with a concrete, persisted theme and no client bridge. */
     readonly exportPage: (
-      input: HtmlSourceInput & {
+      input: HtmlRenderSource & {
         readonly threadId: ThreadId;
         readonly title: string;
         readonly theme?: HtmlRenderTheme | undefined;
@@ -208,10 +239,10 @@ export class HtmlRender extends Context.Service<
         readonly filePath: string;
         readonly fileName: string;
       },
+      | HtmlRenderSourceError
       | HtmlRenderPrepareError
       | HtmlRenderStoreError
       | HtmlArtifactContextError
-      | HtmlArtifactSourceError
       | HtmlArtifactThemeMissingError
     >;
   }
@@ -405,7 +436,9 @@ const MEASURE_FRAGMENT = htmlRenderThemeFragment(
 
 const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const config = yield* ServerConfig.ServerConfig;
+  const isServerInternalPath = yield* makeIsServerInternalPath;
   const previewBrowser = yield* PreviewBrowser.PreviewBrowser;
   const threads = yield* ThreadManagement.ThreadManagementService;
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
@@ -495,31 +528,85 @@ const make = Effect.gen(function* () {
     Effect.mapError((cause) => new HtmlArtifactContextError({ cause })),
   );
 
-  const sourceHtml = Effect.fn("HtmlRender.sourceHtml")(function* (input: HtmlSourceInput) {
-    if ((input.html === undefined) === (input.attachmentId === undefined))
+  const readThreadAttachment = Effect.fn("HtmlRender.readThreadAttachment")(function* (
+    threadId: ThreadId | undefined,
+    attachmentId: string,
+  ) {
+    if (
+      threadId === undefined ||
+      !attachmentId.endsWith("-html") ||
+      parseThreadSegmentFromAttachmentId(attachmentId) !== toSafeThreadAttachmentSegment(threadId)
+    ) {
       return yield* new HtmlArtifactSourceError({});
-    let html = input.html;
-    if (html === undefined && input.attachmentId !== undefined) {
-      if (
-        input.threadId === undefined ||
-        !input.attachmentId.endsWith("-html") ||
-        parseThreadSegmentFromAttachmentId(input.attachmentId) !==
-          toSafeThreadAttachmentSegment(input.threadId)
-      ) {
-        return yield* new HtmlArtifactSourceError({});
-      }
-      const filePath = resolveAttachmentPathById({
-        attachmentsDir: config.attachmentsDir,
-        attachmentId: input.attachmentId,
-      });
-      if (!filePath) return yield* new HtmlArtifactSourceError({});
-      html = yield* fileSystem
-        .readFileString(filePath)
-        .pipe(Effect.mapError(() => new HtmlArtifactSourceError({})));
     }
-    if (html === undefined) return yield* new HtmlArtifactSourceError({});
-    return html;
+    const filePath = resolveAttachmentPathById({
+      attachmentsDir: config.attachmentsDir,
+      attachmentId,
+    });
+    if (!filePath) return yield* new HtmlArtifactSourceError({});
+    return yield* fileSystem
+      .readFileString(filePath)
+      .pipe(Effect.mapError(() => new HtmlArtifactSourceError({})));
   });
+
+  const readPageFile = Effect.fn("HtmlRender.readPageFile")(function* (filePath: string) {
+    const unreadable = new HtmlRenderFileError({ path: filePath });
+    if (!path.isAbsolute(filePath) || isNetworkPath(filePath)) return yield* unreadable;
+    // Check the resolved file, so a symlink named .html cannot reach another file.
+    const realPath = yield* fileSystem
+      .realPath(filePath)
+      .pipe(Effect.mapError((cause) => new HtmlRenderFileError({ path: filePath, cause })));
+    if (!HTML_FILE_EXTENSION.test(realPath) || (yield* isServerInternalPath(realPath))) {
+      return yield* unreadable;
+    }
+    // Open without following links and recheck the path, so a link or FIFO swapped in is refused.
+    const html = yield* Effect.scoped(
+      Effect.gen(function* () {
+        const file = yield* openMediaFile(realPath).pipe(
+          Effect.mapError((cause) => new HtmlRenderFileError({ path: filePath, cause })),
+        );
+        // Unlike client reads, the caller may be sandboxed: a second hard link could give any
+        // file an .html name.
+        if (file === null || file.info.nlink !== 1n) return yield* unreadable;
+        if (file.info.size > BigInt(MAX_PAGE_BYTES)) {
+          return yield* new HtmlRenderFileTooLargeError({
+            path: filePath,
+            sizeBytes: Number(file.info.size),
+          });
+        }
+        // One read may return fewer bytes, so fill up to the checked size; growth past it is ignored.
+        return yield* Effect.tryPromise({
+          try: async () => {
+            const buffer = Buffer.alloc(Number(file.info.size));
+            let filled = 0;
+            while (filled < buffer.length) {
+              const { bytesRead } = await file.handle.read(buffer, filled, buffer.length - filled);
+              if (bytesRead === 0) break;
+              filled += bytesRead;
+            }
+            return buffer.toString("utf8", 0, filled);
+          },
+          catch: (cause) => new HtmlRenderFileError({ path: filePath, cause }),
+        });
+      }),
+    );
+    return HTML_DOCUMENT_START.test(html) ? html : yield* unreadable;
+  });
+
+  const readSource = (
+    input: HtmlRenderSource & { readonly threadId?: ThreadId | undefined },
+  ): Effect.Effect<string, HtmlRenderSourceError> => {
+    // Spread callers can carry more than one source; never guess which one was meant.
+    const sources = ["html", "path", "attachmentId"].filter(
+      (key) => (input as Record<string, unknown>)[key] !== undefined,
+    );
+    if (sources.length !== 1) return Effect.fail(new HtmlArtifactSourceError({}));
+    return "path" in input
+      ? readPageFile(input.path)
+      : "html" in input
+        ? Effect.succeed(input.html)
+        : readThreadAttachment(input.threadId, input.attachmentId);
+  };
 
   // The bootstrap goes in first so its head scan never runs over inlined image data.
   const inline = (html: string) =>
@@ -534,22 +621,18 @@ const make = Effect.gen(function* () {
     return inlined.html;
   });
 
-  const publish = Effect.fn("HtmlRender.publish")(function* (input: {
-    readonly threadId: ThreadId;
-    readonly html: string;
-    readonly title: string;
-    readonly height: number;
-    readonly theme?: HtmlRenderTheme | undefined;
-    readonly standalone?: boolean | undefined;
-  }) {
+  const publish = Effect.fn("HtmlRender.publish")(function* (
+    input: Parameters<HtmlRender["Service"]["publish"]>[0],
+  ) {
+    const source = yield* readSource(input);
     // Standalone exports have no auto-fitting host frame.
-    if (!input.standalone) yield* rejectViewportHeight(input.html);
-    const theme = (yield* requestTheme(input)) ?? readHtmlRenderTheme(input.html);
+    if (!input.standalone) yield* rejectViewportHeight(source);
+    const theme = (yield* requestTheme(input)) ?? readHtmlRenderTheme(source);
     if (input.standalone && !theme) return yield* new HtmlArtifactThemeMissingError({});
     const inlined = yield* inlineLocalImages(
       input.standalone && theme
-        ? exportHtmlRender(input.html, theme)
-        : injectHtmlRenderBootstrap(input.html, theme),
+        ? exportHtmlRender(source, theme)
+        : injectHtmlRenderBootstrap(source, theme),
     ).pipe(Effect.provideContext(services));
     if (inlined.missing.length > 0)
       return yield* new HtmlRenderImagesNotFoundError({ paths: inlined.missing });
@@ -581,7 +664,16 @@ const make = Effect.gen(function* () {
           ...(heights === undefined ? {} : { heights }),
         };
         return mcpSessions
-          .recordHtmlRender(input.threadId, input, reference)
+          .recordHtmlRender(
+            input.threadId,
+            {
+              html: source,
+              path: "path" in input ? input.path : undefined,
+              title: input.title,
+              height: input.height,
+            },
+            reference,
+          )
           .pipe(Effect.as(reference));
       }),
       // An interrupted publish must leave neither an attachment nor a recoverable reference.
@@ -598,14 +690,9 @@ const make = Effect.gen(function* () {
   });
 
   const preview = Effect.fn("HtmlRender.preview")(function* (
-    input: HtmlSourceInput & {
-      readonly width?: number | undefined;
-      readonly appearance?: ThemeAppearance | undefined;
-      readonly theme?: HtmlRenderTheme | undefined;
-      readonly standalone?: boolean | undefined;
-    },
+    input: Parameters<HtmlRender["Service"]["preview"]>[0],
   ) {
-    const html = yield* sourceHtml(input);
+    const html = yield* readSource(input);
     if (!input.standalone) yield* rejectViewportHeight(html);
     const capturedTheme = input.standalone ? undefined : yield* requestTheme(input);
     const width = Math.min(
@@ -645,7 +732,7 @@ const make = Effect.gen(function* () {
   const exportPage = Effect.fn("HtmlRender.exportPage")(function* (
     input: Parameters<HtmlRender["Service"]["exportPage"]>[0],
   ) {
-    const html = yield* sourceHtml(input);
+    const html = yield* readSource(input);
     const theme = (yield* requestTheme(input)) ?? readHtmlRenderTheme(html);
     if (!theme) return yield* new HtmlArtifactThemeMissingError({});
     const reference = yield* publish({
