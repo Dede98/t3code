@@ -26,7 +26,7 @@ against the live tree and history because they can move over time.
 - Provider hydration that terminates only sessions affected by the changed provider state.
 - Claude Agent SDK compatibility with the native resume store: a null first main `load()` from a
   custom session store must still mean native resume. The fork follows upstream's SDK version
-  (`0.3.316` as of 2026-11-06); before accepting a further bump, re-run the real-SDK server suites
+  (`0.3.321` as of 2026-11-10); before accepting a further bump, re-run the real-SDK server suites
   and the opt-in native memory test against the new version.
 - Desktop notifications.
 - The local macOS signing workflow.

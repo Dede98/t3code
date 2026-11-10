@@ -645,7 +645,7 @@ export const importClaudeNativeSessionToStore = Effect.fn(
 
 /**
  * Query-local SDK SessionStore that keeps the target CLAUDE_CONFIG_DIR. A null first main load
- * means native resume (verified through SDK 0.3.316), so only projects/<session> is materialized
+ * means native resume (verified through SDK 0.3.321), so only projects/<session> is materialized
  * before returning null; target credentials, settings, skills, hooks, and plugins stay untouched.
  */
 export function makeClaudeNativeResumeStore(

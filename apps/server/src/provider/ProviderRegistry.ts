@@ -93,6 +93,12 @@ export class ProviderRegistry extends Context.Service<
       readonly fresh?: boolean | undefined;
     }) => Effect.Effect<void>;
 
+    /**
+     * For an opened model picker: refetch a model manifest older than a few
+     * minutes. When it changed, recheck latest CLI versions and probe providers.
+     */
+    readonly refreshModelCatalog: Effect.Effect<void>;
+
     readonly getProviderMaintenanceCapabilitiesForInstance: (
       instanceId: ProviderInstanceId,
       provider: ProviderDriverKind,
@@ -377,73 +383,77 @@ export const layer = Layer.effect(
 
     // Boot-only cache hydration gives the UI something during the first refresh. Instances added
     // later get their first `providersRef` entry from `syncLiveSources`.
-    const { bootInstances, fallbackProviders, providersRef } = yield* rebuildBarrier.withOperation(
-      Effect.gen(function* () {
-        const bootInstances = yield* instanceRegistry.listInstances;
-        const bootSources = bootInstances.map(buildSnapshotSource);
-        const fallbackProviders = yield* loadProviders(bootSources);
-        const fallbackByInstance = new Map<ProviderInstanceId, ServerProvider>();
-        for (let index = 0; index < fallbackProviders.length; index++) {
-          const provider = fallbackProviders[index];
-          const source = bootSources[index];
-          if (provider === undefined || source === undefined) {
-            continue;
+    const { bootInstances, fallbackProviders, initialManifest, providersRef } =
+      yield* rebuildBarrier.withOperation(
+        Effect.gen(function* () {
+          const bootInstances = yield* instanceRegistry.listInstances;
+          const bootSources = bootInstances.map(buildSnapshotSource);
+          const fallbackProviders = yield* loadProviders(bootSources);
+          const fallbackByInstance = new Map<ProviderInstanceId, ServerProvider>();
+          for (let index = 0; index < fallbackProviders.length; index++) {
+            const provider = fallbackProviders[index];
+            const source = bootSources[index];
+            if (provider === undefined || source === undefined) {
+              continue;
+            }
+            fallbackByInstance.set(source.instanceId, provider);
           }
-          fallbackByInstance.set(source.instanceId, provider);
-        }
 
-        const cachedProviders = yield* Effect.forEach(
-          bootSources,
-          (source) =>
-            Effect.gen(function* () {
-              // Default instances reuse the legacy `<kind>.json` path, so payloads must still carry a
-              // matching instance id and driver kind; identity-less ones are discarded and refilled.
-              const filePath = yield* resolveProviderStatusCachePath({
-                cacheDir: config.providerStatusCacheDir,
-                instanceId: source.instanceId,
-              }).pipe(Effect.provideService(Path.Path, path));
-              const fallbackProvider = fallbackByInstance.get(source.instanceId);
-              if (fallbackProvider === undefined) {
-                return undefined;
-              }
-              return yield* readProviderStatusCache(filePath).pipe(
-                Effect.provideService(FileSystem.FileSystem, fileSystem),
-                Effect.flatMap((cachedProvider) => {
-                  if (cachedProvider === undefined) {
-                    return Effect.void.pipe(Effect.as(undefined as ServerProvider | undefined));
-                  }
-                  const correlation = {
-                    cachedProvider,
-                    fallbackProvider,
-                  } as const;
-                  if (!isCachedProviderCorrelated(correlation)) {
-                    return Effect.logWarning("provider status cache identity mismatch, ignoring", {
-                      path: filePath,
-                      instanceId: source.instanceId,
-                      cachedInstanceId: cachedProvider.instanceId ?? null,
-                      driver: source.driverKind,
-                      cachedDriver: cachedProvider.driver ?? null,
-                    }).pipe(Effect.as(undefined as ServerProvider | undefined));
-                  }
-                  return Effect.succeed(hydrateCachedProvider(correlation));
-                }),
-              );
-            }),
-          { concurrency: "unbounded" },
-        ).pipe(
-          Effect.map((providers) =>
-            orderProviderSnapshots(
-              providers.filter((provider): provider is ServerProvider => provider !== undefined),
+          const cachedProviders = yield* Effect.forEach(
+            bootSources,
+            (source) =>
+              Effect.gen(function* () {
+                // Default instances reuse the legacy `<kind>.json` path, so payloads must still carry a
+                // matching instance id and driver kind; identity-less ones are discarded and refilled.
+                const filePath = yield* resolveProviderStatusCachePath({
+                  cacheDir: config.providerStatusCacheDir,
+                  instanceId: source.instanceId,
+                }).pipe(Effect.provideService(Path.Path, path));
+                const fallbackProvider = fallbackByInstance.get(source.instanceId);
+                if (fallbackProvider === undefined) {
+                  return undefined;
+                }
+                return yield* readProviderStatusCache(filePath).pipe(
+                  Effect.provideService(FileSystem.FileSystem, fileSystem),
+                  Effect.flatMap((cachedProvider) => {
+                    if (cachedProvider === undefined) {
+                      return Effect.void.pipe(Effect.as(undefined as ServerProvider | undefined));
+                    }
+                    const correlation = {
+                      cachedProvider,
+                      fallbackProvider,
+                    } as const;
+                    if (!isCachedProviderCorrelated(correlation)) {
+                      return Effect.logWarning(
+                        "provider status cache identity mismatch, ignoring",
+                        {
+                          path: filePath,
+                          instanceId: source.instanceId,
+                          cachedInstanceId: cachedProvider.instanceId ?? null,
+                          driver: source.driverKind,
+                          cachedDriver: cachedProvider.driver ?? null,
+                        },
+                      ).pipe(Effect.as(undefined as ServerProvider | undefined));
+                    }
+                    return Effect.succeed(hydrateCachedProvider(correlation));
+                  }),
+                );
+              }),
+            { concurrency: "unbounded" },
+          ).pipe(
+            Effect.map((providers) =>
+              orderProviderSnapshots(
+                providers.filter((provider): provider is ServerProvider => provider !== undefined),
+              ),
             ),
-          ),
-        );
-        const initialManifest = yield* manifestService.current;
-        const providersRef = yield* Ref.make<ReadonlyArray<ServerProvider>>(
-          cachedProviders.map((provider) => classifyCompatibility(provider, initialManifest)),
-        );
-        return { bootInstances, fallbackProviders, providersRef };
-      }),
-    );
+          );
+          const initialManifest = yield* manifestService.current;
+          const providersRef = yield* Ref.make<ReadonlyArray<ServerProvider>>(
+            cachedProviders.map((provider) => classifyCompatibility(provider, initialManifest)),
+          );
+          return { bootInstances, fallbackProviders, initialManifest, providersRef };
+        }),
+      );
     const workspaceRefreshesRef = yield* Ref.make<
       ReadonlyMap<ProviderInstance, ReadonlyMap<string, Deferred.Deferred<void>>>
     >(new Map());
@@ -652,6 +662,9 @@ export const layer = Layer.effect(
       Option.none(),
     );
 
+    // What the last full pass could see; a later manifest fetch does not reach providers by itself.
+    const probedManifestUpdatedAt = yield* Ref.make(initialManifest.updatedAt);
+
     const refreshAll = Effect.fn("refreshAll")(function* () {
       const claimed = yield* Ref.modify(
         refreshAllInFlightRef,
@@ -671,15 +684,20 @@ export const layer = Layer.effect(
       if (claimed.owner) {
         // Detach shared passes so the first caller's interruption cannot cancel other callers' work.
         // Syncing first keeps a refresh right after a rebuild from probing the replaced instance.
-        yield* syncLiveSourcesAndContinue.pipe(
-          Effect.andThen(Ref.get(liveSubsRef)),
-          Effect.flatMap((instances) =>
-            Effect.forEach(instances.values(), (instance) => refreshOneSource(instance), {
-              concurrency: "unbounded",
-              discard: true,
-            }),
+        yield* manifestService.current.pipe(
+          Effect.flatMap(({ updatedAt }) =>
+            syncLiveSourcesAndContinue.pipe(
+              Effect.andThen(Ref.get(liveSubsRef)),
+              Effect.flatMap((instances) =>
+                Effect.forEach(instances.values(), (instance) => refreshOneSource(instance), {
+                  concurrency: "unbounded",
+                  discard: true,
+                }),
+              ),
+              Effect.andThen(Ref.get(providersRef)),
+              Effect.tap(() => Ref.set(probedManifestUpdatedAt, updatedAt)),
+            ),
           ),
-          Effect.andThen(Ref.get(providersRef)),
           rebuildBarrier.withOperation,
           Effect.onExit((exit) =>
             Ref.set(refreshAllInFlightRef, Option.none()).pipe(
@@ -1121,6 +1139,17 @@ export const layer = Layer.effect(
       );
     });
 
+    const refreshModelCatalog = Effect.fn("ProviderRegistry.refreshModelCatalog")(function* () {
+      const { updatedAt } = yield* manifestService.refreshOnDemand;
+      // The first pass can be one that started before the fetch, so allow one more.
+      for (let pass = 0; pass < 2; pass++) {
+        if ((yield* Ref.get(probedManifestUpdatedAt)) === updatedAt) return;
+        // A new model usually ships with the CLI release that supports it.
+        yield* latestVersions.invalidateAll;
+        yield* refreshAll();
+      }
+    });
+
     return {
       getProviders: Ref.get(providersRef),
       refresh: (provider?: ProviderDriverKind) =>
@@ -1134,6 +1163,10 @@ export const layer = Layer.effect(
       refreshAfterUpdate: (provider, instanceId) =>
         rebuildBarrier.withOperation(refreshAfterUpdate(provider, instanceId)),
       invalidateModelCaches,
+      refreshModelCatalog: refreshModelCatalog().pipe(
+        Effect.catchCause(recoverRefreshFailure),
+        Effect.asVoid,
+      ),
       getProviderMaintenanceCapabilitiesForInstance,
       setProviderMaintenanceActionState,
       get streamChanges() {
