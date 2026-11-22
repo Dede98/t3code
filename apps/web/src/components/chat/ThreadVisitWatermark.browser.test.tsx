@@ -68,6 +68,8 @@ const NOW = Date.parse("2026-01-04T00:00:00.000Z");
 const ENVIRONMENT = EnvironmentId.make("environment-visit-watermark");
 const threadA: ScopedThreadRef = { environmentId: ENVIRONMENT, threadId: ThreadId.make("a") };
 const threadB: ScopedThreadRef = { environmentId: ENVIRONMENT, threadId: ThreadId.make("b") };
+// Its own thread: the module-level tracker still throttles the thread the first test visited.
+const threadC: ScopedThreadRef = { environmentId: ENVIRONMENT, threadId: ThreadId.make("c") };
 
 function setShell(ref: ScopedThreadRef, updatedAt: string) {
   appAtomRegistry.set(shellAtom(shellKey(ref)), {
@@ -115,26 +117,26 @@ it("records the visit of the next thread at once after switching threads", async
 
 it("records no visit for a background thread or an unfocused window until it is viewed", async () => {
   setup(threadB);
-  setShell(threadA, "2026-01-02T00:00:00.000Z");
+  setShell(threadC, "2026-01-02T00:00:00.000Z");
   using _timers = fakeTimers();
   vi.setSystemTime(NOW);
 
   await using screen = await render(
     <AppAtomRegistryProvider>
-      <ThreadVisitWatermark threadRef={threadA} />
+      <ThreadVisitWatermark threadRef={threadC} />
     </AppAtomRegistryProvider>,
   );
   expect(visitedThreadIds()).toEqual([]);
 
-  mocks.routeParams = { environmentId: threadA.environmentId, threadId: threadA.threadId };
+  mocks.routeParams = { environmentId: threadC.environmentId, threadId: threadC.threadId };
   mocks.activity = { visible: true, focused: false };
   await screen.rerender(
     <AppAtomRegistryProvider>
-      <ThreadVisitWatermark threadRef={threadA} />
+      <ThreadVisitWatermark threadRef={threadC} />
     </AppAtomRegistryProvider>,
   );
   expect(visitedThreadIds()).toEqual([]);
 
   setDocumentActivity({ visible: true, focused: true });
-  await vi.waitFor(() => expect(visitedThreadIds()).toEqual(["a"]));
+  await vi.waitFor(() => expect(visitedThreadIds()).toEqual(["c"]));
 });

@@ -390,7 +390,10 @@ describe("useQueuedRunEdit", () => {
     expect(mocks.editQueuedRun).toHaveBeenCalledWith(
       expect.objectContaining({
         input: expect.objectContaining({
-          edit: expect.objectContaining({ context: { version: 1, records: [kept] } }),
+          edit: expect.objectContaining({
+            // The fork also sends the client's HTML theme in the context.
+            context: expect.objectContaining({ version: 1, records: [kept] }),
+          }),
         }),
       }),
     );

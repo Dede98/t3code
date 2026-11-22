@@ -140,6 +140,7 @@ function setup(
   const router = {
     state: { matches: [{ params: { environmentId: "env-1", threadId: activeThreadId } }] },
     navigate: state.navigate,
+    subscribe: () => () => {},
   } as unknown as AnyRouter;
   return {
     start: () => {
