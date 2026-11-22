@@ -444,7 +444,14 @@ const make = Effect.gen(function* () {
         threadId: candidate.id,
         manualContinuationOfRunId: runId,
         modelSelection: target.modelSelection,
-        text: `Continue where you left off. (${sourceName} reached its usage limit, which resets in ${formatWait(Date.parse(resetAt) - nowMs)}, so T3 Code moved this thread to ${targetName}.)`,
+        // A manual continuation resumes natively without a prompt; the notice carries the reason.
+        text: "",
+        notification: {
+          source: { kind: "system" },
+          outcome: "updated",
+          summary: "Resumed thread",
+          detail: `${sourceName} reached its usage limit, which resets in ${formatWait(Date.parse(resetAt) - nowMs)}, so T3 Code moved this thread to ${targetName}.`,
+        },
         attachments: [],
         dispatchMode: { type: "start_immediately" },
         createdBy: "user",

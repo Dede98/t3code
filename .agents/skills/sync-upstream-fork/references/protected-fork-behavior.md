@@ -14,9 +14,17 @@ against the live tree and history because they can move over time.
   (`failoverLimitedThreads`, `apps/server/src/orchestration-v2/UsageLimitFailover.ts`, hooked into
   `UsageLimitRecoveryWorker`). Upstream's FAQ rejects an auto-switcher, so it never goes upstream.
   It also patches two upstream files: `ScheduledTaskService` asks `launchSelection` for the account
-  of a new thread, and `followsCurrentConversation` in `Orchestrator.ts` calls `movedPastUsageLimit`
-  (`UsageLimitQueueFollow.ts`). That second part applies regardless of the setting, so queued runs
-  pinned to a limited account follow a manual Resume on another account too.
+  of a new thread, and `queuedRunFollowsCurrentConversation` in `Orchestrator.ts` adds
+  `movedPastUsageLimit` (`UsageLimitQueueFollow.ts`) to upstream's `followsCurrentConversation`.
+  That second part applies regardless of the setting, so queued runs pinned to a limited account
+  follow a manual Resume on another account too. Upstream instead holds such a run until the
+  limit resets (#22425); that hold still applies to runs queued on the limited account after the
+  move. The failover resumes natively (upstream #36526) and says which account it moved to in
+  the resume notification's `detail`.
+- Sessions without a DPoP key stay signed in while they are used (`slides` and `renewIfDue` in
+  `SessionStore.ts`): bearer pairings from clients that cannot renew, browser cookies, CLI-issued
+  sessions of 30 days or more, and outside MCP clients. Peer links and DPoP pairing links use
+  upstream's own renewal (#39399, #37980); do not add a second mechanism for those.
 - Linked environments over Tailscale IPv4: `PeerLinks` accepts plain http to a 100.64.0.0/10
   address only while the local running Tailscale lists it (`readTailnetNodeAddresses` in
   `packages/tailscale`), re-checked before every token use. Server-config subscriptions re-send a
@@ -60,6 +68,16 @@ changes the area:
   policy, one-time schedules). Run completion follows upstream's single write transaction.
 - Desktop packaging has combined local signing configuration with upstream packaging and resource
   monitoring.
+- Migration lineages (`Migrations.ts`): the fork's `ClaudeSessionStore` slot shifts upstream ids by
+  one. Upstream migrations after 080 go in `laterUpstreamMigrationEntries` only (one line per
+  migration); every lineage appends them shifted, and `upstreamHeadMigrationEntries` adopts official
+  databases at any later head. Upstream's preflight (`skippedV2Migrations`, `hasPendingMigrations`,
+  `servicePreflight.ts`) must check the selected lineage, never `migrationManifest`.
+- Upstream requires every web component to compile under the React Compiler
+  (`reactCompilerCoverage.test.ts`), every UI string to be wrapped for translation
+  (`t3code/no-untranslated-copy`, `vp run i18n:generate`, `i18n:check`), and every MCP tool that
+  acts as its calling thread to be hidden from outside clients (`McpToolAccess.routed`). Fork
+  components, copy, and tools (`html_export`) must follow.
 
 If upstream replaces any of these mechanisms with a better coherent design, use that design as the
 base and carry forward only the required behavior. Do not recreate a superseded mechanism merely to

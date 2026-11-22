@@ -5,6 +5,7 @@ import type {
   ExternalMcpServerConfig,
   ExternalMcpServerId,
 } from "@t3tools/contracts";
+import { T, useGT } from "gt-react";
 import { EllipsisIcon, PlusIcon } from "lucide-react";
 import { useState } from "react";
 
@@ -26,7 +27,7 @@ import {
 import { ExternalMcpServerEditor } from "./ExternalMcpServerEditor";
 import type { ExternalMcpServerDraft } from "./externalMcpServerDraft";
 import { SettingsSection } from "./settingsLayout";
-import { searchableSetting } from "./settingsSearch";
+import { useSearchableSetting } from "./settingsSearch";
 
 export function ExternalMcpServersSettings({
   environmentId,
@@ -35,6 +36,7 @@ export function ExternalMcpServersSettings({
   readonly environmentId: EnvironmentId;
   readonly disabled?: boolean;
 }) {
+  const searchableSetting = useSearchableSetting();
   const settings = useEnvironmentSettings(environmentId);
   const servers = settings.externalMcpServers;
   const updateSettings = useUpdateEnvironmentSettings(environmentId);
@@ -75,15 +77,17 @@ export function ExternalMcpServersSettings({
           disabled={disabled}
           onClick={() => setEditing({ id: null })}
         >
-          <PlusIcon className="size-3.5" /> Add server
+          <PlusIcon className="size-3.5" /> <T>Add server</T>
         </Button>
       }
     >
       <div inert={disabled} className={cn(disabled && "opacity-50 select-none")}>
         {entries.length === 0 ? (
           <p className="px-3 py-4 text-sm text-muted-foreground sm:px-4">
-            Give agents the tools of a remote MCP server, such as your issue tracker or asset store.
-            Servers sign in with OAuth or send fixed headers.
+            <T>
+              Give agents the tools of a remote MCP server, such as your issue tracker or asset
+              store. Servers sign in with OAuth or send fixed headers.
+            </T>
           </p>
         ) : (
           entries.map(([id, server]) => (
@@ -100,8 +104,10 @@ export function ExternalMcpServersSettings({
         )}
         {entries.length > 0 ? (
           <p className="border-t border-border/60 px-3 py-2.5 text-xs text-muted-foreground sm:px-4">
-            Every project on this environment gets these servers. Changes reach running threads once
-            their sessions are idle.
+            <T>
+              Every project on this environment gets these servers. Changes reach running threads
+              once their sessions are idle.
+            </T>
           </p>
         ) : null}
       </div>
@@ -139,6 +145,7 @@ function ExternalMcpServerRow({
   readonly onEdit: () => void;
   readonly onChange: (next: ExternalMcpServerConfig | null) => void;
 }) {
+  const gt = useGT();
   const oauth = server.auth?.type === "oauth";
   const actions = useExternalMcpOAuth(environmentId, id);
   const name = server.displayName ?? id;
@@ -147,7 +154,9 @@ function ExternalMcpServerRow({
 
   async function remove() {
     const confirmed = await ensureLocalApi().dialogs.confirm(
-      `Remove ${name}? Its stored secrets${oauth ? " and sign-in" : ""} are deleted.`,
+      oauth
+        ? gt("Remove {name}? Its stored secrets and sign-in are deleted.", { name })
+        : gt("Remove {name}? Its stored secrets are deleted.", { name }),
       { variant: "destructive" },
     );
     if (confirmed) onChange(null);
@@ -160,11 +169,11 @@ function ExternalMcpServerRow({
           <div className="flex min-w-0 items-center gap-1.5">
             <p className="truncate text-sm font-medium">{name}</p>
             <Badge size="sm" variant="outline">
-              {oauth ? "OAuth" : server.headers.length > 0 ? "Headers" : "No auth"}
+              {oauth ? gt("OAuth") : server.headers.length > 0 ? gt("Headers") : gt("No auth")}
             </Badge>
             {!server.enabled ? (
               <Badge size="sm" variant="secondary">
-                Off
+                <T>Off</T>
               </Badge>
             ) : null}
           </div>
@@ -180,31 +189,43 @@ function ExternalMcpServerRow({
               disabled={actions.pending || status === undefined}
               onClick={() => void actions.signIn()}
             >
-              Sign in
+              <T>Sign in</T>
             </Button>
           ) : null}
           <Switch
             checked={server.enabled}
             onCheckedChange={(enabled) => onChange({ ...server, enabled })}
-            aria-label={`Enable ${name}`}
+            aria-label={gt("Enable {name}", { name })}
           />
           <Menu>
             <MenuTrigger
-              render={<Button size="icon-sm" variant="ghost" aria-label={`${name} actions`} />}
+              render={
+                <Button
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label={gt("{name} actions", { name })}
+                />
+              }
             >
               <EllipsisIcon className="size-4" />
             </MenuTrigger>
             <MenuPopup align="end">
-              <MenuItem onClick={onEdit}>Edit…</MenuItem>
+              <MenuItem onClick={onEdit}>
+                <T>Edit…</T>
+              </MenuItem>
               {oauth && connected ? (
-                <MenuItem onClick={() => void actions.signIn()}>Sign in again</MenuItem>
+                <MenuItem onClick={() => void actions.signIn()}>
+                  <T>Sign in again</T>
+                </MenuItem>
               ) : null}
               {oauth && (connected || status?.state === "needs-login") ? (
-                <MenuItem onClick={() => void actions.signOut()}>Sign out</MenuItem>
+                <MenuItem onClick={() => void actions.signOut()}>
+                  <T>Sign out</T>
+                </MenuItem>
               ) : null}
               <MenuSeparator />
               <MenuItem variant="destructive" onClick={() => void remove()}>
-                Remove
+                <T>Remove</T>
               </MenuItem>
             </MenuPopup>
           </Menu>

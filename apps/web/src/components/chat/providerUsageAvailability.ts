@@ -1,5 +1,9 @@
 import type { ServerProviderUsageLimits, ServerProviderUsageWindow } from "@t3tools/contracts";
-import { formatResetsIn, remainingPercent } from "@t3tools/shared/usageLimits";
+import { remainingPercent } from "@t3tools/shared/usageLimits";
+import { formatResetsIn } from "@t3tools/shared/usageLimitsCopy";
+import { msg } from "gt-react";
+
+import { m, type MessageResolver } from "../../i18n/messages";
 
 export type ProviderUsageAttention = {
   readonly severity: "warning";
@@ -34,14 +38,17 @@ export function selectPrimaryUsageWindow(
 export function getProviderUsageAttention(
   limits: ServerProviderUsageLimits | undefined,
   now: number = Date.now(),
+  resolve: MessageResolver = m,
 ): ProviderUsageAttention | null {
   const window = selectPrimaryUsageWindow(limits, now);
   if (!window || window.usedPercent <= 90) return null;
-  const label = `${window.label} ${remainingPercent(window)}% left`;
-  const reset = formatResetsIn(window, now);
+  const variables = { label: window.label, percent: remainingPercent(window) };
+  const reset = formatResetsIn(window, now, resolve);
   return {
     severity: "warning",
-    label,
-    reason: `${label}.${reset ? ` ${reset}.` : ""}`,
+    label: resolve(msg("{label} {percent}% left", variables)),
+    reason: reset
+      ? resolve(msg("{label} {percent}% left. {reset}.", { ...variables, reset }))
+      : resolve(msg("{label} {percent}% left.", variables)),
   };
 }

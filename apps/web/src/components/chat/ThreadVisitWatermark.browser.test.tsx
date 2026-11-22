@@ -1,6 +1,7 @@
 import { claimThreadOpen } from "@t3tools/client-runtime/state/thread-search";
 import { EnvironmentId, type ScopedThreadRef, ThreadId } from "@t3tools/contracts";
-import { AsyncResult, Atom } from "effect/reactivity";
+import * as Effect from "effect/Effect";
+import { Atom } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
 
 import { fakeTimers, render } from "../../../test/render";
@@ -15,7 +16,7 @@ const mocks = vi.hoisted(() => ({
 
 function setup(route: ScopedThreadRef) {
   mocks.visitRun.mockReset();
-  mocks.visitRun.mockResolvedValue(AsyncResult.success(undefined));
+  mocks.visitRun.mockReturnValue(Effect.void);
   mocks.routeParams = { environmentId: route.environmentId, threadId: route.threadId };
   mocks.activity = { visible: true, focused: true };
   mocks.activityListeners.clear();

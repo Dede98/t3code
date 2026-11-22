@@ -6,6 +6,7 @@ import type {
   ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
+import { useGT, useMessages } from "gt-react";
 import { ArrowRightLeftIcon } from "lucide-react";
 import { useState } from "react";
 
@@ -41,6 +42,8 @@ export function useQueuedProviderSwitchBanner(
   input: QueuedProviderSwitchBannerInput,
 ): ComposerBannerStackItem | null {
   const { thread, activeInstanceId, selectedInstanceId, providerStatuses } = input;
+  const gt = useGT();
+  const m = useMessages();
   const syncThreadContinuation = useAtomCommand(threadEnvironment.syncContinuation, {
     reportFailure: false,
   });
@@ -100,7 +103,7 @@ export function useQueuedProviderSwitchBanner(
           toastManager.add(
             stackedThreadToast({
               type: "error",
-              title: "Could not sync Claude history",
+              title: gt("Could not sync Claude history"),
               data: { threadRef },
               description: describeClaudeContinuationSyncError(error),
             }),
@@ -115,9 +118,9 @@ export function useQueuedProviderSwitchBanner(
         toastManager.add(
           stackedThreadToast({
             type: "success",
-            title: "Claude history synced",
+            title: gt("Claude history synced"),
             data: { threadRef },
-            description: "The next turn can start on the selected Claude account.",
+            description: gt("The next turn can start on the selected Claude account."),
           }),
         );
       })
@@ -133,10 +136,11 @@ export function useQueuedProviderSwitchBanner(
     id: `provider-switch-queued:${queuedProviderSwitch.instanceId}`,
     variant: "info",
     icon: <ArrowRightLeftIcon />,
-    title: `Continue with ${queuedProviderSwitch.label}`,
-    description: getQueuedProviderSwitchDescription({
-      canSyncClaudeContinuation: canSyncQueuedClaudeSwitch,
-    }),
+    title: gt("Continue with {provider}", { provider: queuedProviderSwitch.label }),
+    description: getQueuedProviderSwitchDescription(
+      { canSyncClaudeContinuation: canSyncQueuedClaudeSwitch },
+      m,
+    ),
     ...(canSyncQueuedClaudeSwitch
       ? {
           actions: (
@@ -147,10 +151,10 @@ export function useQueuedProviderSwitchBanner(
               onClick={() => void handleSyncThreadContinuation()}
             >
               {isSyncingContinuation
-                ? "Syncing…"
+                ? gt("Syncing…")
                 : hasSyncedContinuation
-                  ? "History synced"
-                  : "Sync history now"}
+                  ? gt("History synced")
+                  : gt("Sync history now")}
             </Button>
           ),
         }

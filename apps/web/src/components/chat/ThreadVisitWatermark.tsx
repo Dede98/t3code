@@ -6,6 +6,7 @@ import { useParams } from "@tanstack/react-router";
 import { useSyncExternalStore } from "react";
 import { getDocumentActivity, subscribeDocumentActivity } from "~/lib/documentActivity";
 
+import { environmentCatalog } from "../../connection/catalog";
 import { useUiStateStore } from "../../uiStateStore";
 import { environmentThreadShells, threadEnvironment } from "../../state/threads";
 import { resolveThreadRouteRef } from "../../threadRoutes";
@@ -13,6 +14,7 @@ import { isViewingThread } from "../ChatView.logic";
 
 const threadVisitTracker = createThreadVisitTracker({
   threadShellAtom: environmentThreadShells.threadShellAtom,
+  sessionGenerationAtom: environmentCatalog.sessionGenerationAtom,
   visit: threadEnvironment.visit,
   markLocalVisit: (ref, visitedAt) =>
     useUiStateStore.getState().markThreadVisited(scopedThreadKey(ref), visitedAt),

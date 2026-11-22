@@ -8,7 +8,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
-import { runMigrations, forkIntegrationMigrationEntries } from "./Migrations.ts";
+import { forkIntegrationMigrationEntries, migrationManifest, runMigrations } from "./Migrations.ts";
 import OrchestrationV2 from "./Migrations/055_OrchestrationV2.ts";
 import ClaudeSessionStore from "./Migrations/033_ClaudeSessionStore.ts";
 import RemoveIndexes from "./Migrations/056_RemoveRedundantProjectionIndexes.ts";
@@ -98,11 +98,26 @@ it.effect.each(
           observer.prepare("SELECT * FROM orchestration_v2_legacy_imports").all(),
           progress,
         );
+        // Every lineage ends at the fresh head with each migration recorded once.
         assert.equal(
           observer.prepare("SELECT MAX(migration_id) AS id FROM effect_sql_migrations").get()?.id,
-          81,
+          Math.max(...migrationManifest.map(([id]) => id)),
+        );
+        assert.deepEqual(
+          observer
+            .prepare("SELECT name FROM effect_sql_migrations")
+            .all()
+            .map((row) => (row.name === "ForkOrchestrationV2" ? "OrchestrationV2" : row.name))
+            .toSorted(),
+          migrationManifest.map(([, name]) => name).toSorted(),
         );
         for (const name of [
+          "orchestration_v2_projection_turn_item_counts",
+          "orchestration_v2_projection_thread_item_counts",
+          "auth_connect_devices",
+          "issue_tracker_bindings",
+          "task_folders",
+          "orchestration_v2_projection_messages_deferred_command_idx",
           "mcp_app_model_context",
           "peer_environment_links",
           "orchestration_v2_projection_turn_items_waiting_link_idx",

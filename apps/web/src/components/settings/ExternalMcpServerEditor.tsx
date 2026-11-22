@@ -1,4 +1,5 @@
 import type { ExternalMcpServerConfig, ServerProvider } from "@t3tools/contracts";
+import { T, Var, useGT, useMessages } from "gt-react";
 import { PlusIcon, Trash2Icon } from "lucide-react";
 import { useState } from "react";
 
@@ -86,7 +87,10 @@ function ExternalMcpServerForm({
     () => Math.max(-1, ...draft.headers.map((header) => header.key)) + 1,
   );
   const [showErrors, setShowErrors] = useState(false);
-  const problem = validate(draft, takenIds, isNew);
+  const gt = useGT();
+  const m = useMessages();
+  const problem = validate(draft, takenIds, isNew, m);
+  const serverName = server?.displayName ?? serverId ?? "";
   const update = (patch: Partial<ExternalMcpServerDraft>) =>
     setDraft((current) => ({ ...current, ...patch }));
   const updateHeader = (key: number, patch: Partial<HeaderDraft>) =>
@@ -111,17 +115,19 @@ function ExternalMcpServerForm({
     >
       <DialogHeader>
         <DialogTitle>
-          {isNew ? "Add MCP server" : `Edit ${server?.displayName ?? serverId}`}
+          {isNew ? gt("Add MCP server") : gt("Edit {name}", { name: serverName })}
         </DialogTitle>
         <DialogDescription>
-          A Streamable HTTP server whose tools agents on this environment get.
+          <T>A Streamable HTTP server whose tools agents on this environment get.</T>
         </DialogDescription>
       </DialogHeader>
       <DialogPanel>
         <div className="space-y-5 text-sm">
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="block space-y-1.5">
-              <span>ID</span>
+              <span>
+                <T>ID</T>
+              </span>
               <Input
                 value={draft.id}
                 disabled={!isNew}
@@ -132,17 +138,22 @@ function ExternalMcpServerForm({
             </label>
             <label className="block space-y-1.5">
               <span>
-                Display name <span className="text-muted-foreground">(optional)</span>
+                <T>
+                  Display name <span className="text-muted-foreground">(optional)</span>
+                </T>
               </span>
               <Input
                 value={draft.displayName}
+                // oxlint-disable-next-line t3code/no-untranslated-copy -- a product name as the example
                 placeholder={draft.id || "Linear"}
                 onChange={(event) => update({ displayName: event.target.value })}
               />
             </label>
           </div>
           <label className="block space-y-1.5">
-            <span>URL</span>
+            <span>
+              <T>URL</T>
+            </span>
             <Input
               type="url"
               value={draft.url}
@@ -152,9 +163,11 @@ function ExternalMcpServerForm({
           </label>
 
           <fieldset className="space-y-2">
-            <legend className="mb-1.5">Authentication</legend>
+            <legend className="mb-1.5">
+              <T>Authentication</T>
+            </legend>
             <ToggleGroup
-              aria-label="Authentication"
+              aria-label={gt("Authentication")}
               variant="segmented"
               value={[draft.auth]}
               onValueChange={(next) => {
@@ -162,40 +175,56 @@ function ExternalMcpServerForm({
                 if (auth === "headers" || auth === "oauth") update({ auth });
               }}
             >
-              <Toggle value="oauth">Sign in with OAuth</Toggle>
-              <Toggle value="headers">Headers only</Toggle>
+              <Toggle value="oauth">
+                <T>Sign in with OAuth</T>
+              </Toggle>
+              <Toggle value="headers">
+                <T>Headers only</T>
+              </Toggle>
             </ToggleGroup>
             <p className="text-xs text-muted-foreground">
               {draft.auth === "oauth"
-                ? "Sign in after saving. This environment keeps the sign-in, refreshes it, and passes the server to agents through T3 Code."
-                : "Send fixed headers, such as an API key. Codex only receives a secret Authorization header."}
+                ? gt(
+                    "Sign in after saving. This environment keeps the sign-in, refreshes it, and passes the server to agents through T3 Code.",
+                  )
+                : gt(
+                    "Send fixed headers, such as an API key. Codex only receives a secret Authorization header.",
+                  )}
             </p>
             {draft.auth === "oauth" ? (
               <details className="text-xs">
-                <summary className="cursor-pointer text-muted-foreground">Advanced</summary>
+                <summary className="cursor-pointer text-muted-foreground">
+                  <T>Advanced</T>
+                </summary>
                 <div className="mt-2 grid gap-3 sm:grid-cols-2">
                   <label className="block space-y-1.5">
-                    <span>Client ID</span>
+                    <span>
+                      <T>Client ID</T>
+                    </span>
                     <Input
                       size="sm"
                       value={draft.clientId}
-                      placeholder="Registered automatically"
+                      placeholder={gt("Registered automatically")}
                       onChange={(event) => update({ clientId: event.target.value })}
                     />
                   </label>
                   <label className="block space-y-1.5">
-                    <span>Scopes</span>
+                    <span>
+                      <T>Scopes</T>
+                    </span>
                     <Input
                       size="sm"
                       value={draft.scopes}
-                      placeholder="From the server"
+                      placeholder={gt("From the server")}
                       onChange={(event) => update({ scopes: event.target.value })}
                     />
                   </label>
                 </div>
                 <p className="mt-2 text-muted-foreground">
-                  Only needed when the authorization server does not register clients on its own. It
-                  must accept http://127.0.0.1 redirect URIs.
+                  <T>
+                    Only needed when the authorization server does not register clients on its own.
+                    It must accept <Var>{"http://127.0.0.1"}</Var> redirect URIs.
+                  </T>
                 </p>
               </details>
             ) : null}
@@ -203,18 +232,22 @@ function ExternalMcpServerForm({
 
           <fieldset className="space-y-2">
             <legend className="mb-1.5">
-              Headers{" "}
               {draft.auth === "oauth" ? (
-                <span className="text-muted-foreground">(optional)</span>
-              ) : null}
+                <T>
+                  Headers <span className="text-muted-foreground">(optional)</span>
+                </T>
+              ) : (
+                <T>Headers</T>
+              )}
             </legend>
             {draft.headers.map((header) => (
               <div key={header.key} className="flex items-center gap-2">
                 <Input
                   size="sm"
                   value={header.name}
+                  // oxlint-disable-next-line t3code/no-untranslated-copy -- an HTTP header name
                   placeholder="Authorization"
-                  aria-label="Header name"
+                  aria-label={gt("Header name")}
                   onChange={(event) => updateHeader(header.key, { name: event.target.value })}
                 />
                 <Input
@@ -222,8 +255,12 @@ function ExternalMcpServerForm({
                   value={header.value}
                   type={header.sensitive ? "password" : "text"}
                   autoComplete="off"
-                  placeholder={keepsStoredSecret(header) ? "Stored secret, unchanged" : "Value"}
-                  aria-label={`${header.name || "Header"} value`}
+                  placeholder={
+                    keepsStoredSecret(header) ? gt("Stored secret, unchanged") : gt("Value")
+                  }
+                  aria-label={
+                    header.name ? gt("{name} value", { name: header.name }) : gt("Header value")
+                  }
                   onChange={(event) => updateHeader(header.key, { value: event.target.value })}
                 />
                 <label className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
@@ -233,13 +270,15 @@ function ExternalMcpServerForm({
                       updateHeader(header.key, { sensitive: Boolean(checked) })
                     }
                   />
-                  Secret
+                  <T>Secret</T>
                 </label>
                 <Button
                   type="button"
                   size="icon-sm"
                   variant="ghost"
-                  aria-label={`Remove ${header.name || "header"}`}
+                  aria-label={
+                    header.name ? gt("Remove {name}", { name: header.name }) : gt("Remove header")
+                  }
                   onClick={() =>
                     update({ headers: draft.headers.filter((item) => item.key !== header.key) })
                   }
@@ -269,13 +308,15 @@ function ExternalMcpServerForm({
                 setNextKey(nextKey + 1);
               }}
             >
-              <PlusIcon className="size-4" /> Add header
+              <PlusIcon className="size-4" /> <T>Add header</T>
             </Button>
           </fieldset>
 
           {providers.length > 0 ? (
             <fieldset className="space-y-2">
-              <legend className="mb-1.5">Providers</legend>
+              <legend className="mb-1.5">
+                <T>Providers</T>
+              </legend>
               <label className="flex items-center gap-2">
                 <Checkbox
                   checked={selectedInstances === null}
@@ -287,7 +328,7 @@ function ExternalMcpServerForm({
                     })
                   }
                 />
-                Every provider, including ones added later
+                <T>Every provider, including ones added later</T>
               </label>
               {selectedInstances !== null ? (
                 <div className="grid gap-1.5 ps-6 sm:grid-cols-2">
@@ -315,8 +356,9 @@ function ExternalMcpServerForm({
 
           {endsSignIn(draft, server) ? (
             <p className="text-xs text-muted-foreground">
-              Saving these changes signs out of {server?.displayName ?? serverId}. Sign in again
-              afterwards.
+              <T>
+                Saving these changes signs out of <Var>{serverName}</Var>. Sign in again afterwards.
+              </T>
             </p>
           ) : null}
           {showErrors && problem ? (
@@ -328,9 +370,9 @@ function ExternalMcpServerForm({
       </DialogPanel>
       <DialogFooter>
         <Button type="button" variant="ghost" onClick={onClose}>
-          Cancel
+          <T>Cancel</T>
         </Button>
-        <Button type="submit">{isNew ? "Add server" : "Save"}</Button>
+        <Button type="submit">{isNew ? gt("Add server") : gt("Save")}</Button>
       </DialogFooter>
     </form>
   );

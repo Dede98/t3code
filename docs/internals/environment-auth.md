@@ -27,19 +27,35 @@ model. DPoP binds a token to a client's proof key; an invalid proof must fail
 rather than fall back to bearer authentication. The OAuth token-exchange
 vocabulary gives these grants a familiar meaning.
 
-### Sessions in use do not expire
+A device that exchanges a plain pairing link with a DPoP proof gets a one-hour
+token on a session that renews: presenting the token, even expired, with a
+proof from the same key moves the session's expiry 30 days out and returns a
+fresh token for the same session. The session itself must still be unexpired
+and unrevoked, so a device idle past the window pairs again. Renewal stays in place rather than issuing a
+successor, so live sockets keep their session, Sharing & access shows one row
+per device for its whole renewal window, and one revoke ends it. T3 Connect
+sessions never renew, so unlinking Connect still cuts a device off.
 
-A paired client keeps its token for good: the App Store app and older clients
-cannot take a new one. So the session row's `expires_at`, not the signed `exp`,
-decides expiry, as the row's scopes decide authority. A session issued for at
-least 30 days moves its deadline to 30 days from now when it is used, at most
-once a day, by a verified request or a socket held open
-([SessionStore](../../apps/server/src/auth/SessionStore.ts)). Revocation and 30
-idle days end it, so a narrow token, such as a read-only MCP agent's, lasts
-until it is revoked or goes idle. DPoP sessions keep their hour and renew by re-minting. A peer
-link mirrors the rule on each successful call, because the linking side refuses
-an expired link before sending its token
-([PeerLinks](../../apps/server/src/peer/PeerLinks.ts)).
+A [peer link](remote.md#peer-links)'s session renews on use instead: its
+bearer token is never reissued, so the session row alone holds its deadline and
+the token's own expiry is ignored. Authenticating a call from it moves the
+row 30 days out, at most once a day so a busy link does not write on every
+call. Only an unexpired, unrevoked row moves, so an idle link still ends after
+30 days and a revoke is final.
+
+### Sessions without a key slide too
+
+A client that pairs without a DPoP key keeps its token for good: the App Store
+app and older clients cannot take a new one or ask for a renewal. So every
+other non-DPoP session issued for at least 30 days (a paired bearer token, a
+browser cookie, a CLI-issued session, an outside MCP client's) follows the
+peer link rule: the row's `expires_at`, not the signed `exp`, decides expiry,
+and a verified request or a socket held open moves it 30 days out, at most
+once a day ([SessionStore](../../apps/server/src/auth/SessionStore.ts)).
+`/api/auth/session` re-sets a browser cookie with the moved deadline.
+Revocation and 30 idle days end such a session, so a narrow token, such as a
+read-only MCP agent's, lasts until it is revoked or goes idle. Shorter sessions
+keep the expiry their token carries.
 
 ### Guest links are not sessions
 
@@ -73,11 +89,31 @@ The result is an ordinary session with subject `mcp-client`. A read-only
 grant holds `orchestration:read` alone. On `/mcp` it passes only tools
 declared as reads in [McpToolAccess](../../apps/server/src/mcp/McpToolAccess.ts),
 where every tool must declare who may call it to compile. Any other grant adds
-`orchestration:operate` and a signed ceiling. Only `/mcp` accepts these sessions. Every other HTTP and WebSocket
+`orchestration:operate` and a signed ceiling. Only `/mcp` accepts these sessions, and for a
+[peer link](remote.md#peer-links)'s session alone the thread routes in
+[linkThreadHttp](../../apps/server/src/peer/linkThreadHttp.ts), which only read, and the
+client pairing described below. Every other HTTP and WebSocket
 path rejects that subject, because the RPC surface would let the agent act
 above its ceiling. Inside MCP the credential sets the limits and tool
 parameters only pick targets; see
 [threadAccess](../../apps/server/src/mcp/threadAccess.ts).
+
+These clients have no calling thread, so `/mcp` does not offer them tools that
+act as one, such as `request_secret` or `delegate_task`. Hiding is only
+discovery: the handlers still refuse such a call with
+`thread_credential_required`. A secret card belongs to a thread's run, so an
+outside agent that needs a secret starts a thread and lets that agent ask.
+
+A full-access [peer link](../../apps/server/src/peer/PeerClientPairing.ts) may
+mint a one-time pairing for a client of the environment that holds it. Its
+agents already run as this machine's user and could run `t3 auth pairing create`,
+so this adds no authority; a narrower link would gain some, so it is refused
+here, on the linked side, whatever the linking side sent. The pairing carries
+the client's scopes on the linking environment intersected with a normal
+pairing's. A person starts it: the linking environment exposes it as a WebSocket
+RPC behind `access:write`, and the linked side as an HTTP route that accepts only
+a link's session. It is not an MCP tool, because a tool is reachable by whatever
+holds a thread credential, and hiding one from tool listings is only discovery.
 
 Issuer and resource URLs come from the request's Host and
 `X-Forwarded-Proto`, so one server answers over loopback, Tailscale Serve and a

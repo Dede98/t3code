@@ -22,6 +22,7 @@ import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as FileSystem from "effect/FileSystem";
+import type * as SqlClient from "effect/sql/SqlClient";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 
@@ -62,7 +63,9 @@ type ProviderInstanceRegistryHydrationEnv =
   // Secret provider reads.
   | SecureRandom.SecureRandom
   // The Claude runner counts its CLIs as running agents for port discovery.
-  | PortScanner.PortDiscovery;
+  | PortScanner.PortDiscovery
+  // Adapter ids read which subagent threads predate short ids.
+  | SqlClient.SqlClient;
 
 export const deriveProviderInstanceConfigMap = (
   settings: ServerSettings,
@@ -189,6 +192,9 @@ export const seedDevReplayInstance = Effect.fn(
 // A label is display-only, so only kind and config can change what a vault returns.
 const vaultConfigs = (settings: ServerSettings) =>
   Object.entries(settings.secretProviders).map(([id, { kind, config }]) => [id, kind, config]);
+
+// A host built earlier (for the ACP registry) lacks PortDiscovery; build this one fresh.
+export const providerHostLayer = Layer.fresh(ProviderHostLive.layer);
 
 export interface DesiredProviderRegistrySettings {
   readonly settings: ServerSettings | undefined;
@@ -442,7 +448,7 @@ export const layer: Layer.Layer<
     }).pipe(
       Layer.provide(ProviderOrchestrationAdapterInfrastructure.layer),
       Layer.provide(AcpRegistrySupport.layerFromHost),
-      Layer.provide(ProviderHostLive.layer),
+      Layer.provide(providerHostLayer),
       Layer.provide(Layer.succeed(HostProcess.Environment, hostEnvironment)),
       Layer.provide(SecretResolver.layer),
     );

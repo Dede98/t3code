@@ -5,11 +5,14 @@ import {
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
 import { useNavigate, useParams } from "@tanstack/react-router";
-import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
+import { T, msg, useGT, useMessages } from "gt-react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 
 import { isCommandPaletteOpen } from "../commandPaletteBus";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { environmentCatalog } from "../connection/catalog";
+import { useStableCallback } from "../hooks/useStableCallback";
+import { m, type MessageResolver } from "../i18n/messages";
 import { resolveShortcutCommand } from "../keybindings";
 import { isEditableFocused } from "../lib/editableFocus";
 import { isPreviewFocused } from "../lib/previewFocus";
@@ -36,7 +39,7 @@ import {
 import { Dialog, DialogHeader, DialogPopup, DialogTitle } from "./ui/dialog";
 import { toastManager } from "./ui/toast";
 
-function resolveRecentThread(entry: RecentThread) {
+function resolveRecentThread(entry: RecentThread, resolve: MessageResolver = m) {
   const draft = entry.draftId
     ? useComposerDraftStore.getState().getDraftSession(entry.draftId)
     : null;
@@ -56,14 +59,19 @@ function resolveRecentThread(entry: RecentThread) {
   return {
     ref,
     draftId: draft && !draft.promotedTo ? entry.draftId : undefined,
-    title: thread?.title || "New thread",
-    project: project?.title ?? "No project",
-    environment: environment.profile._tag === "Some" ? environment.profile.value.label : "Local",
+    title: thread?.title || resolve(msg("New thread")),
+    project: project?.title ?? resolve(msg("No project")),
+    environment:
+      environment.profile._tag === "Some"
+        ? environment.profile.value.label
+        : resolve(msg("Local", { $context: "the environment on this machine" })),
   };
 }
 
 export function RecentThreadSwitcher() {
   const navigate = useNavigate();
+  const gt = useGT();
+  const messages = useMessages();
   const params = useParams({ strict: false });
   const route = resolveThreadRouteTarget(params);
   const draftId = route?.kind === "draft" ? route.draftId : null;
@@ -83,19 +91,20 @@ export function RecentThreadSwitcher() {
   const sessionRef = useRef<ThreadSwitchSession | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  const updateSession = useCallback((next: ThreadSwitchSession | null) => {
+  // One identity: the window key listeners below subscribe once and call it.
+  const updateSession = useStableCallback((next: ThreadSwitchSession | null) => {
     sessionRef.current = next;
     setSession(next);
-  }, []);
+  });
 
   const rememberRoute = useEffectEvent((entry: RecentThread | null) => {
     updateSession(null);
     if (entry) useRecentThreadStore.getState().remember(entry);
   });
   const routeReady = draft !== null || (currentThread !== null && !currentThread.deletedAt);
-  // oxlint-disable-next-line t3code/react-effect-budget -- A committed route is only known after navigation resolves.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- records the route the router committed in the recent-thread store; navigation starts outside this component
   useEffect(() => {
-    // oxlint-disable-next-line react/set-state-in-effect -- A committed router navigation cancels the in-progress keyboard selection.
+    // A committed router navigation also cancels the in-progress keyboard selection.
     rememberRoute(
       routeReady && environmentId && threadId
         ? {
@@ -106,7 +115,7 @@ export function RecentThreadSwitcher() {
     );
   }, [environmentId, threadId, draftId, routeReady]);
 
-  // oxlint-disable-next-line t3code/react-effect-budget -- Subscribes to the external draft store.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- subscribes to the draft store so visited drafts follow host changes and promotion
   useEffect(
     () =>
       useComposerDraftStore.subscribe((state, previous) => {
@@ -130,21 +139,21 @@ export function RecentThreadSwitcher() {
     [],
   );
 
-  const commit = useEffectEvent(
-    (selected = sessionRef.current?.entries[sessionRef.current.index]) => {
-      updateSession(null);
-      if (!selected) return;
-      // Resolve again: a thread can disappear or a draft can promote while held.
-      const target = resolveRecentThread(selected);
-      if (!target) return;
-      const navigation = target.draftId
-        ? navigate({ to: "/draft/$draftId", params: buildDraftThreadRouteParams(target.draftId) })
-        : navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(target.ref) });
-      void navigation.catch(() => {
-        toastManager.add({ type: "error", title: "Could not open the selected thread" });
-      });
-    },
-  );
+  const commit = useEffectEvent((picked?: RecentThread) => {
+    const session = sessionRef.current;
+    const selected = picked ?? session?.entries[session.index];
+    updateSession(null);
+    if (!selected) return;
+    // Resolve again: a thread can disappear or a draft can promote while held.
+    const target = resolveRecentThread(selected);
+    if (!target) return;
+    const navigation = target.draftId
+      ? navigate({ to: "/draft/$draftId", params: buildDraftThreadRouteParams(target.draftId) })
+      : navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(target.ref) });
+    void navigation.catch(() => {
+      toastManager.add({ type: "error", title: gt("Could not open the selected thread") });
+    });
+  });
 
   const onKeyDown = useEffectEvent((event: KeyboardEvent) => {
     if (event.isComposing || event.defaultPrevented) return;
@@ -225,7 +234,7 @@ export function RecentThreadSwitcher() {
     }
   });
 
-  // oxlint-disable-next-line t3code/react-effect-budget -- Window and desktop key listeners need capture-phase subscription.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- capture-phase window key listeners and the desktop bridge drive the switcher
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => onKeyDown(event);
     const keyup = (event: KeyboardEvent) => onKeyUp(event);
@@ -252,7 +261,7 @@ export function RecentThreadSwitcher() {
   }, [updateSession]);
 
   const selectedIndex = session?.index;
-  // oxlint-disable-next-line t3code/react-effect-budget -- The selected row exists in the DOM only after the dialog renders it.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- scrolls the selected row's DOM node into view once the dialog has rendered it
   useEffect(() => {
     listRef.current
       ?.querySelector(`#recent-thread-${selectedIndex}`)
@@ -268,18 +277,20 @@ export function RecentThreadSwitcher() {
     >
       <DialogPopup showCloseButton={false} bottomStickOnMobile={false} initialFocus={listRef}>
         <DialogHeader>
-          <DialogTitle>Recent threads</DialogTitle>
+          <DialogTitle>
+            <T>Recent threads</T>
+          </DialogTitle>
         </DialogHeader>
         <div
           ref={listRef}
           role="listbox"
-          aria-label="Recent threads"
+          aria-label={gt("Recent threads")}
           aria-activedescendant={session ? `recent-thread-${session.index}` : undefined}
           tabIndex={0}
           className="max-h-80 overflow-y-auto px-2 pb-2 outline-none"
         >
           {session?.entries.map((entry, index) => {
-            const target = resolveRecentThread(entry);
+            const target = resolveRecentThread(entry, messages);
             return (
               <div
                 key={scopedThreadKey(entry.threadRef)}
@@ -291,7 +302,7 @@ export function RecentThreadSwitcher() {
                 onClick={() => commit(entry)}
               >
                 <div className="truncate text-sm font-medium">
-                  {target?.title ?? "Thread unavailable"}
+                  {target?.title ?? gt("Thread unavailable")}
                 </div>
                 <div className="truncate text-xs text-muted-foreground">
                   {target ? `${target.project} · ${target.environment}` : ""}
@@ -301,7 +312,7 @@ export function RecentThreadSwitcher() {
           })}
         </div>
         <p className="px-5 pb-4 text-xs text-muted-foreground">
-          Release the shortcut modifier to switch. Escape cancels.
+          <T>Release the shortcut modifier to switch. Escape cancels.</T>
         </p>
       </DialogPopup>
     </Dialog>

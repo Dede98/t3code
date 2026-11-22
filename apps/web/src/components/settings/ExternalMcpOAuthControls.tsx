@@ -9,6 +9,7 @@ import type {
   ExternalMcpServerId,
 } from "@t3tools/contracts";
 import { isLoopbackHost } from "@t3tools/shared/preview";
+import { T, Var, msg, useGT } from "gt-react";
 import { CopyIcon } from "lucide-react";
 import { useRef, useState } from "react";
 
@@ -41,6 +42,7 @@ export function useExternalMcpOAuth(environmentId: EnvironmentId, serverId: stri
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const pendingRef = useRef(false);
+  const gt = useGT();
   const id = serverId as ExternalMcpServerId;
 
   async function run(command: () => Promise<AtomCommandResult<unknown, unknown>>) {
@@ -50,11 +52,11 @@ export function useExternalMcpOAuth(environmentId: EnvironmentId, serverId: stri
     setError(null);
     const result = await command().catch(() => null);
     let succeeded = false;
-    if (result === null) setError("Sign-in failed. Try again.");
+    if (result === null) setError(gt("Sign-in failed. Try again."));
     else if (result._tag === "Success") succeeded = true;
     else if (!isAtomCommandInterrupted(result)) {
       const failure = squashAtomCommandFailure(result);
-      setError(failure instanceof Error ? failure.message : "Sign-in failed. Try again.");
+      setError(failure instanceof Error ? failure.message : gt("Sign-in failed. Try again."));
     }
     pendingRef.current = false;
     setPending(false);
@@ -66,7 +68,9 @@ export function useExternalMcpOAuth(environmentId: EnvironmentId, serverId: stri
       .shell.openExternal(url)
       .then(() => true)
       .catch(() => false);
-    if (!opened) setError("Could not open the browser. Copy the link and open it yourself.");
+    if (!opened) {
+      setError(gt("Could not open the browser. Copy the link and open it yourself."));
+    }
   }
 
   async function signIn() {
@@ -115,17 +119,18 @@ export function ExternalMcpOAuthStatusLine({
   readonly status: ExternalMcpOAuthStatus | undefined;
   readonly error: string | null;
 }) {
+  const gt = useGT();
   const host = issuerHost(status?.issuer ?? null);
   const [dot, label] =
     status === undefined
-      ? ["bg-muted-foreground/40", "Checking sign-in…"]
+      ? ["bg-muted-foreground/40", gt("Checking sign-in…")]
       : status.flow !== null
-        ? ["bg-info", "Waiting for sign-in"]
+        ? ["bg-info", gt("Waiting for sign-in")]
         : status?.state === "connected"
-          ? ["bg-success", host ? `Signed in with ${host}` : "Signed in"]
+          ? ["bg-success", host ? gt("Signed in with {host}", { host }) : gt("Signed in")]
           : status?.state === "needs-login"
-            ? ["bg-warning", "Sign-in expired. Agents don't get this server until you sign in."]
-            : ["bg-muted-foreground/40", "Not signed in. Agents don't get this server yet."];
+            ? ["bg-warning", gt("Sign-in expired. Agents don't get this server until you sign in.")]
+            : ["bg-muted-foreground/40", gt("Not signed in. Agents don't get this server yet.")];
   const message = error ?? (status?.state === "connected" ? null : status?.message) ?? null;
   return (
     <div className="mt-1.5 space-y-1 text-xs">
@@ -152,12 +157,15 @@ export function ExternalMcpSignInPanel({
   const [callbackUrl, setCallbackUrl] = useState("");
   // Without a listener on this machine, pasting is the only way back.
   const [pasteOpen, setPasteOpen] = useState(!flow.serverReceivesCallback);
+  const gt = useGT();
   return (
     <div className="mt-3 space-y-3 rounded-lg border border-border/60 bg-muted/30 p-3 text-xs">
       <div className="flex flex-wrap items-center gap-2">
         <Spinner size="xs" />
         <span className="min-w-0 flex-1 text-muted-foreground">
-          Finish signing in to {serverName} in your browser.
+          <T>
+            Finish signing in to <Var>{serverName}</Var> in your browser.
+          </T>
         </span>
         <Button
           type="button"
@@ -166,14 +174,22 @@ export function ExternalMcpSignInPanel({
           disabled={actions.pending}
           onClick={() => void actions.openBrowser(flow.authorizationUrl)}
         >
-          Open again
+          <T>Open again</T>
         </Button>
         <Button
           type="button"
           size="icon-xs"
           variant="ghost"
-          aria-label="Copy sign-in link"
-          onClick={() => void writeTextToClipboard(flow.authorizationUrl, "MCP sign-in link")}
+          aria-label={gt("Copy sign-in link")}
+          onClick={() =>
+            void writeTextToClipboard(flow.authorizationUrl, {
+              target: "MCP sign-in link",
+              unavailableMessage: msg(
+                "Clipboard API is unavailable while copying MCP sign-in link.",
+              ),
+              failureMessage: msg("Failed to copy MCP sign-in link to the clipboard."),
+            })
+          }
         >
           <CopyIcon className="size-3.5" />
         </Button>
@@ -184,7 +200,7 @@ export function ExternalMcpSignInPanel({
           disabled={actions.pending}
           onClick={() => void actions.cancel(flow.flowId)}
         >
-          Cancel
+          <T>Cancel</T>
         </Button>
       </div>
       {pasteOpen ? (
@@ -200,8 +216,10 @@ export function ExternalMcpSignInPanel({
         >
           <label className="block space-y-1.5 text-muted-foreground">
             <span>
-              After you approve, the browser opens a 127.0.0.1 page that doesn't load. Paste that
-              page's full address here.
+              <T>
+                After you approve, the browser opens a <Var>{"127.0.0.1"}</Var> page that doesn't
+                load. Paste that page's full address here.
+              </T>
             </span>
             <div className="flex gap-2">
               <Input
@@ -213,7 +231,7 @@ export function ExternalMcpSignInPanel({
                 maxLength={16_384}
                 placeholder="http://127.0.0.1:…/callback?code=…"
                 onChange={(event) => setCallbackUrl(event.target.value)}
-                aria-label={`${serverName} redirect URL`}
+                aria-label={gt("{name} redirect URL", { name: serverName })}
               />
               <Button
                 type="submit"
@@ -221,14 +239,14 @@ export function ExternalMcpSignInPanel({
                 variant="outline"
                 disabled={actions.pending || !callbackUrl.trim()}
               >
-                {actions.pending ? <Spinner size="xs" /> : null} Continue
+                {actions.pending ? <Spinner size="xs" /> : null} <T>Continue</T>
               </Button>
             </div>
           </label>
         </form>
       ) : (
         <InlineButton tone="muted" onClick={() => setPasteOpen(true)}>
-          Browser didn't come back? Paste the redirect address
+          <T>Browser didn't come back? Paste the redirect address</T>
         </InlineButton>
       )}
     </div>

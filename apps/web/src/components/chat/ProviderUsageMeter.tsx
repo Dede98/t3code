@@ -1,6 +1,8 @@
 import type { EnvironmentId, ServerProvider } from "@t3tools/contracts";
 import { Link } from "@tanstack/react-router";
-import { limitsNotice, remainingPercent } from "@t3tools/shared/usageLimits";
+import { remainingPercent } from "@t3tools/shared/usageLimits";
+import { limitsNotice } from "@t3tools/shared/usageLimitsCopy";
+import { T, useGT, useMessages } from "gt-react";
 import { GaugeIcon } from "lucide-react";
 import { useState } from "react";
 
@@ -22,15 +24,21 @@ export function ProviderUsageMeter(props: {
   });
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const gt = useGT();
+  const m = useMessages();
   const limits = props.provider.usageLimits;
   const [openedAt, setOpenedAt] = useState(Date.now);
   const now = Math.max(openedAt, limits ? Date.parse(limits.checkedAt) : openedAt);
   const primary = selectPrimaryUsageWindow(limits, now);
-  const notice = limits ? limitsNotice(limits) : "Waiting for provider limits.";
-  const percent = primary ? remainingPercent(primary) : null;
-  const label = primary
-    ? `${primary.usedPercent > 90 ? `${primary.label} ` : ""}${percent}% left`
-    : "Limits -";
+  const notice = limits ? limitsNotice(limits, m) : gt("Waiting for provider limits.");
+  const label = !primary
+    ? gt("Limits -")
+    : primary.usedPercent > 90
+      ? gt("{label} {percent}% left", {
+          label: primary.label,
+          percent: remainingPercent(primary),
+        })
+      : gt("{percent}% left", { percent: remainingPercent(primary) });
 
   // Drivers without subscription limits (including API-key accounts) have no quota meter.
   if (
@@ -44,16 +52,16 @@ export function ProviderUsageMeter(props: {
     if (!props.environmentId || refreshing) return;
     setRefreshing(true);
     setRefreshError(null);
-    try {
-      const result = await refreshProviders({
-        environmentId: props.environmentId,
-        input: { instanceId: props.provider.instanceId },
-      });
-      if (result._tag === "Failure") setRefreshError("Could not refresh limits.");
-    } finally {
-      setOpenedAt(Date.now());
-      setRefreshing(false);
-    }
+    const failed = await refreshProviders({
+      environmentId: props.environmentId,
+      input: { instanceId: props.provider.instanceId },
+    }).then(
+      (result) => result._tag === "Failure",
+      () => true,
+    );
+    if (failed) setRefreshError(gt("Could not refresh limits."));
+    setOpenedAt(Date.now());
+    setRefreshing(false);
   };
 
   return (
@@ -66,8 +74,11 @@ export function ProviderUsageMeter(props: {
         render={
           <button
             type="button"
-            className="inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 text-[11px] tabular-nums text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-            aria-label={`${props.providerDisplayName} subscription limits: ${label}`}
+            className="inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 text-2xs tabular-nums text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+            aria-label={gt("{provider} subscription limits: {label}", {
+              provider: props.providerDisplayName,
+              label,
+            })}
           >
             <GaugeIcon
               className="size-3.5"
@@ -91,7 +102,9 @@ export function ProviderUsageMeter(props: {
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="text-xs font-medium">{props.providerDisplayName}</div>
-              <div className="text-[10px] text-muted-foreground">Subscription limits</div>
+              <div className="text-3xs text-muted-foreground">
+                <T>Subscription limits</T>
+              </div>
             </div>
             <Button
               size="xs"
@@ -99,7 +112,7 @@ export function ProviderUsageMeter(props: {
               disabled={refreshing || !props.environmentId}
               onClick={() => void refresh()}
             >
-              {refreshing ? "Refreshing…" : "Refresh"}
+              {refreshing ? gt("Refreshing…") : gt("Refresh")}
             </Button>
           </div>
           {notice ? (
@@ -114,7 +127,7 @@ export function ProviderUsageMeter(props: {
           ) : null}
           {!notice && limits && !primary ? (
             <p className="text-xs text-muted-foreground">
-              Reset time passed. Refresh to check the current limits.
+              <T>Reset time passed. Refresh to check the current limits.</T>
             </p>
           ) : null}
           {refreshError ? (
@@ -130,11 +143,11 @@ export function ProviderUsageMeter(props: {
               now={now}
             />
           ) : null}
-          <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-2 text-[10px] text-muted-foreground">
+          <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-2 text-3xs text-muted-foreground">
             <span>
               {limits
-                ? `Updated ${new Date(limits.checkedAt).toLocaleTimeString()}`
-                : "No limits received"}
+                ? gt("Updated {time}", { time: new Date(limits.checkedAt).toLocaleTimeString() })
+                : gt("No limits received")}
             </span>
             <Link
               to="/usage"
@@ -143,7 +156,7 @@ export function ProviderUsageMeter(props: {
               }
               className="hover:text-foreground"
             >
-              View all limits
+              <T>View all limits</T>
             </Link>
           </div>
         </div>

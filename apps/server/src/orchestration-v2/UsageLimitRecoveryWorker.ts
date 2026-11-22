@@ -13,7 +13,7 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as UsageLimitFailover from "./UsageLimitFailover.ts";
 
-const MAX_OVERDUE_ARM_MS = 24 * 60 * 60 * 1000;
+export const MAX_OVERDUE_ARM_MS = 24 * 60 * 60 * 1000;
 
 export function limitRecoveryCommand(
   thread: ProjectionStore.ProjectionLimitRecoveryCandidate,

@@ -8,24 +8,71 @@ import { assert, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
-import { migrationEntries, runMigrations } from "./Migrations.ts";
-import { seedForkMigrations } from "./Migrations.testkit.ts";
-import PeerLinks from "./Migrations/070_PeerLinks.ts";
-import PeerLinkFence from "./Migrations/071_PeerLinkFence.ts";
-import WaitingLinkRequestIndex from "./Migrations/072_WaitingLinkRequestIndex.ts";
-import ActiveTurnItemIndexes from "./Migrations/073_ActiveTurnItemIndexes.ts";
-import ExcludeAttachmentPlaceholders from "./Migrations/074_ExcludeAttachmentPlaceholdersFromSearch.ts";
-import SubagentDeliveryState from "./Migrations/075_SubagentDeliveryState.ts";
-import ProjectionProjectsPinArchive from "./Migrations/076_ProjectionProjectsPinArchive.ts";
-import RepairBooleanSettledOverride from "./Migrations/077_RepairBooleanSettledOverride.ts";
-import DropOrchestrationEventCorrelationIndex from "./Migrations/078_DropOrchestrationEventCorrelationIndex.ts";
-import DelegatedRecoveryIndexes from "./Migrations/079_DelegatedRecoveryIndexes.ts";
-import ScheduledTaskThreadMode from "./Migrations/080_ScheduledTaskThreadMode.ts";
+import { migrationManifest, runMigrations } from "./Migrations.ts";
+import { seedForkMigrations, seedUpstreamMigrations } from "./Migrations.testkit.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 
 const seedFork = (through = 55) => seedForkMigrations(through);
+const manifestNames = migrationManifest.map(([, name]) => name).toSorted();
+
+// The live fork ledger past its seeded foundation. Applied pairs never change; a sync only
+// appends the new upstream migrations, one id after their upstream id.
+const forkLedgerAfterFoundation: ReadonlyArray<readonly [number, string]> = [
+  [56, "ForkOrchestrationV2"],
+  [57, "RemoveRedundantProjectionIndexes"],
+  [58, "ScheduledTaskWebhooks"],
+  [59, "WebhookRelayDeliveries"],
+  [60, "McpAppModelContext"],
+  [61, "ThreadSnapshotWindowIndexes"],
+  [62, "PullRequestReviewGuides"],
+  [63, "ThreadFailureLookupIndex"],
+  [64, "DropUnusedV1Projections"],
+  [65, "CanonicalizeThreadPullRequestLinks"],
+  [66, "CodexUsageNativeTurnIndex"],
+  [67, "RepairClientSettlementTimestamps"],
+  [68, "WebhookDedupe"],
+  [69, "ShellStopRequestIndex"],
+  [70, "ThreadMessageSearch"],
+  [71, "PeerLinks"],
+  [72, "PeerLinkFence"],
+  [73, "WaitingLinkRequestIndex"],
+  [74, "ActiveTurnItemIndexes"],
+  [75, "ExcludeAttachmentPlaceholdersFromSearch"],
+  [76, "SubagentDeliveryState"],
+  [77, "ProjectionProjectsPinArchive"],
+  [78, "RepairBooleanSettledOverride"],
+  [79, "DropOrchestrationEventCorrelationIndex"],
+  [80, "DelegatedRecoveryIndexes"],
+  [81, "ScheduledTaskThreadMode"],
+  [82, "ProjectionMessageSearchText"],
+  [83, "TurnItemConversationIndex"],
+  [84, "CommandReadIndexes"],
+  [85, "LastExecutedRunIndex"],
+  [86, "TurnItemCounts"],
+  [87, "QueuedTurnInputIndex"],
+  [88, "ProjectionProjectsCustomTitle"],
+  [89, "TurnItemTypeStatusIndex"],
+  [90, "ShellThreadReadIndexes"],
+  [91, "AuthConnectDevices"],
+  [92, "AuthConnectDeniedRequests"],
+  [93, "QueuedTurnInputIndexJsonValid"],
+  [94, "ProviderTurnAttemptIndex"],
+  [95, "TurnItemMessageOrdinalIndex"],
+  [96, "TurnItemInlineWorkOutput"],
+  [97, "RepairStaleTitleRegeneration"],
+  [98, "IssueTrackerBindings"],
+  [99, "ActiveShellIndexIndexes"],
+  [100, "BackgroundRecoveryIndexes"],
+  [101, "TurnStartReadIndexes"],
+  [102, "DelegatedTaskReadIndexes"],
+  [103, "ThreadItemCounts"],
+  [104, "IssueTrackerAdditionalScopes"],
+  [105, "ProjectionProjectsTrackedFolders"],
+  [106, "TaskFolders"],
+  [107, "WorktreePathKeyIndex"],
+  [108, "DeferredSlashCommandIndex"],
+];
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 it.effect(
@@ -62,34 +109,7 @@ it.effect(
         const migrate = runMigrations().pipe(
           Effect.provide(NodeSqliteClient.layer({ filename: destination })),
         );
-        assert.deepEqual(yield* migrate, [
-          [56, "ForkOrchestrationV2"],
-          [57, "RemoveRedundantProjectionIndexes"],
-          [58, "ScheduledTaskWebhooks"],
-          [59, "WebhookRelayDeliveries"],
-          [60, "McpAppModelContext"],
-          [61, "ThreadSnapshotWindowIndexes"],
-          [62, "PullRequestReviewGuides"],
-          [63, "ThreadFailureLookupIndex"],
-          [64, "DropUnusedV1Projections"],
-          [65, "CanonicalizeThreadPullRequestLinks"],
-          [66, "CodexUsageNativeTurnIndex"],
-          [67, "RepairClientSettlementTimestamps"],
-          [68, "WebhookDedupe"],
-          [69, "ShellStopRequestIndex"],
-          [70, "ThreadMessageSearch"],
-          [71, "PeerLinks"],
-          [72, "PeerLinkFence"],
-          [73, "WaitingLinkRequestIndex"],
-          [74, "ActiveTurnItemIndexes"],
-          [75, "ExcludeAttachmentPlaceholdersFromSearch"],
-          [76, "SubagentDeliveryState"],
-          [77, "ProjectionProjectsPinArchive"],
-          [78, "RepairBooleanSettledOverride"],
-          [79, "DropOrchestrationEventCorrelationIndex"],
-          [80, "DelegatedRecoveryIndexes"],
-          [81, "ScheduledTaskThreadMode"],
-        ]);
+        assert.deepEqual(yield* migrate, forkLedgerAfterFoundation);
         // Each startup owns a fresh connection/layer.
         assert.deepEqual(yield* migrate, []);
         yield* initializeV2Database(destination);
@@ -176,34 +196,7 @@ it.effect("rolls back a failed fork foundation and retries from a fresh connecti
     }
     assert.deepEqual(
       yield* runMigrations().pipe(Effect.provide(NodeSqliteClient.layer({ filename }))),
-      [
-        [56, "ForkOrchestrationV2"],
-        [57, "RemoveRedundantProjectionIndexes"],
-        [58, "ScheduledTaskWebhooks"],
-        [59, "WebhookRelayDeliveries"],
-        [60, "McpAppModelContext"],
-        [61, "ThreadSnapshotWindowIndexes"],
-        [62, "PullRequestReviewGuides"],
-        [63, "ThreadFailureLookupIndex"],
-        [64, "DropUnusedV1Projections"],
-        [65, "CanonicalizeThreadPullRequestLinks"],
-        [66, "CodexUsageNativeTurnIndex"],
-        [67, "RepairClientSettlementTimestamps"],
-        [68, "WebhookDedupe"],
-        [69, "ShellStopRequestIndex"],
-        [70, "ThreadMessageSearch"],
-        [71, "PeerLinks"],
-        [72, "PeerLinkFence"],
-        [73, "WaitingLinkRequestIndex"],
-        [74, "ActiveTurnItemIndexes"],
-        [75, "ExcludeAttachmentPlaceholdersFromSearch"],
-        [76, "SubagentDeliveryState"],
-        [77, "ProjectionProjectsPinArchive"],
-        [78, "RepairBooleanSettledOverride"],
-        [79, "DropOrchestrationEventCorrelationIndex"],
-        [80, "DelegatedRecoveryIndexes"],
-        [81, "ScheduledTaskThreadMode"],
-      ],
+      forkLedgerAfterFoundation,
     );
   }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
@@ -301,36 +294,13 @@ it.effect.each([0, 32, 52, 53, 54].map((through) => ({ through })))(
   },
 );
 
+// 81 and later take the derived lineage: its first, a middle, and the current upstream head.
 it.effect.each([
   57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
+  81, 94, 107,
 ])("preserves official upstream webhook ledger through %s", (through) =>
   Effect.gen(function* () {
-    const official = [
-      ...migrationEntries.filter(([id]) => id <= 56),
-      ...migrationEntries
-        .filter(([id]) => id >= 58 && id <= 70)
-        .map(([id, name, migration]) => [id - 1, name, migration] as const),
-      [70, "PeerLinks", PeerLinks] as const,
-      [71, "PeerLinkFence", PeerLinkFence] as const,
-      [72, "WaitingLinkRequestIndex", WaitingLinkRequestIndex] as const,
-      [73, "ActiveTurnItemIndexes", ActiveTurnItemIndexes] as const,
-      [74, "ExcludeAttachmentPlaceholdersFromSearch", ExcludeAttachmentPlaceholders] as const,
-      [75, "SubagentDeliveryState", SubagentDeliveryState] as const,
-      [76, "ProjectionProjectsPinArchive", ProjectionProjectsPinArchive] as const,
-      [77, "RepairBooleanSettledOverride", RepairBooleanSettledOverride] as const,
-      [
-        78,
-        "DropOrchestrationEventCorrelationIndex",
-        DropOrchestrationEventCorrelationIndex,
-      ] as const,
-      [79, "DelegatedRecoveryIndexes", DelegatedRecoveryIndexes] as const,
-      [80, "ScheduledTaskThreadMode", ScheduledTaskThreadMode] as const,
-    ].filter(([id]) => id <= through);
-    yield* Migrator.make({})({
-      loader: Migrator.fromRecord(
-        Object.fromEntries(official.map(([id, name, migration]) => [`${id}_${name}`, migration])),
-      ),
-    });
+    yield* seedUpstreamMigrations(through);
     const sql = yield* SqlClient.SqlClient;
     const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
     const appContextRow = {
@@ -419,6 +389,11 @@ it.effect.each([
       history,
     );
     assert.deepEqual(yield* runMigrations(), []);
+    const ledger = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+      SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
+    `;
+    assert.equal(ledger.at(-1)?.migration_id, migrationManifest.at(-1)?.[0]);
+    assert.deepEqual(ledger.map((row) => row.name).toSorted(), manifestNames);
     assert.equal(
       (yield* sql`SELECT name FROM sqlite_master WHERE name = 'pull_request_review_guides'`).length,
       1,

@@ -3,6 +3,9 @@ import type {
   ExternalMcpServerConfig,
   ProviderInstanceId,
 } from "@t3tools/contracts";
+import { msg } from "gt-react";
+
+import { m, type MessageResolver } from "../../i18n/messages";
 
 const SERVER_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
 const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
@@ -62,14 +65,20 @@ export function keepsStoredSecret(header: HeaderDraft): boolean {
   );
 }
 
-function urlProblem(value: string): string | null {
-  if (!value) return "Enter the server's URL.";
-  if (!URL.canParse(value)) return "Enter a full URL, such as https://example.com/mcp.";
+function urlProblem(value: string, resolve: MessageResolver): string | null {
+  if (!value) return resolve(msg("Enter the server's URL."));
+  if (!URL.canParse(value)) {
+    return resolve(
+      msg("Enter a full URL, such as {example}.", { example: "https://example.com/mcp" }),
+    );
+  }
   const url = new URL(value);
-  if (url.username || url.password) return "Put credentials in a secret header, not the URL.";
+  if (url.username || url.password) {
+    return resolve(msg("Put credentials in a secret header, not the URL."));
+  }
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
   if (url.protocol === "https:" || (url.protocol === "http:" && loopback)) return null;
-  return "Use HTTPS. Plain HTTP works only for localhost.";
+  return resolve(msg("Use HTTPS. Plain HTTP works only for localhost."));
 }
 
 const scopeList = (scopes: string) => scopes.split(/[\s,]+/u).filter(Boolean);
@@ -79,35 +88,44 @@ export function validate(
   draft: ExternalMcpServerDraft,
   takenIds: ReadonlySet<string>,
   isNew: boolean,
+  resolve: MessageResolver = m,
 ): string | null {
   if (isNew) {
     if (!SERVER_ID_PATTERN.test(draft.id)) {
-      return "The ID starts with a letter and uses up to 64 letters, digits, - or _.";
+      return resolve(msg("The ID starts with a letter and uses up to 64 letters, digits, - or _."));
     }
-    if (draft.id === "t3-code") return "t3-code is reserved for T3 Code's own server.";
-    if (takenIds.has(draft.id)) return `A server named ${draft.id} already exists.`;
+    if (draft.id === "t3-code") {
+      return resolve(msg("{id} is reserved for T3 Code's own server.", { id: "t3-code" }));
+    }
+    if (takenIds.has(draft.id)) {
+      return resolve(msg("A server named {id} already exists.", { id: draft.id }));
+    }
   }
-  const problem = urlProblem(draft.url.trim());
+  const problem = urlProblem(draft.url.trim(), resolve);
   if (problem) return problem;
   if (draft.auth === "oauth") {
-    if (draft.clientId.trim().length > 512) return "The client ID is too long.";
+    if (draft.clientId.trim().length > 512) return resolve(msg("The client ID is too long."));
     if (scopeList(draft.scopes).some((scope) => scope.length > 256)) {
-      return "A scope is too long.";
+      return resolve(msg("A scope is too long."));
     }
   }
   const names = new Set<string>();
   for (const header of draft.headers) {
     const name = header.name.trim();
     if (!HEADER_NAME_PATTERN.test(name) || name.length > 128) {
-      return `"${name || "(empty)"}" is not a header name.`;
+      return name
+        ? resolve(msg('"{name}" is not a header name.', { name }))
+        : resolve(msg('"(empty)" is not a header name.'));
     }
-    if (names.has(name.toLowerCase())) return `The ${name} header is listed twice.`;
+    if (names.has(name.toLowerCase())) {
+      return resolve(msg("The {name} header is listed twice.", { name }));
+    }
     names.add(name.toLowerCase());
     if (draft.auth === "oauth" && name.toLowerCase() === "authorization") {
-      return "With OAuth, sign-in provides the Authorization header. Remove it.";
+      return resolve(msg("With OAuth, sign-in provides the Authorization header. Remove it."));
     }
     if (header.storedSecretName !== null && !keepsStoredSecret(header) && !header.value) {
-      return `Enter the value of ${name} again, or remove the header.`;
+      return resolve(msg("Enter the value of {name} again, or remove the header.", { name }));
     }
   }
   return null;

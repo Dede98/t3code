@@ -1,6 +1,11 @@
 import * as Migrator from "effect/sql/Migrator";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
+import {
+  DATABASE_MIGRATION_PROGRESS_MESSAGE,
+  DATABASE_MIGRATIONS_FINISHED_MESSAGE,
+  DATABASE_MIGRATIONS_STARTED_MESSAGE,
+} from "@t3tools/shared/databaseMigrationLog";
 
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
 import Migration0002 from "./Migrations/002_OrchestrationCommandReceipts.ts";
@@ -83,6 +88,69 @@ import Migration0077 from "./Migrations/077_RepairBooleanSettledOverride.ts";
 import Migration0078 from "./Migrations/078_DropOrchestrationEventCorrelationIndex.ts";
 import Migration0079 from "./Migrations/079_DelegatedRecoveryIndexes.ts";
 import Migration0080 from "./Migrations/080_ScheduledTaskThreadMode.ts";
+import Migration0081 from "./Migrations/081_ProjectionMessageSearchText.ts";
+import Migration0082 from "./Migrations/082_TurnItemConversationIndex.ts";
+import Migration0083 from "./Migrations/083_CommandReadIndexes.ts";
+import Migration0084 from "./Migrations/084_LastExecutedRunIndex.ts";
+import Migration0085 from "./Migrations/085_TurnItemCounts.ts";
+import Migration0086 from "./Migrations/086_QueuedTurnInputIndex.ts";
+import Migration0087 from "./Migrations/087_ProjectionProjectsCustomTitle.ts";
+import Migration0088 from "./Migrations/088_TurnItemTypeStatusIndex.ts";
+import Migration0089 from "./Migrations/089_ShellThreadReadIndexes.ts";
+import Migration0090 from "./Migrations/090_AuthConnectDevices.ts";
+import Migration0091 from "./Migrations/091_AuthConnectDeniedRequests.ts";
+import Migration0092 from "./Migrations/092_QueuedTurnInputIndexJsonValid.ts";
+import Migration0093 from "./Migrations/093_ProviderTurnAttemptIndex.ts";
+import Migration0094 from "./Migrations/094_TurnItemMessageOrdinalIndex.ts";
+import Migration0095 from "./Migrations/095_TurnItemInlineWorkOutput.ts";
+import Migration0096 from "./Migrations/096_RepairStaleTitleRegeneration.ts";
+import Migration0097 from "./Migrations/097_IssueTrackerBindings.ts";
+import Migration0098 from "./Migrations/098_ActiveShellIndexIndexes.ts";
+import Migration0099 from "./Migrations/099_BackgroundRecoveryIndexes.ts";
+import Migration0100 from "./Migrations/100_TurnStartReadIndexes.ts";
+import Migration0101 from "./Migrations/101_DelegatedTaskReadIndexes.ts";
+import Migration0102 from "./Migrations/102_ThreadItemCounts.ts";
+import Migration0103 from "./Migrations/103_IssueTrackerAdditionalScopes.ts";
+import Migration0104 from "./Migrations/104_ProjectionProjectsTrackedFolders.ts";
+import Migration0105 from "./Migrations/105_TaskFolders.ts";
+import Migration0106 from "./Migrations/106_WorktreePathKeyIndex.ts";
+import Migration0107 from "./Migrations/107_DeferredSlashCommandIndex.ts";
+
+// Upstream migrations after 080, at upstream ids. A sync adds new ones here only: every
+// lineage below appends them one id later, because ClaudeSessionStore took a slot before them.
+const laterUpstreamMigrationEntries = [
+  [81, "ProjectionMessageSearchText", Migration0081],
+  [82, "TurnItemConversationIndex", Migration0082],
+  [83, "CommandReadIndexes", Migration0083],
+  [84, "LastExecutedRunIndex", Migration0084],
+  [85, "TurnItemCounts", Migration0085],
+  [86, "QueuedTurnInputIndex", Migration0086],
+  [87, "ProjectionProjectsCustomTitle", Migration0087],
+  [88, "TurnItemTypeStatusIndex", Migration0088],
+  [89, "ShellThreadReadIndexes", Migration0089],
+  [90, "AuthConnectDevices", Migration0090],
+  [91, "AuthConnectDeniedRequests", Migration0091],
+  [92, "QueuedTurnInputIndexJsonValid", Migration0092],
+  [93, "ProviderTurnAttemptIndex", Migration0093],
+  [94, "TurnItemMessageOrdinalIndex", Migration0094],
+  [95, "TurnItemInlineWorkOutput", Migration0095],
+  [96, "RepairStaleTitleRegeneration", Migration0096],
+  [97, "IssueTrackerBindings", Migration0097],
+  [98, "ActiveShellIndexIndexes", Migration0098],
+  [99, "BackgroundRecoveryIndexes", Migration0099],
+  [100, "TurnStartReadIndexes", Migration0100],
+  [101, "DelegatedTaskReadIndexes", Migration0101],
+  [102, "ThreadItemCounts", Migration0102],
+  [103, "IssueTrackerAdditionalScopes", Migration0103],
+  [104, "ProjectionProjectsTrackedFolders", Migration0104],
+  [105, "TaskFolders", Migration0105],
+  [106, "WorktreePathKeyIndex", Migration0106],
+  [107, "DeferredSlashCommandIndex", Migration0107],
+] as const;
+
+const shiftedLaterMigrationEntries = laterUpstreamMigrationEntries.map(
+  ([id, name, migration]) => [id + 1, name, migration] as const,
+);
 
 export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -167,6 +235,7 @@ export const migrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // These are ledger lineages, not aliases for migration numbers. Once applied,
@@ -208,6 +277,7 @@ export const forkMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 export const forkIntegrationMigrationEntries = [
@@ -239,6 +309,7 @@ export const forkIntegrationMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamIntegrationMigrationEntries = [
@@ -271,6 +342,7 @@ const upstreamIntegrationMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const preview54MigrationEntries = [
@@ -303,6 +375,7 @@ const preview54MigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const preview53MigrationEntries = [
@@ -336,6 +409,7 @@ const preview53MigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamWebhookMigrationEntries = [
@@ -365,6 +439,7 @@ const upstreamWebhookMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Official upstream databases may already have the app migrations at 59/60.
@@ -394,6 +469,7 @@ const upstreamMcpAppMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Upstream databases that already applied review guides keep that id/name pair.
@@ -420,6 +496,7 @@ const upstreamReviewGuideMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Official upstream databases may already have the failure index at 62.
@@ -446,6 +523,7 @@ const upstreamFailureIndexMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Official databases may have used 63/64 before ever opening in the fork.
@@ -471,6 +549,7 @@ const upstreamDropProjectionsMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamCanonicalLinksMigrationEntries = [
@@ -493,6 +572,7 @@ const upstreamCanonicalLinksMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamUsageIndexMigrationEntries = [
@@ -514,6 +594,7 @@ const upstreamUsageIndexMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamSettlementMigrationEntries = [
@@ -534,6 +615,7 @@ const upstreamSettlementMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Official upstream databases may already have webhook dedupe at 67.
@@ -554,6 +636,7 @@ const upstreamWebhookDedupeMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Official upstream databases may already have the shell stop index at 68.
@@ -573,6 +656,7 @@ const upstreamShellStopIndexMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Official upstream databases may already have message search at 69.
@@ -591,6 +675,7 @@ const upstreamThreadMessageSearchMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Keep official peer-link ledger entries and append the missing Claude store.
@@ -608,6 +693,7 @@ const upstreamPeerLinksMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamPeerLinkFenceMigrationEntries = [
@@ -623,6 +709,7 @@ const upstreamPeerLinkFenceMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamWaitingLinkRequestMigrationEntries = [
@@ -637,6 +724,7 @@ const upstreamWaitingLinkRequestMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamActiveTurnItemIndexesMigrationEntries = [
@@ -650,6 +738,7 @@ const upstreamActiveTurnItemIndexesMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Official upstream databases may already have 074-077 before opening in the fork.
@@ -663,6 +752,7 @@ const upstreamAttachmentSearchMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamSubagentDeliveryMigrationEntries = [
@@ -674,6 +764,7 @@ const upstreamSubagentDeliveryMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamProjectPinArchiveMigrationEntries = [
@@ -684,6 +775,7 @@ const upstreamProjectPinArchiveMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamSettledOverrideRepairMigrationEntries = [
@@ -693,6 +785,7 @@ const upstreamSettledOverrideRepairMigrationEntries = [
   [79, "DropOrchestrationEventCorrelationIndex", Migration0078],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 const upstreamDropCorrelationIndexMigrationEntries = [
@@ -701,6 +794,7 @@ const upstreamDropCorrelationIndexMigrationEntries = [
   [79, "ClaudeSessionStore", ClaudeSessionStore],
   [80, "DelegatedRecoveryIndexes", Migration0079],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Official upstream databases may already have delegated recovery indexes at 79.
@@ -709,6 +803,7 @@ const upstreamDelegatedRecoveryIndexesMigrationEntries = [
   [79, "DelegatedRecoveryIndexes", Migration0079],
   [80, "ClaudeSessionStore", ClaudeSessionStore],
   [81, "ScheduledTaskThreadMode", Migration0080],
+  ...shiftedLaterMigrationEntries,
 ] as const;
 
 // Official upstream databases may already have the scheduled task thread mode at 80.
@@ -716,14 +811,23 @@ const upstreamScheduledTaskThreadModeMigrationEntries = [
   ...upstreamDelegatedRecoveryIndexesMigrationEntries.filter(([id]) => id <= 79),
   [80, "ScheduledTaskThreadMode", Migration0080],
   [81, "ClaudeSessionStore", ClaudeSessionStore],
+  ...shiftedLaterMigrationEntries,
 ] as const;
+
+// Official upstream databases at head 81 or later keep their ids up to that head. The Claude
+// store follows it, and the rest of the later migrations run one id after their upstream id.
+const upstreamHeadMigrationEntries = (head: number) => [
+  ...upstreamScheduledTaskThreadModeMigrationEntries.filter(([id]) => id <= 80),
+  ...laterUpstreamMigrationEntries.filter(([id]) => id <= head),
+  [head + 1, "ClaudeSessionStore", ClaudeSessionStore] as const,
+  ...shiftedLaterMigrationEntries.filter(([id]) => id > head + 1),
+];
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
 
-const makeMigrationLoader = (
-  entries: ReadonlyArray<readonly [number, string, (typeof migrationEntries)[number][2]]>,
-  throughId?: number,
-) =>
+type MigrationEntry = readonly [number, string, (typeof migrationEntries)[number][2]];
+
+const makeMigrationLoader = (entries: ReadonlyArray<MigrationEntry>, throughId?: number) =>
   Migrator.fromRecord(
     Object.fromEntries(
       entries
@@ -737,19 +841,20 @@ const makeMigrationLoader = (
 // of its ids from 55 on.
 const FIRST_V2_MIGRATION_ID = 55;
 
+type RecordedMigration = { readonly id: number; readonly name: string };
+
 /**
- * Fail before migrating when the migrator would skip one of the selected lineage's migrations
- * from V2 on: it skips every id up to the highest recorded one, whatever name was recorded.
- * Earlier ids keep the warning below; databases with a site-local migration there still work.
+ * The selected lineage's migrations from V2 on that the migrator would skip: it skips every id
+ * up to the highest recorded one, whatever name was recorded. Earlier ids only get the warning
+ * in runMigrations; databases with a site-local migration there still work.
  */
-const assertV2MigrationsCanRun = Effect.fn("assertV2MigrationsCanRun")(function* (
-  entries: ReadonlyArray<readonly [number, string, unknown]>,
-  recorded: ReadonlyArray<{ readonly migration_id: number; readonly name: string }>,
+export function skippedV2Migrations(
+  recorded: ReadonlyArray<RecordedMigration>,
   throughId?: number,
-) {
-  const latestRecordedId = Math.max(0, ...recorded.map((row) => row.migration_id));
-  const recordedNames = new Map(recorded.map((row) => [row.migration_id, row.name]));
-  const skipped = entries.flatMap(([id, name]) => {
+): string[] {
+  const latestRecordedId = Math.max(0, ...recorded.map((row) => row.id));
+  const recordedNames = new Map(recorded.map((row) => [row.id, row.name]));
+  return selectMigrationEntries(recorded).flatMap(([id, name]) => {
     if (
       id < FIRST_V2_MIGRATION_ID ||
       id > latestRecordedId ||
@@ -757,14 +862,38 @@ const assertV2MigrationsCanRun = Effect.fn("assertV2MigrationsCanRun")(function*
     )
       return [];
     const recordedName = recordedNames.get(id);
-    if (recordedName === name) return [];
-    return [`${id}_${name} (recorded: ${recordedName ?? "nothing"})`];
+    return recordedName === name ? [] : [`${id}_${name} (recorded: ${recordedName ?? "nothing"})`];
   });
+}
+
+// Migrators skip ids up to the highest recorded; reject collisions that would skip V2 schema.
+const assertV2MigrationsCanRun = Effect.fn("assertV2MigrationsCanRun")(function* (
+  recorded: ReadonlyArray<RecordedMigration>,
+  throughId?: number,
+) {
+  const skipped = skippedV2Migrations(recorded, throughId);
   if (skipped.length === 0) return;
+  const latestRecordedId = Math.max(0, ...recorded.map((row) => row.id));
   return yield* new Migrator.MigrationError({
     kind: "BadState",
     message: `This database's migration history would skip required schema migrations: ${skipped.join(", ")}. The migrator skips every id up to the highest recorded id (${latestRecordedId}), regardless of name. It was probably written by a different build. Start the build that wrote it, or report this migration history so an upgrade path can be added.`,
   });
+});
+
+const latestMigrationId = Math.max(...migrationEntries.map(([id]) => id));
+
+// Mirrors the Migrator, which runs only ids above the highest recorded. Every lineage ends at
+// the same id, and preview ledgers are selected as lineages instead of being rewritten.
+export const hasPendingMigrations = Effect.fn("hasPendingMigrations")(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const tables = yield* sql`
+    SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'
+  `;
+  if (tables.length === 0) return true;
+  const rows = yield* sql<{ readonly latestId: number | null }>`
+    SELECT MAX(migration_id) AS latestId FROM effect_sql_migrations
+  `;
+  return (rows[0]?.latestId ?? 0) < latestMigrationId;
 });
 
 const run = Migrator.make({});
@@ -773,11 +902,21 @@ export interface RunMigrationsOptions {
   readonly toMigrationInclusive?: number | undefined;
 }
 
+// An official ledger past 80 matches the later upstream ids up to its head, where the fork's
+// Claude store then follows. Ids there are contiguous from 81, so the first miss gives the head.
+function selectLaterUpstreamMigrationEntries(has: (id: number, name: string) => boolean) {
+  const missing = laterUpstreamMigrationEntries.findIndex(([id, name]) => !has(id, name));
+  const head = 80 + (missing === -1 ? laterUpstreamMigrationEntries.length : missing);
+  return head === 80
+    ? upstreamScheduledTaskThreadModeMigrationEntries
+    : upstreamHeadMigrationEntries(head);
+}
+
 function selectMigrationEntries(
-  recorded: ReadonlyArray<{ readonly migration_id: number; readonly name: string }>,
-) {
+  recorded: ReadonlyArray<RecordedMigration>,
+): ReadonlyArray<MigrationEntry> {
   const has = (id: number, name: string) =>
-    recorded.some((row) => row.migration_id === id && row.name === name);
+    recorded.some((row) => row.id === id && row.name === name);
   return has(33, "ClaudeSessionStore")
     ? has(55, "ForkOrchestrationV2")
       ? forkIntegrationMigrationEntries
@@ -809,7 +948,7 @@ function selectMigrationEntries(
                                               ? has(78, "DropOrchestrationEventCorrelationIndex")
                                                 ? has(79, "DelegatedRecoveryIndexes")
                                                   ? has(80, "ScheduledTaskThreadMode")
-                                                    ? upstreamScheduledTaskThreadModeMigrationEntries
+                                                    ? selectLaterUpstreamMigrationEntries(has)
                                                     : upstreamDelegatedRecoveryIndexesMigrationEntries
                                                   : upstreamDropCorrelationIndexMigrationEntries
                                                 : upstreamSettledOverrideRepairMigrationEntries
@@ -839,25 +978,26 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
 }: RunMigrationsOptions = {}) {
   const sql = yield* SqlClient.SqlClient;
-  const ledger = yield* sql`SELECT name FROM sqlite_master WHERE name = 'effect_sql_migrations'`;
+  const ledger = yield* sql`
+    SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'
+  `;
   const recorded =
     ledger.length === 0
       ? []
-      : yield* sql<{
-          readonly migration_id: number;
-          readonly name: string;
-        }>`SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id`;
+      : yield* sql<RecordedMigration>`
+          SELECT migration_id AS id, name FROM effect_sql_migrations ORDER BY migration_id
+        `;
   const entries = selectMigrationEntries(recorded);
-  yield* assertV2MigrationsCanRun(entries, recorded, toMigrationInclusive);
+  yield* assertV2MigrationsCanRun(recorded, toMigrationInclusive);
   const expected = new Map<number, string>(entries.map(([id, name]) => [id, name]));
   // Select known fork/preview lineages without rewriting their ledger. Preserve
   // upstream's diagnostic behavior for site-local migrations sharing an id.
   const divergent = recorded.flatMap((row) => {
-    const name = expected.get(row.migration_id);
+    const name = expected.get(row.id);
     return name === row.name
       ? []
       : [
-          `${row.migration_id}:${row.name} (${name === undefined ? "unknown to this build" : `this build: ${name}`})`,
+          `${row.id}:${row.name} (${name === undefined ? "unknown to this build" : `this build: ${name}`})`,
         ];
   });
   if (divergent.length > 0) {
@@ -865,35 +1005,45 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
       "Database migration history diverges from this build; recorded migration ids are skipped, not reconciled by name.",
     ).pipe(Effect.annotateLogs({ divergent }));
   }
-  const executedMigrations = yield* run({
-    loader: makeMigrationLoader(entries, toMigrationInclusive),
-  });
-  // Effect's migrator treats every ledger constraint failure as a concurrent
-  // runner and returns []. Verify progress so a rejected insert cannot let the
-  // server start against an unupgraded schema. A successful competing runner
-  // has already committed these rows and satisfies the same check.
-  const previousId = recorded.at(-1)?.migration_id ?? 0;
+  const latestRecordedId = recorded.at(-1)?.id ?? 0;
   const pending = entries.filter(
-    ([id]) => id > previousId && (toMigrationInclusive === undefined || id <= toMigrationInclusive),
+    ([id]) =>
+      id > latestRecordedId && (toMigrationInclusive === undefined || id <= toMigrationInclusive),
   );
-  if (pending.length > 0 && executedMigrations.length === 0) {
-    const completed = yield* sql<{
-      readonly migration_id: number;
-      readonly name: string;
-    }>`SELECT migration_id, name FROM effect_sql_migrations WHERE migration_id > ${previousId}`;
-    const missing = pending.filter(
-      ([id, name]) => !completed.some((row) => row.migration_id === id && row.name === name),
-    );
-    if (missing.length > 0) {
-      return yield* new Migrator.MigrationError({
-        kind: "Failed",
-        message: `Database migrations did not complete: ${missing.map(([id, name]) => `${id}_${name}`).join(", ")}`,
-      });
+  // The desktop waits past its readiness budget until the finished line follows this one.
+  if (pending.length > 0) yield* Effect.log(DATABASE_MIGRATIONS_STARTED_MESSAGE);
+  // One transaction per migration: an index build on a large database can take minutes, and a
+  // restart then resumes after the last finished migration instead of rolling all of them back.
+  const executedMigrations: Array<readonly [id: number, name: string]> = [];
+  for (const [index, [id, name]] of pending.entries()) {
+    if (latestRecordedId > 0) {
+      yield* Effect.log(DATABASE_MIGRATION_PROGRESS_MESSAGE).pipe(
+        Effect.annotateLogs({
+          migration: `${id}_${name}`,
+          progress: `${index + 1} of ${pending.length}`,
+        }),
+      );
     }
+    const executed = yield* run({ loader: makeMigrationLoader(entries, id) });
+    // Effect's migrator treats every ledger constraint failure as a concurrent runner and
+    // returns []. A competing runner has committed this row; a rejected insert has not, and
+    // must not let the server start against an unupgraded schema.
+    if (executed.length === 0) {
+      const completed = yield* sql`
+        SELECT 1 FROM effect_sql_migrations WHERE migration_id = ${id} AND name = ${name}
+      `;
+      if (completed.length === 0) {
+        return yield* new Migrator.MigrationError({
+          kind: "Failed",
+          message: `Database migration did not complete: ${id}_${name}`,
+        });
+      }
+    }
+    executedMigrations.push(...executed);
   }
   const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
   yield* migrations.length === 0
     ? Effect.logDebug("Database schema is current")
-    : Effect.log("Migrations ran successfully").pipe(Effect.annotateLogs({ migrations }));
+    : Effect.log(DATABASE_MIGRATIONS_FINISHED_MESSAGE).pipe(Effect.annotateLogs({ migrations }));
   return executedMigrations;
 });
