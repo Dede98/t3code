@@ -253,9 +253,11 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           );
           yield* writeTextFile(path.join(sharedHome, "auth.json"), '{"shared":true}\n');
           yield* writeTextFile(path.join(sharedHome, "auth.lock"), "");
+          yield* writeTextFile(path.join(sharedHome, "auth.json.lock"), "");
           yield* fileSystem.makeDirectory(shadowHome, { recursive: true });
           yield* writeTextFile(path.join(shadowHome, "auth.json"), '{"shadow":true}\n');
           yield* writeTextFile(path.join(shadowHome, "auth.lock"), "");
+          yield* writeTextFile(path.join(shadowHome, "auth.json.lock"), "");
           yield* fileSystem.symlink(
             path.join(sharedHome, "models_cache.json"),
             path.join(shadowHome, "models_cache.json"),
@@ -285,6 +287,9 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           const authLockLinkResult = yield* fileSystem
             .readLink(path.join(shadowHome, "auth.lock"))
             .pipe(Effect.result);
+          const authJsonLockLinkResult = yield* fileSystem
+            .readLink(path.join(shadowHome, "auth.json.lock"))
+            .pipe(Effect.result);
 
           expect(sessionsTarget).toBe(path.join(sharedHome, "sessions"));
           expect(configTarget).toBe(path.join(sharedHome, "config.toml"));
@@ -308,6 +313,7 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           expect(authLinkResult._tag).toBe("Failure");
           expect(authContents).toContain("shadow");
           expect(authLockLinkResult._tag).toBe("Failure");
+          expect(authJsonLockLinkResult._tag).toBe("Failure");
         }),
     );
 
