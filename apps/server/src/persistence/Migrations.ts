@@ -115,6 +115,10 @@ import Migration0104 from "./Migrations/104_ProjectionProjectsTrackedFolders.ts"
 import Migration0105 from "./Migrations/105_TaskFolders.ts";
 import Migration0106 from "./Migrations/106_WorktreePathKeyIndex.ts";
 import Migration0107 from "./Migrations/107_DeferredSlashCommandIndex.ts";
+import Migration0108 from "./Migrations/108_AgentFeedback.ts";
+import Migration0109 from "./Migrations/109_IssueTrackerAccounts.ts";
+import Migration0110 from "./Migrations/110_Workflows.ts";
+import Migration0111 from "./Migrations/111_SupersededRunAttemptIndex.ts";
 
 // Upstream migrations after 080, at upstream ids. A sync adds new ones here only: every
 // lineage below appends them one id later, because ClaudeSessionStore took a slot before them.
@@ -146,6 +150,10 @@ const laterUpstreamMigrationEntries = [
   [105, "TaskFolders", Migration0105],
   [106, "WorktreePathKeyIndex", Migration0106],
   [107, "DeferredSlashCommandIndex", Migration0107],
+  [108, "AgentFeedback", Migration0108],
+  [109, "IssueTrackerAccounts", Migration0109],
+  [110, "Workflows", Migration0110],
+  [111, "SupersededRunAttemptIndex", Migration0111],
 ] as const;
 
 const shiftedLaterMigrationEntries = laterUpstreamMigrationEntries.map(

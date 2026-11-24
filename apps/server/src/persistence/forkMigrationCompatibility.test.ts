@@ -72,6 +72,10 @@ const forkLedgerAfterFoundation: ReadonlyArray<readonly [number, string]> = [
   [106, "TaskFolders"],
   [107, "WorktreePathKeyIndex"],
   [108, "DeferredSlashCommandIndex"],
+  [109, "AgentFeedback"],
+  [110, "IssueTrackerAccounts"],
+  [111, "Workflows"],
+  [112, "SupersededRunAttemptIndex"],
 ];
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
