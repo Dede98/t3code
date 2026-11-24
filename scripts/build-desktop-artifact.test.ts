@@ -574,6 +574,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         false,
         undefined,
         undefined,
+        false,
+        undefined,
       );
 
       assert.nestedPropertyVal(linux, "linux.desktop.entry.StartupWMClass", "com.t3tools.T3Code");
@@ -583,9 +585,17 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
   it.effect("names updatable AppImages without a version and apart per channel", () =>
     Effect.gen(function* () {
       const appImageName = (version: string) =>
-        createBuildConfig("linux", "AppImage", version, false, false, undefined, undefined).pipe(
-          Effect.map((config) => (config.appImage as { artifactName: string }).artifactName),
-        );
+        createBuildConfig(
+          "linux",
+          "AppImage",
+          version,
+          false,
+          false,
+          undefined,
+          undefined,
+          false,
+          undefined,
+        ).pipe(Effect.map((config) => (config.appImage as { artifactName: string }).artifactName));
 
       const stable = yield* appImageName("0.0.37");
       const nightly = yield* appImageName("0.0.38-nightly.20261026.3740");
@@ -613,6 +623,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
             signed,
             false,
             undefined,
+            undefined,
+            false,
             undefined,
           );
           const mac = config.mac as { extendInfo: Record<string, unknown> };
