@@ -26,6 +26,7 @@ import {
   shouldRecedeSidebarThread,
   sortInboxThreadsByReturn,
   resolveSidebarDropTarget,
+  resolveSidebarThreadSection,
   planSidebarThreadDrop,
   resolveSidebarReorderableThreadKeys,
   sortPinnedThreadsForSidebar,
@@ -1206,6 +1207,44 @@ describe("Working shelf (beta)", () => {
       expect(resolveSidebarDropVerb("active", "working")).toBeNull();
     });
 
+    it("shelves an agent-started thread unless it is pinned, snoozed or settled", () => {
+      const base = { snoozed: false, settled: false, pinned: false, agentStarted: true };
+      expect(resolveSidebarThreadSection(base)).toBe("agent");
+      expect(resolveSidebarThreadSection({ ...base, pinned: true })).toBe("pinned");
+      expect(resolveSidebarThreadSection({ ...base, settled: true })).toBe("settled");
+      expect(resolveSidebarThreadSection({ ...base, snoozed: true })).toBe("snoozed");
+      expect(resolveSidebarThreadSection({ ...base, agentStarted: false })).toBe("active");
+    });
+
+    it("never drops into the agent threads shelf, nor moves its rows by drag", () => {
+      const withAgent: readonly SidebarListItem[] = [
+        ...items.slice(0, 5),
+        marker("agent-header"),
+        row("g1", "agent"),
+        ...items.slice(7),
+      ];
+      expect(resolveSidebarDropTarget(withAgent, "a1", "g1")).toBeNull();
+      expect(resolveSidebarDropTarget(withAgent, "p1", "a2")?.activeOrder).toEqual([
+        "a1",
+        "a2",
+        "p1",
+      ]);
+      expect(resolveSidebarDropVerb("active", "agent")).toBeNull();
+      const target = resolveSidebarDropTarget(withAgent, "g1", "p1");
+      expect(target?.section).toBe("pinned");
+      expect(
+        planSidebarThreadDrop({
+          activeKey: "g1",
+          activeSection: "agent",
+          target: target!,
+          pinnedOrder: ["p1"],
+          pinnedKeysById: new Map([["p1", "m"]]),
+          activeOrder: ["a1", "a2"],
+          activeKeysById: new Map(),
+        }),
+      ).toEqual({ kind: "none" });
+    });
+
     it.each([
       ["pinned", "p1"],
       ["active", "a2"],
@@ -1565,6 +1604,26 @@ describe("Working shelf (beta)", () => {
         unsettle: false,
         unsnooze: false,
       });
+      // Also every drop of an agent-started thread: its shelf keeps no order.
+      for (const [activeSection, lifecycle] of [
+        ["settled", { unsettle: true, unsnooze: false }],
+        ["snoozed", { unsettle: false, unsnooze: true }],
+      ] as const) {
+        expect(
+          planSidebarThreadDrop({
+            ...base,
+            activeKey: "x1",
+            activeSection,
+            target: { section: "active", pinnedOrder: ["p1"], activeOrder: ["a1", "x1", "a2"] },
+          }),
+        ).toEqual({
+          kind: "move-active",
+          order: null,
+          assignments: [],
+          unpin: false,
+          ...lifecycle,
+        });
+      }
     });
   });
 });

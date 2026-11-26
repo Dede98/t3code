@@ -139,6 +139,10 @@ it.effect("resets a fork's pin, snooze, settle and delegation state but keeps it
     const linkOrigin = { sessionId: "mcp-session:fork-source", label: "Linked laptop" };
     const sourceThread: OrchestrationV2AppThread = {
       ...makeSourceThread(),
+      lineage: {
+        ...makeSourceThread().lineage,
+        launchedByThreadId: ThreadId.make("thread:agent-starter"),
+      },
       lastSnoozeWakeAt: snoozedAt,
       pinnedAt: snoozedAt,
       pinOrderKey: "a0",

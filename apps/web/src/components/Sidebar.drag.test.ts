@@ -32,15 +32,22 @@ function layout(
   over: string,
   scale = 1,
   cardHeight = 82,
+  pinned: { rowHeight?: number; headerHeight?: number } = {},
 ) {
   let top = 100;
   const rects = items.map((item) => {
     const height =
       item.kind === "thread"
-        ? (item.section === "pinned" || item.section === "active" ? cardHeight : 36) * scale
-        : item.marker === "pinned-header" || item.marker === "pinned-divider"
-          ? 0
-          : (item.marker.endsWith("placeholder") ? 0 : 32) * scale;
+        ? (item.section === "pinned"
+            ? (pinned.rowHeight ?? cardHeight)
+            : item.section === "active" || item.section === "agent"
+              ? cardHeight
+              : 36) * scale
+        : item.marker === "pinned-header"
+          ? (pinned.headerHeight ?? 0)
+          : item.marker === "pinned-divider"
+            ? 0
+            : (item.marker.endsWith("placeholder") ? 0 : 32) * scale;
     const rect = { top, height, bottom: top + height, left: 0, right: 260, width: 260 };
     top += height + 1;
     return rect;
@@ -60,9 +67,10 @@ function preview(
   active: string,
   over: string,
   scale = 1,
+  pinned: Parameters<typeof layout>[5] = {},
 ) {
   const strategy = createSidebarSortingStrategy(input);
-  const args = layout(input.items, active, over, scale);
+  const args = layout(input.items, active, over, scale, 82, pinned);
   return new Map(
     input.items.map((item, index) => [sidebarListItemId(item), strategy({ ...args, index })]),
   );
@@ -528,6 +536,63 @@ describe("sidebar drag projection", () => {
     expect(byTime.get("a2")?.y).toBe(-83);
     expect(byTime.get(sidebarMarkerId("working-header"))).toEqual(stationary);
     expect(byTime.get("w")).toEqual(stationary);
+  });
+
+  it("keeps the agent threads shelf in place below a drag", () => {
+    const items = [
+      pinnedHeader,
+      thread("p", "pinned"),
+      divider,
+      thread("a1", "active"),
+      thread("a2", "active"),
+      marker("agent-header"),
+      thread("g", "agent"),
+      settledHeader,
+      marker("settled-placeholder"),
+    ];
+    const result = preview({ items, settledOrder: [], settledExpanded: false }, "a2", "a1");
+    expect(result.get("a1")?.y).toBe(83);
+    expect(result.get(sidebarMarkerId("agent-header"))).toEqual(stationary);
+    expect(result.get("g")).toEqual(stationary);
+  });
+
+  it("leaves rows where they rest under a Pinned header that already shows", () => {
+    const items = [
+      pinnedHeader,
+      thread("p", "pinned"),
+      divider,
+      thread("a1", "active"),
+      thread("a2", "active"),
+      settledHeader,
+      thread("s", "settled"),
+    ];
+    const result = preview(
+      { items, settledOrder: [], settledExpanded: true, boundaryLabelHeight: 24 },
+      "a2",
+      "a1",
+      1,
+      { headerHeight: 32 },
+    );
+    expect(result.get("p")?.y).toBe(0);
+    expect(result.get(sidebarMarkerId("pinned-divider"))?.y).toBe(0);
+    expect(result.get("a1")?.y).toBe(24 + 83);
+  });
+
+  it("sizes a row moving into Pinned as a compact pinned card", () => {
+    const items = [
+      pinnedHeader,
+      thread("p", "pinned"),
+      divider,
+      thread("a1", "active"),
+      thread("a2", "active"),
+      settledHeader,
+      thread("s", "settled"),
+    ];
+    const result = preview({ items, settledOrder: [], settledExpanded: true }, "a1", "p", 1, {
+      rowHeight: 56,
+    });
+    expect(result.get("p")?.y).toBe(57);
+    expect(result.get("a2")?.y).toBe(56 - 82);
   });
 
   it("updates the projection when the target or measured geometry changes", () => {

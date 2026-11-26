@@ -570,6 +570,37 @@ it.effect("leaves delegated tasks and workflow agent steps out of the top-level 
   }).pipe(Effect.provide(harness.layer));
 });
 
+it.effect("records the thread whose agent launched a thread and keeps it listed", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const starter = yield* launches.launch(
+      launchInput({ command: "command:starter", thread: "thread:starter" }),
+    );
+    const launched = yield* launches.launch({
+      ...launchInput({ command: "command:launched", thread: "thread:launched" }),
+      createdBy: "agent",
+      creationSource: "mcp",
+      launchedByThreadId: starter.threadId,
+    });
+    assert.isUndefined(starter.projection.thread.lineage.launchedByThreadId);
+    assert.deepEqual(launched.projection.thread.lineage, {
+      parentThreadId: null,
+      relationshipToParent: null,
+      rootThreadId: launched.threadId,
+      launchedByThreadId: starter.threadId,
+    });
+    const listed = yield* threads.listProjectThreads({ projectId, includeSubagents: false });
+    assert.sameMembers(
+      listed.map((thread) => thread.id),
+      [starter.threadId, launched.threadId],
+    );
+    const shell = yield* threads.getThreadShell(launched.threadId);
+    assert.equal(shell?.lineage.launchedByThreadId, starter.threadId);
+  }).pipe(Effect.provide(harness.layer));
+});
+
 it.effect("runs a thread-bound automation on the provider the thread uses now", () => {
   const harness = makeHarness({ adapters: [adapter, claudeAdapter] });
   const layerScheduledTasks = ScheduledTasks.layer.pipe(

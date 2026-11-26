@@ -15,6 +15,8 @@ export function useThreadListV2ShelfPreferences() {
   const workingShelfEnabled = loaded && preferencesResult.value.workingShelfEnabled !== false;
   const workingShelfExpanded =
     loaded && preferencesResult.value.threadListWorkingShelfExpanded === true;
+  const agentShelfExpanded =
+    loaded && preferencesResult.value.threadListAgentShelfExpanded === true;
 
   // Transforms read optimistic state so same-frame presses toggle twice.
   const toggleSnoozedShelf = () => {
@@ -41,9 +43,19 @@ export function useThreadListV2ShelfPreferences() {
       }),
     });
   };
+  const toggleAgentShelf = () => {
+    if (!loaded) return;
+    void savePreferences({
+      transform: (current) => ({
+        threadListAgentShelfExpanded: current.threadListAgentShelfExpanded !== true,
+      }),
+    });
+  };
 
   return {
     loaded,
+    agentShelfExpanded,
+    toggleAgentShelf,
     settledShelfExpanded,
     snoozedShelfExpanded,
     workingShelfEnabled,

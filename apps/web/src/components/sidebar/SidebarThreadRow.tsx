@@ -48,6 +48,7 @@ import {
   CircleDashedIcon,
   CircleDotDashedIcon,
   ClockIcon,
+  CornerDownRightIcon,
   FolderGit2Icon,
   GitBranchIcon,
   MessageCircleQuestionIcon,
@@ -609,6 +610,12 @@ type SidebarThreadRowProps = {
   // "folder" is a one-line row inside a boring sidebar project folder;
   // "folder-multiline" adds the card's environment and PR line under it.
   variant: "card" | "slim" | "folder" | "folder-multiline";
+  // A pinned card: two lines on a tinted surface, without the environment and PR line.
+  compact?: boolean | undefined;
+  // Replaces the project name on a card, to say which thread's agent started this one.
+  // `originTitle` is that thread's title when the client holds it.
+  originLabel?: string | null | undefined;
+  originTitle?: string | null | undefined;
   navigationParent?: string | undefined;
   variantAction: SidebarSweepAction;
   settlementSupported: boolean;
@@ -1054,9 +1061,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
         ? "bg-sidebar-row-selected text-sidebar-foreground light:ring-1 light:ring-inset light:ring-sidebar-border/70"
         : hasUnsentDraft
           ? cn(draftSurfaceClassName, "text-sidebar-foreground")
-          : shouldRecede
-            ? "text-sidebar-muted-foreground/75 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
-            : "bg-transparent text-sidebar-foreground hover:bg-sidebar-row-hover",
+          : cn(
+              // The light theme's hover color barely differs from the sidebar, so it adds an outline.
+              // `light:` outranks the file-drop ring, so the outline yields to it.
+              props.compact
+                ? cn(
+                    "bg-sidebar-row-hover/50",
+                    !isFileDragOver && "light:ring-1 light:ring-inset light:ring-sidebar-border/50",
+                  )
+                : "bg-transparent",
+              shouldRecede
+                ? "text-sidebar-muted-foreground/75 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
+                : "text-sidebar-foreground hover:bg-sidebar-row-hover",
+            ),
     shouldRecede &&
       (status === "preparing" || status === "working") &&
       "opacity-70 transition-opacity hover:opacity-100 focus-within:opacity-100 motion-reduce:transition-none",
@@ -1100,7 +1117,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
   const accessibility = resolveSidebarRowAccessibility({
     title: thread.title,
     statusLabel: pendingSync ? gt("Pending") : (topStatus?.label ?? null),
-    projectDisplayName: props.projectDisplayName,
+    projectDisplayName: props.originLabel ?? props.projectDisplayName,
     isActive: props.isActive,
   });
 
@@ -1286,11 +1303,12 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
   const diff = latestRunDiff(thread);
   // Only the trailing icons would remain, so the row moves them to the title line instead.
   const metaLineEmpty =
-    props.environmentLabel === null &&
-    prBadge === null &&
-    issueBadge === null &&
-    diff === null &&
-    runningTerminalIds.length === 0;
+    props.compact === true ||
+    (props.environmentLabel === null &&
+      prBadge === null &&
+      issueBadge === null &&
+      diff === null &&
+      runningTerminalIds.length === 0);
   const metaLine = metaLineEmpty ? null : (
     <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-secondary-label text-xs">
       {props.environmentLabel !== null ? (
@@ -1559,6 +1577,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
       className={cn(
         "list-none py-0.5 [content-visibility:auto] [contain-intrinsic-size:auto_78px]",
         metaLineEmpty && "[contain-intrinsic-size:auto_60px]",
+        props.compact && "[contain-intrinsic-size:auto_52px]",
         sortable?.isDragging && "relative z-20",
       )}
     >
@@ -1575,6 +1594,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
             aria-label={accessibility.label}
             aria-current={accessibility.current}
             data-testid="sidebar-row-card"
+            data-compact={props.compact || undefined}
             aria-busy={isRegeneratingTitle || undefined}
             className={rowSurfaceClassName}
             onClick={handleClick}
@@ -1591,6 +1611,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
           className={cn(
             "relative z-10 h-[4.875rem] px-(--sidebar-row-content-inset) py-(--sidebar-content-inset)",
             metaLineEmpty && "h-auto",
+            props.compact && "py-1.5",
           )}
         >
           <div className="flex h-5 min-w-0 items-center gap-1.5">
@@ -1601,7 +1622,12 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
             {/* Left of the status slot, the pin would slide when hover swaps the
                 label for the wider row controls. */}
             {pinIndicator}
-            {props.projectDisplayName ? (
+            {props.originLabel ? (
+              <span className="flex min-w-0 flex-1 items-center gap-1 font-normal text-secondary-label text-xs">
+                <CornerDownRightIcon aria-hidden className="size-3 shrink-0 text-icon-muted" />
+                <span className="min-w-0 truncate">{props.originTitle ?? props.originLabel}</span>
+              </span>
+            ) : props.projectDisplayName ? (
               <span
                 className={cn("min-w-0 flex-1 truncate font-normal text-secondary-label text-xs")}
               >
@@ -1753,7 +1779,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
             )}
             {props.sweepAction !== null ? dragDestination : null}
           </div>
-          <div className="mt-1 flex min-w-0 items-center gap-1.5">
+          <div className={cn("flex min-w-0 items-center gap-1.5", !props.compact && "mt-1")}>
             {title}
             {isRegeneratingTitle ? (
               <span role="status" className="sr-only">

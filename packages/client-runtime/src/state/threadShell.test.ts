@@ -17,8 +17,10 @@ import { v2Now, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixt
 import { applyShellStreamEvent } from "./shellReducer.ts";
 import { isThreadWorking } from "./threadInbox.ts";
 import {
+  agentStarterTitle,
   childThreadInputsTitle,
   createEnvironmentThreadShellAtoms,
+  isAgentStartedThread,
   resolveListedAncestorThreadRef,
 } from "./threadShell.ts";
 
@@ -778,5 +780,33 @@ describe("resolveListedAncestorThreadRef", () => {
     expect(rowOf(task.id, environmentId, [parent, task])).toEqual(
       ref(remoteEnvironmentId, parent.id),
     );
+  });
+});
+
+describe("agent-started threads", () => {
+  const starterId = ThreadId.make("thread-starter");
+  const lineage = (launchedByThreadId?: ThreadId) => ({
+    parentThreadId: null,
+    relationshipToParent: null,
+    rootThreadId: ThreadId.make("thread-launched"),
+    ...(launchedByThreadId === undefined ? {} : { launchedByThreadId }),
+  });
+
+  it("shelves a thread an agent started until the user pins it", () => {
+    expect(isAgentStartedThread({ lineage: lineage(starterId), pinnedAt: null })).toBe(true);
+    expect(isAgentStartedThread({ lineage: lineage(starterId), pinnedAt: "2026-01-01" })).toBe(
+      false,
+    );
+    expect(isAgentStartedThread({ lineage: lineage(), pinnedAt: null })).toBe(false);
+  });
+
+  it("names the starter only when this environment's thread is loaded", () => {
+    const thread = { environmentId, lineage: lineage(starterId) };
+    const starter = { id: starterId, environmentId, title: "Orchestrator" };
+    expect(agentStarterTitle(thread, [starter])).toBe("Orchestrator");
+    expect(agentStarterTitle(thread, [{ ...starter, environmentId: remoteEnvironmentId }])).toBe(
+      null,
+    );
+    expect(agentStarterTitle({ environmentId, lineage: lineage() }, [starter])).toBe(null);
   });
 });

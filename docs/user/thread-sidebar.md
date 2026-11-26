@@ -26,6 +26,7 @@ Threads don't require a project. Pick **No project** (or press `mod+alt+n` on we
 - **Resize or hide** (web/desktop): Drag the sidebar's right edge past its minimum width to hide it; hover the left window edge and click or drag the handle to bring it back.
 - **Drop files onto a thread** (web/desktop): Drag files from your computer onto any thread row to open it and attach them to its composer.
 - **Pin and reorder**: Pin a thread from its menu or drag threads between **Pinned**, **Active**, and **Settled** (or drag out of **Snoozed** to wake). On mobile, use **Arrange threads** or **Move up / Move down** in the thread menu. Custom order syncs across devices (requires an up-to-date server).
+- **Collapse Pinned** (web/desktop): Click the **Pinned** heading to fold your pins away (per device). The thread you have open stays visible, and you cannot drop a thread onto a collapsed Pinned section.
 - **Undo** (web/desktop): Unpinning, settling, snoozing, archiving, or discarding a draft shows a 5-second **Undo** toast (`mod+z`).
 - **Titles**: Choose **Regenerate title** from a thread's menu, or customize title style in **Settings → Threads → Text generation → Thread title instructions** (global or per-project).
 
@@ -35,9 +36,17 @@ Enabled by default (**Settings → General → Working section**, per device). U
 
 While enabled, Active is sorted by most recent return (manual reordering is paused until you turn it off).
 
+### Agent threads
+
+Threads that an agent started from another thread (as their own top-level threads, not as subagents) collect in an **Agent threads** section below Working (collapsed by default) instead of mixing into Active, also while they run or wait for input. Each row names the thread that started it. Notifications for them are unchanged.
+
+- Pin one to keep it with your own threads; settle or snooze it as usual.
+- Rows there cannot be reordered (on web/desktop, dragging one onto the composer still works).
+- Only threads started after this feature arrived carry the link; older ones stay where they were.
+
 ### Group threads by project (beta)
 
-Enable **Settings → Labs → Boring sidebar (group by project)** on web/desktop (per device) to group active threads into collapsible project folders. Pinned threads stay above; Snoozed and Settled stay below. In this mode, the Working section and sidebar drag-reordering are disabled (dragging a thread onto the composer still works).
+Enable **Settings → Labs → Boring sidebar (group by project)** on web/desktop (per device) to group active threads into collapsible project folders. Pinned threads stay above; Agent threads, Snoozed and Settled stay below. In this mode, the Working section and sidebar drag-reordering are disabled (dragging a thread onto the composer still works).
 
 ## Settle, snooze, and archive
 

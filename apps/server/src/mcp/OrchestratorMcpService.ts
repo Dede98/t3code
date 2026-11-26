@@ -3427,6 +3427,7 @@ const make = Effect.gen(function* () {
                     ? {}
                     : { linkOrigin: parent.thread.linkOrigin }),
                   ...(initialMessage === undefined ? {} : { initialMessage }),
+                  launchedByThreadId: scope.thread.threadId,
                 })
                 .pipe(
                   Effect.mapError((error) =>

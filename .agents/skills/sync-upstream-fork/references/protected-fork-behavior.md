@@ -30,6 +30,14 @@ against the live tree and history because they can move over time.
   `packages/tailscale`), re-checked before every token use. Server-config subscriptions re-send a
   snapshot when the machine's own addresses change (`DirectEndpoints.streamBoundEndpoints`,
   `withLateConfigDiscovery` in `ws.ts`). Drop it only if upstream ships an equivalent.
+- Agent threads shelf: a thread an agent starts through `t3_thread_launch` or `create_threads`
+  records its starter in `lineage.launchedByThreadId` (set by the decider from a server-only
+  `thread.create` field that `withCreationProvenance` strips). It must stay out of
+  `isListedThreadLineage`, `parentThreadId` and `delegatedFrom`, which change push, auto-settle
+  and MCP output. Clients read it through `isAgentStartedThread` (client-runtime `threadShell.ts`):
+  web shelves such threads in the sidebar's `agent` section, mobile in `v2-agent-shelf`. Pinned
+  ones are exempt. The same change made the web Pinned section collapsible and its cards compact
+  (`compact` on `SidebarThreadRow`).
 - A provider registry scoped per instance.
 - Provider hydration that terminates only sessions affected by the changed provider state.
 - Claude Agent SDK compatibility with the native resume store: a null first main `load()` from a
@@ -73,6 +81,11 @@ changes the area:
   migration); every lineage appends them shifted, and `upstreamHeadMigrationEntries` adopts official
   databases at any later head. Upstream's preflight (`skippedV2Migrations`, `hasPendingMigrations`,
   `servicePreflight.ts`) must check the selected lineage, never `migrationManifest`.
+- The web sidebar's sections are enumerated in several places that must agree when upstream adds
+  or reorders one: `partitionSidebarThreads` and the list items in `Sidebar.tsx`,
+  `sectionAtSidebarSlot` and `resolveSidebarDropTarget` in `Sidebar.logic.ts`, the projection in
+  `Sidebar.drag.ts` (which also sizes pinned rows separately from cards), and mobile's
+  `buildThreadListV2Items` with its header-index slicing.
 - Upstream requires every web component to compile under the React Compiler
   (`reactCompilerCoverage.test.ts`), every UI string to be wrapped for translation
   (`t3code/no-untranslated-copy`, `vp run i18n:generate`, `i18n:check`), and every MCP tool that

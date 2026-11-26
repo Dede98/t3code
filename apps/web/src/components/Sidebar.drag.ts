@@ -16,8 +16,12 @@ type Layout = Parameters<SortingStrategy>[0];
 const isShelfHeader = (item: SidebarListItem | undefined) =>
   item?.kind === "marker" &&
   (item.marker === "working-header" ||
+    item.marker === "agent-header" ||
     item.marker === "snoozed-header" ||
     item.marker === "settled-header");
+
+const isCardSection = (section: SidebarSection) =>
+  section === "active" || section === "working" || section === "agent";
 
 export function restrictBelowSidebarLabel(
   { transform, containerNodeRect, draggingNodeRect }: Parameters<Modifier>[0],
@@ -56,7 +60,9 @@ export function createSidebarCollisionDetection(
       if (pointer.x >= boundary.left && pointer.x <= boundary.right) {
         if (pointer.y < previousY && pointer.y <= boundary.bottom) boundarySection = "pinned";
         else if (pointer.y > previousY && pointer.y >= boundary.top) boundarySection = "active";
-        const nextHeader = (["working-header", "snoozed-header", "settled-header"] as const)
+        const nextHeader = (
+          ["working-header", "agent-header", "snoozed-header", "settled-header"] as const
+        )
           .map((marker) =>
             args.droppableContainers.find((container) => container.id === sidebarMarkerId(marker)),
           )
@@ -99,6 +105,7 @@ export function createSidebarSortingStrategy(input: {
   routeThreadKey?: string | null;
   snoozedThreadCount?: number;
   cardHeight?: number;
+  pinnedHeight?: number;
   slimHeight?: number;
   boundaryLabelHeight?: number;
 }): SortingStrategy {
@@ -118,10 +125,12 @@ export function createSidebarSortingStrategy(input: {
       pinned: [],
       active: [],
       working: [],
+      agent: [],
       snoozed: [],
       settled: [],
     };
     let cardHeight = input.cardHeight;
+    let pinnedHeight = input.pinnedHeight;
     let slimHeight = input.slimHeight;
     let headerScale: number | undefined;
     for (const [index, item] of items.entries()) {
@@ -132,14 +141,15 @@ export function createSidebarSortingStrategy(input: {
         }
         continue;
       }
-      if (item.section === "pinned" || item.section === "active" || item.section === "working")
-        cardHeight ??= rects[index]?.height;
+      if (item.section === "pinned") pinnedHeight ??= rects[index]?.height;
+      else if (isCardSection(item.section)) cardHeight ??= rects[index]?.height;
       else slimHeight ??= rects[index]?.height;
       if (item.key !== active.key) groups[item.section].push(item);
     }
     const scale =
       slimHeight !== undefined ? slimHeight / 36 : (headerScale ?? (cardHeight ?? 82) / 82);
     cardHeight ??= 82 * scale;
+    pinnedHeight ??= 56 * scale;
     slimHeight ??= 36 * scale;
     const labelHeight = (input.boundaryLabelHeight ?? 0) * scale;
     const group = groups[target.section];
@@ -180,6 +190,10 @@ export function createSidebarSortingStrategy(input: {
       marker("working-header");
       projected.push(...groups.working);
     }
+    if (items.some((item) => item.kind === "marker" && item.marker === "agent-header")) {
+      marker("agent-header");
+      projected.push(...groups.agent);
+    }
     if (
       groups.snoozed.length > 0 ||
       ((active.section !== "snoozed" || (input.snoozedThreadCount ?? 0) > 1) &&
@@ -194,19 +208,24 @@ export function createSidebarSortingStrategy(input: {
       const index = indices.get(sidebarListItemId(item));
       const rect = index === undefined ? undefined : rects[index];
       const fallback =
-        item.kind === "thread" &&
-        (item.section === "pinned" || item.section === "active" || item.section === "working")
-          ? cardHeight
-          : slimHeight;
-      const moved = item.kind === "thread" && item.key === active.key;
-      return item.kind === "marker" &&
-        (item.marker === "pinned-header" || item.marker === "pinned-divider")
-        ? labelHeight
-        : item.kind === "marker" && item.marker.endsWith("placeholder")
+        item.kind !== "thread"
           ? slimHeight
-          : moved
-            ? fallback
-            : (rect?.height ?? fallback);
+          : item.section === "pinned"
+            ? pinnedHeight
+            : isCardSection(item.section)
+              ? cardHeight
+              : slimHeight;
+      const moved = item.kind === "thread" && item.key === active.key;
+      // A Pinned header that shows at rest already holds the room its drag label needs.
+      return item.kind === "marker" && item.marker === "pinned-header"
+        ? Math.max(labelHeight, rect?.height ?? 0)
+        : item.kind === "marker" && item.marker === "pinned-divider"
+          ? labelHeight
+          : item.kind === "marker" && item.marker.endsWith("placeholder")
+            ? slimHeight
+            : moved
+              ? fallback
+              : (rect?.height ?? fallback);
     });
     const firstShelf = items.findIndex(isShelfHeader);
     const shelfRect = rects[firstShelf];

@@ -193,6 +193,11 @@ export const OrchestrationV2AppThreadLineage = Schema.Struct({
   sideChat: Schema.optional(Schema.Boolean),
   /** An agent step of a workflow run, which the thread's `workflowRun` names. */
   workflowStep: Schema.optional(Schema.Boolean),
+  /**
+   * The thread whose agent started this one as its own top-level thread. Unlike a parent, it owns
+   * nothing here: the thread stays listed, and clients only shelve it apart from the user's own.
+   */
+  launchedByThreadId: Schema.optional(ThreadId),
 });
 export type OrchestrationV2AppThreadLineage = typeof OrchestrationV2AppThreadLineage.Type;
 
@@ -3340,6 +3345,8 @@ export const OrchestrationV2Command = Schema.Union([
     delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
     /** Only the server sets this, for a thread that is a workflow run's agent step. */
     workflowRun: Schema.optional(OrchestrationV2WorkflowOrigin),
+    /** Only the server sets this, for a thread an agent's MCP call started from another thread. */
+    launchedByThreadId: Schema.optional(ThreadId),
     importedNativeThread: Schema.optional(
       Schema.Struct({
         ref: Schema.Struct({

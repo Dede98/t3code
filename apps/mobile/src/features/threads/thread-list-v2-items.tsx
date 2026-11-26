@@ -334,6 +334,12 @@ const SHELF_COPY = {
     collapse: msg("Collapses the working threads."),
     expand: msg("Expands the working threads."),
   },
+  agent: {
+    label: msg("Agent threads", { $context: "thread list section" }),
+    count: msg("{count, plural, one {{count} agent thread} other {{count} agent threads}}"),
+    collapse: msg("Collapses the agent threads."),
+    expand: msg("Expands the agent threads."),
+  },
   snoozed: {
     label: msg("Snoozed", { $context: "thread list section" }),
     count: msg("{count, plural, one {{count} snoozed thread} other {{count} snoozed threads}}"),
@@ -375,6 +381,12 @@ export const ThreadListV2WorkingShelfHeader = memo(function ThreadListV2WorkingS
   props: ThreadListV2ShelfHeaderProps,
 ) {
   return <ThreadListV2ShelfHeader {...props} kind="working" />;
+});
+
+export const ThreadListV2AgentShelfHeader = memo(function ThreadListV2AgentShelfHeader(
+  props: ThreadListV2ShelfHeaderProps,
+) {
+  return <ThreadListV2ShelfHeader {...props} kind="agent" />;
 });
 
 export const ThreadListV2SnoozedShelfHeader = memo(function ThreadListV2SnoozedShelfHeader(
@@ -752,6 +764,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly snoozed?: boolean;
   readonly pinned?: boolean;
   readonly wokeAt: string | null;
+  /** On the agent threads shelf: the starting thread's title, or null when it is not loaded. */
+  readonly agentStarterTitle?: string | null | undefined;
   readonly snoozeWakeLabelText?: string;
   readonly timeLabel: string;
   readonly snoozePresetMinute: string;
@@ -1530,6 +1544,20 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
             numberOfLines={1}
           >
             {thread.runtime.lastError}
+          </Text>
+        ) : props.agentStarterTitle !== undefined ? (
+          <Text
+            className={cn(
+              "flex-1 text-xs",
+              selected
+                ? selectedThreadRowColors.mutedForegroundClassName
+                : rowAppearance.tertiaryForegroundClassName,
+            )}
+            numberOfLines={1}
+          >
+            {props.agentStarterTitle === null
+              ? gt("Started by an agent")
+              : gt("Started by {title}", { title: props.agentStarterTitle })}
           </Text>
         ) : props.environmentLabel ? (
           <View className="min-w-0 flex-1 flex-row items-center gap-1">

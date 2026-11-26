@@ -78,6 +78,7 @@ import {
   ThreadListV2SettledShelfHeader,
   ThreadListV2ShowMoreRow,
   ThreadListV2SnoozedShelfHeader,
+  ThreadListV2AgentShelfHeader,
   ThreadListV2WorkingShelfHeader,
 } from "../threads/thread-list-v2-items";
 import { useThreadRowProviderInstanceResolver } from "../threads/thread-provider-instance";
@@ -393,6 +394,8 @@ export function HomeScreen(props: HomeScreenProps) {
     snoozedShelfExpanded,
     workingShelfEnabled,
     workingShelfExpanded,
+    agentShelfExpanded,
+    toggleAgentShelf,
     toggleSettledShelf,
     toggleSnoozedShelf,
     toggleWorkingShelf,
@@ -436,6 +439,7 @@ export function HomeScreen(props: HomeScreenProps) {
     shelfPreferencesLoaded,
     workingShelfEnabled,
     workingShelfExpanded,
+    agentShelfExpanded,
     snoozedShelfExpanded,
     settledShelfExpanded,
     selectedThreadKey,
@@ -507,6 +511,16 @@ export function HomeScreen(props: HomeScreenProps) {
         />
       );
     }
+    if (item.type === "v2-agent-shelf") {
+      return (
+        <ThreadListV2AgentShelfHeader
+          count={item.count}
+          disabled={item.disabled}
+          expanded={item.expanded}
+          onToggle={toggleAgentShelf}
+        />
+      );
+    }
     if (item.type === "v2-snoozed-shelf") {
       return (
         <ThreadListV2SnoozedShelfHeader
@@ -540,6 +554,7 @@ export function HomeScreen(props: HomeScreenProps) {
         snoozed={item.item.snoozed}
         pinned={item.item.pinned}
         wokeAt={item.item.wokeAt}
+        agentStarterTitle={item.item.agentStarterTitle}
         snoozePresetMinute={item.snoozePresetMinute ?? ""}
         snoozeWakeLabelText={item.snoozeWakeLabelText}
         timeLabel={item.timeLabel}

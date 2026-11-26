@@ -109,6 +109,30 @@ export function resolveListedAncestorThreadRef(
   return ref;
 }
 
+/**
+ * Whether a thread sits on the agent threads shelf: an agent started it from another thread as a
+ * top-level thread of its own. Pinning one claims it, so it lists with the user's pins.
+ */
+export function isAgentStartedThread(
+  thread: Pick<EnvironmentThreadShell, "lineage" | "pinnedAt">,
+): boolean {
+  return thread.lineage.launchedByThreadId !== undefined && thread.pinnedAt == null;
+}
+
+/** The title of the thread that started `thread`, or null when the client holds no such thread. */
+export function agentStarterTitle(
+  thread: Pick<EnvironmentThreadShell, "environmentId" | "lineage">,
+  threads: readonly Pick<EnvironmentThreadShell, "id" | "environmentId" | "title">[],
+): string | null {
+  const starterId = thread.lineage.launchedByThreadId;
+  if (starterId === undefined) return null;
+  return (
+    threads.find(
+      (candidate) => candidate.id === starterId && candidate.environmentId === thread.environmentId,
+    )?.title ?? null
+  );
+}
+
 /** Provider-native
     subagents ask on their parent, so they are skipped. */
 function subagentRequest(thread: OrchestrationV2ThreadShell): PendingSubagentRequest | null {

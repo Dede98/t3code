@@ -110,8 +110,16 @@ export function SidebarDragBoundary(props: {
   );
 }
 
+const SHELF_BY_HEADER = {
+  "pinned-header": "pinned",
+  "working-header": "working",
+  "agent-header": "agent",
+  "snoozed-header": "snoozed",
+  "settled-header": "settled",
+} as const;
+
 export function SidebarSectionHeader(props: {
-  marker: "working-header" | "snoozed-header" | "settled-header";
+  marker: keyof typeof SHELF_BY_HEADER;
   label: string;
   /** A muted trailing count. */
   count: number;
@@ -120,12 +128,7 @@ export function SidebarSectionHeader(props: {
   isDropTarget?: boolean;
   toggle: { expanded: boolean; onToggle: () => void };
 }) {
-  const shelf =
-    props.marker === "working-header"
-      ? "working"
-      : props.marker === "snoozed-header"
-        ? "snoozed"
-        : "settled";
+  const shelf = SHELF_BY_HEADER[props.marker];
   return (
     <SortableSidebarMarker
       marker={props.marker}

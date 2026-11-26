@@ -131,6 +131,8 @@ export interface ThreadLaunchInput {
   readonly delegatedFrom?: OrchestrationV2DelegatedFrom;
   /** The workflow run this thread is an agent step of. */
   readonly workflowRun?: OrchestrationV2WorkflowOrigin;
+  /** The thread whose agent asked for this launch. */
+  readonly launchedByThreadId?: ThreadId;
 }
 
 type PreparationInput = Pick<
@@ -1586,6 +1588,9 @@ const make = Effect.gen(function* () {
                   ? {}
                   : { delegatedFrom: input.delegatedFrom }),
                 ...(input.workflowRun === undefined ? {} : { workflowRun: input.workflowRun }),
+                ...(input.launchedByThreadId === undefined
+                  ? {}
+                  : { launchedByThreadId: input.launchedByThreadId }),
                 createdBy: input.createdBy,
                 creationSource: input.creationSource,
                 ...(initialMessage === undefined

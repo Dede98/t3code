@@ -81,6 +81,8 @@ it("stamps authoritative provenance on commands that create threads or messages"
       workflow: "fix",
       step: "write",
     },
+    // Nor name the thread whose agent started it.
+    launchedByThreadId: ThreadId.make("thread:elsewhere"),
   };
 
   const stamped = ThreadManagementService.withCreationProvenance(command, {
@@ -95,6 +97,7 @@ it("stamps authoritative provenance on commands that create threads or messages"
   expect(stamped).not.toHaveProperty("delegatedFrom");
   expect(stamped).not.toHaveProperty("initialMessage");
   expect(stamped).not.toHaveProperty("workflowRun");
+  expect(stamped).not.toHaveProperty("launchedByThreadId");
 });
 
 const layerReceiptsTest = CommandReceiptStore.layer.pipe(

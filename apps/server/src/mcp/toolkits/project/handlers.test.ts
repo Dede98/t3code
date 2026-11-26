@@ -66,6 +66,8 @@ const clientLaunchHarness = (input: {
   readonly hostedAppUrl?: string;
   /** The orchestrator refuses the new thread's mode, as under a managed ceiling. */
   readonly refusedByCeiling?: true;
+  /** The agent of this live thread calls, instead of a client from outside. */
+  readonly callerThreadId?: ThreadId;
 }) => {
   const projectId = ProjectId.make("project:client-target");
   const modelSelection = {
@@ -109,19 +111,41 @@ const clientLaunchHarness = (input: {
     Layer.succeed(McpInvocationContext.McpInvocationContext, {
       environmentId: EnvironmentId.make("environment"),
       requestNamespace: "client:session-1",
-      thread: undefined,
-      client: {
-        sessionId: "session-1",
-        label: "Claude Code",
-        access: input.runtimeModeCeiling,
-        hostedAppUrl: input.hostedAppUrl,
-      },
+      thread:
+        input.callerThreadId === undefined
+          ? undefined
+          : {
+              threadId: input.callerThreadId,
+              providerSessionId: "provider-session:caller",
+              providerInstanceId: modelSelection.instanceId,
+            },
+      client:
+        input.callerThreadId === undefined
+          ? {
+              sessionId: "session-1",
+              label: "Claude Code",
+              access: input.runtimeModeCeiling,
+              hostedAppUrl: input.hostedAppUrl,
+            }
+          : undefined,
       issuedAt: 0,
       capabilities: new Set(["orchestration" as const]),
     }),
     Layer.mock(ThreadManagement.ThreadManagementService)({
       // A thread exists once a launch started it.
       getThreadShell: (threadId) => {
+        if (threadId === input.callerThreadId)
+          return Effect.succeed({
+            id: threadId,
+            projectId,
+            modelSelection,
+            providerInstanceId: modelSelection.instanceId,
+            runtimeMode: input.runtimeModeCeiling,
+            interactionMode: "default",
+            activeRunId: "run:caller",
+            archivedAt: null,
+            deletedAt: null,
+          } as unknown as OrchestrationV2ThreadShell);
         const launch = input.launched.find((candidate) => candidate.threadId === threadId);
         return Effect.succeed(
           launch === undefined
@@ -255,6 +279,7 @@ it.effect(
       });
       expect(belowCeiling.launched[0]?.runtimeMode).toBe("approval-required");
       expect(belowCeiling.launched[0]?.initialMessage?.senderThreadId).toBeUndefined();
+      expect(belowCeiling.launched[0]?.launchedByThreadId).toBeUndefined();
       expect(belowCeiling.launched[0]?.generateTitle).toBeUndefined();
       expect(belowCeiling.launched[0]?.titleRenamed).toBe(true);
 
@@ -324,6 +349,31 @@ it.effect(
         message: "Example Corp limits threads to Supervised.",
       });
     }),
+);
+
+it.effect("a thread's agent launch names that thread as its starter", () =>
+  Effect.gen(function* () {
+    const callerThreadId = ThreadId.make("thread:caller");
+    const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+    const { projectId, dependencies } = clientLaunchHarness({
+      runtimeModeCeiling: "full-access",
+      launched,
+      callerThreadId,
+    });
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+    const result = yield* toolkit
+      .handle("t3_thread_launch", { title: "Fix", message: "Fix the bug" })
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+
+    expect(result.at(-1)?.result).toMatchObject({ projectId });
+    expect(launched).toHaveLength(1);
+    expect(launched[0]?.launchedByThreadId).toBe(callerThreadId);
+    expect(launched[0]?.initialMessage?.senderThreadId).toBe(callerThreadId);
+  }),
 );
 
 it.effect("a launch steps an inherited mode down to the provider's, and refuses one it lacks", () =>

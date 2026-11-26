@@ -1865,6 +1865,104 @@ describe("Working section beta", () => {
   });
 });
 
+describe("agent threads shelf", () => {
+  const starterId = ThreadId.make("starter");
+  const startedBy = (id: ThreadId): EnvironmentThreadShell["lineage"] => ({
+    parentThreadId: null,
+    relationshipToParent: null,
+    rootThreadId: id,
+    launchedByThreadId: starterId,
+  });
+  const launched = (id: string, input: Partial<EnvironmentThreadShell> = {}) =>
+    makeThread({
+      id: ThreadId.make(id),
+      title: id,
+      lineage: startedBy(ThreadId.make(id)),
+      ...input,
+    });
+  const threads = [
+    makeThread({ id: starterId, title: "Orchestrator" }),
+    launched("launched"),
+    launched("launched-pinned", { pinnedAt: "2026-06-01T00:00:00.000Z" }),
+    launched("launched-settled", { settledOverride: "settled", settledAt: NOW }),
+  ];
+  const build = (input: Partial<Parameters<typeof buildThreadListV2Items>[0]> = {}) =>
+    buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+      workingShelfEnabled: true,
+      ...input,
+    });
+  const ids = (layout: ReturnType<typeof buildThreadListV2Items>) =>
+    layout.items.map((item) => item.thread.id);
+
+  it("shelves agent-started threads apart from pinned, active and settled ones", () => {
+    const collapsed = build();
+    expect(ids(collapsed)).toEqual(["launched-pinned", "starter", "launched-settled"]);
+    expect(collapsed.agentCount).toBe(1);
+    expect(collapsed.agentShelfHeaderIndex).toBe(2);
+
+    const expanded = build({ agentShelfExpanded: true });
+    expect(ids(expanded)).toEqual(["launched-pinned", "starter", "launched", "launched-settled"]);
+    expect(expanded.items[2]?.agentStarterTitle).toBe("Orchestrator");
+    expect(expanded.items[1]?.agentStarterTitle).toBeUndefined();
+  });
+
+  it("keeps the open thread visible in the collapsed shelf and out of the Active order", () => {
+    const layout = build({ selectedThreadKey: `${environmentId}:launched` });
+    expect(ids(layout)).toEqual(["launched-pinned", "starter", "launched", "launched-settled"]);
+    expect(
+      getThreadListV2OrderedSection({ threads, section: "active", now: NOW }).map(
+        (thread) => thread.id,
+      ),
+    ).toEqual(["starter"]);
+  });
+
+  it("puts the shelf header between Active and Settled", () => {
+    const layout = build({ agentShelfExpanded: true });
+    const items = buildThreadListV2ListItems({
+      items: layout.items,
+      pendingTasks: [],
+      agentCount: layout.agentCount,
+      agentShelfExpanded: true,
+      agentShelfHeaderIndex: layout.agentShelfHeaderIndex,
+      settledCount: layout.settledCount,
+      settledShelfHeaderIndex: layout.settledShelfHeaderIndex,
+    });
+    expect(
+      items.map((item) => (item.type === "v2-thread" ? item.item.thread.id : item.type)),
+    ).toEqual([
+      "launched-pinned",
+      "starter",
+      "v2-agent-shelf",
+      "launched",
+      "v2-settled-shelf",
+      "launched-settled",
+    ]);
+  });
+
+  it("re-renders a recycled agent row when only its starter is renamed", () => {
+    const row = (starterTitle: string) => {
+      const layout = build({
+        threads: [{ ...threads[0]!, title: starterTitle }, ...threads.slice(1)],
+        agentShelfExpanded: true,
+      });
+      const item = buildThreadListV2ListItems({ items: layout.items, pendingTasks: [] }).find(
+        (candidate) => candidate.key === `v2-thread:${environmentId}:launched`,
+      );
+      if (item?.type !== "v2-thread") throw new Error("missing agent row");
+      return item;
+    };
+    const before = row("Orchestrator");
+    const after = row("Renamed");
+    expect(after.item.thread).toBe(before.item.thread);
+    expect(after.item.agentStarterTitle).toBe("Renamed");
+    expect(threadListV2ListItemsAreEqual(before, after)).toBe(false);
+  });
+});
+
 describe("queued messages keep a settled thread active", () => {
   const threads = [
     makeThread({ id: ThreadId.make("active"), title: "Active" }),

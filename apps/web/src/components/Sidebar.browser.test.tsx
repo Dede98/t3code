@@ -480,6 +480,78 @@ describe("sidebar thread menu", () => {
   });
 });
 
+describe("sidebar agent threads", () => {
+  it("shelves agent-started threads collapsed, pins one compactly, and folds Pinned", async () => {
+    using stack = new DisposableStack();
+    for (const key of ["t3code:sidebar:agent-expanded", "t3code:sidebar:pinned-expanded"]) {
+      localStorage.removeItem(key);
+      stack.defer(() => localStorage.removeItem(key));
+    }
+    const previousSettings = getClientSettings();
+    stack.defer(() => __setClientSettingsForTests(previousSettings));
+    __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
+    const activeProject = project("active");
+    const starter = threadShell(activeProject.id, 0);
+    const launched = (id: string, title: string, pinnedAt: string | null) =>
+      makeThreadFixture({
+        environmentId: activeProject.environmentId,
+        projectId: activeProject.id,
+        id: ThreadId.make(id),
+        title,
+        lineage: {
+          parentThreadId: null,
+          relationshipToParent: null,
+          rootThreadId: ThreadId.make(id),
+          launchedByThreadId: starter.id,
+        },
+        pinnedAt,
+      });
+    const routeThreadRef = { environmentId: activeProject.environmentId, threadId: starter.id };
+    vi.mocked(useProjects).mockReturnValue([activeProject]);
+    vi.mocked(useQuietThreadShells).mockReturnValue([
+      starter,
+      launched("launched", "Launched work", null),
+      launched("launched-pinned", "Pinned launch", "2026-01-01T00:00:00.000Z"),
+    ]);
+    vi.mocked(useThreadRouteTarget).mockReturnValue({ kind: "server", threadRef: routeThreadRef });
+    vi.mocked(useHandleNewThread).mockReturnValue({
+      activeDraftThread: null,
+      activeThread: null,
+      defaultProjectRef: {
+        environmentId: activeProject.environmentId,
+        projectId: activeProject.id,
+      },
+      defaultProjectFallbackReady: true,
+      handleNewThread: vi.fn().mockResolvedValue(null),
+      routeDraftId: null,
+      routeThreadRef,
+    });
+    await using screen = await render(
+      <SidebarProvider>
+        <Sidebar routeReveal={{ observedKey: null, pendingKey: null }} />
+      </SidebarProvider>,
+    );
+    const card = (title: string) =>
+      screen.getByText(title).first().element().closest('[data-testid="sidebar-row-card"]');
+
+    const agentShelf = screen.getByTestId("sidebar-agent-shelf-toggle");
+    await expect.element(agentShelf).toHaveAttribute("aria-expanded", "false");
+    await expect.element(screen.getByText("Thread 0").first()).toBeInTheDocument();
+    await expect.element(screen.getByText("Launched work")).not.toBeInTheDocument();
+    await userEvent.click(agentShelf);
+    await expect.element(screen.getByText("Launched work").first()).toBeInTheDocument();
+    await expect.element(screen.getByText("Started by Thread 0")).toBeInTheDocument();
+
+    expect(card("Pinned launch")?.getAttribute("data-compact")).toBe("true");
+    expect(card("Launched work")?.hasAttribute("data-compact")).toBe(false);
+    const pinnedSection = screen.getByTestId("sidebar-pinned-shelf-toggle");
+    await expect.element(pinnedSection).toHaveAttribute("aria-expanded", "true");
+    await userEvent.click(pinnedSection);
+    await expect.element(screen.getByText("Pinned launch")).not.toBeInTheDocument();
+    expect(localStorage.getItem("t3code:sidebar:pinned-expanded")).toBe("false");
+  });
+});
+
 describe("sidebar settled pagination", () => {
   it("keeps the viewport in place when showing more settled threads", async () => {
     using stack = new DisposableStack();
