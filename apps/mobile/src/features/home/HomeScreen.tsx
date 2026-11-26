@@ -514,6 +514,7 @@ export function HomeScreen(props: HomeScreenProps) {
     if (item.type === "v2-agent-shelf") {
       return (
         <ThreadListV2AgentShelfHeader
+          attention={item.attention}
           count={item.count}
           disabled={item.disabled}
           expanded={item.expanded}

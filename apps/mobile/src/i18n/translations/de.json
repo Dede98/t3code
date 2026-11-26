@@ -4926,6 +4926,8 @@
   "38e34af247d4fc5f": "{count, plural, one {{count} erledigter Thread} other {{count} erledigte Threads}}",
   "41fff04f12ad189f": "Klappt die erledigten Threads ein.",
   "0a271ec720fbe202": "Klappt die erledigten Threads aus.",
+  "1ec9fee03159bc3e": ", einer braucht dich",
+  "44c32bc46dca317f": ", einer ist fehlgeschlagen",
   "905197486607072f": "Verwerfen",
   "02c0ae493e689f90": "Ziel",
   "13300e8565fbd665": "{label} ({count})",

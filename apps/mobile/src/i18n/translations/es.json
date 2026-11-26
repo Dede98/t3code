@@ -4919,6 +4919,8 @@
   "38e34af247d4fc5f": "{count, plural, one {{count} hilo resuelto} other {{count} hilos resueltos}}",
   "41fff04f12ad189f": "Contrae los hilos resueltos.",
   "0a271ec720fbe202": "Expande los hilos resueltos.",
+  "1ec9fee03159bc3e": ", uno te necesita",
+  "44c32bc46dca317f": ", uno falló",
   "905197486607072f": "Descartar",
   "02c0ae493e689f90": "Objetivo",
   "13300e8565fbd665": "{label} ({count})",

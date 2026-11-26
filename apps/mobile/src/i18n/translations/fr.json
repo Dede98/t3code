@@ -4920,6 +4920,8 @@
   "38e34af247d4fc5f": "{count, plural, one {{count} fil clos} other {{count} fils clos}}",
   "41fff04f12ad189f": "Réduit les fils clos.",
   "0a271ec720fbe202": "Développe les fils clos.",
+  "1ec9fee03159bc3e": ", l'un a besoin de vous",
+  "44c32bc46dca317f": ", l'un a échoué",
   "905197486607072f": "Abandonner",
   "02c0ae493e689f90": "Objectif",
   "13300e8565fbd665": "{label} ({count})",

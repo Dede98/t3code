@@ -224,6 +224,7 @@ export function useThreadListV2(input: {
         agentCount: layout.agentCount,
         agentShelfExpanded: input.agentShelfExpanded,
         agentShelfHeaderIndex: layout.agentShelfHeaderIndex,
+        agentAttention: layout.agentAttention,
         snoozedCount: layout.snoozedCount,
         snoozedShelfExpanded: input.snoozedShelfExpanded,
         snoozedShelfHeaderIndex: layout.snoozedShelfHeaderIndex,

@@ -1060,6 +1060,17 @@ export function resolveSidebarFolderDot(
 }
 
 /**
+ * What a collapsed shelf says about the threads it hides. Unlike a folder, it stays quiet about
+ * finished and running threads: only one that waits on the user, or failed, shows through.
+ */
+export function resolveSidebarShelfAttention(
+  threads: ReadonlyArray<ThreadStatusInput & SidebarThreadStatusInput>,
+): "attention" | "failed" | null {
+  const dot = resolveSidebarFolderDot(threads);
+  return dot === "attention" || dot === "failed" ? dot : null;
+}
+
+/**
  * Keys the old per-project sidebar saved folder open state under, most
  * specific first, for `resolveProjectExpanded`. Boring folders read and write
  * the same keys, so a legacy user's closed folders stay closed after regrouping.

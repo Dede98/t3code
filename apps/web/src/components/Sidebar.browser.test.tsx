@@ -481,7 +481,7 @@ describe("sidebar thread menu", () => {
 });
 
 describe("sidebar agent threads", () => {
-  it("shelves agent-started threads collapsed, pins one compactly, and folds Pinned", async () => {
+  it("shelves agent-started threads collapsed, flags one waiting on the user, pins one compactly, and folds Pinned", async () => {
     using stack = new DisposableStack();
     for (const key of ["t3code:sidebar:agent-expanded", "t3code:sidebar:pinned-expanded"]) {
       localStorage.removeItem(key);
@@ -510,7 +510,7 @@ describe("sidebar agent threads", () => {
     vi.mocked(useProjects).mockReturnValue([activeProject]);
     vi.mocked(useQuietThreadShells).mockReturnValue([
       starter,
-      launched("launched", "Launched work", null),
+      { ...launched("launched", "Launched work", null), hasPendingUserInput: true },
       launched("launched-pinned", "Pinned launch", "2026-01-01T00:00:00.000Z"),
     ]);
     vi.mocked(useThreadRouteTarget).mockReturnValue({ kind: "server", threadRef: routeThreadRef });
@@ -538,9 +538,13 @@ describe("sidebar agent threads", () => {
     await expect.element(agentShelf).toHaveAttribute("aria-expanded", "false");
     await expect.element(screen.getByText("Thread 0").first()).toBeInTheDocument();
     await expect.element(screen.getByText("Launched work")).not.toBeInTheDocument();
+    const attentionDot = screen.getByTestId("sidebar-shelf-attention");
+    await expect.element(attentionDot).toBeInTheDocument();
     await userEvent.click(agentShelf);
     await expect.element(screen.getByText("Launched work").first()).toBeInTheDocument();
     await expect.element(screen.getByText("Started by Thread 0")).toBeInTheDocument();
+    // Expanded, the row itself shows that it waits on the user.
+    await expect.element(attentionDot).not.toBeInTheDocument();
 
     expect(card("Pinned launch")?.getAttribute("data-compact")).toBe("true");
     expect(card("Launched work")?.hasAttribute("data-compact")).toBe(false);

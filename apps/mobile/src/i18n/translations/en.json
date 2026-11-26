@@ -4928,6 +4928,8 @@
   "38e34af247d4fc5f": "{count, plural, one {{count} settled thread} other {{count} settled threads}}",
   "41fff04f12ad189f": "Collapses the settled threads.",
   "0a271ec720fbe202": "Expands the settled threads.",
+  "1ec9fee03159bc3e": ", one needs you",
+  "44c32bc46dca317f": ", one failed",
   "905197486607072f": "Discard",
   "02c0ae493e689f90": "Goal",
   "13300e8565fbd665": "{label} ({count})",

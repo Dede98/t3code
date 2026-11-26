@@ -89,6 +89,7 @@ import {
   resolveThreadListV2SwipeActions,
   layoutThreadListV2RowMenuActions,
   threadListV2RowAccessibilityLabel,
+  type ThreadListV2ShelfAttention,
   type ThreadListV2Status,
 } from "./threadListV2";
 import { QueuedMessageIcon } from "./queued-message-icon";
@@ -237,6 +238,7 @@ function ThreadListV2Section(props: {
   readonly label: string;
   readonly pane?: "screen" | "sidebar";
   readonly tone?: "default" | "snoozed";
+  readonly attention?: ThreadListV2ShelfAttention;
   readonly disclosure?: {
     readonly expanded: boolean;
     readonly disabled?: boolean;
@@ -271,6 +273,14 @@ function ThreadListV2Section(props: {
           snoozed ? "bg-primary/20" : sidebarPane ? "bg-drawer-border" : "bg-border",
         )}
       />
+      {props.attention ? (
+        <View
+          className={cn(
+            "size-1.5 rounded-full",
+            props.attention === "failed" ? "bg-danger-foreground" : "bg-warning-foreground",
+          )}
+        />
+      ) : null}
       {props.disclosure ? (
         <SymbolView
           name="chevron.down"
@@ -319,6 +329,7 @@ const ThreadListV2SectionDivider = memo(function ThreadListV2SectionDivider(prop
 
 type ThreadListV2ShelfHeaderProps = {
   readonly count: number;
+  readonly attention?: ThreadListV2ShelfAttention;
   readonly disabled?: boolean;
   readonly expanded: boolean;
   readonly onToggle: () => void;
@@ -354,6 +365,15 @@ const SHELF_COPY = {
   },
 } as const;
 
+const SHELF_ATTENTION_LABEL = {
+  attention: msg(", one needs you", {
+    $context: "thread list section status, read after its thread count",
+  }),
+  failed: msg(", one failed", {
+    $context: "thread list section status, read after its thread count",
+  }),
+} as const;
+
 function ThreadListV2ShelfHeader(
   props: ThreadListV2ShelfHeaderProps & { readonly kind: keyof typeof SHELF_COPY },
 ) {
@@ -366,11 +386,14 @@ function ThreadListV2ShelfHeader(
       label={props.expanded ? label : gt("{label} ({count})", { label, count: props.count })}
       pane={props.pane}
       tone={props.kind === "snoozed" ? "snoozed" : "default"}
+      attention={props.attention}
       disclosure={{
         expanded: props.expanded,
         disabled: props.disabled,
         onToggle: props.onToggle,
-        accessibilityLabel: m(copy.count, { count: props.count }),
+        accessibilityLabel: `${m(copy.count, { count: props.count })}${
+          props.attention ? m(SHELF_ATTENTION_LABEL[props.attention]) : ""
+        }`,
         accessibilityHint: m(props.expanded ? copy.collapse : copy.expand),
       }}
     />

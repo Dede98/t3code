@@ -39,6 +39,7 @@ import {
   resolveSidebarDropVerb,
   groupSidebarThreadsByProject,
   resolveSidebarFolderDot,
+  resolveSidebarShelfAttention,
   sidebarFolderExpansionKeys,
   withoutRemovedCheckout,
 } from "./Sidebar.logic";
@@ -1821,6 +1822,25 @@ describe("resolveSidebarFolderDot", () => {
     expect(resolveSidebarFolderDot([idle, working])).toBe("working");
     expect(resolveSidebarFolderDot([working, unread])).toBe("unread");
     expect(resolveSidebarFolderDot([unread, limited])).toBe("attention");
+
+    // A shelf header only speaks up for a thread that waits on the user.
+    expect(resolveSidebarShelfAttention([idle, working, unread])).toBeNull();
+    expect(resolveSidebarShelfAttention([working, { ...idle, hasPendingUserInput: true }])).toBe(
+      "attention",
+    );
+    expect(resolveSidebarShelfAttention([unread, limited])).toBe("attention");
+    const failed = {
+      ...idle,
+      latestRun: { ...makeLatestRun(), status: "failed" as const },
+      lastVisitedAt: "2026-03-09T10:04:00.000Z",
+      runtime: { ...runtime, status: "failed" as const },
+    };
+    expect(resolveSidebarShelfAttention([working, failed])).toBe("failed");
+    // A failure the user already opened settles, like its row.
+    expect(
+      resolveSidebarShelfAttention([{ ...failed, lastVisitedAt: idle.lastVisitedAt }]),
+    ).toBeNull();
+    expect(resolveSidebarShelfAttention([failed, limited])).toBe("attention");
   });
 });
 

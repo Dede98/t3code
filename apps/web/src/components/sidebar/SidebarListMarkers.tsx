@@ -1,10 +1,16 @@
 import { CollapsibleSectionHeader } from "../ui/collapsible-section-header";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
+import { msg, useMessages } from "gt-react";
 import { type ReactNode, useLayoutEffect } from "react";
 import { cn } from "~/lib/utils";
+import { useUiStateStore } from "../../uiStateStore";
 import {
   animateSidebarLayoutChanges,
+  resolveSidebarShelfAttention,
+  resolveThreadLastVisitedAt,
   sidebarMarkerId,
   type SidebarListMarker,
 } from "../Sidebar.logic";
@@ -118,11 +124,57 @@ const SHELF_BY_HEADER = {
   "settled-header": "settled",
 } as const;
 
+const SHELF_ATTENTION_CLASS_NAME = { attention: "bg-warning", failed: "bg-error" } as const;
+
+const SHELF_ATTENTION_LABEL = {
+  attention: msg(", one needs you", {
+    $context: "sidebar section status, read after its name and thread count",
+  }),
+  failed: msg(", one failed", {
+    $context: "sidebar section status, read after its name and thread count",
+  }),
+} as const;
+
+// A collapsed section would otherwise hide that one of its threads waits on the user.
+function ShelfCountWithAttention(props: {
+  count: number;
+  hiddenThreads: readonly EnvironmentThreadShell[];
+}) {
+  const m = useMessages();
+  const localLastVisitedAtById = useUiStateStore((state) => state.threadLastVisitedAtById);
+  const attention = resolveSidebarShelfAttention(
+    props.hiddenThreads.map((thread) => ({
+      ...thread,
+      lastVisitedAt: resolveThreadLastVisitedAt(
+        thread.lastVisitedAt,
+        localLastVisitedAtById[scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))],
+      ),
+    })),
+  );
+  return (
+    <>
+      {attention === null ? null : (
+        <span
+          aria-hidden
+          data-testid="sidebar-shelf-attention"
+          className={cn("size-1.5 shrink-0 rounded-full", SHELF_ATTENTION_CLASS_NAME[attention])}
+        />
+      )}
+      <span className="font-normal tabular-nums">{props.count}</span>
+      {attention === null ? null : (
+        <span className="sr-only">{m(SHELF_ATTENTION_LABEL[attention])}</span>
+      )}
+    </>
+  );
+}
+
 export function SidebarSectionHeader(props: {
   marker: keyof typeof SHELF_BY_HEADER;
   label: string;
   /** A muted trailing count. */
   count: number;
+  /** The threads the collapsed section hides, to flag one that needs the user. */
+  hiddenThreads?: readonly EnvironmentThreadShell[] | undefined;
   className?: string;
   dragging?: boolean;
   isDropTarget?: boolean;
@@ -141,7 +193,13 @@ export function SidebarSectionHeader(props: {
         expanded={props.toggle.expanded}
         tone={props.isDropTarget ? "accent" : props.dragging ? "emphasized" : "muted"}
         data-testid={`sidebar-${shelf}-shelf-toggle`}
-        accessory={<span className="font-normal tabular-nums">{props.count}</span>}
+        accessory={
+          props.hiddenThreads?.length ? (
+            <ShelfCountWithAttention count={props.count} hiddenThreads={props.hiddenThreads} />
+          ) : (
+            <span className="font-normal tabular-nums">{props.count}</span>
+          )
+        }
       >
         {props.label}
       </CollapsibleSectionHeader>

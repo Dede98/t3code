@@ -1920,6 +1920,54 @@ describe("agent threads shelf", () => {
     ).toEqual(["starter"]);
   });
 
+  it("flags a hidden thread that waits on the user, until the shelf opens", () => {
+    const waiting = [...threads, launched("asks", { hasPendingUserInput: true })];
+    expect(build().agentAttention).toBeNull();
+    expect(build({ threads: waiting }).agentAttention).toBe("attention");
+    expect(build({ threads: waiting, agentShelfExpanded: true }).agentAttention).toBeNull();
+    // The open thread shows in the collapsed shelf, so its own row carries the status.
+    expect(
+      build({ threads: waiting, selectedThreadKey: `${environmentId}:asks` }).agentAttention,
+    ).toBeNull();
+    const failedAt = "2026-06-01T12:00:00.000Z";
+    const fails = (lastVisitedAt: string) =>
+      launched("fails", {
+        lastVisitedAt,
+        runtime: {
+          status: "failed",
+          activeRunId: null,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerName: "Codex",
+          lastError: "Run failed",
+          updatedAt: failedAt,
+        },
+        latestRun: {
+          runId: RunId.make("failed-run"),
+          status: "failed",
+          requestedAt: failedAt,
+          startedAt: failedAt,
+          completedAt: failedAt,
+          assistantMessageId: null,
+        },
+      });
+    const unseen = fails("2026-06-01T00:00:00.000Z");
+    expect(build({ threads: [...threads, unseen] }).agentAttention).toBe("failed");
+    // A failure the user already opened settles, like its row.
+    expect(build({ threads: [...threads, fails(NOW)] }).agentAttention).toBeNull();
+    expect(build({ threads: [...waiting, unseen] }).agentAttention).toBe("attention");
+
+    const header = (attention: "attention" | null) =>
+      buildThreadListV2ListItems({
+        items: [],
+        pendingTasks: [],
+        agentCount: 2,
+        agentShelfHeaderIndex: 0,
+        agentAttention: attention,
+      })[0]!;
+    expect(header("attention")).toMatchObject({ type: "v2-agent-shelf", attention: "attention" });
+    expect(threadListV2ListItemsAreEqual(header(null), header("attention"))).toBe(false);
+  });
+
   it("puts the shelf header between Active and Settled", () => {
     const layout = build({ agentShelfExpanded: true });
     const items = buildThreadListV2ListItems({

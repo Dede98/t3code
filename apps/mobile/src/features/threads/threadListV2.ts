@@ -78,6 +78,24 @@ export type ThreadListV2Status =
   | "failed"
   | "limited"
   | "ready";
+/** What a collapsed shelf flags about the threads it hides: one waits on the user, or failed. */
+export type ThreadListV2ShelfAttention = "attention" | "failed" | null;
+
+export function resolveThreadListV2ShelfAttention(
+  threads: ReadonlyArray<Parameters<typeof resolveThreadListV2RowStatus>[0]>,
+): ThreadListV2ShelfAttention {
+  const statuses = new Set(threads.map(resolveThreadListV2RowStatus));
+  if (
+    statuses.has("input") ||
+    statuses.has("approval") ||
+    statuses.has("request") ||
+    statuses.has("limited")
+  ) {
+    return "attention";
+  }
+  return statuses.has("failed") ? "failed" : null;
+}
+
 export type ThreadListV2SwipeAction = "archive" | "settle" | "unsettle" | "snooze" | "unsnooze";
 
 /**
@@ -434,6 +452,7 @@ export interface ThreadListV2Layout {
   readonly workingShelfHeaderIndex: number | null;
   readonly agentCount: number;
   readonly agentShelfHeaderIndex: number | null;
+  readonly agentAttention: ThreadListV2ShelfAttention;
   readonly snoozedCount: number;
   readonly snoozedShelfHeaderIndex: number | null;
   readonly settledCount: number;
@@ -480,6 +499,7 @@ export interface ThreadListV2AgentShelfListItem {
   readonly count: number;
   readonly expanded: boolean;
   readonly disabled: boolean;
+  readonly attention: ThreadListV2ShelfAttention;
 }
 
 export interface ThreadListV2SnoozedShelfListItem {
@@ -564,7 +584,8 @@ export function threadListV2ListItemsAreEqual(
         previous.type === "v2-agent-shelf" &&
         previous.count === item.count &&
         previous.expanded === item.expanded &&
-        previous.disabled === item.disabled
+        previous.disabled === item.disabled &&
+        previous.attention === item.attention
       );
     case "v2-snoozed-shelf":
       return (
@@ -615,6 +636,7 @@ export function buildThreadListV2ListItems(input: {
   readonly agentCount?: number;
   readonly agentShelfExpanded?: boolean;
   readonly agentShelfHeaderIndex?: number | null;
+  readonly agentAttention?: ThreadListV2ShelfAttention;
   readonly snoozedCount?: number;
   readonly snoozedShelfExpanded?: boolean;
   readonly snoozedShelfHeaderIndex?: number | null;
@@ -699,6 +721,7 @@ export function buildThreadListV2ListItems(input: {
       count: agentCount,
       expanded: input.agentShelfExpanded === true,
       disabled: shelfDisabled,
+      attention: input.agentAttention ?? null,
     });
     result.push(...threadItems.slice(agentShelfHeaderIndex, agentEnd));
   }
@@ -903,6 +926,7 @@ export function buildThreadListV2Items(input: {
       workingShelfHeaderIndex: null,
       agentCount: 0,
       agentShelfHeaderIndex: null,
+      agentAttention: null,
       snoozedCount: 0,
       snoozedShelfHeaderIndex: null,
       settledCount: 0,
@@ -1047,6 +1071,9 @@ export function buildThreadListV2Items(input: {
     workingShelfHeaderIndex,
     agentCount: orderedAgent.length,
     agentShelfHeaderIndex,
+    agentAttention: resolveThreadListV2ShelfAttention(
+      orderedAgent.filter((thread) => !visibleAgent.includes(thread)),
+    ),
     snoozedCount: orderedSnoozed.length,
     snoozedShelfHeaderIndex,
     settledCount: settledTotal,

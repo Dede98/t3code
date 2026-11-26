@@ -3756,6 +3756,13 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                                 marker="pinned-header"
                                 label={gt("Pinned", { $context: "sidebar section" })}
                                 count={pinnedThreads.length}
+                                hiddenThreads={
+                                  pinnedExpanded
+                                    ? undefined
+                                    : pinnedThreads.filter(
+                                        (thread) => !visiblePinnedThreads.includes(thread),
+                                      )
+                                }
                                 dragging={from !== null && pinnedExpanded}
                                 isDropTarget={dragTargetSection === "pinned"}
                                 toggle={{ expanded: pinnedExpanded, onToggle: togglePinned }}
@@ -3815,6 +3822,13 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               className={cn(workingThreads.length === 0 && "mt-auto")}
                               label={gt("Agent threads", { $context: "sidebar section" })}
                               count={agentThreads.length}
+                              hiddenThreads={
+                                agentShelfExpanded
+                                  ? undefined
+                                  : agentThreads.filter(
+                                      (thread) => !visibleAgentThreads.includes(thread),
+                                    )
+                              }
                               toggle={{
                                 expanded: agentShelfExpanded,
                                 onToggle: toggleAgentShelf,
