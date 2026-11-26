@@ -1307,37 +1307,15 @@ describe("Claude continuation sync errors", () => {
 describe("isViewingThread", () => {
   const viewedThreadRef = { environmentId, threadId };
 
-  it("counts only the currently routed, visible, and focused thread as viewed", () => {
-    const viewing = { viewedThreadRef, activeRouteThreadRef: viewedThreadRef };
-    expect(isViewingThread({ ...viewing, isDocumentVisible: true, isDocumentFocused: true })).toBe(
-      true,
-    );
+  it("counts only the currently routed thread as viewed", () => {
+    expect(isViewingThread({ viewedThreadRef, activeRouteThreadRef: viewedThreadRef })).toBe(true);
     expect(
       isViewingThread({
         viewedThreadRef,
         activeRouteThreadRef: { environmentId, threadId: ThreadId.make("thread-2") },
-        isDocumentVisible: true,
-        isDocumentFocused: true,
       }),
     ).toBe(false);
-    expect(
-      isViewingThread({
-        viewedThreadRef,
-        activeRouteThreadRef: null,
-        isDocumentVisible: true,
-        isDocumentFocused: true,
-      }),
-    ).toBe(false);
-  });
-
-  it("does not count a hidden or unfocused window as viewing", () => {
-    const viewing = { viewedThreadRef, activeRouteThreadRef: viewedThreadRef };
-    expect(
-      isViewingThread({ ...viewing, isDocumentVisible: false, isDocumentFocused: false }),
-    ).toBe(false);
-    expect(isViewingThread({ ...viewing, isDocumentVisible: true, isDocumentFocused: false })).toBe(
-      false,
-    );
+    expect(isViewingThread({ viewedThreadRef, activeRouteThreadRef: null })).toBe(false);
   });
 });
 

@@ -3,14 +3,24 @@ import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { createThreadVisitTracker } from "@t3tools/client-runtime/state/thread-visits";
 import { type ScopedThreadRef } from "@t3tools/contracts";
 import { useParams } from "@tanstack/react-router";
-import { useSyncExternalStore } from "react";
-import { getDocumentActivity, subscribeDocumentActivity } from "~/lib/documentActivity";
+import { Atom } from "effect/reactivity";
 
 import { environmentCatalog } from "../../connection/catalog";
+import { getDocumentActivity, subscribeDocumentActivity } from "../../lib/documentActivity";
 import { useUiStateStore } from "../../uiStateStore";
 import { environmentThreadShells, threadEnvironment } from "../../state/threads";
 import { resolveThreadRouteRef } from "../../threadRoutes";
 import { isViewingThread } from "../ChatView.logic";
+
+const isDocumentViewed = () => {
+  const activity = getDocumentActivity();
+  return activity.visible && activity.focused;
+};
+
+const documentViewedAtom = Atom.make((get) => {
+  get.addFinalizer(subscribeDocumentActivity(() => get.setSelf(isDocumentViewed())));
+  return isDocumentViewed();
+}).pipe(Atom.withLabel("document-viewed"));
 
 const threadVisitTracker = createThreadVisitTracker({
   threadShellAtom: environmentThreadShells.threadShellAtom,
@@ -18,6 +28,7 @@ const threadVisitTracker = createThreadVisitTracker({
   visit: threadEnvironment.visit,
   markLocalVisit: (ref, visitedAt) =>
     useUiStateStore.getState().markThreadVisited(scopedThreadKey(ref), visitedAt),
+  viewingAtom: documentViewedAtom,
 });
 
 // The visit watermark is the one part of the chat view that follows the
@@ -28,14 +39,9 @@ export function ThreadVisitWatermark(props: { readonly threadRef: ScopedThreadRe
     strict: false,
     select: (params) => resolveThreadRouteRef(params),
   });
-  const documentActivity = useSyncExternalStore(subscribeDocumentActivity, getDocumentActivity);
-  // A mounted tracker counts as viewing, so background threads and unfocused windows stay unread.
-  const viewing = isViewingThread({
-    viewedThreadRef: props.threadRef,
-    activeRouteThreadRef,
-    isDocumentVisible: documentActivity.visible,
-    isDocumentFocused: documentActivity.focused,
-  });
-  useAtomMount(threadVisitTracker(viewing ? props.threadRef : null));
+  // Background threads stay mounted, so only the routed thread counts; the tracker's
+  // viewingAtom covers hidden and unfocused windows.
+  const routed = isViewingThread({ viewedThreadRef: props.threadRef, activeRouteThreadRef });
+  useAtomMount(threadVisitTracker(routed ? props.threadRef : null));
   return null;
 }

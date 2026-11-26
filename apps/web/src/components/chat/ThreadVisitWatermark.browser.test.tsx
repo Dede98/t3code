@@ -10,36 +10,18 @@ import { AppAtomRegistryProvider, appAtomRegistry } from "../../rpc/atomRegistry
 const mocks = vi.hoisted(() => ({
   visitRun: vi.fn(),
   routeParams: {} as Record<string, string>,
-  activity: { visible: true, focused: true },
-  activityListeners: new Set<() => void>(),
 }));
 
 function setup(route: ScopedThreadRef) {
   mocks.visitRun.mockReset();
   mocks.visitRun.mockReturnValue(Effect.void);
   mocks.routeParams = { environmentId: route.environmentId, threadId: route.threadId };
-  mocks.activity = { visible: true, focused: true };
-  mocks.activityListeners.clear();
-}
-
-function setDocumentActivity(activity: { visible: boolean; focused: boolean }) {
-  mocks.activity = activity;
-  for (const listener of mocks.activityListeners) listener();
 }
 
 vi.mock(import("@tanstack/react-router"), async (original) => ({
   ...(await original()),
   useParams: (({ select }: { select: (params: Record<string, string>) => unknown }) =>
     select(mocks.routeParams)) as never,
-}));
-
-vi.mock(import("~/lib/documentActivity"), async (original) => ({
-  ...(await original()),
-  getDocumentActivity: () => mocks.activity,
-  subscribeDocumentActivity: (listener: () => void) => {
-    mocks.activityListeners.add(listener);
-    return () => mocks.activityListeners.delete(listener);
-  },
 }));
 
 const shellKey = (ref: ScopedThreadRef) => `${ref.environmentId}:${ref.threadId}`;
@@ -69,7 +51,7 @@ const ENVIRONMENT = EnvironmentId.make("environment-visit-watermark");
 const threadA: ScopedThreadRef = { environmentId: ENVIRONMENT, threadId: ThreadId.make("a") };
 const threadB: ScopedThreadRef = { environmentId: ENVIRONMENT, threadId: ThreadId.make("b") };
 // Its own thread: the module-level tracker still throttles the thread the first test visited.
-const threadC: ScopedThreadRef = { environmentId: ENVIRONMENT, threadId: ThreadId.make("c") };
+const threadD: ScopedThreadRef = { environmentId: ENVIRONMENT, threadId: ThreadId.make("d") };
 
 function setShell(ref: ScopedThreadRef, updatedAt: string) {
   appAtomRegistry.set(shellAtom(shellKey(ref)), {
@@ -91,6 +73,7 @@ it("records the visit of the next thread at once after switching threads", async
   setup(threadA);
   setShell(threadA, "2026-01-02T00:00:00.000Z");
   setShell(threadB, "2026-01-03T00:00:00.000Z");
+  using _focus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
   using _timers = fakeTimers();
   vi.setSystemTime(NOW);
   // A palette pick already sent B's open with its query, so B's visit is a plain watermark advance.
@@ -115,28 +98,71 @@ it("records the visit of the next thread at once after switching threads", async
   expect(visitedThreadIds()).toEqual(["a", "b"]);
 });
 
-it("records no visit for a background thread or an unfocused window until it is viewed", async () => {
+it("records no visit for a background thread until it is the routed thread", async () => {
   setup(threadB);
-  setShell(threadC, "2026-01-02T00:00:00.000Z");
+  setShell(threadD, "2026-01-02T00:00:00.000Z");
+  using _focus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
   using _timers = fakeTimers();
   vi.setSystemTime(NOW);
 
   await using screen = await render(
     <AppAtomRegistryProvider>
-      <ThreadVisitWatermark threadRef={threadC} />
+      <ThreadVisitWatermark threadRef={threadD} />
     </AppAtomRegistryProvider>,
   );
   expect(visitedThreadIds()).toEqual([]);
 
-  mocks.routeParams = { environmentId: threadC.environmentId, threadId: threadC.threadId };
-  mocks.activity = { visible: true, focused: false };
+  mocks.routeParams = { environmentId: threadD.environmentId, threadId: threadD.threadId };
   await screen.rerender(
+    <AppAtomRegistryProvider>
+      <ThreadVisitWatermark threadRef={threadD} />
+    </AppAtomRegistryProvider>,
+  );
+  expect(visitedThreadIds()).toEqual(["d"]);
+});
+
+it("does not mark a run that finishes in a background window as seen", async () => {
+  const threadC: ScopedThreadRef = { environmentId: ENVIRONMENT, threadId: ThreadId.make("c") };
+  setup(threadC);
+  setShell(threadC, "2026-01-02T00:00:00.000Z");
+  let focused = true;
+  let visibility: DocumentVisibilityState = "visible";
+  using _focus = vi.spyOn(document, "hasFocus").mockImplementation(() => focused);
+  using _visibility = vi
+    .spyOn(document, "visibilityState", "get")
+    .mockImplementation(() => visibility);
+  using _timers = fakeTimers();
+  vi.setSystemTime(NOW);
+
+  await using _screen = await render(
     <AppAtomRegistryProvider>
       <ThreadVisitWatermark threadRef={threadC} />
     </AppAtomRegistryProvider>,
   );
-  expect(visitedThreadIds()).toEqual([]);
+  expect(visitedThreadIds()).toEqual(["c"]);
 
-  setDocumentActivity({ visible: true, focused: true });
-  await vi.waitFor(() => expect(visitedThreadIds()).toEqual(["c"]));
+  // The user switches to another app while the run is still working.
+  focused = false;
+  visibility = "hidden";
+  window.dispatchEvent(new Event("blur"));
+  document.dispatchEvent(new Event("visibilitychange"));
+
+  const completedAt = "2026-01-03T00:00:00.000Z";
+  appAtomRegistry.set(shellAtom(shellKey(threadC)), {
+    environmentId: threadC.environmentId,
+    id: threadC.threadId,
+    updatedAt: completedAt,
+    lastVisitedAt: "2026-01-02T00:00:00.000Z",
+    latestRun: { completedAt },
+  });
+  vi.advanceTimersByTime(60_000);
+
+  expect(visitedThreadIds()).toEqual(["c"]);
+
+  focused = true;
+  visibility = "visible";
+  document.dispatchEvent(new Event("visibilitychange"));
+  window.dispatchEvent(new Event("focus"));
+
+  expect(visitedThreadIds()).toEqual(["c", "c"]);
 });

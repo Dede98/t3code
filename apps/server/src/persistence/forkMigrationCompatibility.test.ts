@@ -76,6 +76,14 @@ const forkLedgerAfterFoundation: ReadonlyArray<readonly [number, string]> = [
   [110, "IssueTrackerAccounts"],
   [111, "Workflows"],
   [112, "SupersededRunAttemptIndex"],
+  [113, "LayoutCommandApprovals"],
+  [114, "WorkflowSkippedRuns"],
+  [115, "WorkflowRunIndexes"],
+  [116, "WorkflowRunTags"],
+  [117, "ForkHistoryMembership"],
+  [118, "WorkflowMailSender"],
+  [119, "WorkflowPools"],
+  [120, "WorkflowRunSubject"],
 ];
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 

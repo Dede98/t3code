@@ -205,9 +205,15 @@ export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationG
   function* (
     config: Pick<ClaudeSettings, "configDirPath" | "homePath">,
     baseEnv?: NodeJS.ProcessEnv,
-  ): Effect.fn.Return<string, never, Path.Path> {
+  ): Effect.fn.Return<string, never, Path.Path | FileSystem.FileSystem> {
+    const fileSystem = yield* FileSystem.FileSystem;
     const resolvedConfigDirPath = yield* resolveClaudeConfigDirPath(config, baseEnv);
-    return `claude:home:${resolvedConfigDirPath}`;
+    // Two instances that reach one Claude home through a symlink share sessions, so they can resume.
+    // Only the key uses the real path: the spawn keeps the literal path, which names the Keychain login.
+    const canonicalConfigDirPath = yield* fileSystem
+      .realPath(resolvedConfigDirPath)
+      .pipe(Effect.orElseSucceed(() => resolvedConfigDirPath));
+    return `claude:home:${canonicalConfigDirPath}`;
   },
 );
 
@@ -216,7 +222,7 @@ export const makeClaudeThreadContinuationGroupKey = Effect.fn(
 )(function* (
   config: Pick<ClaudeSettings, "configDirPath" | "crossAccountContinuationEnabled" | "homePath">,
   baseEnv?: NodeJS.ProcessEnv,
-): Effect.fn.Return<string, never, Path.Path> {
+): Effect.fn.Return<string, never, Path.Path | FileSystem.FileSystem> {
   return config.crossAccountContinuationEnabled
     ? CLAUDE_SESSION_STORE_CONTINUATION_KEY
     : yield* makeClaudeContinuationGroupKey(config, baseEnv);
@@ -228,8 +234,8 @@ export const makeClaudeCapabilitiesCacheKey = Effect.fn("makeClaudeCapabilitiesC
     baseEnv?: NodeJS.ProcessEnv,
     cwd?: string,
   ): Effect.fn.Return<string, never, Path.Path> {
-    const continuationGroupKey = yield* makeClaudeContinuationGroupKey(config, baseEnv);
-    return `${config.binaryPath}\0${continuationGroupKey}\0${cwd ?? ""}`;
+    const resolvedConfigDirPath = yield* resolveClaudeConfigDirPath(config, baseEnv);
+    return `${config.binaryPath}\0claude:home:${resolvedConfigDirPath}\0${cwd ?? ""}`;
   },
 );
 

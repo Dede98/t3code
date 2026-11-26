@@ -7,6 +7,7 @@ import {
   readHtmlRenderTheme,
   withHtmlTheme,
   htmlRenderTheme,
+  htmlRenderFileName,
   injectHtmlRenderBootstrap,
   readHtmlRenderImageRequest,
   readHtmlRenderLinkRequest,
@@ -16,6 +17,15 @@ import { htmlRenderFromToolItem } from "./toolOutput.ts";
 
 const reference = { attachmentId: "thread-abc-123.html", title: "Chart", height: 420 };
 const decodeMessageContext = Schema.decodeSync(OrchestrationMessageContext);
+
+describe("htmlRenderFileName", () => {
+  it("never ends on half of an emoji at the length limit", () => {
+    const fits = "a".repeat(118);
+    const crosses = "a".repeat(119);
+    expect(htmlRenderFileName(`${fits}🚀 report`)).toBe(`${fits}🚀.html`);
+    expect(htmlRenderFileName(`${crosses}🚀 report`)).toBe(`${crosses}.html`);
+  });
+});
 
 describe("injectHtmlRenderBootstrap", () => {
   it("puts the theme ahead of the page's own head content", () => {
