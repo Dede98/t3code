@@ -66,6 +66,7 @@ const LINUX_ICON_SIZES = [16, 22, 24, 32, 48, 64, 128, 256, 512] as const;
 const DESKTOP_APP_ID = "com.t3tools.t3code";
 const APPLE_TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/u;
 const LOCAL_MAC_SIGN_HOOK_FILE = "local-mac-sign.cjs";
+const LOCAL_MAC_ENTITLEMENTS_FILE = "local-mac-entitlements.plist";
 const APPLE_DEVELOPMENT_IDENTITY_PATTERN =
   /^\s*\d+\)\s+([0-9A-F]{40})\s+"(Apple Development: .+)"\s*$/iu;
 
@@ -1409,6 +1410,24 @@ export function resolveMacWebAuthnEntitlements(
   };
 }
 
+// Shared by every hardened-runtime signing path so none of them falls behind the others.
+const MAC_HARDENED_RUNTIME_ENTITLEMENTS = `    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+    <!-- The hardened runtime denies camera and microphone to the app and every
+         child process, with no prompt, unless the app claims these. Terminals
+         and coding agents inherit the app's TCC identity, so without these a
+         command like ffmpeg or imagesnap gets silent access-denied. -->
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>`;
+
 export function renderMacPasskeyEntitlements(
   configuration: MacPasskeySigningConfiguration,
   webAuthn: MacWebAuthnEntitlements,
@@ -1441,22 +1460,19 @@ export function renderMacPasskeyEntitlements(
     <array>
 ${associatedDomains}
     </array>${keychainAccessGroups}${browserPasskeys}
-    <key>com.apple.security.cs.allow-jit</key>
-    <true/>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <true/>
-    <key>com.apple.security.cs.disable-library-validation</key>
-    <true/>
-    <key>com.apple.security.automation.apple-events</key>
-    <true/>
-    <!-- The hardened runtime denies camera and microphone to the app and every
-         child process, with no prompt, unless the app claims these. Terminals
-         and coding agents inherit the app's TCC identity, so without these a
-         command like ffmpeg or imagesnap gets silent access-denied. -->
-    <key>com.apple.security.device.camera</key>
-    <true/>
-    <key>com.apple.security.device.audio-input</key>
-    <true/>
+${MAC_HARDENED_RUNTIME_ENTITLEMENTS}
+  </dict>
+</plist>
+`;
+}
+
+/** electron-builder's fallback entitlements omit camera and microphone, so local-sign builds need their own file. */
+export function renderMacLocalSignEntitlements(): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+${MAC_HARDENED_RUNTIME_ENTITLEMENTS}
   </dict>
 </plist>
 `;
@@ -2892,6 +2908,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     | {
         readonly identity: AppleDevelopmentSigningIdentity;
         readonly hookPath: string;
+        readonly entitlementsPath: string;
       }
     | undefined,
   localSignUpdates: boolean,
@@ -3016,6 +3033,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
             identity: localMacSigning.identity.name,
             type: "development",
             sign: localMacSigning.hookPath,
+            entitlements: localMacSigning.entitlementsPath,
           }
         : signed
           ? { sign: path.join(repoRoot, "scripts/sign-macos.ts") }
@@ -3990,6 +4008,10 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
         identityHash: localMacSigningIdentity.hash,
       }),
     );
+    yield* fs.writeFileString(
+      path.join(stageRoot, LOCAL_MAC_ENTITLEMENTS_FILE),
+      renderMacLocalSignEntitlements(),
+    );
   }
   const distDirs = {
     desktopDist: path.join(repoRoot, "apps/desktop/dist-electron"),
@@ -4232,6 +4254,7 @@ const buildDesktopArtifactUnlocked = Effect.fn("buildDesktopArtifactUnlocked")(f
         ? {
             identity: localMacSigningIdentity,
             hookPath: path.join(stageAppDir, LOCAL_MAC_SIGN_HOOK_FILE),
+            entitlementsPath: path.join(stageRoot, LOCAL_MAC_ENTITLEMENTS_FILE),
           }
         : undefined,
       options.localSignUpdates,

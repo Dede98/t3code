@@ -139,6 +139,11 @@ jobs:
           compgen -G 'release-alpha/*.zip' >/dev/null
           compgen -G 'release-alpha/*.blockmap' >/dev/null
           test -f release-alpha/nightly-mac.yml
+          # Without this entitlement the hardened runtime denies the microphone with no prompt.
+          zips=(release-alpha/*.zip)
+          ditto -x -k "${zips[0]}" "$RUNNER_TEMP/alpha-verify"
+          codesign -d --entitlements - "$RUNNER_TEMP"/alpha-verify/*.app 2>/dev/null |
+            grep -q 'com.apple.security.device.audio-input'
 
       - name: Publish fork alpha release
         uses: softprops/action-gh-release@v2

@@ -40,6 +40,7 @@ import {
   MissingMacPasskeyProvisioningProfileError,
   packWindowsServerAsar,
   preflightWindowsDesktopBuild,
+  renderMacLocalSignEntitlements,
   renderMacPasskeyEntitlements,
   renderLocalMacSigningHook,
   parseAppleDevelopmentSigningIdentities,
@@ -1856,7 +1857,11 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         false,
         false,
         undefined,
-        { identity, hookPath: "/tmp/stage/local-mac-sign.cjs" },
+        {
+          identity,
+          hookPath: "/tmp/stage/local-mac-sign.cjs",
+          entitlementsPath: "/tmp/local-mac-entitlements.plist",
+        },
         false,
         undefined,
       );
@@ -1871,6 +1876,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       assert.equal(mac.identity, identity.name);
       assert.equal(mac.type, "development");
       assert.equal(mac.sign, "/tmp/stage/local-mac-sign.cjs");
+      assert.equal(mac.entitlements, "/tmp/local-mac-entitlements.plist");
       assert.deepStrictEqual(mac.target, ["dmg"]);
       assert.notProperty(mac, "provisioningProfile");
     }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
@@ -1891,6 +1897,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
             name: "Apple Development: Example Developer (TEAMID1234)",
           },
           hookPath: "/tmp/stage/local-mac-sign.cjs",
+          entitlementsPath: "/tmp/local-mac-entitlements.plist",
         },
         true,
         undefined,
@@ -1900,6 +1907,21 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       assert.deepStrictEqual(mac.target, ["dmg", "zip"]);
     }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
   );
+
+  it("claims camera and microphone for local macOS signing without team-bound entitlements", () => {
+    const entitlements = renderMacLocalSignEntitlements();
+
+    assert.match(entitlements, /<key>com\.apple\.security\.device\.audio-input<\/key>\s*<true\/>/u);
+    assert.match(entitlements, /<key>com\.apple\.security\.device\.camera<\/key>\s*<true\/>/u);
+    assert.match(
+      entitlements,
+      /<key>com\.apple\.security\.automation\.apple-events<\/key>\s*<true\/>/u,
+    );
+    assert.include(entitlements, "<key>com.apple.security.cs.allow-jit</key>");
+    assert.notInclude(entitlements, "com.apple.application-identifier");
+    assert.notInclude(entitlements, "com.apple.developer.");
+    assert.notInclude(entitlements, "keychain-access-groups");
+  });
 
   it("parses duplicate-name Apple Development certificates by fingerprint", () => {
     const identity = "Apple Development: Example Developer (TEAMID1234)";
