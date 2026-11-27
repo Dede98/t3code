@@ -1,4 +1,4 @@
-import type { ThreadId } from "@t3tools/contracts";
+import type { RunId, ThreadId } from "@t3tools/contracts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { isNetworkPath } from "@t3tools/shared/path";
@@ -52,6 +52,8 @@ import * as PreviewBrowserHost from "../preview/PreviewBrowserHost.ts";
 const MIB = 1024 * 1024;
 const MAX_IMAGE_BYTES = 10 * MIB;
 const MAX_PAGE_BYTES = 25 * MIB;
+// Past this many runs without a client theme, an export reports it missing instead of guessing.
+const THEME_LOOKBACK_RUNS = 50;
 const HTML_FILE_EXTENSION = /\.html?$/i;
 // Like the image check, judge the bytes: a renamed .env or key does not start like a page.
 const HTML_DOCUMENT_START = /^\s*<(?:!doctype\s+html|html)[\s>]/i;
@@ -525,22 +527,43 @@ const make = Effect.gen(function* () {
     ),
   );
 
-  const requestTheme = Effect.fn("HtmlRender.requestTheme")(
-    function* (input: {
-      readonly threadId?: ThreadId | undefined;
-      readonly theme?: HtmlRenderTheme | undefined;
-    }) {
+  const capturedTheme = Effect.fn("HtmlRender.capturedTheme")(function* (
+    threadId: ThreadId,
+    runIds: ReadonlyArray<RunId>,
+  ) {
+    const { messages } = yield* threads.getThreadRecords(threadId, ["messages"], {
+      messageRunIds: runIds,
+      messageRoles: ["user"],
+    });
+    return messages.findLast((message) => message.context?.htmlTheme !== undefined)?.context
+      ?.htmlTheme;
+  });
+
+  // Steering belongs to the active run; queued requests have not started and cannot recolor it.
+  // Turns the server starts carry no theme, so after the page's own the newest one a started
+  // run captured applies.
+  const threadTheme = Effect.fn("HtmlRender.threadTheme")(
+    function* (
+      input: {
+        readonly threadId?: ThreadId | undefined;
+        readonly theme?: HtmlRenderTheme | undefined;
+      },
+      html: string,
+    ) {
       if (input.theme) return input.theme;
-      if (input.threadId === undefined) return undefined;
+      const embedded = readHtmlRenderTheme(html);
+      if (input.threadId === undefined) return embedded;
       const shell = yield* threads.getThreadShell(input.threadId);
-      if (!shell?.activeRunId) return undefined;
-      const { messages } = yield* threads.getThreadRecords(input.threadId, ["messages"], {
-        messageRunIds: [shell.activeRunId],
-        messageRoles: ["user"],
+      if (shell === null) return embedded;
+      const requested = shell.activeRunId
+        ? yield* capturedTheme(input.threadId, [shell.activeRunId])
+        : undefined;
+      if (requested ?? embedded) return requested ?? embedded;
+      const { runs } = yield* threads.getThreadRecords(input.threadId, ["runs"], {
+        latestRunLimit: THEME_LOOKBACK_RUNS,
       });
-      // Steering belongs to this run; queued requests belong to other runs and cannot recolor it.
-      return messages.findLast((message) => message.context?.htmlTheme !== undefined)?.context
-        ?.htmlTheme;
+      const started = runs.filter((run) => run.startedAt !== null).map((run) => run.id);
+      return started.length === 0 ? undefined : yield* capturedTheme(input.threadId, started);
     },
     Effect.mapError((cause) => new HtmlArtifactContextError({ cause })),
   );
@@ -644,7 +667,7 @@ const make = Effect.gen(function* () {
     const source = yield* readSource(input);
     // Standalone exports have no auto-fitting host frame.
     if (!input.standalone) yield* rejectViewportHeight(source);
-    const theme = (yield* requestTheme(input)) ?? readHtmlRenderTheme(source);
+    const theme = yield* threadTheme(input, source);
     if (input.standalone && !theme) return yield* new HtmlArtifactThemeMissingError({});
     const inlined = yield* inlineLocalImages(
       input.standalone && theme
@@ -711,7 +734,9 @@ const make = Effect.gen(function* () {
   ) {
     const html = yield* readSource(input);
     if (!input.standalone) yield* rejectViewportHeight(html);
-    const capturedTheme = input.standalone ? undefined : yield* requestTheme(input);
+    const requested = input.standalone
+      ? readHtmlRenderTheme(html)
+      : yield* threadTheme(input, html);
     const width = Math.min(
       MAX_PREVIEW_WIDTH,
       Math.max(MIN_PREVIEW_WIDTH, Math.round(input.width ?? HTML_RENDER_COLUMN_WIDTH)),
@@ -722,8 +747,7 @@ const make = Effect.gen(function* () {
       : yield* inline(html);
     const executable = yield* previewBrowser.executable;
     const theme =
-      capturedTheme ??
-      readHtmlRenderTheme(html) ??
+      requested ??
       htmlRenderTheme(
         appearance === "light" ? T3_CODE_LIGHT_THEME_COLORS : T3_CODE_DARK_THEME_COLORS,
         appearance,
@@ -750,7 +774,7 @@ const make = Effect.gen(function* () {
     input: Parameters<HtmlRender["Service"]["exportPage"]>[0],
   ) {
     const html = yield* readSource(input);
-    const theme = (yield* requestTheme(input)) ?? readHtmlRenderTheme(html);
+    const theme = yield* threadTheme(input, html);
     if (!theme) return yield* new HtmlArtifactThemeMissingError({});
     const reference = yield* publish({
       threadId: input.threadId,

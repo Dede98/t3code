@@ -428,6 +428,7 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
           Layer.mock(ThreadManagement.ThreadManagementService)({
             getThreadRecords: () =>
               Effect.succeed({
+                runs: [] as ReadonlyArray<import("@t3tools/contracts").OrchestrationV2Run>,
                 messages: [] as ReadonlyArray<
                   import("@t3tools/contracts").OrchestrationV2ConversationMessage
                 >,
