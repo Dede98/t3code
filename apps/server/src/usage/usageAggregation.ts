@@ -174,6 +174,9 @@ export function mergeUsageCopies(held: UsageRecord, copy: UsageRecord): UsageRec
     held.reportedCostUsd === null || copy.reportedCostUsd === null
       ? (held.reportedCostUsd ?? copy.reportedCostUsd)
       : Math.max(held.reportedCostUsd, copy.reportedCostUsd);
+  const heldModelCalls = held.modelCalls ?? 0;
+  const copyModelCalls = copy.modelCalls ?? 0;
+  const modelCalls = Math.max(heldModelCalls, copyModelCalls);
   if (
     b.uncachedInputTokens <= a.uncachedInputTokens &&
     b.cachedInputTokens <= a.cachedInputTokens &&
@@ -181,6 +184,7 @@ export function mergeUsageCopies(held: UsageRecord, copy: UsageRecord): UsageRec
     b.outputTokens <= a.outputTokens &&
     b.reasoningTokens <= a.reasoningTokens &&
     (copy.cacheCreation1hTokens ?? 0) <= (held.cacheCreation1hTokens ?? 0) &&
+    copyModelCalls <= heldModelCalls &&
     reportedCostUsd === held.reportedCostUsd
   ) {
     return held;
@@ -192,6 +196,7 @@ export function mergeUsageCopies(held: UsageRecord, copy: UsageRecord): UsageRec
   return {
     ...held,
     ...(cacheCreation1hTokens > 0 ? { cacheCreation1hTokens } : {}),
+    ...(modelCalls > 1 ? { modelCalls } : {}),
     totals: {
       uncachedInputTokens: Math.max(a.uncachedInputTokens, b.uncachedInputTokens),
       cachedInputTokens: Math.max(a.cachedInputTokens, b.cachedInputTokens),
@@ -214,8 +219,13 @@ function smallestGrokCopy(held: UsageRecord, copy: UsageRecord): UsageRecord {
     held.reportedCostUsd === null || copy.reportedCostUsd === null
       ? (held.reportedCostUsd ?? copy.reportedCostUsd)
       : Math.min(held.reportedCostUsd, copy.reportedCostUsd);
+  const modelCalls =
+    held.modelCalls !== undefined && copy.modelCalls !== undefined
+      ? Math.min(held.modelCalls, copy.modelCalls)
+      : (held.modelCalls ?? copy.modelCalls);
   return {
     ...held,
+    ...(modelCalls !== undefined && modelCalls > 1 ? { modelCalls } : {}),
     totals: {
       uncachedInputTokens: Math.min(a.uncachedInputTokens, b.uncachedInputTokens),
       cachedInputTokens: Math.min(a.cachedInputTokens, b.cachedInputTokens),

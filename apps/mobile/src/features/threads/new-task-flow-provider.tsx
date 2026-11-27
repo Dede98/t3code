@@ -94,7 +94,11 @@ import {
   resolveNewTaskBranchWorktreePath,
   resolveNewTaskLocalWorkspaceSelection,
 } from "./new-task-context-presentation";
-import { isSameRepository, resolveEnvironmentProjectMatch } from "./new-task-project-selection";
+import {
+  isSameRepository,
+  resolveEnvironmentProjectMatch,
+  workspaceFolderName,
+} from "./new-task-project-selection";
 import { useNewTaskProjectDefaults } from "./use-new-task-project-defaults";
 import { resolveNewThreadRuntimeMode } from "./thread-settings-options";
 import { resolveProjectThreadCreationBranch } from "./projectThreadCreationValidation";
@@ -866,8 +870,9 @@ export function NewTaskFlowProvider(
   const selectedRepositoryKey = selectedProject?.repositoryIdentity
     ? repositoryGroupingKeyOf(selectedProject.repositoryIdentity)
     : null;
-  // Use || null: placeholder workspaceRoot can be empty, and an empty basename rejects real hosts.
-  const selectedWorkspaceBasename = selectedProject?.workspaceRoot.split("/").at(-1) || null;
+  const selectedWorkspaceBasename = selectedProject
+    ? workspaceFolderName(selectedProject.workspaceRoot)
+    : null;
   const selectedProjectTitle = selectedProject?.title ?? null;
   const environments = (() => {
     if (isScratchDraft) {
@@ -892,7 +897,8 @@ export function NewTaskFlowProvider(
         return projectKey === selectedRepositoryKey;
       }
       return (
-        project.workspaceRoot.split("/").at(-1) === selectedWorkspaceBasename ||
+        (selectedWorkspaceBasename !== null &&
+          workspaceFolderName(project.workspaceRoot) === selectedWorkspaceBasename) ||
         (selectedProjectTitle !== null && project.title === selectedProjectTitle)
       );
     };
